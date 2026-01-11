@@ -7,6 +7,7 @@ from arenamcp.parser import LogParser
 from arenamcp.gamestate import GameState, create_game_state_handler
 from arenamcp.scryfall import ScryfallCache, ScryfallCard
 from arenamcp.draftstats import DraftStatsCache, DraftStats
+from arenamcp.server import mcp, start_watching, stop_watching
 
 __version__ = "0.1.0"
 
@@ -49,4 +50,7 @@ __all__ = [
     "ScryfallCard",
     "DraftStatsCache",
     "DraftStats",
+    "mcp",
+    "start_watching",
+    "stop_watching",
 ]
