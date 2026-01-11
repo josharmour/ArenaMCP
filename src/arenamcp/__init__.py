@@ -6,6 +6,7 @@ from arenamcp.watcher import MTGALogWatcher
 from arenamcp.parser import LogParser
 from arenamcp.gamestate import GameState, create_game_state_handler
 from arenamcp.scryfall import ScryfallCache, ScryfallCard
+from arenamcp.draftstats import DraftStatsCache, DraftStats
 
 __version__ = "0.1.0"
 
@@ -46,4 +47,6 @@ __all__ = [
     "create_game_state_handler",
     "ScryfallCache",
     "ScryfallCard",
+    "DraftStatsCache",
+    "DraftStats",
 ]
