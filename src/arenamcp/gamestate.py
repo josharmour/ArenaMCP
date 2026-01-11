@@ -250,6 +250,58 @@ class GameState:
         self.game_objects[instance_id] = game_object
         logger.debug(f"Updated game object {instance_id} (grpId={grp_id})")
 
+        # Track cards when first seen in non-library zones (reveals card identity)
+        self._track_played_card(game_object)
+
+    def _track_played_card(self, game_object: GameObject) -> None:
+        """Track a card as played/revealed if first seen in non-library zone.
+
+        This records the grp_id (card identity) when a card instance is
+        first observed outside of the library, which indicates the card
+        has been revealed to both players.
+
+        Args:
+            game_object: The game object to potentially track.
+        """
+        # Skip if already seen this instance
+        if game_object.instance_id in self._seen_instances:
+            return
+
+        # Skip if grp_id is 0 (unknown/hidden card)
+        if game_object.grp_id == 0:
+            return
+
+        # Determine zone type for this object
+        zone = self.zones.get(game_object.zone_id)
+        if zone is None:
+            # Zone not yet known; can't determine if revealed
+            return
+
+        # Only track cards in non-library zones (where identity is revealed)
+        # Library cards are hidden; once they move elsewhere, they're revealed
+        non_library_zones = {
+            ZoneType.BATTLEFIELD,
+            ZoneType.HAND,
+            ZoneType.GRAVEYARD,
+            ZoneType.EXILE,
+            ZoneType.STACK,
+            ZoneType.COMMAND,
+            ZoneType.REVEALED,
+        }
+
+        if zone.zone_type not in non_library_zones:
+            return
+
+        # Mark as seen
+        self._seen_instances.add(game_object.instance_id)
+
+        # Add to played cards for this owner
+        owner = game_object.owner_seat_id
+        if owner not in self.played_cards:
+            self.played_cards[owner] = []
+        self.played_cards[owner].append(game_object.grp_id)
+        logger.debug(f"Tracked played card: owner={owner}, grpId={game_object.grp_id}")
+
     def _update_zone(self, zone_data: dict) -> None:
         """Update or create a zone from message data.
 
