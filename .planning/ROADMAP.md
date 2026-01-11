@@ -16,7 +16,7 @@ None
 
 - [x] **Phase 1: Foundation** - Log watcher and parser for real-time event extraction
 - [x] **Phase 2: Game State** - State manager tracking zones, turns, and game objects
-- [ ] **Phase 3: External Data** - Scryfall card data and 17lands draft statistics
+- [x] **Phase 3: External Data** - Scryfall card data and 17lands draft statistics
 - [ ] **Phase 4: MCP Server** - FastMCP tools exposing game state and card info
 
 ## Phase Details
@@ -81,5 +81,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 |-------|----------------|--------|-----------|
 | 1. Foundation | 2/2 | Complete | 2026-01-11 |
 | 2. Game State | 1/1 | Complete | 2026-01-11 |
-| 3. External Data | 1/2 | In progress | - |
+| 3. External Data | 2/2 | Complete | 2026-01-11 |
 | 4. MCP Server | 0/TBD | Not started | - |
