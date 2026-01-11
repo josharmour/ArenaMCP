@@ -4,6 +4,7 @@ from typing import Optional
 
 from arenamcp.watcher import MTGALogWatcher
 from arenamcp.parser import LogParser
+from arenamcp.gamestate import GameState, create_game_state_handler
 
 __version__ = "0.1.0"
 
@@ -40,4 +41,6 @@ __all__ = [
     "MTGALogWatcher",
     "LogParser",
     "create_log_pipeline",
+    "GameState",
+    "create_game_state_handler",
 ]
