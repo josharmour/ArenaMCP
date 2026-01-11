@@ -1,13 +1,11 @@
-"""17lands draft statistics with CSV download and caching."""
+"""17lands draft statistics with JSON download and caching."""
 
-import csv
-import io
+import json
 import logging
-import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 
@@ -32,7 +30,7 @@ class DraftStats:
 
 
 class DraftStatsCache:
-    """17lands draft statistics with CSV download and caching.
+    """17lands draft statistics with JSON download and caching.
 
     Downloads and caches 17lands card ratings by set, providing
     GIH WR, ALSA, and IWD metrics for draft card evaluation.
@@ -51,8 +49,8 @@ class DraftStatsCache:
         self._stats_cache: dict[str, dict[str, DraftStats]] = {}
 
     def _get_cache_path(self, set_code: str) -> Path:
-        """Get path to the cached CSV file for a set."""
-        return self._cache_dir / f"{set_code.upper()}_PremierDraft.csv"
+        """Get path to the cached JSON file for a set."""
+        return self._cache_dir / f"{set_code.upper()}_PremierDraft.json"
 
     def _is_cache_stale(self, set_code: str) -> bool:
         """Check if the cache file is older than CACHE_MAX_AGE_HOURS."""
@@ -64,50 +62,14 @@ class DraftStatsCache:
         age = datetime.now() - mtime
         return age > timedelta(hours=CACHE_MAX_AGE_HOURS)
 
-    def _parse_percentage(self, value: str) -> Optional[float]:
-        """Parse a percentage string like '55.2%' to 0.552 float.
-
-        Returns None for 'NA', empty strings, or unparseable values.
-        """
-        if not value or value.strip().upper() in ("NA", "N/A", ""):
-            return None
-
-        try:
-            # Remove % sign and convert
-            value = value.strip().rstrip("%")
-            return float(value) / 100.0
-        except (ValueError, TypeError):
-            return None
-
-    def _parse_float(self, value: str) -> Optional[float]:
-        """Parse a float string, returning None for 'NA' or invalid."""
-        if not value or value.strip().upper() in ("NA", "N/A", ""):
-            return None
-
-        try:
-            return float(value.strip())
-        except (ValueError, TypeError):
-            return None
-
-    def _parse_int(self, value: str) -> int:
-        """Parse an int string, returning 0 for invalid."""
-        if not value or value.strip().upper() in ("NA", "N/A", ""):
-            return 0
-
-        try:
-            # Handle numbers with commas like "1,234"
-            return int(value.strip().replace(",", ""))
-        except (ValueError, TypeError):
-            return 0
-
-    def _download_set_data(self, set_code: str) -> str:
-        """Download card ratings CSV from 17lands.
+    def _download_set_data(self, set_code: str) -> list[dict[str, Any]]:
+        """Download card ratings JSON from 17lands.
 
         Args:
             set_code: Set code like 'DSK', 'BLB', etc.
 
         Returns:
-            Raw CSV content as string.
+            List of card data dicts from 17lands API.
 
         Raises:
             requests.RequestException: If download fails.
@@ -118,31 +80,47 @@ class DraftStatsCache:
         response = requests.get(url, timeout=30)
         response.raise_for_status()
 
+        data = response.json()
+
         # Save to cache
         cache_path = self._get_cache_path(set_code)
-        cache_path.write_text(response.text, encoding="utf-8")
+        cache_path.write_text(json.dumps(data), encoding="utf-8")
         logger.info(f"Cached 17lands data to {cache_path}")
 
-        return response.text
+        return data
 
-    def _parse_csv(self, csv_content: str, set_code: str) -> dict[str, DraftStats]:
-        """Parse 17lands CSV into DraftStats dict keyed by lowercase card name."""
+    def _parse_json(
+        self, cards_data: list[dict[str, Any]], set_code: str
+    ) -> dict[str, DraftStats]:
+        """Parse 17lands JSON into DraftStats dict keyed by lowercase card name.
+
+        17lands JSON fields:
+        - name: Card name
+        - avg_seen: ALSA (Average Last Seen At)
+        - ever_drawn_win_rate: GIH WR (Games in Hand Win Rate)
+        - ever_drawn_game_count: Number of games for GIH WR
+        - drawn_improvement_win_rate: IWD (Improvement When Drawn)
+        """
         result: dict[str, DraftStats] = {}
 
-        reader = csv.DictReader(io.StringIO(csv_content))
-
-        for row in reader:
-            name = row.get("Name", "").strip()
+        for card in cards_data:
+            name = card.get("name", "").strip()
             if not name:
                 continue
+
+            # Parse win rates (already as decimals 0.0-1.0, or null)
+            gih_wr = card.get("ever_drawn_win_rate")
+            alsa = card.get("avg_seen")
+            iwd = card.get("drawn_improvement_win_rate")
+            games_in_hand = card.get("ever_drawn_game_count") or 0
 
             stats = DraftStats(
                 name=name,
                 set_code=set_code.upper(),
-                gih_wr=self._parse_percentage(row.get("GIH WR", "")),
-                alsa=self._parse_float(row.get("ALSA", "")),
-                iwd=self._parse_percentage(row.get("IWD", "")),
-                games_in_hand=self._parse_int(row.get("# GIH", "")),
+                gih_wr=gih_wr,
+                alsa=alsa,
+                iwd=iwd,
+                games_in_hand=games_in_hand,
             )
 
             result[name.lower()] = stats
@@ -162,13 +140,14 @@ class DraftStatsCache:
         cache_path = self._get_cache_path(set_code)
         if cache_path.exists() and not self._is_cache_stale(set_code):
             logger.info(f"Loading cached 17lands data from {cache_path}")
-            csv_content = cache_path.read_text(encoding="utf-8")
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cards_data = json.load(f)
         else:
             # Download fresh data
-            csv_content = self._download_set_data(set_code)
+            cards_data = self._download_set_data(set_code)
 
         # Parse and cache in memory
-        self._stats_cache[set_code] = self._parse_csv(csv_content, set_code)
+        self._stats_cache[set_code] = self._parse_json(cards_data, set_code)
         return self._stats_cache[set_code]
 
     def load_set(self, set_code: str) -> None:
