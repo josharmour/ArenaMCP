@@ -5,6 +5,7 @@ from typing import Optional
 from arenamcp.watcher import MTGALogWatcher
 from arenamcp.parser import LogParser
 from arenamcp.gamestate import GameState, create_game_state_handler
+from arenamcp.scryfall import ScryfallCache, ScryfallCard
 
 __version__ = "0.1.0"
 
@@ -43,4 +44,6 @@ __all__ = [
     "create_log_pipeline",
     "GameState",
     "create_game_state_handler",
+    "ScryfallCache",
+    "ScryfallCard",
 ]
