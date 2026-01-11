@@ -81,5 +81,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 |-------|----------------|--------|-----------|
 | 1. Foundation | 2/2 | Complete | 2026-01-11 |
 | 2. Game State | 1/1 | Complete | 2026-01-11 |
-| 3. External Data | 0/TBD | Not started | - |
+| 3. External Data | 1/2 | In progress | - |
 | 4. MCP Server | 0/TBD | Not started | - |
