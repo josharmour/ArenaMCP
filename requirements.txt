@@ -1,2 +1,4 @@
 watchdog>=3.0.0
 requests>=2.28.0
+sounddevice>=0.4.6
+numpy>=1.24.0
