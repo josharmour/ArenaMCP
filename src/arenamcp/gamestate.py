@@ -84,7 +84,7 @@ class GameState:
         self.players: dict[int, Player] = {}
         self.turn_info: TurnInfo = TurnInfo()
 
-        # Local player tracking (set externally from MatchCreated event)
+        # Local player tracking (inferred from hand zone visibility)
         self.local_seat_id: Optional[int] = None
 
         # Opponent card history tracking
@@ -172,6 +172,33 @@ class GameState:
         if self.opponent_seat_id is None:
             return []
         return self.played_cards.get(self.opponent_seat_id, [])
+
+    def reset_local_player(self) -> None:
+        """Reset local_seat_id to force re-inference.
+
+        Call this when starting a new game or if player detection is wrong.
+        """
+        self.local_seat_id = None
+        logger.info("Reset local_seat_id for re-inference")
+
+    def ensure_local_seat_id(self) -> None:
+        """Ensure local_seat_id is set by inferring from existing data.
+
+        Called by server before returning game state to ensure is_local
+        is correctly determined. Uses hand zone with visible cards
+        (opponent's hand zone exists but has no visible objects).
+        """
+        if self.local_seat_id is not None:
+            return  # Already set
+
+        # Try to infer from hand zones that have visible cards
+        for zone in self.zones.values():
+            if (zone.zone_type == ZoneType.HAND and
+                zone.owner_seat_id is not None and
+                zone.object_instance_ids):  # Must have visible cards
+                self.local_seat_id = zone.owner_seat_id
+                logger.info(f"Inferred local player as seat {zone.owner_seat_id} from existing hand zone with {len(zone.object_instance_ids)} cards")
+                return
 
     def update_from_message(self, message: dict) -> None:
         """Update game state from a GameStateMessage payload.
@@ -332,6 +359,13 @@ class GameState:
         self.zones[zone_id] = zone
         logger.debug(f"Updated zone {zone_id} ({zone_type.name})")
 
+        # Infer local player from hand visibility (you only see your own hand's CARDS)
+        # Only infer if hand zone has visible objects - opponent's hand zone exists but is empty
+        if zone_type == ZoneType.HAND and owner_seat_id is not None and object_instance_ids:
+            if self.local_seat_id is None:
+                self.local_seat_id = owner_seat_id
+                logger.info(f"Inferred local player as seat {owner_seat_id} from hand zone with {len(object_instance_ids)} cards")
+
     def _update_player(self, player_data: dict) -> None:
         """Update or create a player from message data.
 
@@ -366,7 +400,16 @@ class GameState:
         Args:
             turn_data: TurnInfo dict from GameStateMessage.
         """
-        self.turn_info.turn_number = turn_data.get("turnNumber", self.turn_info.turn_number)
+        new_turn = turn_data.get("turnNumber", self.turn_info.turn_number)
+
+        # Detect new game: turn number resets to 1 or decreases significantly
+        if self.turn_info.turn_number > 3 and new_turn <= 1:
+            logger.info(f"New game detected (turn {self.turn_info.turn_number} -> {new_turn}), resetting local_seat_id")
+            self.local_seat_id = None
+            self.played_cards.clear()
+            self._seen_instances.clear()
+
+        self.turn_info.turn_number = new_turn
         self.turn_info.active_player = turn_data.get("activePlayer", self.turn_info.active_player)
         self.turn_info.priority_player = turn_data.get("priorityPlayer", self.turn_info.priority_player)
         self.turn_info.phase = turn_data.get("phase", self.turn_info.phase)
@@ -392,16 +435,21 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
         parser.register_handler('GreToClientEvent', handler)
     """
     def handler(payload: dict) -> None:
-        # GreToClientEvent wraps the actual event data
-        gre_event = payload.get("greToClientEvent", payload)
+        # GreToClientEvent contains greToClientMessages array
+        gre_event = payload.get("greToClientEvent", {})
+        messages = gre_event.get("greToClientMessages", [])
 
-        # Check for gameStateMessage in the event
-        game_state_msg = gre_event.get("gameStateMessage")
-        if game_state_msg:
-            game_state.update_from_message(game_state_msg)
-            return
+        # Process each message in the array
+        for msg in messages:
+            msg_type = msg.get("type", "")
 
-        # Also handle direct GameStateMessage events
+            # Handle GameStateMessage
+            if msg_type == "GREMessageType_GameStateMessage":
+                game_state_msg = msg.get("gameStateMessage")
+                if game_state_msg:
+                    game_state.update_from_message(game_state_msg)
+
+        # Also handle direct GameStateMessage events (legacy format)
         if "gameObjects" in payload or "zones" in payload or "players" in payload:
             game_state.update_from_message(payload)
 
