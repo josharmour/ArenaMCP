@@ -38,16 +38,19 @@ file_handler.setFormatter(logging.Formatter(
     datefmt='%Y-%m-%d %H:%M:%S'
 ))
 
-# Set up console handler with simpler format
+# Configure root logger directly (basicConfig is a no-op if already configured)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+# Remove any existing handlers to avoid duplicates
+for h in root_logger.handlers[:]:
+    root_logger.removeHandler(h)
+root_logger.addHandler(file_handler)
+
+# Also add a simple console handler for INFO level
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter('%(message)s'))
-
-# Configure root logger
-logging.basicConfig(
-    level=logging.DEBUG,
-    handlers=[file_handler, console_handler]
-)
+root_logger.addHandler(console_handler)
 
 logger = logging.getLogger(__name__)
 
@@ -466,13 +469,15 @@ Debug logs are written to ~/.arenamcp/debug.log
 
     # Check API keys
     if args.backend == "gemini" and not os.environ.get("GOOGLE_API_KEY"):
-        print("Error: GOOGLE_API_KEY environment variable not set")
-        print("Get a key at: https://makersuite.google.com/app/apikey")
+        msg = "GOOGLE_API_KEY environment variable not set. Get a key at: https://makersuite.google.com/app/apikey"
+        logger.error(msg)
+        print(f"Error: {msg}")
         sys.exit(1)
 
     if args.backend == "claude" and not os.environ.get("ANTHROPIC_API_KEY"):
-        print("Error: ANTHROPIC_API_KEY environment variable not set")
-        print("Get a key at: https://console.anthropic.com/")
+        msg = "ANTHROPIC_API_KEY environment variable not set. Get a key at: https://console.anthropic.com/"
+        logger.error(msg)
+        print(f"Error: {msg}")
         sys.exit(1)
 
     # Run coach
@@ -487,6 +492,12 @@ Debug logs are written to ~/.arenamcp/debug.log
         coach.run_forever()
     except KeyboardInterrupt:
         coach.stop()
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        logger.debug(traceback.format_exc())
+        print(f"\nFatal error: {e}")
+        print(f"See debug log for details: {LOG_FILE}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
