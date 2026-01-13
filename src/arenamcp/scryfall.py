@@ -52,6 +52,7 @@ class ScryfallCache:
 
         self._arena_index: dict[int, dict[str, Any]] = {}
         self._last_api_call: float = 0.0
+        self._not_found_cache: set[int] = set()  # Negative cache for 404s
 
         self._load_or_download_bulk_data()
 
@@ -189,6 +190,10 @@ class ScryfallCache:
         if arena_id in self._arena_index:
             return self._card_dict_to_scryfall_card(self._arena_index[arena_id])
 
+        # Check negative cache - don't re-fetch known missing cards
+        if arena_id in self._not_found_cache:
+            return None
+
         # Fall back to API
         card_data = self._fetch_from_api(arena_id)
         if card_data:
@@ -196,4 +201,7 @@ class ScryfallCache:
             self._arena_index[arena_id] = card_data
             return self._card_dict_to_scryfall_card(card_data)
 
+        # Add to negative cache to avoid repeated API calls
+        self._not_found_cache.add(arena_id)
+        logger.debug(f"Added arena_id {arena_id} to not-found cache")
         return None

@@ -74,11 +74,11 @@ class ClaudeBackend:
 class GeminiBackend:
     """LLM backend using Google's Gemini API."""
 
-    def __init__(self, model: str = "gemini-1.5-flash"):
+    def __init__(self, model: str = "gemini-2.0-flash"):
         """Initialize Gemini backend with lazy client creation.
 
         Args:
-            model: The Gemini model to use (default: gemini-1.5-flash for speed)
+            model: The Gemini model to use (default: gemini-2.0-flash)
         """
         self.model = model
         self._client = None

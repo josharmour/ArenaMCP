@@ -74,6 +74,8 @@ root_logger.addHandler(console_handler)
 logger = logging.getLogger(__name__)
 
 # Now import our modules
+import keyboard
+
 from arenamcp.coach import CoachEngine, GameStateTrigger, create_backend
 from arenamcp.gamestate import GameState, create_game_state_handler
 from arenamcp.parser import LogParser
@@ -181,6 +183,7 @@ class StandaloneCoach:
                 "card_types": obj.card_types,
             }
             # Try to get card name from Scryfall
+            card_found = False
             if _scryfall and obj.grp_id:
                 try:
                     card = _scryfall.get_card_by_arena_id(obj.grp_id)
@@ -188,8 +191,35 @@ class StandaloneCoach:
                         card_data["name"] = card.name
                         card_data["mana_cost"] = card.mana_cost
                         card_data["oracle_text"] = card.oracle_text
+                        card_found = True
                 except Exception:
                     pass
+
+            # Generate descriptive name for unknown cards using subtypes from logs
+            if not card_found:
+                type_names = [t.replace("CardType_", "") for t in obj.card_types] if obj.card_types else []
+                # Use subtypes if available (e.g., "Badger Mole" instead of "Creature")
+                subtype_str = " ".join(obj.subtypes) if hasattr(obj, 'subtypes') and obj.subtypes else ""
+
+                if obj.power is not None and obj.toughness is not None:
+                    # It's a creature - show P/T and subtypes
+                    if subtype_str:
+                        card_data["name"] = f"Unknown {obj.power}/{obj.toughness} {subtype_str}"
+                    else:
+                        type_str = "/".join(type_names) if type_names else "Creature"
+                        card_data["name"] = f"Unknown {obj.power}/{obj.toughness} {type_str}"
+                elif subtype_str:
+                    card_data["name"] = f"Unknown {subtype_str}"
+                elif type_names:
+                    card_data["name"] = f"Unknown {'/'.join(type_names)}"
+                else:
+                    card_data["name"] = f"Unknown Card (ID: {obj.grp_id})"
+                card_data["mana_cost"] = ""
+                card_data["oracle_text"] = ""
+                # Add subtypes to card_data for LLM context
+                if hasattr(obj, 'subtypes') and obj.subtypes:
+                    card_data["subtypes"] = obj.subtypes
+
             return card_data
 
         return {
@@ -222,14 +252,25 @@ class StandaloneCoach:
         logger.info("Coaching loop started")
         prev_state: dict[str, Any] = {}
 
+        # Debouncing state - prevent repeated advice
+        last_advice_turn: int = 0
+        last_advice_phase: str = ""
+        last_advice_trigger: str = ""
+
+        # High-priority triggers that always warrant advice
+        HIGH_PRIORITY_TRIGGERS = {"stack_spell", "low_life", "opponent_low_life", "combat_blockers"}
+
         while self._running:
             try:
                 curr_state = self._get_game_state_dict()
+                curr_turn = curr_state.get("turn", {})
+                turn_num = curr_turn.get("turn_number", 0)
+                phase = curr_turn.get("phase", "")
 
                 # Log state periodically for debugging
-                if curr_state.get("turn", {}).get("turn_number", 0) > 0:
-                    logger.debug(f"Game state: turn={curr_state['turn']['turn_number']}, "
-                                f"phase={curr_state['turn']['phase']}, "
+                if turn_num > 0:
+                    logger.debug(f"Game state: turn={turn_num}, "
+                                f"phase={phase}, "
                                 f"players={len(curr_state['players'])}, "
                                 f"battlefield={len(curr_state['battlefield'])}")
 
@@ -237,6 +278,34 @@ class StandaloneCoach:
                     triggers = self._trigger.check_triggers(prev_state, curr_state)
 
                     for trigger in triggers:
+                        logger.debug(f"TRIGGER detected: {trigger}")
+
+                        # Debouncing logic - skip if we already advised this turn/phase
+                        should_advise = False
+
+                        if trigger in HIGH_PRIORITY_TRIGGERS:
+                            # Always advise on high-priority events
+                            should_advise = True
+                            logger.debug(f"High priority trigger: {trigger}")
+                        elif trigger == "new_turn" and turn_num > last_advice_turn:
+                            # New turn - advise once per turn
+                            should_advise = True
+                            logger.debug(f"New turn {turn_num} > last {last_advice_turn}")
+                        elif trigger == "combat_attackers" and last_advice_trigger != "combat_attackers":
+                            # Combat attackers - advise once per combat
+                            should_advise = True
+                        elif trigger == "priority_gained":
+                            # Only advise on priority if it's a new turn or new phase
+                            if turn_num > last_advice_turn or phase != last_advice_phase:
+                                should_advise = True
+                                logger.debug(f"Priority in new context: turn {turn_num}, phase {phase}")
+                            else:
+                                logger.debug(f"Skipping priority_gained (same turn/phase)")
+
+                        if not should_advise:
+                            logger.debug(f"Skipping {trigger} (debounced)")
+                            continue
+
                         logger.info(f"TRIGGER: {trigger}")
                         self._log_game_state(curr_state, trigger)
 
@@ -244,6 +313,11 @@ class StandaloneCoach:
                         if self._coach:
                             advice = self._coach.get_advice(curr_state, trigger=trigger)
                             logger.info(f"ADVICE: {advice}")
+
+                            # Update debounce state
+                            last_advice_turn = turn_num
+                            last_advice_phase = phase
+                            last_advice_trigger = trigger
 
                             # Speak if enabled
                             if self.auto_speak and self._voice_output:
@@ -272,7 +346,7 @@ class StandaloneCoach:
 
         logger.info(f"Voice loop started ({self.voice_mode} mode)")
         if self.voice_mode == "ptt":
-            print("\n[MIC] Press and hold F4 to ask a question\n")
+            print("\n[MIC] Press F4 to ask a question (tap for quick advice)\n")
         else:
             print("\n[MIC] Voice activation enabled - just speak\n")
 
@@ -283,25 +357,37 @@ class StandaloneCoach:
                 # Wait for voice input
                 text = self._voice_input.wait_for_speech(timeout=2.0)
 
-                if text and text.strip():
-                    logger.info(f"VOICE INPUT: {text}")
-                    print(f"\n🗣️ You asked: {text}")
+                # Check if event was triggered (result_ready was set)
+                if not self._voice_input._result_ready.is_set():
+                    continue  # Timeout, no input
 
-                    # Get advice for the question
-                    if self._coach:
-                        game_state = self._get_game_state_dict()
+                if self._coach:
+                    game_state = self._get_game_state_dict()
+
+                    if text and text.strip():
+                        # User asked a specific question
+                        logger.info(f"VOICE INPUT: {text}")
+                        print(f"\n[YOU] {text}")
+
                         self._log_game_state(game_state, f"question: {text}")
-
                         advice = self._coach.get_advice(game_state, question=text)
                         logger.info(f"RESPONSE: {advice}")
+                        print(f"\n[ANSWER] {advice}\n")
+                    else:
+                        # Empty speech (F4 tap) - give quick advice on current state
+                        logger.info("QUICK ADVICE REQUEST (F4 tap)")
+                        print("\n[QUICK] Analyzing current situation...")
 
-                        print(f"\n💡 {advice}\n")
+                        self._log_game_state(game_state, "quick_advice")
+                        advice = self._coach.get_advice(game_state, trigger="user_request")
+                        logger.info(f"QUICK ADVICE: {advice}")
+                        print(f"\n[COACH] {advice}\n")
 
-                        if self.auto_speak and self._voice_output:
-                            try:
-                                self._voice_output.speak(advice, blocking=True)
-                            except Exception as e:
-                                logger.error(f"TTS error: {e}")
+                    if self.auto_speak and self._voice_output:
+                        try:
+                            self._voice_output.speak(advice, blocking=True)
+                        except Exception as e:
+                            logger.error(f"TTS error: {e}")
 
             except Exception as e:
                 if self._running:  # Only log if not shutting down
@@ -316,6 +402,75 @@ class StandaloneCoach:
         logger.debug(f"=== GAME STATE ({context}) ===")
         logger.debug(json.dumps(state, indent=2, default=str))
         logger.debug("=== END GAME STATE ===")
+
+    def _on_mute_hotkey(self) -> None:
+        """Handle F5 mute toggle hotkey."""
+        if self._voice_output:
+            muted = self._voice_output.toggle_mute()
+            status = "MUTED" if muted else "UNMUTED"
+            logger.info(f"Voice output {status}")
+            print(f"\n[VOICE] Coach {status}\n")
+        else:
+            print("\n[VOICE] TTS not enabled\n")
+
+    def _on_voice_hotkey(self) -> None:
+        """Handle F6 voice change hotkey."""
+        if self._voice_output:
+            voice_id, description = self._voice_output.next_voice()
+            logger.info(f"Changed voice to: {voice_id} ({description})")
+            print(f"\n[VOICE] Changed to: {description}\n")
+            # Speak a sample with new voice
+            try:
+                self._voice_output.speak("Voice changed.", blocking=False)
+            except Exception as e:
+                logger.debug(f"Could not play voice sample: {e}")
+        else:
+            print("\n[VOICE] TTS not enabled\n")
+
+    def _on_bug_report_hotkey(self) -> None:
+        """Handle F7 bug report hotkey."""
+        # Save current game state snapshot for later analysis
+        bug_dir = LOG_DIR / "bug_reports"
+        bug_dir.mkdir(exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        bug_file = bug_dir / f"bug_{timestamp}.json"
+
+        try:
+            game_state = self._get_game_state_dict()
+            report = {
+                "timestamp": datetime.now().isoformat(),
+                "backend": self.backend_name,
+                "model": self.model_name,
+                "game_state": game_state,
+            }
+
+            with open(bug_file, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, default=str)
+
+            logger.info(f"Bug report saved: {bug_file}")
+            print(f"\n[BUG] Report saved: {bug_file}\n")
+        except Exception as e:
+            logger.error(f"Failed to save bug report: {e}")
+            print(f"\n[BUG] Failed to save report: {e}\n")
+
+    def _register_hotkeys(self) -> None:
+        """Register global hotkeys for coach control."""
+        try:
+            keyboard.on_press_key("f5", lambda _: self._on_mute_hotkey(), suppress=False)
+            keyboard.on_press_key("f6", lambda _: self._on_voice_hotkey(), suppress=False)
+            keyboard.on_press_key("f7", lambda _: self._on_bug_report_hotkey(), suppress=False)
+            logger.info("Hotkeys registered: F5=mute, F6=voice, F7=bug report")
+        except Exception as e:
+            logger.warning(f"Failed to register hotkeys: {e}")
+
+    def _unregister_hotkeys(self) -> None:
+        """Unregister global hotkeys."""
+        try:
+            keyboard.unhook_all()
+            logger.info("Hotkeys unregistered")
+        except Exception:
+            pass
 
     def _on_log_chunk(self, chunk: str) -> None:
         """Handle new log chunks from MTGA."""
@@ -356,13 +511,18 @@ class StandaloneCoach:
         )
         self._voice_thread.start()
 
+        # Register hotkeys
+        self._register_hotkeys()
+
         print("\n" + "="*50)
         print("MTGA Standalone Coach Running")
         print("="*50)
         print(f"Backend: {self.backend_name}" + (f" ({self.model_name})" if self.model_name else ""))
         print(f"Auto-speak: {self.auto_speak}")
-        print(f"Voice: {self.voice_mode.upper()} mode" + (" - Hold F4 to talk" if self.voice_mode == "ptt" else ""))
+        print(f"Voice: {self.voice_mode.upper()} mode" + (" - Hold F4 to talk, tap for quick advice" if self.voice_mode == "ptt" else ""))
         print(f"Debug log: {LOG_FILE}")
+        print("-"*50)
+        print("Hotkeys: F4=talk/advice  F5=mute  F6=voice  F7=bug")
         print("="*50)
         print("\nWaiting for MTGA game... (Ctrl+C to quit)\n")
 
@@ -375,6 +535,9 @@ class StandaloneCoach:
 
         logger.info("Stopping standalone coach...")
         self._running = False
+
+        # Unregister hotkeys
+        self._unregister_hotkeys()
 
         # Stop watcher
         if self._watcher:

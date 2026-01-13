@@ -196,6 +196,21 @@ class VoiceOutput:
         downloaded manually - see KokoroTTS docstring.
     """
 
+    # Available Kokoro voices (name, description)
+    VOICES = [
+        ("af_heart", "American Female - Heart (Grade A)"),
+        ("af_bella", "American Female - Bella"),
+        ("af_nicole", "American Female - Nicole"),
+        ("af_sarah", "American Female - Sarah"),
+        ("af_sky", "American Female - Sky"),
+        ("am_adam", "American Male - Adam"),
+        ("am_michael", "American Male - Michael"),
+        ("bf_emma", "British Female - Emma"),
+        ("bf_isabella", "British Female - Isabella"),
+        ("bm_george", "British Male - George"),
+        ("bm_lewis", "British Male - Lewis"),
+    ]
+
     def __init__(
         self,
         voice: str = "af_heart",
@@ -210,6 +225,14 @@ class VoiceOutput:
         """
         self._voice = voice
         self._speed = speed
+        self._voice_index = 0  # Index into VOICES list
+        self._muted = False
+
+        # Find initial voice index
+        for i, (vid, _) in enumerate(self.VOICES):
+            if vid == voice:
+                self._voice_index = i
+                break
 
         # Lazy-initialized TTS
         self._tts: Optional[KokoroTTS] = None
@@ -225,6 +248,43 @@ class VoiceOutput:
         """Initialize TTS on first use."""
         if self._tts is None:
             self._tts = KokoroTTS(voice=self._voice, speed=self._speed)
+
+    @property
+    def muted(self) -> bool:
+        """Check if output is muted."""
+        return self._muted
+
+    @property
+    def current_voice(self) -> tuple[str, str]:
+        """Get current voice (id, description)."""
+        return self.VOICES[self._voice_index]
+
+    def toggle_mute(self) -> bool:
+        """Toggle mute state.
+
+        Returns:
+            New mute state (True if now muted).
+        """
+        self._muted = not self._muted
+        if self._muted:
+            self.stop()  # Stop any current playback
+        return self._muted
+
+    def next_voice(self) -> tuple[str, str]:
+        """Cycle to the next voice.
+
+        Returns:
+            Tuple of (voice_id, description) for the new voice.
+        """
+        self._voice_index = (self._voice_index + 1) % len(self.VOICES)
+        voice_id, description = self.VOICES[self._voice_index]
+        self._voice = voice_id
+
+        # Recreate TTS with new voice
+        if self._tts is not None:
+            self._tts = KokoroTTS(voice=self._voice, speed=self._speed)
+
+        return (voice_id, description)
 
     @property
     def is_speaking(self) -> bool:
@@ -248,6 +308,10 @@ class VoiceOutput:
             FileNotFoundError: If TTS model files not found.
             sd.PortAudioError: If no audio output device available.
         """
+        # Skip if muted
+        if self._muted:
+            return
+
         if not blocking:
             self.speak_async(text)
             return

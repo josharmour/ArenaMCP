@@ -19,6 +19,7 @@ Example:
     voice.stop()
 """
 
+import logging
 import threading
 from typing import Literal, Optional
 
@@ -28,6 +29,30 @@ import sounddevice as sd
 from arenamcp.audio import AudioRecorder, AudioConfig
 from arenamcp.transcription import WhisperTranscriber
 from arenamcp.triggers import PTTHandler, VOXDetector
+
+logger = logging.getLogger(__name__)
+
+
+def play_beep(frequency: float = 880, duration: float = 0.1, volume: float = 0.3) -> None:
+    """Play a simple beep tone.
+
+    Args:
+        frequency: Tone frequency in Hz. Default 880 (A5).
+        duration: Duration in seconds. Default 0.1.
+        volume: Volume from 0.0 to 1.0. Default 0.3.
+    """
+    try:
+        sample_rate = 44100
+        t = np.linspace(0, duration, int(sample_rate * duration), False)
+        tone = np.sin(2 * np.pi * frequency * t) * volume
+        # Apply quick fade in/out to avoid clicks
+        fade_samples = int(sample_rate * 0.01)
+        if fade_samples > 0 and len(tone) > fade_samples * 2:
+            tone[:fade_samples] *= np.linspace(0, 1, fade_samples)
+            tone[-fade_samples:] *= np.linspace(1, 0, fade_samples)
+        sd.play(tone.astype(np.float32), sample_rate, blocking=False)
+    except Exception as e:
+        logger.debug(f"Could not play beep: {e}")
 
 
 class VoiceInput:
@@ -109,6 +134,8 @@ class VoiceInput:
 
     def _on_recording_start(self) -> None:
         """Called when PTT key is pressed."""
+        # Play start beep (higher pitch)
+        play_beep(frequency=880, duration=0.08, volume=0.25)
         with self._lock:
             self._result_ready.clear()
             if self._recorder is not None:
@@ -116,6 +143,8 @@ class VoiceInput:
 
     def _on_recording_stop(self) -> None:
         """Called when PTT key is released."""
+        # Play stop beep (lower pitch, double beep)
+        play_beep(frequency=660, duration=0.06, volume=0.25)
         with self._lock:
             if self._recorder is not None:
                 audio = self._recorder.stop_recording()
