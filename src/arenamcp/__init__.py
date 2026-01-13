@@ -8,12 +8,14 @@ from arenamcp.gamestate import GameState, create_game_state_handler
 from arenamcp.scryfall import ScryfallCache, ScryfallCard
 from arenamcp.draftstats import DraftStatsCache, DraftStats
 from arenamcp.server import mcp, start_watching, stop_watching
+from arenamcp.voice import VoiceInput
 
 __version__ = "0.1.0"
 
 
 def create_log_pipeline(
-    log_path: Optional[str] = None
+    log_path: Optional[str] = None,
+    backfill: bool = True
 ) -> tuple[MTGALogWatcher, LogParser]:
     """Create a connected watcher -> parser pipeline.
 
@@ -22,6 +24,9 @@ def create_log_pipeline(
     Args:
         log_path: Path to MTGA Player.log. Defaults to MTGA_LOG_PATH env var
                  or standard Windows location.
+        backfill: If True, parse existing log content from the last match
+                 start when the watcher starts. Enables catching up on
+                 in-progress games. Defaults to True.
 
     Returns:
         Tuple of (watcher, parser). Start the watcher to begin processing.
@@ -35,7 +40,11 @@ def create_log_pipeline(
             time.sleep(10)
     """
     parser = LogParser()
-    watcher = MTGALogWatcher(callback=parser.process_chunk, log_path=log_path)
+    watcher = MTGALogWatcher(
+        callback=parser.process_chunk,
+        log_path=log_path,
+        backfill=backfill
+    )
     return watcher, parser
 
 
@@ -53,4 +62,5 @@ __all__ = [
     "mcp",
     "start_watching",
     "stop_watching",
+    "VoiceInput",
 ]
