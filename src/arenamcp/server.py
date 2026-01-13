@@ -583,6 +583,78 @@ def clear_pending_advice() -> dict[str, Any]:
     return {"cleared": True, "count": count}
 
 
+@mcp.tool()
+def start_coaching(
+    backend: str = "claude",
+    auto_speak: bool = False
+) -> dict[str, Any]:
+    """Start background game monitoring with proactive coaching.
+
+    Begins a background loop that monitors game state changes and generates
+    coaching advice when triggers fire (new turn, combat, low life, etc.).
+    Advice is queued and can be retrieved with get_pending_advice().
+
+    Args:
+        backend: LLM backend to use for advice generation.
+            Options: "claude" (default), "gemini", "ollama"
+        auto_speak: If True, automatically speak advice via TTS when generated.
+            Default False - retrieve advice manually with get_pending_advice().
+
+    Returns:
+        Dict with:
+        - started: True if coaching started successfully
+        - backend: The LLM backend being used
+        - auto_speak: Whether auto-speak is enabled
+
+        or {"error": message} if already running or backend invalid.
+    """
+    try:
+        start_background_coaching(backend=backend, auto_speak=auto_speak)
+        return {"started": True, "backend": backend, "auto_speak": auto_speak}
+    except RuntimeError as e:
+        return {"error": str(e)}
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def stop_coaching() -> dict[str, Any]:
+    """Stop background game monitoring.
+
+    Stops the coaching loop if running. Any pending advice remains in the queue.
+
+    Returns:
+        Dict with:
+        - stopped: True if coaching was stopped
+
+        or {"error": "not running"} if coaching wasn't active.
+    """
+    try:
+        stop_background_coaching()
+        return {"stopped": True}
+    except RuntimeError:
+        return {"error": "not running"}
+
+
+@mcp.tool()
+def get_coaching_status() -> dict[str, Any]:
+    """Check if background coaching is active and its configuration.
+
+    Use this to see if coaching is running and what settings are being used.
+
+    Returns:
+        Dict with:
+        - active: True if background coaching is running
+        - backend: Name of LLM backend being used (or None if not running)
+        - auto_speak: Whether advice is automatically spoken (or False if not running)
+    """
+    return {
+        "active": _coaching_enabled,
+        "backend": _coaching_backend,
+        "auto_speak": _coaching_auto_speak,
+    }
+
+
 # Entry point for running as module
 if __name__ == "__main__":
     mcp.run()
