@@ -111,7 +111,48 @@ Example for OpenCode (`~/.opencode/config.json`):
 | `GOOGLE_API_KEY` | For Gemini coaching backend | If using Gemini |
 | `MTGA_LOG_PATH` | Custom log path | No (auto-detected) |
 
-## Usage
+## Standalone Mode (No MCP Client Required)
+
+Run the coach directly without Claude Code or any MCP client:
+
+```bash
+# With Gemini (recommended - fast and cheap)
+export GOOGLE_API_KEY="your-key"
+python -m arenamcp.standalone --backend gemini
+
+# With Claude API
+export ANTHROPIC_API_KEY="your-key"
+python -m arenamcp.standalone --backend claude
+
+# With local Ollama (free, runs offline)
+python -m arenamcp.standalone --backend ollama --model gemma3:12b
+
+# Disable auto-speak (text only)
+python -m arenamcp.standalone --backend gemini --no-auto-speak
+```
+
+### Standalone Features
+
+- **Proactive coaching** - Advice triggers automatically on game events
+- **Voice input** - Press F4 to ask questions (or use `--voice vox` for voice activation)
+- **TTS output** - Advice is spoken aloud (disable with `--no-auto-speak`)
+- **Debug logging** - Full logs saved to `~/.arenamcp/debug.log` for bug reports
+
+### Filing Bug Reports
+
+If something goes wrong, the debug log contains everything needed to diagnose issues:
+
+```bash
+# Show log location and recent entries
+python -m arenamcp.standalone --show-log
+
+# Copy log for bug report
+cat ~/.arenamcp/debug.log
+```
+
+The log includes timestamps, game state snapshots, triggers, LLM responses, and error traces.
+
+## Usage (MCP Mode)
 
 ### 1. Start MTGA and Enter a Game
 
