@@ -12,6 +12,25 @@ Usage:
 Logs are written to ~/.arenamcp/debug.log for bug reports.
 """
 
+# Load .env file before anything else
+def _load_dotenv():
+    """Load environment variables from .env file if it exists."""
+    import os
+    from pathlib import Path
+
+    # Look for .env in current dir and parent dirs
+    for env_path in [Path(".env"), Path(__file__).parent.parent.parent / ".env"]:
+        if env_path.exists():
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, _, value = line.partition("=")
+                        os.environ.setdefault(key.strip(), value.strip())
+            break
+
+_load_dotenv()
+
 import argparse
 import json
 import logging
