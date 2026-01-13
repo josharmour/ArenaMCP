@@ -6,6 +6,7 @@ delivering new content via callback as it's written.
 
 import os
 import logging
+import re
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -14,15 +15,26 @@ from watchdog.events import FileSystemEventHandler, FileModifiedEvent, FileCreat
 
 logger = logging.getLogger(__name__)
 
-# Default MTGA log path on Windows
-DEFAULT_LOG_PATH = os.path.join(
-    os.environ.get("APPDATA", ""),
-    "..",
-    "LocalLow",
-    "Wizards Of The Coast",
-    "MTGA",
-    "Player.log"
+# Pattern to identify match start in logs (MatchCreated event or match game room)
+MATCH_START_PATTERN = re.compile(
+    r'\[UnityCrossThreadLogger\].*(?:MatchCreated|Event_Join|"matchId":|MatchGameRoomStateChangedEvent)'
 )
+
+# Default MTGA log path on Windows
+# Use LOCALAPPDATA approach which is more reliable than APPDATA/../LocalLow
+_local_appdata = os.environ.get("LOCALAPPDATA", "")
+if _local_appdata:
+    # LOCALAPPDATA is C:\Users\<user>\AppData\Local, we need LocalLow sibling
+    DEFAULT_LOG_PATH = os.path.join(
+        os.path.dirname(_local_appdata),
+        "LocalLow",
+        "Wizards Of The Coast",
+        "MTGA",
+        "Player.log"
+    )
+else:
+    # Fallback to hardcoded path for joshu user
+    DEFAULT_LOG_PATH = r"C:\Users\joshu\AppData\LocalLow\Wizards Of The Coast\MTGA\Player.log"
 
 
 class MTGALogHandler(FileSystemEventHandler):
@@ -105,6 +117,29 @@ class MTGALogHandler(FileSystemEventHandler):
         except OSError as e:
             logger.warning(f"Error reading log file: {e}")
 
+    def read_from_position(self, start_position: int) -> None:
+        """Read content from a specific position and invoke callback.
+
+        Used for backfilling existing log content on startup.
+
+        Args:
+            start_position: Byte position to start reading from.
+        """
+        try:
+            with open(self.log_path, 'r', encoding='utf-8', errors='replace') as f:
+                f.seek(start_position)
+                content = f.read()
+                self.file_position = f.tell()
+
+                if content:
+                    logger.info(f"Backfill: read {len(content)} chars from position {start_position}")
+                    self.callback(content)
+
+        except FileNotFoundError:
+            logger.debug("Log file not found for backfill")
+        except OSError as e:
+            logger.warning(f"Error during backfill read: {e}")
+
 
 class MTGALogWatcher:
     """Watches the MTGA Player.log file for changes and delivers new content via callback."""
@@ -112,7 +147,8 @@ class MTGALogWatcher:
     def __init__(
         self,
         callback: Callable[[str], None],
-        log_path: Optional[str] = None
+        log_path: Optional[str] = None,
+        backfill: bool = True
     ) -> None:
         """Initialize the log watcher.
 
@@ -120,6 +156,9 @@ class MTGALogWatcher:
             callback: Function called with new log content as chunks of text.
             log_path: Path to Player.log. Defaults to MTGA_LOG_PATH env var
                      or standard Windows location.
+            backfill: If True, parse existing log content from the last match
+                     start on first call to start(). Enables catching up on
+                     in-progress games. Defaults to True.
         """
         # Resolve log path
         if log_path is None:
@@ -127,16 +166,58 @@ class MTGALogWatcher:
 
         self.log_path = Path(log_path).resolve()
         self.callback = callback
+        self._backfill_enabled = backfill
         self._observer: Optional[Observer] = None
         self._handler: Optional[MTGALogHandler] = None
 
         logger.info(f"MTGALogWatcher initialized for: {self.log_path}")
 
+    def find_last_match_start(self) -> int:
+        """Find the byte position of the last match start in the log file.
+
+        Scans the log file to find the most recent MatchCreated or similar
+        match start indicator. This allows catching up on in-progress games.
+
+        Returns:
+            Byte position to start reading from, or 0 if no match found.
+        """
+        if not self.log_path.exists():
+            return 0
+
+        try:
+            # Read as bytes to get accurate byte positions for seek()
+            with open(self.log_path, 'rb') as f:
+                content_bytes = f.read()
+
+            # Decode for regex matching, tracking byte positions
+            content = content_bytes.decode('utf-8', errors='replace')
+
+            # Find all match start positions (character positions)
+            last_char_pos = 0
+            for match in MATCH_START_PATTERN.finditer(content):
+                # Find the start of this line (search backward for newline)
+                line_start = content.rfind('\n', 0, match.start())
+                last_char_pos = line_start + 1 if line_start != -1 else 0
+
+            if last_char_pos > 0:
+                # Convert character position to byte position
+                last_byte_pos = len(content[:last_char_pos].encode('utf-8'))
+                logger.info(f"Found last match start at byte position {last_byte_pos}")
+                return last_byte_pos
+            else:
+                logger.info("No match start found in log, will read from beginning")
+                return 0
+
+        except OSError as e:
+            logger.warning(f"Error scanning log for match start: {e}")
+            return 0
+
     def start(self) -> None:
         """Start watching the log file.
 
         Creates a watchdog Observer that monitors the directory containing
-        the log file for modifications.
+        the log file for modifications. If backfill is enabled, first processes
+        existing log content from the last match start.
         """
         if self._observer is not None:
             logger.warning("Watcher already started")
@@ -149,6 +230,12 @@ class MTGALogWatcher:
             # Still set up the watcher - it will detect when directory is created
 
         self._handler = MTGALogHandler(str(self.log_path), self.callback)
+
+        # Backfill existing content if enabled
+        if self._backfill_enabled and self.log_path.exists():
+            start_pos = self.find_last_match_start()
+            self._handler.read_from_position(start_pos)
+
         self._observer = Observer()
 
         # Watch the parent directory (watchdog requires watching directories)
