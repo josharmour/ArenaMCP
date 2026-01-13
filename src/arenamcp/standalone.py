@@ -160,14 +160,38 @@ class StandaloneCoach:
             "step": self._game_state.turn_info.step,
         }
 
-        # Build players list
+        # Build players list with land info
         players = []
         for p in self._game_state.players.values():
+            is_local = p.seat_id == self._game_state.local_seat_id
+
+            # Count lands controlled by this player
+            lands = []
+            for obj in self._game_state.battlefield:
+                controller = obj.controller_seat_id or obj.owner_seat_id
+                if controller == p.seat_id and "CardType_Land" in obj.card_types:
+                    land_name = None
+                    if _scryfall and obj.grp_id:
+                        try:
+                            card = _scryfall.get_card_by_arena_id(obj.grp_id)
+                            if card:
+                                land_name = card.name
+                        except Exception:
+                            pass
+                    if not land_name:
+                        # Use subtypes for unknown lands (e.g., "Forest", "Island")
+                        if hasattr(obj, 'subtypes') and obj.subtypes:
+                            land_name = " ".join(obj.subtypes)
+                        else:
+                            land_name = f"Unknown Land (ID: {obj.grp_id})"
+                    lands.append({"name": land_name, "tapped": obj.is_tapped})
+
             players.append({
                 "seat_id": p.seat_id,
                 "life_total": p.life_total,
-                "mana_pool": p.mana_pool,
-                "is_local": p.seat_id == self._game_state.local_seat_id,
+                "mana_pool": p.mana_pool,  # Floating mana only
+                "lands": lands,  # Lands this player controls
+                "is_local": is_local,
             })
 
         def serialize_card(obj):
