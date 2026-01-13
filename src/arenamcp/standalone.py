@@ -164,11 +164,11 @@ class StandaloneCoach:
             # Try to get card name from Scryfall
             if _scryfall and obj.grp_id:
                 try:
-                    info = _scryfall.get_card_by_arena_id(obj.grp_id)
-                    if info:
-                        card_data["name"] = info.get("name", "Unknown")
-                        card_data["mana_cost"] = info.get("mana_cost", "")
-                        card_data["oracle_text"] = info.get("oracle_text", "")
+                    card = _scryfall.get_card_by_arena_id(obj.grp_id)
+                    if card:
+                        card_data["name"] = card.name
+                        card_data["mana_cost"] = card.mana_cost
+                        card_data["oracle_text"] = card.oracle_text
                 except Exception:
                     pass
             return card_data
