@@ -65,7 +65,7 @@ Plans:
 **Plans**: TBD
 
 Plans:
-- [ ] 07-01: TBD
+- [ ] 07-01: Multi-backend CoachEngine (Claude/Gemini/Ollama) with triggers
 
 #### Phase 8: MCP Voice Tools
 
