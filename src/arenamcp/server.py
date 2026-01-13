@@ -48,6 +48,7 @@ _pending_advice: deque[dict[str, Any]] = deque(maxlen=10)
 _coaching_thread: Optional[threading.Thread] = None
 _coaching_enabled: bool = False
 _coaching_backend: Optional[str] = None
+_coaching_model: Optional[str] = None
 _coaching_auto_speak: bool = False
 
 
@@ -149,6 +150,7 @@ def _background_coaching_loop(
 
 def start_background_coaching(
     backend: str = "claude",
+    model: Optional[str] = None,
     auto_speak: bool = False
 ) -> None:
     """Start background game monitoring with proactive coaching.
@@ -158,20 +160,22 @@ def start_background_coaching(
 
     Args:
         backend: LLM backend to use ("claude", "gemini", "ollama")
+        model: Optional model override (uses backend default if not specified)
         auto_speak: If True, automatically speak advice via TTS
     """
-    global _coaching_thread, _coaching_enabled, _coaching_backend, _coaching_auto_speak
+    global _coaching_thread, _coaching_enabled, _coaching_backend, _coaching_model, _coaching_auto_speak
 
     if _coaching_enabled:
         raise RuntimeError("Background coaching already running")
 
     # Create coach components
-    llm_backend = create_backend(backend)
+    llm_backend = create_backend(backend, model=model)
     coach = CoachEngine(backend=llm_backend)
     trigger_detector = GameStateTrigger()
 
     # Store config
     _coaching_backend = backend
+    _coaching_model = model
     _coaching_auto_speak = auto_speak
     _coaching_enabled = True
 
@@ -183,12 +187,12 @@ def start_background_coaching(
         name="coaching-loop"
     )
     _coaching_thread.start()
-    logger.info(f"Started background coaching with {backend} backend, auto_speak={auto_speak}")
+    logger.info(f"Started background coaching with {backend} backend (model={model}), auto_speak={auto_speak}")
 
 
 def stop_background_coaching() -> None:
     """Stop background coaching if running."""
-    global _coaching_thread, _coaching_enabled, _coaching_backend, _coaching_auto_speak
+    global _coaching_thread, _coaching_enabled, _coaching_backend, _coaching_model, _coaching_auto_speak
 
     if not _coaching_enabled:
         raise RuntimeError("Background coaching not running")
@@ -200,6 +204,7 @@ def stop_background_coaching() -> None:
         _coaching_thread = None
 
     _coaching_backend = None
+    _coaching_model = None
     _coaching_auto_speak = False
     logger.info("Stopped background coaching")
 
@@ -313,6 +318,9 @@ def get_game_state() -> dict[str, Any]:
     # Auto-start watcher if not running
     if watcher is None:
         start_watching()
+
+    # Ensure local player is detected before serializing
+    game_state.ensure_local_seat_id()
 
     # Serialize turn info
     turn = {
@@ -447,6 +455,25 @@ def get_draft_rating(card_name: str, set_code: str) -> dict[str, Any]:
         "alsa": stats.alsa,
         "iwd": stats.iwd,
         "games_in_hand": stats.games_in_hand,
+    }
+
+
+@mcp.tool()
+def reset_game_state() -> dict[str, Any]:
+    """Reset game state tracking for a new game.
+
+    Clears local player detection and forces re-inference from hand zones.
+    Use this if player detection is wrong or when starting a new game.
+
+    Returns:
+        Dict with:
+        - reset: True
+        - message: Confirmation message
+    """
+    game_state.reset_local_player()
+    return {
+        "reset": True,
+        "message": "Game state reset. Local player will be re-inferred from next hand zone update."
     }
 
 
@@ -586,6 +613,7 @@ def clear_pending_advice() -> dict[str, Any]:
 @mcp.tool()
 def start_coaching(
     backend: str = "claude",
+    model: Optional[str] = None,
     auto_speak: bool = False
 ) -> dict[str, Any]:
     """Start background game monitoring with proactive coaching.
@@ -597,6 +625,10 @@ def start_coaching(
     Args:
         backend: LLM backend to use for advice generation.
             Options: "claude" (default), "gemini", "ollama"
+        model: Optional model name to use. Defaults vary by backend:
+            - claude: claude-sonnet-4-20250514
+            - gemini: gemini-1.5-flash
+            - ollama: llama3.2
         auto_speak: If True, automatically speak advice via TTS when generated.
             Default False - retrieve advice manually with get_pending_advice().
 
@@ -604,13 +636,14 @@ def start_coaching(
         Dict with:
         - started: True if coaching started successfully
         - backend: The LLM backend being used
+        - model: The model being used (or None for default)
         - auto_speak: Whether auto-speak is enabled
 
         or {"error": message} if already running or backend invalid.
     """
     try:
-        start_background_coaching(backend=backend, auto_speak=auto_speak)
-        return {"started": True, "backend": backend, "auto_speak": auto_speak}
+        start_background_coaching(backend=backend, model=model, auto_speak=auto_speak)
+        return {"started": True, "backend": backend, "model": model, "auto_speak": auto_speak}
     except RuntimeError as e:
         return {"error": str(e)}
     except ValueError as e:
@@ -646,11 +679,13 @@ def get_coaching_status() -> dict[str, Any]:
         Dict with:
         - active: True if background coaching is running
         - backend: Name of LLM backend being used (or None if not running)
+        - model: Model name being used (or None for default/not running)
         - auto_speak: Whether advice is automatically spoken (or False if not running)
     """
     return {
         "active": _coaching_enabled,
         "backend": _coaching_backend,
+        "model": _coaching_model,
         "auto_speak": _coaching_auto_speak,
     }
 
