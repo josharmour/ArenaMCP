@@ -6,7 +6,9 @@ while the LLM provides strategic analysis.
 """
 
 import logging
-from typing import Any, Optional
+import time
+from collections import deque
+from typing import Any, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -15,6 +17,8 @@ from arenamcp.parser import LogParser
 from arenamcp.scryfall import ScryfallCache
 from arenamcp.draftstats import DraftStatsCache
 from arenamcp.watcher import MTGALogWatcher
+from arenamcp.voice import VoiceInput
+from arenamcp.tts import VoiceOutput
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,13 @@ watcher: Optional[MTGALogWatcher] = None
 # Lazy-loaded caches (avoid blocking startup with bulk downloads)
 _scryfall: Optional[ScryfallCache] = None
 _draft_stats: Optional[DraftStatsCache] = None
+
+# Lazy-loaded voice components
+_voice_input: Optional[VoiceInput] = None
+_voice_output: Optional[VoiceOutput] = None
+
+# Advice queue for proactive coaching (Phase 9 integration)
+_pending_advice: deque[dict[str, Any]] = deque(maxlen=10)
 
 
 def _get_scryfall() -> ScryfallCache:
@@ -47,6 +58,32 @@ def _get_draft_stats() -> DraftStatsCache:
         logger.info("Initializing 17lands draft stats cache...")
         _draft_stats = DraftStatsCache()
     return _draft_stats
+
+
+def _get_voice_input(mode: Literal["ptt", "vox"] = "ptt") -> VoiceInput:
+    """Get or initialize voice input (lazy loading).
+
+    Args:
+        mode: Voice input mode - 'ptt' for push-to-talk, 'vox' for voice activation.
+
+    Returns:
+        VoiceInput instance configured for the requested mode.
+    """
+    global _voice_input
+    # Recreate if mode changed
+    if _voice_input is None or _voice_input.mode != mode:
+        logger.info(f"Initializing voice input in {mode} mode...")
+        _voice_input = VoiceInput(mode=mode)
+    return _voice_input
+
+
+def _get_voice_output() -> VoiceOutput:
+    """Get or initialize voice output (lazy loading)."""
+    global _voice_output
+    if _voice_output is None:
+        logger.info("Initializing voice output (TTS)...")
+        _voice_output = VoiceOutput()
+    return _voice_output
 
 
 def start_watching() -> None:
@@ -293,6 +330,139 @@ def get_draft_rating(card_name: str, set_code: str) -> dict[str, Any]:
         "iwd": stats.iwd,
         "games_in_hand": stats.games_in_hand,
     }
+
+
+@mcp.tool()
+def listen_for_voice(
+    mode: Literal["ptt", "vox"] = "ptt",
+    timeout: Optional[float] = None,
+) -> dict[str, Any]:
+    """Listen for voice input and return transcription.
+
+    Blocks until voice is captured and transcribed. In PTT mode, waits for
+    the user to press and release F4. In VOX mode, waits for voice activity.
+
+    Use this to get spoken commands or questions from the user during gameplay.
+
+    Args:
+        mode: Voice input mode. 'ptt' (default) for push-to-talk with F4 key,
+             'vox' for voice-activated detection.
+        timeout: Maximum time to wait in seconds. None (default) waits forever.
+
+    Returns:
+        Dict with:
+        - transcription: The transcribed text from speech
+        - mode: The voice mode used ('ptt' or 'vox')
+
+        or {"error": message} if timeout or failure occurs.
+    """
+    try:
+        voice_input = _get_voice_input(mode)
+        voice_input.start()
+        transcription = voice_input.wait_for_speech(timeout=timeout)
+        voice_input.stop()
+
+        if not transcription:
+            return {"error": "No speech detected or timeout", "mode": mode}
+
+        return {"transcription": transcription, "mode": mode}
+    except Exception as e:
+        logger.exception("Voice input error")
+        return {"error": str(e), "mode": mode}
+
+
+@mcp.tool()
+def speak_advice(text: str) -> dict[str, Any]:
+    """Speak text using text-to-speech synthesis.
+
+    Synthesizes the provided text and plays it through the audio output.
+    Blocks until playback is complete.
+
+    Use this to give spoken coaching advice to the player during games.
+
+    Args:
+        text: The text to synthesize and speak.
+
+    Returns:
+        Dict with:
+        - spoken: True if speech completed successfully
+        - text: The text that was spoken
+
+        or {"error": message} if TTS fails (e.g., missing model files).
+    """
+    try:
+        voice_output = _get_voice_output()
+        voice_output.speak(text, blocking=True)
+        return {"spoken": True, "text": text}
+    except FileNotFoundError as e:
+        # Missing Kokoro model files - provide helpful error
+        return {"error": f"TTS model not found: {e}", "spoken": False}
+    except Exception as e:
+        logger.exception("TTS error")
+        return {"error": str(e), "spoken": False}
+
+
+def queue_advice(advice: str, trigger: str) -> None:
+    """Queue proactive coaching advice for later retrieval.
+
+    Internal function called by background monitoring (Phase 9) when
+    game state triggers fire. Advice is queued for retrieval by
+    get_pending_advice().
+
+    Args:
+        advice: The coaching advice text.
+        trigger: Description of what triggered this advice.
+    """
+    _pending_advice.append({
+        "advice": advice,
+        "trigger": trigger,
+        "timestamp": time.time(),
+    })
+    logger.debug(f"Queued advice: {trigger}")
+
+
+@mcp.tool()
+def get_pending_advice() -> dict[str, Any]:
+    """Get all pending proactive coaching advice.
+
+    Returns and clears all advice that has been queued by the background
+    game state monitor. Each advice item includes the trigger that caused it.
+
+    Use this to poll for proactive coaching suggestions during gameplay.
+
+    Returns:
+        Dict with:
+        - advice_items: List of advice dicts, each with:
+          - advice: The coaching advice text
+          - trigger: What triggered this advice
+          - timestamp: When the advice was generated (Unix timestamp)
+        - count: Number of advice items returned
+    """
+    items = []
+    while _pending_advice:
+        try:
+            items.append(_pending_advice.popleft())
+        except IndexError:
+            break  # Queue emptied by another thread
+
+    return {"advice_items": items, "count": len(items)}
+
+
+@mcp.tool()
+def clear_pending_advice() -> dict[str, Any]:
+    """Clear all pending proactive coaching advice.
+
+    Removes all queued advice without returning it. Use this to reset
+    the advice queue, for example when starting a new game.
+
+    Returns:
+        Dict with:
+        - cleared: True
+        - count: Number of items that were cleared
+    """
+    count = len(_pending_advice)
+    _pending_advice.clear()
+    return {"cleared": True, "count": count}
 
 
 # Entry point for running as module
