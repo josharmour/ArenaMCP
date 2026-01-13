@@ -228,13 +228,13 @@ class StandaloneCoach:
 
                             # Speak if enabled
                             if self.auto_speak and self._voice_output:
-                                print(f"\n🎯 [{trigger}] {advice}\n")
+                                print(f"\n[COACH] [{trigger}] {advice}\n")
                                 try:
                                     self._voice_output.speak(advice, blocking=True)
                                 except Exception as e:
                                     logger.error(f"TTS error: {e}")
                             else:
-                                print(f"\n🎯 [{trigger}] {advice}\n")
+                                print(f"\n[COACH] [{trigger}] {advice}\n")
 
                 prev_state = curr_state
 
@@ -253,9 +253,9 @@ class StandaloneCoach:
 
         logger.info(f"Voice loop started ({self.voice_mode} mode)")
         if self.voice_mode == "ptt":
-            print("\n🎤 Press and hold F4 to ask a question\n")
+            print("\n[MIC] Press and hold F4 to ask a question\n")
         else:
-            print("\n🎤 Voice activation enabled - just speak\n")
+            print("\n[MIC] Voice activation enabled - just speak\n")
 
         self._voice_input.start()
 
@@ -298,10 +298,10 @@ class StandaloneCoach:
         logger.debug(json.dumps(state, indent=2, default=str))
         logger.debug("=== END GAME STATE ===")
 
-    def _on_log_line(self, line: str) -> None:
-        """Handle new log lines from MTGA."""
+    def _on_log_chunk(self, chunk: str) -> None:
+        """Handle new log chunks from MTGA."""
         try:
-            self._parser.parse_line(line)
+            self._parser.process_chunk(chunk)
         except Exception as e:
             logger.debug(f"Parse error: {e}")
 
@@ -318,7 +318,7 @@ class StandaloneCoach:
 
         # Start log watcher
         logger.info("Starting MTGA log watcher...")
-        self._watcher = MTGALogWatcher(callback=self._on_log_line)
+        self._watcher = MTGALogWatcher(callback=self._on_log_chunk)
         self._watcher.start()
 
         # Start coaching thread
