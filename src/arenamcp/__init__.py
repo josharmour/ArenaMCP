@@ -9,6 +9,7 @@ from arenamcp.scryfall import ScryfallCache, ScryfallCard
 from arenamcp.draftstats import DraftStatsCache, DraftStats
 from arenamcp.server import mcp, start_watching, stop_watching
 from arenamcp.voice import VoiceInput
+from arenamcp.tts import VoiceOutput, KokoroTTS
 
 __version__ = "0.1.0"
 
@@ -63,4 +64,6 @@ __all__ = [
     "start_watching",
     "stop_watching",
     "VoiceInput",
+    "VoiceOutput",
+    "KokoroTTS",
 ]
