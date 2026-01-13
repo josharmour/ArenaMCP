@@ -65,7 +65,7 @@ Plans:
 **Plans**: TBD
 
 Plans:
-- [ ] 07-01: Multi-backend CoachEngine (Claude/Gemini/Ollama) with triggers
+- [x] 07-01: Multi-backend CoachEngine (Claude/Gemini/Ollama) with triggers
 
 #### Phase 8: MCP Voice Tools
 
@@ -100,7 +100,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 4. MCP Server | v1.0 | 1/1 | Complete | 2026-01-11 |
 | 5. Voice Input | v1.1 | 3/3 | Complete | 2026-01-12 |
 | 6. Voice Output | v1.1 | 1/1 | Complete | 2026-01-13 |
-| 7. Coach Engine | v1.1 | 0/? | Not started | - |
+| 7. Coach Engine | v1.1 | 1/1 | Complete | 2026-01-12 |
 | 8. MCP Voice Tools | v1.1 | 0/? | Not started | - |
 | 9. Integration | v1.1 | 0/? | Not started | - |
 
