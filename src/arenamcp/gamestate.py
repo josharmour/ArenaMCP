@@ -37,6 +37,7 @@ class GameObject:
     controller_seat_id: Optional[int] = None
     visibility: Optional[str] = None
     card_types: list[str] = field(default_factory=list)
+    subtypes: list[str] = field(default_factory=list)
     power: Optional[int] = None
     toughness: Optional[int] = None
     is_tapped: bool = False
@@ -254,6 +255,13 @@ class GameState:
         for ct in obj_data.get("cardTypes", []):
             card_types.append(ct)
 
+        # Extract subtypes (e.g., SubType_Badger, SubType_Mole -> Badger, Mole)
+        subtypes = []
+        for st in obj_data.get("subtypes", []):
+            # Remove SubType_ prefix if present
+            clean_subtype = st.replace("SubType_", "") if isinstance(st, str) else str(st)
+            subtypes.append(clean_subtype)
+
         # Extract power/toughness if present
         power = obj_data.get("power", {}).get("value") if isinstance(obj_data.get("power"), dict) else obj_data.get("power")
         toughness = obj_data.get("toughness", {}).get("value") if isinstance(obj_data.get("toughness"), dict) else obj_data.get("toughness")
@@ -269,6 +277,7 @@ class GameState:
             controller_seat_id=controller_seat_id,
             visibility=visibility,
             card_types=card_types,
+            subtypes=subtypes,
             power=power,
             toughness=toughness,
             is_tapped=is_tapped,
