@@ -9,12 +9,12 @@ See: .planning/PROJECT.md (updated 2026-01-11)
 
 ## Current Position
 
-Phase: 7 of 9 (Coach Engine)
+Phase: 8 of 9 (MCP Voice Tools)
 Plan: 1 of 1 in current phase
 Status: Phase complete
-Last activity: 2026-01-12 — Completed 07-01-PLAN.md
+Last activity: 2026-01-12 — Completed 08-01-PLAN.md
 
-Progress: [██████░░░░] 33% of v1.1 (5/15 plans)
+Progress: [██████░░░░] 40% of v1.1 (6/15 plans)
 
 ## Performance Metrics
 
@@ -53,5 +53,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-01-12
-Stopped at: Completed 07-01-PLAN.md (Phase 7 complete)
+Stopped at: Completed 08-01-PLAN.md (Phase 8 complete)
 Resume file: None

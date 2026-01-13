@@ -75,7 +75,7 @@ Plans:
 **Plans**: TBD
 
 Plans:
-- [ ] 08-01: TBD
+- [x] 08-01: MCP voice tools (listen_for_voice, speak_advice, get_pending_advice)
 
 #### Phase 9: Integration
 
@@ -101,7 +101,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 5. Voice Input | v1.1 | 3/3 | Complete | 2026-01-12 |
 | 6. Voice Output | v1.1 | 1/1 | Complete | 2026-01-13 |
 | 7. Coach Engine | v1.1 | 1/1 | Complete | 2026-01-12 |
-| 8. MCP Voice Tools | v1.1 | 0/? | Not started | - |
+| 8. MCP Voice Tools | v1.1 | 1/1 | Complete | 2026-01-12 |
 | 9. Integration | v1.1 | 0/? | Not started | - |
 
 **v1.0 Complete:** All 4 phases delivered.
