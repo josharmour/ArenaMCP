@@ -44,7 +44,7 @@ None
 Plans:
 - [x] 05-01: Audio capture with sounddevice
 - [x] 05-02: PTT with global F4 hotkey
-- [ ] 05-03: Whisper STT transcription
+- [x] 05-03: Whisper STT transcription
 
 #### Phase 6: Voice Output
 
@@ -98,7 +98,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 →
 | 2. Game State | v1.0 | 1/1 | Complete | 2026-01-11 |
 | 3. External Data | v1.0 | 2/2 | Complete | 2026-01-11 |
 | 4. MCP Server | v1.0 | 1/1 | Complete | 2026-01-11 |
-| 5. Voice Input | v1.1 | 2/3 | In progress | - |
+| 5. Voice Input | v1.1 | 3/3 | Complete | 2026-01-12 |
 | 6. Voice Output | v1.1 | 0/? | Not started | - |
 | 7. Coach Engine | v1.1 | 0/? | Not started | - |
 | 8. MCP Voice Tools | v1.1 | 0/? | Not started | - |
