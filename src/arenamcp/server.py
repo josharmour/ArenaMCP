@@ -6,11 +6,14 @@ while the LLM provides strategic analysis.
 """
 
 import logging
+import threading
 import time
 from collections import deque
 from typing import Any, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
+
+from arenamcp.coach import CoachEngine, GameStateTrigger, create_backend
 
 from arenamcp.gamestate import GameState, ZoneType, create_game_state_handler
 from arenamcp.parser import LogParser
@@ -40,6 +43,12 @@ _voice_output: Optional[VoiceOutput] = None
 
 # Advice queue for proactive coaching (Phase 9 integration)
 _pending_advice: deque[dict[str, Any]] = deque(maxlen=10)
+
+# Background coaching state
+_coaching_thread: Optional[threading.Thread] = None
+_coaching_enabled: bool = False
+_coaching_backend: Optional[str] = None
+_coaching_auto_speak: bool = False
 
 
 def _get_scryfall() -> ScryfallCache:
@@ -84,6 +93,115 @@ def _get_voice_output() -> VoiceOutput:
         logger.info("Initializing voice output (TTS)...")
         _voice_output = VoiceOutput()
     return _voice_output
+
+
+def _background_coaching_loop(
+    coach: CoachEngine,
+    trigger_detector: GameStateTrigger,
+    auto_speak: bool
+) -> None:
+    """Background loop that monitors game state and generates proactive advice.
+
+    Args:
+        coach: CoachEngine instance to generate advice
+        trigger_detector: GameStateTrigger to detect state changes
+        auto_speak: Whether to automatically speak advice via TTS
+    """
+    global _coaching_enabled
+
+    logger.info("Background coaching loop started")
+    prev_state: dict[str, Any] = {}
+
+    while _coaching_enabled:
+        try:
+            # Get current game state
+            curr_state = get_game_state()
+
+            # Check for triggers (skip on first iteration when prev_state empty)
+            if prev_state:
+                triggers = trigger_detector.check_triggers(prev_state, curr_state)
+
+                for trigger in triggers:
+                    logger.debug(f"Trigger fired: {trigger}")
+                    try:
+                        advice = coach.get_advice(curr_state, trigger=trigger)
+                        queue_advice(advice, trigger)
+
+                        if auto_speak:
+                            try:
+                                voice = _get_voice_output()
+                                voice.speak(advice, blocking=True)
+                            except Exception as e:
+                                logger.error(f"TTS error: {e}")
+                    except Exception as e:
+                        logger.error(f"Error getting advice for {trigger}: {e}")
+
+            prev_state = curr_state
+
+        except Exception as e:
+            logger.error(f"Error in coaching loop: {e}")
+
+        # Poll interval
+        time.sleep(1.5)
+
+    logger.info("Background coaching loop stopped")
+
+
+def start_background_coaching(
+    backend: str = "claude",
+    auto_speak: bool = False
+) -> None:
+    """Start background game monitoring with proactive coaching.
+
+    Creates a daemon thread that polls game state and generates advice
+    when triggers fire.
+
+    Args:
+        backend: LLM backend to use ("claude", "gemini", "ollama")
+        auto_speak: If True, automatically speak advice via TTS
+    """
+    global _coaching_thread, _coaching_enabled, _coaching_backend, _coaching_auto_speak
+
+    if _coaching_enabled:
+        raise RuntimeError("Background coaching already running")
+
+    # Create coach components
+    llm_backend = create_backend(backend)
+    coach = CoachEngine(backend=llm_backend)
+    trigger_detector = GameStateTrigger()
+
+    # Store config
+    _coaching_backend = backend
+    _coaching_auto_speak = auto_speak
+    _coaching_enabled = True
+
+    # Start daemon thread
+    _coaching_thread = threading.Thread(
+        target=_background_coaching_loop,
+        args=(coach, trigger_detector, auto_speak),
+        daemon=True,
+        name="coaching-loop"
+    )
+    _coaching_thread.start()
+    logger.info(f"Started background coaching with {backend} backend, auto_speak={auto_speak}")
+
+
+def stop_background_coaching() -> None:
+    """Stop background coaching if running."""
+    global _coaching_thread, _coaching_enabled, _coaching_backend, _coaching_auto_speak
+
+    if not _coaching_enabled:
+        raise RuntimeError("Background coaching not running")
+
+    _coaching_enabled = False
+
+    if _coaching_thread is not None:
+        _coaching_thread.join(timeout=5.0)
+        _coaching_thread = None
+
+    _coaching_backend = None
+    _coaching_auto_speak = False
+    logger.info("Stopped background coaching")
 
 
 def start_watching() -> None:
