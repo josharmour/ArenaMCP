@@ -616,7 +616,7 @@ def _serialize_game_object(obj) -> dict[str, Any]:
         "power": obj.power,
         "toughness": obj.toughness,
         "is_tapped": obj.is_tapped,
-        "turn_entered_battlefield": getattr(obj, "turn_entered_battlefield", -1),
+        "turn_entered_battlefield": obj.turn_entered_battlefield,
     }
 
     if source_card:

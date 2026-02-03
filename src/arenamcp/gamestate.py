@@ -46,6 +46,22 @@ class GameObject:
     parent_instance_id: Optional[int] = None
     # For summoning sickness tracking
     turn_entered_battlefield: int = -1
+    def to_dict(self) -> dict:
+        """Convert to simple dict for snapshot serialization."""
+        return {
+            "instance_id": self.instance_id,
+            "grp_id": self.grp_id,
+            "zone_id": self.zone_id,
+            "owner_seat_id": self.owner_seat_id,
+            "controller_seat_id": self.controller_seat_id,
+            "visibility": self.visibility,
+            "card_types": self.card_types,
+            "subtypes": self.subtypes,
+            "power": self.power,
+            "toughness": self.toughness,
+            "is_tapped": self.is_tapped,
+            "turn_entered_battlefield": self.turn_entered_battlefield,
+        }
 
 
 @dataclass
@@ -55,6 +71,14 @@ class Zone:
     zone_type: ZoneType
     owner_seat_id: Optional[int] = None
     object_instance_ids: list[int] = field(default_factory=list)
+    def to_dict(self) -> dict:
+        """Convert to simple dict for snapshot."""
+        return {
+            "zone_id": self.zone_id,
+            "zone_type": self.zone_type.name, # Enum to string
+            "owner_seat_id": self.owner_seat_id,
+            "object_instance_ids": self.object_instance_ids,
+        }
 
 
 @dataclass
@@ -64,6 +88,13 @@ class Player:
     life_total: int = 20
     lands_played: int = 0
     mana_pool: dict[str, int] = field(default_factory=dict)
+    def to_dict(self) -> dict:
+        return {
+            "seat_id": self.seat_id,
+            "life_total": self.life_total,
+            "lands_played": self.lands_played,
+            "mana_pool": self.mana_pool,
+        }
 
 
 @dataclass
@@ -74,6 +105,14 @@ class TurnInfo:
     priority_player: int = 0
     phase: str = ""
     step: str = ""
+    def to_dict(self) -> dict:
+        return {
+            "turn_number": self.turn_number,
+            "active_player": self.active_player,
+            "priority_player": self.priority_player,
+            "phase": self.phase,
+            "step": self.step,
+        }
 
 
 class GameState:
@@ -234,6 +273,38 @@ class GameState:
         """
         return self._pending_combat_steps.copy()
 
+    def get_snapshot(self) -> dict:
+        """Get a complete, serializable snapshot of the current game state.
+        
+        This 'flattens' the state into a single JSON-ready dictionary, 
+        serving as the 'State Anchor' for the middleware.
+        """
+        # Resolve owners
+        local_player = self.players.get(self.local_seat_id) if self.local_seat_id else None
+        opponent_seat = self.opponent_seat_id
+        
+        # Serialize zones of interest
+        # We group by meaningful logical zones rather than just raw zone IDs
+        
+        snapshot = {
+            "match_id": self.match_id,
+            "local_seat_id": self.local_seat_id,
+            "opponent_seat_id": opponent_seat,
+            "turn_info": self.turn_info.to_dict(),
+            "players": [p.to_dict() for p in self.players.values()],
+            "zones": {
+                "battlefield": [obj.to_dict() for obj in self.battlefield],
+                "my_hand": [obj.to_dict() for obj in self.hand] if self.local_seat_id else [],
+                "opponent_hand_count": len(self.get_objects_in_zone(ZoneType.HAND, opponent_seat)) if opponent_seat else 0,
+                "stack": [obj.to_dict() for obj in self.stack],
+                "graveyard": [obj.to_dict() for obj in self.graveyard],
+                "exile": [obj.to_dict() for obj in self.get_objects_in_zone(ZoneType.EXILE)],
+            },
+            "pending_decision": self.pending_decision,
+            "decision_seat_id": self.decision_seat_id,
+        }
+        return snapshot
+
     def clear_pending_combat_steps(self) -> None:
         """Clear the pending combat steps after processing."""
         self._pending_combat_steps.clear()
@@ -331,6 +402,11 @@ class GameState:
         msg_type = message.get("type", "Unknown")
         logger.debug(f"Processing GameStateMessage type: {msg_type}")
 
+        # Update turn info FIRST so that zone updates use the correct turn number
+        turn_info = message.get("turnInfo")
+        if turn_info:
+            self._update_turn_info(turn_info)
+
         # Update game objects
         game_objects = message.get("gameObjects", [])
         for obj_data in game_objects:
@@ -346,11 +422,6 @@ class GameState:
         for player_data in players:
             self._update_player(player_data)
 
-        # Update turn info
-        turn_info = message.get("turnInfo")
-        if turn_info:
-            self._update_turn_info(turn_info)
-
     def _update_game_object(self, obj_data: dict) -> None:
         """Update or create a game object from message data.
 
@@ -361,37 +432,72 @@ class GameState:
         if instance_id is None:
             return
 
-        grp_id = obj_data.get("grpId", 0)
-        zone_id = obj_data.get("zoneId", 0)
-        owner_seat_id = obj_data.get("ownerSeatId", 0)
-        controller_seat_id = obj_data.get("controllerSeatId")
-        visibility = obj_data.get("visibility")
-
-        # Extract card types
-        card_types = []
-        for ct in obj_data.get("cardTypes", []):
-            card_types.append(ct)
-
-        # Extract subtypes (e.g., SubType_Badger, SubType_Mole -> Badger, Mole)
-        subtypes = []
-        for st in obj_data.get("subtypes", []):
-            # Remove SubType_ prefix if present
-            clean_subtype = st.replace("SubType_", "") if isinstance(st, str) else str(st)
-            subtypes.append(clean_subtype)
-
-        # Extract power/toughness if present
-        power = obj_data.get("power", {}).get("value") if isinstance(obj_data.get("power"), dict) else obj_data.get("power")
-        toughness = obj_data.get("toughness", {}).get("value") if isinstance(obj_data.get("toughness"), dict) else obj_data.get("toughness")
-
-        # Check if tapped
-        is_tapped = obj_data.get("isTapped", False)
-
-        # For abilities: get the source permanent's instance ID
-        parent_instance_id = obj_data.get("parentId")
-
-        # Preserve state from existing object
         existing_obj = self.game_objects.get(instance_id)
-        turn_entered_battlefield = existing_obj.turn_entered_battlefield if existing_obj else -1
+
+        # Helper to get value from update or fallback to existing
+        def get_val(key, default):
+            if existing_obj:
+                # If existing, prefer update if key exists, else existing attr
+                # We need to map key string to attr name sometimes
+                return obj_data.get(key, default)
+                # Wait, this logic is tricky if I want "if key in obj_data".
+            return obj_data.get(key, default)
+
+        # Better merge logic:
+        # 1. Start with defaults or existing values
+        if existing_obj:
+            grp_id = existing_obj.grp_id
+            zone_id = existing_obj.zone_id
+            owner_seat_id = existing_obj.owner_seat_id
+            controller_seat_id = existing_obj.controller_seat_id
+            visibility = existing_obj.visibility
+            power = existing_obj.power
+            toughness = existing_obj.toughness
+            is_tapped = existing_obj.is_tapped
+            card_types = existing_obj.card_types
+            subtypes = existing_obj.subtypes
+            parent_instance_id = existing_obj.parent_instance_id
+            turn_entered_battlefield = existing_obj.turn_entered_battlefield
+        else:
+            grp_id = 0
+            zone_id = 0
+            owner_seat_id = 0
+            controller_seat_id = None
+            visibility = None
+            power = None
+            toughness = None
+            is_tapped = False
+            card_types = []
+            subtypes = []
+            parent_instance_id = None
+            turn_entered_battlefield = -1
+
+        # 2. Overwrite with present data
+        if "grpId" in obj_data: grp_id = obj_data["grpId"]
+        if "zoneId" in obj_data: zone_id = obj_data["zoneId"]
+        if "ownerSeatId" in obj_data: owner_seat_id = obj_data["ownerSeatId"]
+        if "controllerSeatId" in obj_data: controller_seat_id = obj_data["controllerSeatId"]
+        if "visibility" in obj_data: visibility = obj_data["visibility"]
+        
+        if "power" in obj_data:
+             p = obj_data["power"]
+             power = p.get("value") if isinstance(p, dict) else p
+        
+        if "toughness" in obj_data:
+             t = obj_data["toughness"]
+             toughness = t.get("value") if isinstance(t, dict) else t
+
+        if "isTapped" in obj_data: is_tapped = obj_data["isTapped"]
+        if "parentId" in obj_data: parent_instance_id = obj_data["parentId"]
+
+        if "cardTypes" in obj_data:
+            card_types = list(obj_data["cardTypes"])
+            
+        if "subtypes" in obj_data:
+            subtypes = []
+            for st in obj_data["subtypes"]:
+                clean_subtype = st.replace("SubType_", "") if isinstance(st, str) else str(st)
+                subtypes.append(clean_subtype)
 
         game_object = GameObject(
             instance_id=instance_id,
