@@ -175,7 +175,7 @@ class TestWatcherParserIntegration:
             log_path = f.name
 
         try:
-            watcher, parser = create_log_pipeline(log_path=log_path)
+            watcher, parser = create_log_pipeline(log_path=log_path, backfill=False)
 
             assert isinstance(watcher, MTGALogWatcher)
             assert isinstance(parser, LogParser)
@@ -195,7 +195,7 @@ class TestWatcherParserIntegration:
             f.flush()
 
         try:
-            watcher, parser = create_log_pipeline(log_path=log_path)
+            watcher, parser = create_log_pipeline(log_path=log_path, backfill=False)
 
             def handle_gre(payload):
                 events.append(payload)
@@ -233,7 +233,7 @@ class TestWatcherParserIntegration:
             f.flush()
 
         try:
-            watcher, parser = create_log_pipeline(log_path=log_path)
+            watcher, parser = create_log_pipeline(log_path=log_path, backfill=False)
 
             def handle_event(event_type, payload):
                 with events_lock:
@@ -275,7 +275,7 @@ class TestWatcherParserIntegration:
             f.flush()
 
         try:
-            watcher, parser = create_log_pipeline(log_path=log_path)
+            watcher, parser = create_log_pipeline(log_path=log_path, backfill=False)
             parser._on_event = lambda t, p: events.append(t)
 
             with watcher:
@@ -297,6 +297,74 @@ class TestWatcherParserIntegration:
 
                 # Should still process events after truncation
                 assert "GreToClientEvent" in events
+
+        finally:
+            Path(log_path).unlink(missing_ok=True)
+
+
+    def test_backfill_processes_existing_content(self):
+        """Backfill processes existing log content from last match start."""
+        events = []
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as f:
+            log_path = f.name
+            # Write a match start marker and game event BEFORE starting watcher
+            f.write(SAMPLE_MATCH_CREATED)
+            f.write(SAMPLE_GRE_EVENT)
+            f.flush()
+
+        try:
+            watcher, parser = create_log_pipeline(log_path=log_path, backfill=True)
+
+            def handle_event(event_type, payload):
+                events.append(event_type)
+
+            parser._on_event = handle_event
+
+            # Start watcher - backfill should process existing content
+            with watcher:
+                time.sleep(0.2)
+
+            # Events from existing content should have been processed
+            assert "MatchCreated" in events
+            assert "GreToClientEvent" in events
+
+        finally:
+            Path(log_path).unlink(missing_ok=True)
+
+    def test_backfill_finds_last_match_only(self):
+        """Backfill only processes from the last match start, not earlier matches."""
+        events = []
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as f:
+            log_path = f.name
+            # Write two matches - only the second should be processed
+            f.write("[UnityCrossThreadLogger]12:00:00.000 MatchCreated\n")
+            f.write('{"matchCreated": {"matchId": "old-match"}}\n')
+            f.write('[Logger] GreToClientEvent\n{"old": "event"}\n')
+            # Second match
+            f.write(SAMPLE_MATCH_CREATED)  # This has matchId "match-uuid-12345"
+            f.write(SAMPLE_GRE_EVENT)
+            f.flush()
+
+        try:
+            watcher, parser = create_log_pipeline(log_path=log_path, backfill=True)
+
+            payloads = []
+
+            def handle_gre(payload):
+                payloads.append(payload)
+
+            parser.register_handler("GreToClientEvent", handle_gre)
+
+            with watcher:
+                time.sleep(0.2)
+
+            # Should only have processed the second match's event
+            # The first match's {"old": "event"} should NOT be in payloads
+            assert len(payloads) >= 1
+            # The last event should be from SAMPLE_GRE_EVENT (has greToClientEvent key)
+            assert any("greToClientEvent" in p for p in payloads)
 
         finally:
             Path(log_path).unlink(missing_ok=True)

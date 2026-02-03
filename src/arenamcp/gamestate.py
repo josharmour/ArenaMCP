@@ -29,7 +29,7 @@ class ZoneType(Enum):
 
 @dataclass
 class GameObject:
-    """A game object (card, token, etc.) in the game."""
+    """A game object (card, token, ability, etc.) in the game."""
     instance_id: int
     grp_id: int
     zone_id: int
@@ -41,6 +41,11 @@ class GameObject:
     power: Optional[int] = None
     toughness: Optional[int] = None
     is_tapped: bool = False
+    # For abilities: instance_id of the source permanent
+    # For abilities: instance_id of the source permanent
+    parent_instance_id: Optional[int] = None
+    # For summoning sickness tracking
+    turn_entered_battlefield: int = -1
 
 
 @dataclass
@@ -57,6 +62,7 @@ class Player:
     """A player in the game."""
     seat_id: int
     life_total: int = 20
+    lands_played: int = 0
     mana_pool: dict[str, int] = field(default_factory=dict)
 
 
@@ -85,12 +91,58 @@ class GameState:
         self.players: dict[int, Player] = {}
         self.turn_info: TurnInfo = TurnInfo()
 
-        # Local player tracking (inferred from hand zone visibility)
+        # Local player tracking
         self.local_seat_id: Optional[int] = None
-
+        # Source of the seat ID: 0=None, 1=Inferred, 2=System (MatchCreated), 3=User (F8)
+        self._seat_source: int = 0
+        
         # Opponent card history tracking
         self.played_cards: dict[int, list[int]] = {}  # seat_id -> list of grp_ids
         self._seen_instances: set[int] = set()  # Track instances to avoid double-counting
+
+        # Combat step tracking - captures steps that happen between polls
+        # This ensures fast combat phases aren't missed
+        self._pending_combat_steps: list[str] = []
+
+        # Decision tracking (for Mulligan advice, etc.)
+        self.pending_decision: Optional[str] = None  # e.g. "Mulligan"
+        self.decision_seat_id: Optional[int] = None
+        
+        # Match tracking (to avoid stale state across matches)
+        self.match_id: Optional[str] = None
+
+    def reset(self) -> None:
+        """Reset the game state to essentially empty (for new match)."""
+        logger.info("Resetting GameState for new match")
+        self.zones.clear()
+        self.game_objects.clear()
+        self.players.clear()
+        self.turn_info = TurnInfo()
+        
+        # Reset local player seat logic (but keep User/System if we want persistence?)
+        # Actually for a NEW match, System seat ID will change, so we should clear it.
+        # But User override (F8) might be intended to persist? 
+        # Usually seat ID changes every match, so User override might be wrong for next match.
+        # Better to reset seat source to 0 or keep it if it's 3?
+        # Let's trust reset_local_player(force=False) logic which keeps User/System.
+        # But wait, if System ID is from OLD match, it's invalid.
+        # So for a full match reset, we probably want to clear System source too.
+        # Always reset seat ID for a new match. 
+        # Even if user manually set it (Source 3) in previous match, 
+        # it is likely invalid for the new match.
+        self.local_seat_id = None
+        self._seat_source = 0
+            
+        self.played_cards.clear()
+        self._seen_instances.clear()
+        self._pending_combat_steps.clear()
+        self.pending_decision = None
+        self.decision_seat_id = None
+
+    # Backward compatibility for _seat_manually_set
+    @property
+    def _seat_manually_set(self) -> bool:
+        return self._seat_source == 3
 
     @property
     def opponent_seat_id(self) -> Optional[int]:
@@ -174,32 +226,97 @@ class GameState:
             return []
         return self.played_cards.get(self.opponent_seat_id, [])
 
-    def reset_local_player(self) -> None:
-        """Reset local_seat_id to force re-inference.
+    def get_pending_combat_steps(self) -> list[dict]:
+        """Get combat steps that occurred since last check.
 
-        Call this when starting a new game or if player detection is wrong.
+        Returns list of dicts with 'step', 'active_player', 'turn' keys.
+        This allows catching fast combat phases that happen between polls.
         """
-        self.local_seat_id = None
-        logger.info("Reset local_seat_id for re-inference")
+        return self._pending_combat_steps.copy()
+
+    def clear_pending_combat_steps(self) -> None:
+        """Clear the pending combat steps after processing."""
+        self._pending_combat_steps.clear()
+    
+    def get_seat_source_name(self) -> str:
+        """Get human-readable name of the seat ID source."""
+        if self._seat_source == 0: return "None"
+        if self._seat_source == 1: return "Inferred"
+        if self._seat_source == 2: return "System"
+        if self._seat_source == 3: return "User"
+        return "Unknown"
+
+    def set_local_seat_id(self, seat_id: int, source: int = 2) -> None:
+        """Explicitly set the local player's seat ID if source priority allows.
+        
+        Source levels:
+        1: Inferred (from hand visibility)
+        2: System (from MatchCreated events)
+        3: User (Manual override via F8)
+
+        Args:
+            seat_id: The local player's seat ID.
+            source: Priority level (default 2=System).
+        """
+        # Only overwrite if new source is >= current source
+        if source >= self._seat_source:
+            self.local_seat_id = seat_id
+            self._seat_source = source
+            source_name = self.get_seat_source_name()
+            logger.info(f"Set local_seat_id to {seat_id} (Source: {source_name})")
+        else:
+            logger.info(f"Ignored seat update to {seat_id} (Source {source} < Current {self._seat_source})")
+
+    def reset_local_player(self, force: bool = False) -> None:
+        """Reset local_seat_id logic.
+        
+        Args:
+            force: If True, reset EVERYTHING (used for full restart).
+                   If False, only reset INFERRED (1) sources. 
+                   System (2) and User (3) are preserved across game resets (e.g. BO3).
+        """
+        if force or self._seat_source <= 1:
+            self.local_seat_id = None
+            self._seat_source = 0
+            logger.info("Reset local_seat_id (cleared)")
+        else:
+            logger.info(f"Preserving local_seat_id={self.local_seat_id} (Source: {self.get_seat_source_name()})")
 
     def ensure_local_seat_id(self) -> None:
         """Ensure local_seat_id is set by inferring from existing data.
 
         Called by server before returning game state to ensure is_local
-        is correctly determined. Uses hand zone with visible cards
-        (opponent's hand zone exists but has no visible objects).
+        is correctly determined. Uses hand zone with cards that have
+        known grp_ids (you can see your own cards but not opponent's).
         """
         if self.local_seat_id is not None:
             return  # Already set
 
-        # Try to infer from hand zones that have visible cards
+        # Try to infer from hand zones that have cards with VISIBLE grp_ids
+        # Opponent's hand zone may have instance_ids but grp_id=0 (hidden)
         for zone in self.zones.values():
-            if (zone.zone_type == ZoneType.HAND and
-                zone.owner_seat_id is not None and
-                zone.object_instance_ids):  # Must have visible cards
-                self.local_seat_id = zone.owner_seat_id
-                logger.info(f"Inferred local player as seat {zone.owner_seat_id} from existing hand zone with {len(zone.object_instance_ids)} cards")
+            if zone.zone_type != ZoneType.HAND:
+                continue
+            if zone.owner_seat_id is None:
+                continue
+            if not zone.object_instance_ids:
+                continue
+
+            # Check if ANY card in this hand has a known grp_id (not 0)
+            has_visible_card = False
+            for instance_id in zone.object_instance_ids:
+                obj = self.game_objects.get(instance_id)
+                if obj and obj.grp_id != 0:
+                    has_visible_card = True
+                    break
+
+            if has_visible_card:
+                # Use source=1 (Inferred)
+                self.set_local_seat_id(zone.owner_seat_id, source=1)
                 return
+
+        # Fallback: log that we couldn't determine local player
+        logger.debug("Could not infer local_seat_id - no hand zone with visible grp_ids found")
 
     def update_from_message(self, message: dict) -> None:
         """Update game state from a GameStateMessage payload.
@@ -269,6 +386,13 @@ class GameState:
         # Check if tapped
         is_tapped = obj_data.get("isTapped", False)
 
+        # For abilities: get the source permanent's instance ID
+        parent_instance_id = obj_data.get("parentId")
+
+        # Preserve state from existing object
+        existing_obj = self.game_objects.get(instance_id)
+        turn_entered_battlefield = existing_obj.turn_entered_battlefield if existing_obj else -1
+
         game_object = GameObject(
             instance_id=instance_id,
             grp_id=grp_id,
@@ -281,6 +405,8 @@ class GameState:
             power=power,
             toughness=toughness,
             is_tapped=is_tapped,
+            parent_instance_id=parent_instance_id,
+            turn_entered_battlefield=turn_entered_battlefield,
         )
 
         self.game_objects[instance_id] = game_object
@@ -368,12 +494,32 @@ class GameState:
         self.zones[zone_id] = zone
         logger.debug(f"Updated zone {zone_id} ({zone_type.name})")
 
-        # Infer local player from hand visibility (you only see your own hand's CARDS)
-        # Only infer if hand zone has visible objects - opponent's hand zone exists but is empty
+        # Track battlefield entry for summoning sickness
+        if zone_type == ZoneType.BATTLEFIELD:
+            current_turn = self.turn_info.turn_number
+            for instance_id in object_instance_ids:
+                obj = self.game_objects.get(instance_id)
+                if obj and obj.turn_entered_battlefield == -1:
+                    obj.turn_entered_battlefield = current_turn
+                    logger.debug(f"Object {instance_id} entered battlefield on turn {current_turn}")
+
+        # Infer local player from hand visibility
+        # Only infer if hand zone has cards with known grp_ids (not 0)
+        # Opponent's hand has instance_ids but grp_id=0 (hidden cards)
+        # NEVER override a manually set seat
         if zone_type == ZoneType.HAND and owner_seat_id is not None and object_instance_ids:
-            if self.local_seat_id is None:
-                self.local_seat_id = owner_seat_id
-                logger.info(f"Inferred local player as seat {owner_seat_id} from hand zone with {len(object_instance_ids)} cards")
+            if self.local_seat_id is None and not self._seat_manually_set:
+                # Check if any card in this zone has a visible grp_id
+                has_visible_card = False
+                for instance_id in object_instance_ids:
+                    obj = self.game_objects.get(instance_id)
+                    if obj and obj.grp_id != 0:
+                        has_visible_card = True
+                        break
+
+                if has_visible_card:
+                    self.local_seat_id = owner_seat_id
+                    logger.info(f"Inferred local player as seat {owner_seat_id} from hand zone with visible grp_ids")
 
     def _update_player(self, player_data: dict) -> None:
         """Update or create a player from message data.
@@ -386,6 +532,7 @@ class GameState:
             return
 
         life_total = player_data.get("lifeTotal", 20)
+        lands_played = player_data.get("landsPlayedThisTurn", 0)
 
         # Extract mana pool if present
         mana_pool = {}
@@ -397,11 +544,12 @@ class GameState:
         player = Player(
             seat_id=seat_id,
             life_total=life_total,
+            lands_played=lands_played,
             mana_pool=mana_pool,
         )
 
         self.players[seat_id] = player
-        logger.debug(f"Updated player {seat_id} (life={life_total})")
+        logger.debug(f"Updated player {seat_id} (life={life_total}, lands={lands_played})")
 
     def _update_turn_info(self, turn_data: dict) -> None:
         """Update turn info from message data.
@@ -413,17 +561,55 @@ class GameState:
 
         # Detect new game: turn number resets to 1 or decreases significantly
         if self.turn_info.turn_number > 3 and new_turn <= 1:
-            logger.info(f"New game detected (turn {self.turn_info.turn_number} -> {new_turn}), resetting local_seat_id")
-            self.local_seat_id = None
+            logger.info(f"New game detected (turn {self.turn_info.turn_number} -> {new_turn})")
+
+            # Reset player according to priority rules (User/System persist, Inferred resets)
+            # This calls reset_local_player(force=False) logic indirectly
+            self.reset_local_player(force=False)
+
             self.played_cards.clear()
             self._seen_instances.clear()
+
+            # Clear any stale decisions from previous game
+            self.pending_decision = None
+            self.decision_seat_id = None
 
         self.turn_info.turn_number = new_turn
         self.turn_info.active_player = turn_data.get("activePlayer", self.turn_info.active_player)
         self.turn_info.priority_player = turn_data.get("priorityPlayer", self.turn_info.priority_player)
-        self.turn_info.phase = turn_data.get("phase", self.turn_info.phase)
-        self.turn_info.step = turn_data.get("step", self.turn_info.step)
-        logger.debug(f"Updated turn info: turn {self.turn_info.turn_number}, phase {self.turn_info.phase}")
+        new_phase = turn_data.get("phase", self.turn_info.phase)
+        new_step = turn_data.get("step", self.turn_info.step)
+
+        # Safety: auto-clear mulligan decision once game proceeds past turn 1
+        # This handles cases where SubmitDeckResp message was missed
+        if self.pending_decision == "Mulligan" and new_turn > 1:
+            logger.info(f"Auto-clearing stale Mulligan decision (now turn {new_turn})")
+            self.pending_decision = None
+            self.decision_seat_id = None
+
+        # Detect phase change
+        if new_phase != self.turn_info.phase:
+            logger.debug(f"Phase change: {self.turn_info.phase} -> {new_phase}")
+            # If step is not explicitly in the update, reset it to avoid stale steps
+            # (e.g., Step_Draw appearing in Phase_Main1)
+            if "step" not in turn_data:
+                new_step = ""
+                logger.debug("Resetting step due to phase change")
+
+        # Track combat steps as they happen (for event-driven triggers)
+        if "Combat" in new_phase and new_step != self.turn_info.step:
+            if "DeclareAttack" in new_step or "DeclareBlock" in new_step:
+                # Store step with active player info for trigger generation
+                self._pending_combat_steps.append({
+                    "step": new_step,
+                    "active_player": self.turn_info.active_player,
+                    "turn": new_turn
+                })
+                logger.info(f"Queued combat step: {new_step} (active_player={self.turn_info.active_player})")
+
+        self.turn_info.phase = new_phase
+        self.turn_info.step = new_step
+        logger.debug(f"Updated turn info: turn {self.turn_info.turn_number}, phase {self.turn_info.phase}, step {self.turn_info.step}")
 
 
 def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
@@ -457,6 +643,47 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                 game_state_msg = msg.get("gameStateMessage")
                 if game_state_msg:
                     game_state.update_from_message(game_state_msg)
+            
+            # Handle Mulligan/Decision Requests
+            elif msg_type == "GREMessageType_SubmitDeckReq" or msg_type == "GREMessageType_IntermissionReq":
+                # This explicitly asks for a deck submission, usually mulligan phase
+                logger.info(f"Captured Decision: Mulligan Check ({msg_type})")
+                game_state.pending_decision = "Mulligan"
+                game_state.decision_seat_id = game_state.local_seat_id 
+                
+            elif msg_type == "GREMessageType_PromptReq":
+                prompt_text = msg.get("promptReq", {}).get("prompt", {}).get("text", "Action Required")
+                logger.info(f"Captured Decision: Prompt ({prompt_text})")
+                game_state.pending_decision = prompt_text
+                
+            elif msg_type == "GREMessageType_SelectTargetsReq":
+                logger.info("Captured Decision: Select Targets")
+                game_state.pending_decision = "Select Targets"
+                
+            elif msg_type == "GREMessageType_SelectNReq":
+                logger.info("Captured Decision: Select N Items")
+                game_state.pending_decision = "Select Items"
+                
+            elif msg_type == "GREMessageType_GroupOptionReq":
+                logger.info("Captured Decision: Choose Mode")
+                game_state.pending_decision = "Choose Mode"
+
+            elif "Resp" in msg_type:
+                # Clear pending decision on any response
+                if game_state.pending_decision and msg_type not in ["GREMessageType_GameStateMessage", "GREMessageType_TimerStateMessage"]:
+                    logger.debug(f"Clearing decision '{game_state.pending_decision}' due to {msg_type}")
+                    game_state.pending_decision = None
+                    game_state.decision_seat_id = None
+
+            elif msg_type == "GREMessageType_TimerStateMessage":
+                pass
+                
+            elif msg_type == "GREMessageType_SubmitDeckResp":
+                # We answered the mulligan, clear it
+                if game_state.pending_decision == "Mulligan":
+                    logger.info("Decision Cleared: Mulligan")
+                    game_state.pending_decision = None
+                    game_state.decision_seat_id = None
 
         # Also handle direct GameStateMessage events (legacy format)
         if "gameObjects" in payload or "zones" in payload or "players" in payload:

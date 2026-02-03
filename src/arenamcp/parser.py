@@ -15,10 +15,23 @@ logger = logging.getLogger(__name__)
 EVENT_PATTERNS = [
     re.compile(r'GreToClientEvent'),
     re.compile(r'MatchCreated'),
+    re.compile(r'MatchGameRoomStateChangedEvent'),
     re.compile(r'ClientToMatchServiceMessage'),
     re.compile(r'MulliganReq'),
     re.compile(r'MulliganResp'),
     re.compile(r'GameStateMessage'),
+    # Draft-related events
+    re.compile(r'Draft\.Notify'),
+    re.compile(r'Draft\.MakeHumanDraftPick'),
+    re.compile(r'Event_PlayerDraftMakePick'),
+    re.compile(r'BotDraft_DraftPick'),
+    re.compile(r'DraftPack'),
+    re.compile(r'DraftStatus'),
+    re.compile(r'CardsInPack'),
+    re.compile(r'EventName'),
+    # Sealed pool events
+    re.compile(r'CardPool'),
+    re.compile(r'InternalEventName'),
 ]
 
 

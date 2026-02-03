@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show:*)",
+      "Bash(uvx --help:*)",
+      "Bash(where:*)",
+      "Bash(uvx voice-mode:*)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "mtga"
+  ]
+}

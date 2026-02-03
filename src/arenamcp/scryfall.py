@@ -106,7 +106,7 @@ class ScryfallCache:
     def _load_bulk_data(self) -> None:
         """Load bulk data JSON and build arena_id index."""
         bulk_path = self._get_bulk_data_path()
-        logger.info(f"Loading bulk data from {bulk_path}...")
+        logger.debug(f"Loading bulk data from {bulk_path}...")
 
         with open(bulk_path, "r", encoding="utf-8") as f:
             cards = json.load(f)
@@ -135,12 +135,33 @@ class ScryfallCache:
         self._load_bulk_data()
 
     def _card_dict_to_scryfall_card(self, card: dict[str, Any]) -> ScryfallCard:
-        """Convert raw Scryfall JSON dict to ScryfallCard dataclass."""
+        """Convert raw Scryfall JSON dict to ScryfallCard dataclass.
+
+        Handles double-faced cards (DFCs) by extracting oracle_text from card_faces.
+        """
+        # For DFCs/transform cards, oracle_text is in card_faces, not top level
+        oracle_text = card.get("oracle_text", "")
+        mana_cost = card.get("mana_cost", "")
+
+        if not oracle_text and "card_faces" in card:
+            # Combine oracle text from all faces
+            faces = card["card_faces"]
+            oracle_parts = []
+            for face in faces:
+                face_text = face.get("oracle_text", "")
+                if face_text:
+                    oracle_parts.append(face_text)
+            oracle_text = "\n---\n".join(oracle_parts)
+
+            # Get mana cost from front face if not at top level
+            if not mana_cost and faces:
+                mana_cost = faces[0].get("mana_cost", "")
+
         return ScryfallCard(
             name=card.get("name", ""),
-            oracle_text=card.get("oracle_text", ""),
+            oracle_text=oracle_text,
             type_line=card.get("type_line", ""),
-            mana_cost=card.get("mana_cost", ""),
+            mana_cost=mana_cost,
             cmc=card.get("cmc", 0.0),
             colors=card.get("colors", []),
             arena_id=card.get("arena_id", 0),
@@ -205,3 +226,36 @@ class ScryfallCache:
         self._not_found_cache.add(arena_id)
         logger.debug(f"Added arena_id {arena_id} to not-found cache")
         return None
+
+    def get_card_by_name(self, name: str) -> Optional[ScryfallCard]:
+        """Get card data by name using Scryfall API fuzzy search.
+
+        Useful for new sets where arena_id mappings aren't in bulk data yet.
+
+        Args:
+            name: The card name to search for
+
+        Returns:
+            ScryfallCard with card data, or None if not found
+        """
+        if not name or name.startswith("Unknown"):
+            return None
+
+        self._rate_limit_api()
+
+        # Use fuzzy search which handles minor variations
+        url = f"https://api.scryfall.com/cards/named"
+        params = {"fuzzy": name}
+        logger.debug(f"Fetching card by name from API: {name}")
+
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            if response.status_code == 404:
+                logger.debug(f"Card not found by name: {name}")
+                return None
+            response.raise_for_status()
+            card_data = response.json()
+            return self._card_dict_to_scryfall_card(card_data)
+        except requests.RequestException as e:
+            logger.warning(f"API request failed for name '{name}': {e}")
+            return None

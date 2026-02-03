@@ -1,4 +1,42 @@
+# ArenaMCP Requirements
+# Install with: pip install -r requirements.txt
+
+# Core MCP server
+mcp>=1.0.0
+
+# Log watching
 watchdog>=3.0.0
+
+# HTTP requests (for Scryfall API)
 requests>=2.28.0
+
+# Hotkeys (Windows)
+keyboard>=0.13.5
+
+# LLM backends
+google-generativeai>=0.3.0
+anthropic>=0.18.0
+ollama>=0.1.0
+
+# Voice input (speech-to-text)
 sounddevice>=0.4.6
+faster-whisper>=0.10.0
+
+# Voice output (text-to-speech)
+kokoro>=0.3.0
+soundfile>=0.12.0
+
+# Utilities
 numpy>=1.24.0
+
+# TUI
+textual>=0.47.0
+
+# OpenAI / Azure OpenAI
+openai>=1.0.0
+
+# WebSocket for GPT-Realtime
+websocket-client>=1.6.0
+
+# Audio resampling (optional, improves quality for GPT-Realtime)
+scipy>=1.10.0

@@ -91,6 +91,7 @@ class VoiceInput:
         self._vox_threshold = vox_threshold
         self._vox_silence = vox_silence
         self._model_size = model_size
+        self.transcription_enabled = True  # New flag to control local transcription
 
         # Components (lazy-initialized)
         self._recorder: Optional[AudioRecorder] = None
@@ -101,6 +102,7 @@ class VoiceInput:
         self._active = False
         self._result_ready = threading.Event()
         self._last_result: str = ""
+        self._last_audio: Optional[np.ndarray] = None  # Raw audio from last recording
         self._lock = threading.Lock()
 
         # VOX mode background thread
@@ -114,7 +116,8 @@ class VoiceInput:
         if self._recorder is None:
             self._recorder = AudioRecorder(AudioConfig())
 
-        if self._transcriber is None:
+        # Only init transcriber if enabled
+        if self._transcriber is None and self.transcription_enabled:
             self._transcriber = WhisperTranscriber(model_size=self._model_size)
 
         if self._trigger is None:
@@ -143,15 +146,25 @@ class VoiceInput:
 
     def _on_recording_stop(self) -> None:
         """Called when PTT key is released."""
-        # Play stop beep (lower pitch, double beep)
+        # Play stop beep IMMEIDATELY for responsiveness
+        # Use simpler beep parameters for speed
         play_beep(frequency=660, duration=0.06, volume=0.25)
+        
         with self._lock:
             if self._recorder is not None:
                 audio = self._recorder.stop_recording()
-                if len(audio) > 0 and self._transcriber is not None:
+                self._last_audio = audio if len(audio) > 0 else None
+                
+                # Only transcribe if enabled
+                if len(audio) > 0 and self.transcription_enabled:
+                    # Ensure transcriber exists (might have been skipped in init)
+                    if self._transcriber is None:
+                        self._transcriber = WhisperTranscriber(model_size=self._model_size)
                     self._last_result = self._transcriber.transcribe(audio)
                 else:
                     self._last_result = ""
+            else:
+                self._last_audio = None
             self._result_ready.set()
 
     def _on_vox_start(self) -> None:
@@ -165,13 +178,24 @@ class VoiceInput:
         """Called when VOX detects voice activity end."""
         with self._lock:
             self._vox_recording = False
-            if self._vox_buffer and self._transcriber is not None:
+            if self._vox_buffer:
                 audio = np.concatenate(self._vox_buffer)
                 if audio.ndim > 1:
                     audio = audio.flatten()
-                self._last_result = self._transcriber.transcribe(audio)
+                
+                self._last_audio = audio  # Save VOX audio too
+                
+                # Only transcribe if enabled
+                if self.transcription_enabled:
+                    if self._transcriber is None:
+                        self._transcriber = WhisperTranscriber(model_size=self._model_size)
+                    self._last_result = self._transcriber.transcribe(audio)
+                else:
+                    self._last_result = ""
             else:
                 self._last_result = ""
+                self._last_audio = None
+                
             self._vox_buffer = []
             self._result_ready.set()
 
@@ -259,3 +283,12 @@ class VoiceInput:
         self._result_ready.clear()
         self._result_ready.wait(timeout=timeout)
         return self._last_result
+
+    def get_last_audio(self) -> Optional[np.ndarray]:
+        """Get the raw audio from the last recording.
+
+        Returns:
+            Numpy array of audio samples (float32, mono), or None if no recording.
+        """
+        with self._lock:
+            return self._last_audio
