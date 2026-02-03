@@ -46,6 +46,9 @@ class GameObject:
     parent_instance_id: Optional[int] = None
     # For summoning sickness tracking
     turn_entered_battlefield: int = -1
+    # Combat status
+    is_attacking: bool = False
+    is_blocking: bool = False
     def to_dict(self) -> dict:
         """Convert to simple dict for snapshot serialization."""
         return {
@@ -60,7 +63,10 @@ class GameObject:
             "power": self.power,
             "toughness": self.toughness,
             "is_tapped": self.is_tapped,
+            "is_tapped": self.is_tapped,
             "turn_entered_battlefield": self.turn_entered_battlefield,
+            "is_attacking": self.is_attacking,
+            "is_blocking": self.is_blocking,
         }
 
 
@@ -146,6 +152,9 @@ class GameState:
         # Decision tracking (for Mulligan advice, etc.)
         self.pending_decision: Optional[str] = None  # e.g. "Mulligan"
         self.decision_seat_id: Optional[int] = None
+        # PHASE 1: Enhanced decision context
+        self.decision_context: Optional[dict] = None  # Rich context: source_card, options, etc.
+        self.decision_timestamp: float = 0  # Track when decision was set
         
         # Match tracking (to avoid stale state across matches)
         self.match_id: Optional[str] = None
@@ -177,6 +186,8 @@ class GameState:
         self._pending_combat_steps.clear()
         self.pending_decision = None
         self.decision_seat_id = None
+        self.decision_context = None
+        self.decision_timestamp = 0
 
     # Backward compatibility for _seat_manually_set
     @property
@@ -242,7 +253,14 @@ class GameState:
     def hand(self) -> list[GameObject]:
         """Get objects in all hands (filtered by local player if set)."""
         if self.local_seat_id is not None:
-            return self.get_objects_in_zone(ZoneType.HAND, self.local_seat_id)
+            # First try zone-based filter
+            result = self.get_objects_in_zone(ZoneType.HAND, self.local_seat_id)
+            if result:
+                return result
+            # Fallback: get all hand cards where the card's owner matches local player
+            # (handles case where zone.owner_seat_id is None but card has owner set)
+            all_hand = self.get_objects_in_zone(ZoneType.HAND)
+            return [obj for obj in all_hand if obj.owner_seat_id == self.local_seat_id]
         return self.get_objects_in_zone(ZoneType.HAND)
 
     @property
@@ -283,25 +301,44 @@ class GameState:
         local_player = self.players.get(self.local_seat_id) if self.local_seat_id else None
         opponent_seat = self.opponent_seat_id
         
+        # Enrich objects with card names for TUI display
+        def enrich_obj(obj):
+            """Add card name to object dict for TUI."""
+            data = obj.to_dict()
+            # Lazy import to avoid circular dependency
+            from arenamcp import server
+            card_info = server.get_card_info(obj.grp_id)
+            data["name"] = card_info.get("name", f"Unknown ({obj.grp_id})")
+            data["type_line"] = card_info.get("type_line", "")
+            return data
+        
         # Serialize zones of interest
         # We group by meaningful logical zones rather than just raw zone IDs
         
+        # Manually serialize players to include is_local flag for TUI
+        players_list = []
+        for p in self.players.values():
+            p_dict = p.to_dict()
+            p_dict["is_local"] = (p.seat_id == self.local_seat_id)
+            players_list.append(p_dict)
+            
         snapshot = {
             "match_id": self.match_id,
             "local_seat_id": self.local_seat_id,
             "opponent_seat_id": opponent_seat,
             "turn_info": self.turn_info.to_dict(),
-            "players": [p.to_dict() for p in self.players.values()],
+            "players": players_list,
             "zones": {
-                "battlefield": [obj.to_dict() for obj in self.battlefield],
-                "my_hand": [obj.to_dict() for obj in self.hand] if self.local_seat_id else [],
+                "battlefield": [enrich_obj(obj) for obj in self.battlefield],
+                "my_hand": [enrich_obj(obj) for obj in self.hand] if self.local_seat_id else [],
                 "opponent_hand_count": len(self.get_objects_in_zone(ZoneType.HAND, opponent_seat)) if opponent_seat else 0,
-                "stack": [obj.to_dict() for obj in self.stack],
-                "graveyard": [obj.to_dict() for obj in self.graveyard],
-                "exile": [obj.to_dict() for obj in self.get_objects_in_zone(ZoneType.EXILE)],
+                "stack": [enrich_obj(obj) for obj in self.stack],
+                "graveyard": [enrich_obj(obj) for obj in self.graveyard],
+                "exile": [enrich_obj(obj) for obj in self.get_objects_in_zone(ZoneType.EXILE)],
             },
             "pending_decision": self.pending_decision,
             "decision_seat_id": self.decision_seat_id,
+            "decision_context": self.decision_context,
         }
         return snapshot
 
@@ -458,6 +495,8 @@ class GameState:
             subtypes = existing_obj.subtypes
             parent_instance_id = existing_obj.parent_instance_id
             turn_entered_battlefield = existing_obj.turn_entered_battlefield
+            is_attacking = existing_obj.is_attacking
+            is_blocking = existing_obj.is_blocking
         else:
             grp_id = 0
             zone_id = 0
@@ -471,6 +510,8 @@ class GameState:
             subtypes = []
             parent_instance_id = None
             turn_entered_battlefield = -1
+            is_attacking = False
+            is_blocking = False
 
         # 2. Overwrite with present data
         if "grpId" in obj_data: grp_id = obj_data["grpId"]
@@ -489,6 +530,9 @@ class GameState:
 
         if "isTapped" in obj_data: is_tapped = obj_data["isTapped"]
         if "parentId" in obj_data: parent_instance_id = obj_data["parentId"]
+
+        if "isAttacking" in obj_data: is_attacking = bool(obj_data["isAttacking"])
+        if "isBlocking" in obj_data: is_blocking = bool(obj_data["isBlocking"])
 
         if "cardTypes" in obj_data:
             card_types = list(obj_data["cardTypes"])
@@ -513,7 +557,10 @@ class GameState:
             is_tapped=is_tapped,
             parent_instance_id=parent_instance_id,
             turn_entered_battlefield=turn_entered_battlefield,
+            is_attacking=is_attacking,
+            is_blocking=is_blocking,
         )
+
 
         self.game_objects[instance_id] = game_object
         logger.debug(f"Updated game object {instance_id} (grpId={grp_id})")
@@ -640,6 +687,29 @@ class GameState:
         life_total = player_data.get("lifeTotal", 20)
         lands_played = player_data.get("landsPlayedThisTurn", 0)
 
+        # FALLBACK: Arena doesn't always track landsPlayedThisTurn correctly
+        # Infer by counting lands that entered battlefield this turn
+        if lands_played == 0 and self.turn_info.turn_number > 0:
+            current_turn = self.turn_info.turn_number
+            inferred_lands = 0
+            for obj in self.battlefield:
+                # Check card_types for "Land" (stored as "CardType_Land" from Arena)
+                is_land_by_type = any("Land" in ct for ct in obj.card_types) if obj.card_types else False
+                # Fallback: check type_line (e.g., "Basic Land — Forest")
+                is_land_by_line = "land" in obj.type_line.lower() if obj.type_line else False
+                is_land = is_land_by_type or is_land_by_line
+                
+                if (obj.owner_seat_id == seat_id and 
+                    obj.controller_seat_id == seat_id and
+                    is_land and
+                    obj.turn_entered_battlefield == current_turn):
+                    inferred_lands += 1
+                    logger.debug(f"Inferred land: {obj.name} entered turn {current_turn} for seat {seat_id}")
+            
+            if inferred_lands > 0:
+                lands_played = inferred_lands
+                logger.info(f"Inferred lands_played={lands_played} for seat {seat_id} (Arena reported 0)")
+
         # Extract mana pool if present
         mana_pool = {}
         for mana_data in player_data.get("manaPool", []):
@@ -666,22 +736,26 @@ class GameState:
         new_turn = turn_data.get("turnNumber", self.turn_info.turn_number)
 
         # Detect new game: turn number resets to 1 or decreases significantly
+        # Detect new game: turn number resets to 1 or decreases significantly
         if self.turn_info.turn_number > 3 and new_turn <= 1:
-            logger.info(f"New game detected (turn {self.turn_info.turn_number} -> {new_turn})")
+            logger.info(f"New game detected (turn {self.turn_info.turn_number} -> {new_turn}) - Performing Search & Destroy on old state.")
+            
+            # FULL RESET of all zones, objects, players
+            self.reset()
+            
+            # reset() makes turn_number 0, which is fine as we overwrite it below
 
-            # Reset player according to priority rules (User/System persist, Inferred resets)
-            # This calls reset_local_player(force=False) logic indirectly
-            self.reset_local_player(force=False)
-
-            self.played_cards.clear()
-            self._seen_instances.clear()
-
-            # Clear any stale decisions from previous game
-            self.pending_decision = None
-            self.decision_seat_id = None
-
+        new_active = turn_data.get("activePlayer", self.turn_info.active_player)
+        
+        # Clear stale pending combat steps when turn or active player changes
+        # Must check BEFORE updating turn_info
+        if new_turn != self.turn_info.turn_number or new_active != self.turn_info.active_player:
+            if self._pending_combat_steps:
+                logger.debug(f"Clearing {len(self._pending_combat_steps)} stale pending combat steps (turn/active changed)")
+                self._pending_combat_steps.clear()
+        
         self.turn_info.turn_number = new_turn
-        self.turn_info.active_player = turn_data.get("activePlayer", self.turn_info.active_player)
+        self.turn_info.active_player = new_active
         self.turn_info.priority_player = turn_data.get("priorityPlayer", self.turn_info.priority_player)
         new_phase = turn_data.get("phase", self.turn_info.phase)
         new_step = turn_data.get("step", self.turn_info.step)
@@ -692,6 +766,8 @@ class GameState:
             logger.info(f"Auto-clearing stale Mulligan decision (now turn {new_turn})")
             self.pending_decision = None
             self.decision_seat_id = None
+            self.decision_context = None
+            self.decision_timestamp = 0
 
         # Detect phase change
         if new_phase != self.turn_info.phase:
@@ -754,32 +830,117 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
             elif msg_type == "GREMessageType_SubmitDeckReq" or msg_type == "GREMessageType_IntermissionReq":
                 # This explicitly asks for a deck submission, usually mulligan phase
                 logger.info(f"Captured Decision: Mulligan Check ({msg_type})")
+                
+                # If we get a Mulligan request while deeply into a game (Turn > 1), 
+                # it implies a restart/rematch that happened before the 'Turn 1' update arrived.
+                if game_state.turn_info.turn_number > 1:
+                     logger.info(f"Mulligan Request detected at Turn {game_state.turn_info.turn_number} -> Resetting Ghost State.")
+                     game_state.reset()
+                
                 game_state.pending_decision = "Mulligan"
-                game_state.decision_seat_id = game_state.local_seat_id 
+                game_state.decision_seat_id = game_state.local_seat_id
+                import time
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {"type": "mulligan"}
                 
             elif msg_type == "GREMessageType_PromptReq":
+                import time
                 prompt_text = msg.get("promptReq", {}).get("prompt", {}).get("text", "Action Required")
                 logger.info(f"Captured Decision: Prompt ({prompt_text})")
                 game_state.pending_decision = prompt_text
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {"type": "prompt", "text": prompt_text}
                 
             elif msg_type == "GREMessageType_SelectTargetsReq":
-                logger.info("Captured Decision: Select Targets")
+                # PHASE 1: Capture rich context for target selection
+                import time
+                req = msg.get("selectTargetsReq", {})
+                source_id = req.get("sourceId")
+                source_card = None
+                if source_id:
+                    # Try to find the source card on the stack
+                    for obj in game_state.stack:
+                        if obj.instance_id == source_id:
+                            source_card = game_state._card_db.get_card_name(obj.grp_id)
+                            break
+                
+                logger.info(f"Captured Decision: Select Targets (source: {source_card or 'unknown'})")
                 game_state.pending_decision = "Select Targets"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "target_selection",
+                    "source_card": source_card,
+                    "source_id": source_id,
+                }
                 
             elif msg_type == "GREMessageType_SelectNReq":
-                logger.info("Captured Decision: Select N Items")
+                # PHASE 1: Capture rich context for N-selection (discard, scry, etc.)
+                import time
+                req = msg.get("selectNReq", {})
+                context_data = req.get("context", {})
+                num_to_select = req.get("count", 1)
+                min_select = req.get("minCount", num_to_select)
+                max_select = req.get("maxCount", num_to_select)
+                
+                # Try to determine the type of selection (discard, scry, etc.)
+                # This is heuristic-based on MTGA's context strings
+                context_str = str(context_data).lower()
+                if "discard" in context_str:
+                    selection_type = "discard"
+                elif "scry" in context_str:
+                    selection_type = "scry"
+                elif "surveil" in context_str:
+                    selection_type = "surveil"
+                else:
+                    selection_type = "select_n"
+                
+                logger.info(f"Captured Decision: Select {num_to_select} Items ({selection_type})")
                 game_state.pending_decision = "Select Items"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": selection_type,
+                    "count": num_to_select,
+                    "min": min_select,
+                    "max": max_select,
+                    "context_raw": context_data,
+                }
                 
             elif msg_type == "GREMessageType_GroupOptionReq":
-                logger.info("Captured Decision: Choose Mode")
+                # PHASE 1: Capture modal spell options
+                import time
+                req = msg.get("groupOptionReq", {})
+                options = req.get("options", [])
+                
+                logger.info(f"Captured Decision: Choose Mode ({len(options)} options)")
                 game_state.pending_decision = "Choose Mode"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "modal_choice",
+                    "num_options": len(options),
+                    "options": options,
+                }
 
             elif "Resp" in msg_type:
-                # Clear pending decision on any response
-                if game_state.pending_decision and msg_type not in ["GREMessageType_GameStateMessage", "GREMessageType_TimerStateMessage"]:
-                    logger.debug(f"Clearing decision '{game_state.pending_decision}' due to {msg_type}")
-                    game_state.pending_decision = None
-                    game_state.decision_seat_id = None
+                # PHASE 3: Only clear decisions on actual decision responses, not generic responses
+                # Only clear on explicit decision submission responses
+                decision_response_types = [
+                    "GREMessageType_SelectTargetsResp",
+                    "GREMessageType_SelectNResp",
+                    "GREMessageType_GroupOptionResp",
+                    "GREMessageType_SubmitDeckResp",  # Mulligan
+                    "GREMessageType_PromptResp",
+                ]
+                
+                if game_state.pending_decision and msg_type in decision_response_types:
+                    # Don't auto-clear Mulligan (handled separately)
+                    if game_state.pending_decision == "Mulligan" and msg_type != "GREMessageType_SubmitDeckResp":
+                        pass
+                    else:
+                        logger.debug(f"Clearing decision '{game_state.pending_decision}' due to {msg_type}")
+                        game_state.pending_decision = None
+                        game_state.decision_seat_id = None
+                        game_state.decision_context = None
+                        game_state.decision_timestamp = 0
 
             elif msg_type == "GREMessageType_TimerStateMessage":
                 pass
@@ -790,9 +951,54 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                     logger.info("Decision Cleared: Mulligan")
                     game_state.pending_decision = None
                     game_state.decision_seat_id = None
+                    game_state.decision_context = None
+                    game_state.decision_timestamp = 0
 
         # Also handle direct GameStateMessage events (legacy format)
         if "gameObjects" in payload or "zones" in payload or "players" in payload:
             game_state.update_from_message(payload)
+        
+        # Record frame if recording is active
+        try:
+            from arenamcp.match_validator import record_frame
+            snapshot = game_state.get_snapshot()
+            record_frame(payload, snapshot)
+        except ImportError:
+            pass  # match_validator not available
+        except Exception as e:
+            logger.debug(f"Frame recording skipped: {e}")
 
     return handler
+
+
+def create_recording_handler(
+    game_state: GameState,
+    recording: "MatchRecording"  # Forward reference to avoid circular import
+) -> Callable[[dict], None]:
+    """Create a handler that updates GameState AND records frames for validation.
+    
+    This wraps the base handler to also capture raw messages alongside
+    our parsed snapshots for post-match comparison.
+    
+    Args:
+        game_state: The GameState instance to update.
+        recording: The MatchRecording to add frames to.
+        
+    Returns:
+        A handler function suitable for LogParser.register_handler().
+    """
+    base_handler = create_game_state_handler(game_state)
+    
+    def recording_handler(payload: dict) -> None:
+        # First, apply the update via base handler
+        base_handler(payload)
+        
+        # Then, record the frame with current snapshot
+        try:
+            snapshot = game_state.get_snapshot()
+            recording.add_frame(payload, snapshot)
+        except Exception as e:
+            logger.warning(f"Failed to record frame: {e}")
+    
+    return recording_handler
+

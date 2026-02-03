@@ -61,9 +61,10 @@ class ClaudeBackend:
             client_time = (time.perf_counter() - client_start) * 1000
 
             request_start = time.perf_counter()
+            # OPTIMIZATION: Increased from 500 to 1000 for complex game states
             response = client.messages.create(
                 model=self.model,
-                max_tokens=500,
+                max_tokens=1000,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}]
             )
@@ -415,7 +416,7 @@ class AzureBackend:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message}
                 ],
-                max_tokens=800
+                max_completion_tokens=800  # GPT-5 requires this instead of max_tokens
             )
             request_time = (time.perf_counter() - client_start) * 1000
 
@@ -433,9 +434,17 @@ class AzureBackend:
                 # Try to list available models to help the user
                 try:
                     available = self.list_models()
-                    help_msg = f"\n\nAvailable models on your Azure endpoint:\n" + "\n".join([f"- {m}" for m in available[:10]])
-                    if len(available) > 10:
-                        help_msg += f"\n...and {len(available)-10} more."
+                    # Prioritize GPT-5 models for visibility
+                    gpt5_models = [m for m in available if "gpt-5" in m.lower() or "5.1" in m or "5.2" in m]
+                    other_gpt = [m for m in available if "gpt" in m.lower() and m not in gpt5_models][:15]
+                    
+                    if gpt5_models:
+                        help_msg = f"\n\nGPT-5 models found:\n" + "\n".join([f"- {m}" for m in gpt5_models[:10]])
+                        if other_gpt:
+                            help_msg += f"\n\nOther GPT models:\n" + "\n".join([f"- {m}" for m in other_gpt])
+                    else:
+                        help_msg = f"\n\nNo GPT-5 deployments found. Available GPT models:\n" + "\n".join([f"- {m}" for m in other_gpt])
+                        help_msg += f"\n\n(Total {len(available)} models available)"
                 except Exception:
                     help_msg = ""
 
@@ -590,15 +599,20 @@ CRITICAL GAME RULES:
 - If it's not your Main phase, do NOT suggest casting creatures or sorceries
 
 CRITICAL MANA RULES:
-- Trust the [CAN CAST] and [NEED X MORE] tags implicitly.
-- Do NOT perform your own mana math checks in the text.
-- If a card says [CAN CAST], you can recommend it.
-- If no castable plays exist, say "pass" or suggest holding mana.
+- Cards tagged [CAN CAST] are the ONLY cards you can suggest casting.
+- Cards tagged [NEED X mana] CANNOT be cast - do NOT suggest them!
+- Do NOT perform your own mana calculations - trust the tags completely.
+- If ALL cards show [NEED X mana], say "pass" - you cannot cast anything.
 
 CRITICAL MATH RULES:
 - When suggesting removal, check the creature's TOUGHNESS (second number, e.g., 4/5 has 5 toughness).
 - -2/-2 or 2 damage ONLY kills toughness 2 or less (unless damaged).
 - Do NOT suggest removal that won't kill the target unless it enables a profitable attack.
+
+CRITICAL BLOCKING RULES:
+- Creatures tagged [FLYING] can ONLY be blocked by creatures with [FLYING] or [REACH].
+- Do NOT suggest blocking a [FLYING] creature with a ground creature (no [FLYING]/[REACH]).
+- If enemy attackers have [FLYING] and you have no flyers/reach, you CANNOT block them.
 
 Analyze: phase (critical for timing!), board state, life totals, cards in hand, mana available.
 Output directly as the coach. No preamble, no meta-commentary."""
@@ -613,10 +627,54 @@ Examples:
 "Main 1: Cast Removal on their flyer. Combat: Swing with 5/5."
 "No attacks. Hold mana for Counterspell."
 
+RULE: Only suggest cards marked [CAN CAST]. Cards marked [NEED X mana] are unplayable!
+
 Style: Military/Pro player. Imperative. No fluff.
 Do NOT explain "why". Just say "what".
 Keep it under 30 words total.
 """
+
+# PHASE 2: Decision-specific prompt guidance
+DECISION_PROMPTS = {
+    "scry": """
+SCRY DECISION: Decide whether to keep the card on top or put it on bottom.
+- KEEP if: It's a land and you need mana, OR it's a threat you can cast soon
+- BOTTOM if: It's redundant/dead right now, or you need to dig for answers
+Evaluate based on: current mana, hand quality, board state urgency.
+Answer: "Keep" or "Bottom" with brief reason (1 sentence).
+""",
+    "surveil": """
+SURVEIL DECISION: Decide whether to keep cards on top or put in graveyard.
+- KEEP if: You want to draw them next (lands if ramping, threats if you have mana)
+- GRAVEYARD if: Enables graveyard synergies OR you want to dig deeper
+Answer: "Keep [card names]" or "Graveyard [card names]" with brief reason.
+""",
+    "discard": """
+DISCARD DECISION: Choose which card(s) to discard.
+Priority (discard FIRST):
+1. Excess lands if you have 4+ in hand
+2. Highest CMC card you can't cast this turn or next
+3. Redundant copies of cards already in play
+4. KEEP: Removal, counters, win conditions
+Answer: "Discard [card name]" with brief reason (1 sentence).
+""",
+    "target_selection": """
+TARGET SELECTION: Choose the best target for this spell/ability.
+Evaluate each potential target:
+- Which target solves the biggest immediate threat?
+- Which target advances your win condition?
+- Consider opponent's likely responses (do they have protection?)
+Answer: "Target [card name]" with brief tactical reason.
+""",
+    "modal_choice": """
+MODAL SPELL: Choose which mode to use.
+Compare each mode's impact:
+- Which mode answers the most pressing threat?
+- Which mode creates the best advantage?
+- Consider mana efficiency and follow-up plays
+Answer: "Choose mode [X]" with brief reason (1 sentence).
+""",
+}
 
 
 # Words that tend to be overused by LLMs in coaching contexts
@@ -703,6 +761,14 @@ class CoachEngine:
         self._backend = backend if backend is not None else ClaudeBackend()
         self._system_prompt = system_prompt if system_prompt is not None else DEFAULT_SYSTEM_PROMPT
         self._word_tracker = WordUsageTracker()
+    
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough token estimate for logging: ~4 chars per token.
+        
+        OPTIMIZATION: Added for prompt size monitoring.
+        """
+        return len(text) // 4
 
 
     def _remove_reminder_text(self, text: str) -> str:
@@ -713,7 +779,15 @@ class CoachEngine:
         return re.sub(r'\(.*?\)', '', text)
 
     def _format_game_context(self, game_state: dict[str, Any], question: str = "") -> str:
-        """Format the game state into a concise context for the LLM."""
+        """Format the game state into a COMPACT context for the LLM.
+        
+        OPTIMIZATION: Heavily compressed to reduce token usage while maintaining accuracy.
+        - Uses symbols (T=tapped, FLY=flying, SS=summoning sick)
+        - Only shows oracle text for relevant cards (not basic lands)
+        - Terse removal analysis (kill range, not individual targets)
+        - Consolidated combat/blocking info
+        - Removed redundant rule explanations (LLM knows MTG rules)
+        """
         
         # Determine local player seat and active turn
         players = game_state.get("players", [])
@@ -726,114 +800,119 @@ class CoachEngine:
         is_my_turn = (active_seat == local_seat)
         has_priority = (priority_seat == local_seat)
         
-        phase = turn.get("phase", "Unknown")
+        phase = turn.get("phase", "Unknown").replace("Phase_", "")
+        step = turn.get("step", "").replace("Step_", "")
         turn_num = turn.get("turn_number", 0)
 
-        # Import RulesEngine here to avoid circular imports given the flat structure
+        # Get legal moves (still useful for complex decisions)
         try:
             from arenamcp.rules_engine import RulesEngine
             valid_moves = RulesEngine.get_legal_actions(game_state)
-            valid_moves_str = "\n".join([f"- {m}" for m in valid_moves])
+            # OPTIMIZATION: Join inline instead of list, limit to 8 most important
+            valid_moves_str = ", ".join(valid_moves[:8])
+            if len(valid_moves) > 8:
+                valid_moves_str += f"... (+{len(valid_moves)-8})"
         except Exception as e:
-            # Use global logger
             logger.error(f"RulesEngine error: {e}")
-            valid_moves_str = "Error calculating legal moves."
+            valid_moves_str = "Error"
 
         lines = []
-        lines.append("=== GAME STATE ===")
-        lines.append("VALID MOVES:")
-        lines.append(valid_moves_str)
-        lines.append("") # Add a blank line for separation
+        lines.append("=== GAME ===")
+        lines.append(f"Legal: {valid_moves_str}")
 
-        # Get player info and identify local player
-        players = game_state.get("players", [])
-        local_player = None
+        # Get player info
         opponent_player = None
         for p in players:
-            if p.get("is_local"):
-                local_player = p
-            else:
+            if not p.get("is_local"):
                 opponent_player = p
-
-        local_seat = local_player.get("seat_id") if local_player else None
+                break
+        
         opp_seat = opponent_player.get("seat_id") if opponent_player else None
 
-        # EXPLICIT seat identification at the top
-        lines.append("=== GAME STATE ===")
-        if local_seat is not None:
-            lines.append(f"YOU ARE SEAT {local_seat}")
-        else:
-            lines.append("WARNING: Local player seat unknown")
-
-        # Turn info with explicit seat references
-        turn = game_state.get("turn", {})
-        turn_num = turn.get("turn_number", "?")
-        phase = turn.get("phase", "").replace("Phase_", "")
-        step = turn.get("step", "").replace("Step_", "")
-        active = turn.get("active_player", 0)
-        priority = turn.get("priority_player", 0)
-
-        active_label = "YOUR" if active == local_seat else "OPPONENT'S"
-        priority_label = "You" if priority == local_seat else "Opponent"
-
-        # Determine if sorcery-speed spells can be cast
-        # Only during your own main phase (Main1 or Main2) with priority
+        # OPTIMIZATION: Compact turn info - one line
+        active_label = "YOUR" if active_seat == local_seat else "OPP"
+        priority_label = "You" if priority_seat == local_seat else "Opp"
+        
+        # Timing context
         is_main_phase = "Main" in phase
-        is_your_turn = active == local_seat
+        is_your_turn = active_seat == local_seat
         stack = game_state.get("stack", [])
         stack_empty = len(stack) == 0
-        can_cast_sorcery = is_your_turn and is_main_phase and stack_empty and priority == local_seat
-
+        can_cast_sorcery = is_your_turn and is_main_phase and stack_empty and has_priority
+        is_blocking = "DeclareBlock" in step and not is_your_turn
+        
         # Decision Check
         pending_decision = game_state.get("pending_decision")
+        decision_context = game_state.get("decision_context")
+        
         if pending_decision:
-             lines.append(f"!!! GAME INTERFACE PROMPT: {pending_decision} !!!")
-             # Special instruction for mulligans
-             if pending_decision == "Mulligan":
-                 lines.append("ACTION: The user must decide whether to KEEP or MULLIGAN.")
-                 lines.append("Evaluate the hand based on: land count, color sources matching spells, curve, and synergy.")
-                 if turn_num <= 1:
-                     lines.append("Recommend 'KEEP' or 'MULLIGAN' explicitly.")
-
-        lines.append(f"Turn {turn_num} - {active_label} TURN")
-        lines.append(f"Phase: {phase}" + (f" ({step})" if step else ""))
-        lines.append(f"Priority: {priority_label}")
-
-        # CRITICAL timing indicator with specific reason
-        is_blocking = step == "DeclareBlock" and active != local_seat
-
-        if can_cast_sorcery:
-            lines.append(">>> CAN CAST: Creatures, Sorceries, Instants <<<")
-        elif is_blocking:
-            lines.append(">>> ACTION: MUST BLOCK (or Pass) - Choose blockers now! <<<")
-        else:
-            # Be specific about WHY sorceries can't be cast
-            if not is_your_turn:
-                reason = "opponent's turn"
-            elif not is_main_phase:
-                reason = "not main phase"
-            elif not stack_empty:
-                reason = "stack not empty"
-            elif priority != local_seat:
-                reason = "opponent has priority"
+            # PHASE 1+2: Enhanced decision display with context
+            if decision_context:
+                dec_type = decision_context.get("type", "unknown")
+                
+                if dec_type == "discard":
+                    count = decision_context.get("count", 1)
+                    lines.append(f"!!! DECISION: DISCARD {count} card(s) !!!")
+                    lines.append("Choose: excess lands > high CMC uncastables > redundant copies")
+                    
+                elif dec_type == "scry":
+                    count = decision_context.get("count", 1)
+                    lines.append(f"!!! DECISION: SCRY {count} !!!")
+                    lines.append("Keep: needed lands/threats | Bottom: dead cards")
+                    
+                elif dec_type == "surveil":
+                    count = decision_context.get("count", 1)
+                    lines.append(f"!!! DECISION: SURVEIL {count} !!!")
+                    lines.append("Keep: want to draw | Graveyard: synergy or digging")
+                    
+                elif dec_type == "target_selection":
+                    source = decision_context.get("source_card", "spell")
+                    lines.append(f"!!! DECISION: TARGET for {source} !!!")
+                    lines.append("Choose: biggest threat or best value target")
+                    
+                elif dec_type == "modal_choice":
+                    num_opts = decision_context.get("num_options", "?")
+                    lines.append(f"!!! DECISION: CHOOSE MODE ({num_opts} options) !!!")
+                    lines.append("Evaluate: which mode solves current problem best")
+                    
+                else:
+                    # Fallback for other decision types
+                    lines.append(f"!!! DECISION: {pending_decision} !!!")
             else:
-                reason = "unknown"
-            lines.append(f">>> CAN CAST: ONLY Instants ({reason}) <<<")
+                # No context available - generic display
+                lines.append(f"!!! DECISION: {pending_decision} !!!")
+                
+            # Special handling for Mulligan (legacy)
+            if pending_decision == "Mulligan":
+                my_hand = game_state.get("zones", {}).get("my_hand", [])
+                if not my_hand:
+                    lines.append("Waiting for hand...")
+                else:
+                    lines.append("Evaluate: lands, colors, curve → KEEP or MULLIGAN")
+        
+        # OPTIMIZATION: Single line for turn/phase/priority
+        phase_str = f"{phase}/{step}" if step else phase
+        lines.append(f"T{turn_num} {active_label} | {phase_str} | Pri:{priority_label}")
+        
+        # OPTIMIZATION: Compact timing rules - single line
+        if can_cast_sorcery:
+            lines.append("Timing: ALL SPELLS")
+        elif is_blocking:
+            lines.append("ACTION: DECLARE BLOCKERS")
+        else:
+            lines.append("Timing: INSTANTS ONLY")
+        
+        # OPTIMIZATION: Compact life totals - single line
+        your_life = local_player.get('life_total', '?') if local_player else '?'
+        opp_life = opponent_player.get('life_total', '?') if opponent_player else '?'
+        lines.append(f"Life: You={your_life} Opp={opp_life}")
 
-        # Life totals with seat IDs
-        lines.append("")
-        lines.append("LIFE TOTALS:")
-        if local_player:
-            lines.append(f"  You (Seat {local_seat}): {local_player.get('life_total', '?')} life")
-        if opponent_player:
-            lines.append(f"  Opponent (Seat {opp_seat}): {opponent_player.get('life_total', '?')} life")
-
-        # Battlefield - grouped by owner with explicit seat labels
+        # Battlefield - grouped by owner
         battlefield = game_state.get("battlefield", [])
         your_cards = [c for c in battlefield if c.get("owner_seat_id") == local_seat]
         opp_cards = [c for c in battlefield if c.get("owner_seat_id") != local_seat]
 
-        # Count available mana by color
+        # OPTIMIZATION: Compact mana calculation
         mana_pool = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0, "C": 0, "Any": 0}
         total_mana = 0
         
@@ -844,179 +923,160 @@ class CoachEngine:
                 name = card.get("name", "")
                 oracle = card.get("oracle_text", "")
                 
-                # Simple heuristic for basic lands and common duals
-                produced = False
-                if "Plains" in name or "{W}" in oracle:
-                    mana_pool["W"] += 1
-                    produced = True
-                if "Island" in name or "{U}" in oracle:
-                    mana_pool["U"] += 1
-                    produced = True
-                if "Swamp" in name or "{B}" in oracle:
-                    mana_pool["B"] += 1
-                    produced = True
-                if "Mountain" in name or "{R}" in oracle:
-                    mana_pool["R"] += 1
-                    produced = True
-                if "Forest" in name or "{G}" in oracle:
-                    mana_pool["G"] += 1
-                    produced = True
-                if "{C}" in oracle:
-                    mana_pool["C"] += 1
-                    produced = True
-                
-                # "Add one mana of any color"
-                if "any color" in oracle.lower():
-                    mana_pool["Any"] += 1
-                    produced = True
-                
-                # If we couldn't identify color (e.g. unknown land), assume colorless for safety
-                # or maybe Any if we want to be generous? Let's treat valid land as generic source at least.
-                pass 
+                # Color detection (simplified)
+                if "Plains" in name or "{W}" in oracle: mana_pool["W"] += 1
+                if "Island" in name or "{U}" in oracle: mana_pool["U"] += 1
+                if "Swamp" in name or "{B}" in oracle: mana_pool["B"] += 1
+                if "Mountain" in name or "{R}" in oracle: mana_pool["R"] += 1
+                if "Forest" in name or "{G}" in oracle: mana_pool["G"] += 1
+                if "{C}" in oracle: mana_pool["C"] += 1
+                if "any color" in oracle.lower(): mana_pool["Any"] += 1
 
-        logger.info(f"Estimated Mana: {mana_pool} (Total: {total_mana})")
-        logger.info(f"Estimated Mana: {mana_pool} (Total: {total_mana})")
-        lines.append(f"YOUR MANA: {total_mana} available (W:{mana_pool['W']} U:{mana_pool['U']} B:{mana_pool['B']} R:{mana_pool['R']} G:{mana_pool['G']} Any:{mana_pool['Any']})")
+        logger.info(f"Mana: {mana_pool} (Total: {total_mana})")
+        
+        # OPTIMIZATION: Compact mana display - only show colors you have
+        mana_colors = [f"{c}:{mana_pool[c]}" for c in "WUBRGC" if mana_pool[c] > 0]
+        if mana_pool["Any"] > 0:
+            mana_colors.append(f"Any:{mana_pool['Any']}")
+        mana_str = " ".join(mana_colors) if mana_colors else "0"
+        lines.append(f"Mana: {total_mana} ({mana_str})")
 
-        # Lands played status - make it VERY clear if a land can be played
+        # OPTIMIZATION: Compact land drop status
         lands_played = local_player.get("lands_played", 0) if local_player else 0
-        if lands_played == 0:
-            lines.append("LAND DROP: AVAILABLE (you can play 1 land this turn)")
+        if is_your_turn and lands_played == 0:
+            lines.append("Land: AVAILABLE")
+        elif is_your_turn:
+            lines.append(f"Land: USED ({lands_played})")
         else:
-            lines.append(f"LAND DROP: USED (already played {lands_played} land this turn - CANNOT play more)")
+            lines.append("Land: N/A (opp turn)")
 
+        # OPTIMIZATION: Compact battlefield display with symbols
+        # T=tapped, FLY=flying, RCH=reach, SS=summoning sick, ATK=attacking, BLK=blocking
         if battlefield:
-            # ... (Existing battlefield rendering code) ...
             lines.append("")
-            lines.append(f"YOUR BATTLEFIELD (Seat {local_seat}):")
+            lines.append(f"YOUR BOARD:")
             if your_cards:
-                 for card in your_cards:
+                for card in your_cards:
                     name = card.get("name", "Unknown")
-                    pt = ""
-                    if card.get("power") is not None:
-                        pt = f" ({card['power']}/{card['toughness']})"
+                    type_line = card.get("type_line", "").lower()
                     
-                    # Check Summoning Sickness
-                    is_tapped = card.get("is_tapped")
-                    tapped_str = " [TAPPED]" if is_tapped else ""
+                    # P/T for creatures
+                    pt = f" {card['power']}/{card['toughness']}" if card.get("power") is not None else ""
                     
-                    turn_entered = card.get("turn_entered_battlefield", -1)
-                    # Safe integer conversion for turn comparison
-                    try:
-                        current_turn_int = int(str(turn_num).replace("?","0"))
-                    except:
-                        current_turn_int = 0
-                        
+                    # Status flags (compact symbols)
+                    flags = []
+                    if card.get("is_tapped"): flags.append("T")
+                    
                     oracle_text = self._remove_reminder_text(card.get("oracle_text", "")).lower()
-                    has_haste = "haste" in oracle_text
-                    is_creature = "creature" in card.get("type_line", "").lower()
+                    is_creature = "creature" in type_line
                     
-                    sick_str = ""
-                    if is_creature and turn_entered == current_turn_int and not has_haste:
-                        sick_str = " [SUMMONING SICK - CANNOT ATTACK]"
-                    elif is_creature and turn_entered == -1 and not has_haste and not is_tapped:
-                        # Fallback: If unknown entry time but appears active...
-                        # We can't safely assume sickness for -1.
-                        pass
-
-                    lines.append(f"  - {name}{pt}{tapped_str}{sick_str}")
+                    # Keywords that matter for combat
+                    if "flying" in oracle_text: flags.append("FLY")
+                    if "reach" in oracle_text: flags.append("RCH")
+                    if "haste" in oracle_text: flags.append("HST")
+                    if "vigilance" in oracle_text: flags.append("VIG")
+                    if "trample" in oracle_text: flags.append("TRM")
+                    if "first strike" in oracle_text: flags.append("FS")
+                    if "deathtouch" in oracle_text: flags.append("DTH")
                     
+                    # Summoning sickness check
+                    if is_creature and card.get("turn_entered_battlefield") == turn_num and "haste" not in oracle_text:
+                        flags.append("SS")
+                    
+                    if card.get("is_attacking"): flags.append("ATK")
+                    if card.get("is_blocking"): flags.append("BLK")
+                    
+                    flag_str = f" [{','.join(flags)}]" if flags else ""
+                    lines.append(f"  {name}{pt}{flag_str}")
 
             else:
                 lines.append("  (empty)")
 
-            lines.append(f"OPPONENT'S BATTLEFIELD (Seat {opp_seat}):")
+            lines.append(f"OPP BOARD:")
             if opp_cards:
                 for card in opp_cards:
                     name = card.get("name", "Unknown")
-                    pt = ""
-                    if card.get("power") is not None:
-                        pt = f" ({card['power']}/{card['toughness']})"
-                    tapped = " [TAPPED]" if card.get("is_tapped") else ""
-                    lines.append(f"  - {name}{pt}{tapped}")
+                    type_line = card.get("type_line", "").lower()
+                    pt = f" {card['power']}/{card['toughness']}" if card.get("power") is not None else ""
+                    
+                    flags = []
+                    if card.get("is_tapped"): flags.append("T")
+                    
+                    oracle_text = self._remove_reminder_text(card.get("oracle_text", "")).lower()
+                    if "flying" in oracle_text: flags.append("FLY")
+                    if "reach" in oracle_text: flags.append("RCH")
+                    if "vigilance" in oracle_text: flags.append("VIG")
+                    if "trample" in oracle_text: flags.append("TRM")
+                    if "first strike" in oracle_text: flags.append("FS")
+                    if "deathtouch" in oracle_text: flags.append("DTH")
+                    
+                    if card.get("is_attacking"): flags.append("ATK")
+                    if card.get("is_blocking"): flags.append("BLK")
+                    
+                    flag_str = f" [{','.join(flags)}]" if flags else ""
+                    lines.append(f"  {name}{pt}{flag_str}")
             else:
                 lines.append("  (empty)")
 
-            # COMBAT ANALYSIS - help LLM understand attacking
-            # Only show attack options during YOUR turn
+            # OPTIMIZATION: Compact combat analysis (was 70+ lines, now ~20)
             if ("Combat" in phase or "Main" in phase) and is_your_turn:
-                # Calculate your potential attackers (untapped creatures WITHOUT summoning sickness)
-                turn_num = turn.get("turn_number", 0)
-                
                 your_creatures = [c for c in your_cards
                                   if c.get("power") is not None
                                   and "land" not in c.get("type_line", "").lower()]
                 
-                valid_attackers = []
-                for c in your_creatures:
-                    if c.get("is_tapped"):
-                        continue
-                        
-                    turn_entered = c.get("turn_entered_battlefield", -1)
-                    oracle_text = self._remove_reminder_text(c.get("oracle_text", "")).lower()
-                    has_haste = "haste" in oracle_text
-                    
-                    if (turn_entered == turn_num) and not has_haste:
-                        continue # Summoning sick
-                        
-                    valid_attackers.append(c)
-                    
+                valid_attackers = [c for c in your_creatures
+                                   if not c.get("is_tapped")
+                                   and not (c.get("turn_entered_battlefield") == turn_num
+                                           and "haste" not in self._remove_reminder_text(c.get("oracle_text", "")).lower())]
+                
                 your_attack_power = sum(c.get("power", 0) for c in valid_attackers)
-                your_untapped_creatures = valid_attackers # Update for below usage (count)
-
-                # Calculate opponent's potential blockers (untapped creatures)
+                
                 opp_creatures = [c for c in opp_cards
                                  if c.get("power") is not None
                                  and "land" not in c.get("type_line", "").lower()]
-                opp_untapped_creatures = [c for c in opp_creatures if not c.get("is_tapped")]
-                opp_block_toughness = sum(c.get("toughness", 0) for c in opp_untapped_creatures)
-                opp_block_count = len(opp_untapped_creatures)
-
+                opp_blockers = [c for c in opp_creatures if not c.get("is_tapped")]
+                opp_block_count = len(opp_blockers)
                 opp_life = opponent_player.get("life_total", 20) if opponent_player else 20
-
-                lines.append("")
-                lines.append("COMBAT ANALYSIS:")
+                
+                # Single line combat summary
                 if valid_attackers:
-                    attacker_names = [c.get("name", "?") for c in valid_attackers]
-                    lines.append(f"  CAN ATTACK: {', '.join(attacker_names)} (total power: {your_attack_power})")
+                    lethal = "LETHAL" if (opp_block_count == 0 and your_attack_power >= opp_life) else f"{opp_block_count}blk"
+                    lines.append(f"Atk: {len(valid_attackers)}cr/{your_attack_power}pwr vs {lethal}")
                 else:
-                    # Explain WHY no attackers
-                    tapped_creatures = [c for c in your_creatures if c.get("is_tapped")]
-                    sick_creatures = [c for c in your_creatures
-                                      if not c.get("is_tapped")
-                                      and c.get("turn_entered_battlefield", -1) == turn_num
-                                      and "haste" not in self._remove_reminder_text(c.get("oracle_text", "")).lower()]
-                    if tapped_creatures and not sick_creatures:
-                        lines.append(f"  NO ATTACKERS: All {len(tapped_creatures)} creatures are tapped")
-                    elif sick_creatures and not tapped_creatures:
-                        lines.append(f"  NO ATTACKERS: All {len(sick_creatures)} creatures have summoning sickness")
-                    elif tapped_creatures and sick_creatures:
-                        lines.append(f"  NO ATTACKERS: {len(tapped_creatures)} tapped, {len(sick_creatures)} summoning sick")
-                    else:
-                        lines.append(f"  NO ATTACKERS: No creatures on battlefield")
-                lines.append(f"  Opponent's untapped blockers: {opp_block_count} (total toughness: {opp_block_toughness})")
-                if opp_block_count > 0:
-                    lines.append(f"  WARNING: Opponent CAN block! Damage will be reduced or prevented.")
-                    # Check if lethal through blockers
-                    if your_attack_power > opp_block_toughness + opp_life:
-                        lines.append(f"  Lethal possible IF you have trample or evasion.")
-                    else:
-                        lines.append(f"  NOT lethal if opponent blocks optimally.")
-                else:
-                    if your_attack_power >= opp_life:
-                        lines.append(f"  LETHAL! No blockers, attack for the win!")
-                    else:
-                        lines.append(f"  No blockers available.")
+                    lines.append(f"Atk: None (T/SS)")
+            
+            # OPTIMIZATION: Compact blocking analysis (was 50+ lines, now ~10)
+            elif "Combat" in phase and not is_your_turn:
+                attacking = [c for c in opp_cards if c.get("is_attacking")]
+                flying_atk = [c for c in attacking if "flying" in self._remove_reminder_text(c.get("oracle_text", "")).lower()]
+                ground_atk = [c for c in attacking if c not in flying_atk]
+                
+                your_creatures = [c for c in your_cards
+                                  if c.get("power") is not None
+                                  and not c.get("is_tapped")
+                                  and "land" not in c.get("type_line", "").lower()]
+                
+                flyer_blockers = [c for c in your_creatures
+                                  if any(kw in self._remove_reminder_text(c.get("oracle_text", "")).lower()
+                                        for kw in ["flying", "reach"])]
+                
+                # Single line blocking summary
+                if attacking:
+                    fly_dmg = sum(c.get("power", 0) for c in flying_atk)
+                    gnd_dmg = sum(c.get("power", 0) for c in ground_atk)
+                    lines.append(f"Blk: {fly_dmg}fly/{gnd_dmg}gnd dmg | {len(flyer_blockers)}FLY-blk avail")
+                    if flying_atk and not flyer_blockers:
+                        lines.append(f"⚠️ {fly_dmg} UNBLOCKABLE!")
         else:
             lines.append("")
-            lines.append("BATTLEFIELD: Empty")
+            lines.append("BOARD: Empty")
 
-        # Hand - these are YOUR cards, with castability and timing info
+        # OPTIMIZATION: Compact hand display
         hand = game_state.get("hand", [])
         lines.append("")
-        lines.append(f"YOUR HAND (Seat {local_seat}):")
+        lines.append(f"HAND:")
 
-        # Pre-compute opponent creatures for removal analysis
+        # Pre-compute opponent creatures for terse removal analysis
         opp_creatures = [c for c in opp_cards
                          if c.get("power") is not None
                          and "land" not in c.get("type_line", "").lower()]
@@ -1024,264 +1084,95 @@ class CoachEngine:
         if hand:
             import re
             
-            # Pre-calculate potential land mana
-            # If we haven't played land, calculate if we have one in hand that enters untapped
+            # OPTIMIZATION: Simplified mana checking - just need to know if castable
             can_play_land = (lands_played == 0) and is_your_turn and is_main_phase and stack_empty
-            possible_extra_mana = 0
-            possible_extra_colors = set()
-            
-            if can_play_land:
-                for c in hand:
-                    c_type = c.get("type_line", "").lower()
-                    c_oracle = c.get("oracle_text", "").lower()
-                    if "land" in c_type and "enters tapped" not in c_oracle:
-                         possible_extra_mana = 1
-                         # Heuristic for colors
-                         c_name = c.get("name", "")
-                         if "Plains" in c_name or "{W}" in c_oracle: possible_extra_colors.add("W")
-                         if "Island" in c_name or "{U}" in c_oracle: possible_extra_colors.add("U")
-                         if "Swamp" in c_name or "{B}" in c_oracle: possible_extra_colors.add("B")
-                         if "Mountain" in c_name or "{R}" in c_oracle: possible_extra_colors.add("R")
-                         if "Forest" in c_name or "{G}" in c_oracle: possible_extra_colors.add("G")
-                         if "any color" in c_oracle: possible_extra_colors.add("Any")
             
             for card in hand:
                 name = card.get("name", "Unknown")
                 cost = card.get("mana_cost", "")
                 type_line = card.get("type_line", "").lower()
-                oracle_text = card.get("oracle_text", "").lower()
+                oracle_text = card.get("oracle_text", "")
+                oracle_lower = oracle_text.lower()
 
-                # Determine timing
-                is_instant_speed = "instant" in type_line or "flash" in oracle_text
-                timing = "[INSTANT]" if is_instant_speed else "[SORCERY SPEED]"
+                # OPTIMIZATION: Simplified timing - just need instant vs sorcery
+                is_instant = "instant" in type_line or "flash" in oracle_lower
+                timing = "I" if is_instant else "S"
 
-                # Parse Requirements
-                reqs = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0, "C": 0}
+                # OPTIMIZATION: Simplified CMC calculation
                 cmc = 0
-                
+                reqs = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0, "C": 0}
                 if cost:
-                    # Generic
                     generic = re.findall(r'\{(\d+)\}', cost)
                     cmc += sum(int(g) for g in generic)
-                    
-                    # Colored pips
-                    for color in ["W", "U", "B", "R", "G", "C"]:
+                    for color in "WUBRGC":
                         count = len(re.findall(rf"\{{{color}\}}", cost))
                         reqs[color] += count
                         cmc += count
-                        
-                    # Hybrid (treat as OR? For now, add to CMC but don't enforce specific color strictness to avoid complexity)
-                    # Ideally: {R/W} needs R or W.
-                    hybrid = re.findall(r'\{([^}]+)/([^}]+)\}', cost)
-                    cmc += len(hybrid) 
-                    # Note: We are under-constraining hybrid mana here, which is safer than over-constraining.
+                    hybrid = re.findall(r'\{[^}]+/[^}]+\}', cost)
+                    cmc += len(hybrid)
 
-                # Check Castability
-                
-                # Logic:
-                # 1. Standard check
-                # 2. If fail, check with potential land mana
-                
-                def check_mana(base_pool, base_total, extra_any=0, extra_colors=None):
-                    if extra_colors is None: extra_colors = set()
-                    
-                    # Total check
-                    sim_total = base_total + extra_any
-                    if sim_total < cmc: return False, ["mana"]
-                    
-                    # Color check
-                    needed_any_generic = 0
-                    for color, amount in reqs.items():
-                        if amount > 0:
-                            have = base_pool.get(color, 0) + (1 if color in extra_colors else 0)
-                            # Note: current `base_pool` logic counts 'Any' separately in coach code?
-                            # Lines 837 define pool: W,U,B,R,G,C,Any.
-                            # Line 1069 checks pool.get(color).
-                            
-                            # If we have 'First Land' logic, we assume we use that land for ONE color.
-                            # But wait, `extra_colors` is a Set of possible colors. 
-                            # If we use it for Red, we can't use it for Green.
-                            # Simplified: We treat the land as adding 1 to the 'Any' pool 
-                            # AND adding 1 to specific color pools for availability check?
-                            # No, we can only add 1 total.
-                            
-                            # Strict check:
-                            if have >= amount:
-                                continue
-                            else:
-                                if color in extra_colors:
-                                    # Use the potential land for this
-                                    # But we can only use it once. 
-                                    # This is getting complex.
-                                    pass
-                                
-                                deficit = amount - have
-                                needed_any_generic += deficit
-
-                    # Can 'Any' pool cover deficit?
-                    # pool['Any'] + 1 (if land is generic source)
-                    available_any = base_pool["Any"]
-                    if "Any" in extra_colors:
-                         # Land produces Any
-                         available_any += 1
-                    elif extra_colors:
-                         # Land produces specific, but if we didn't use it for specific above...
-                         # This logic is too complex for inline.
-                         # Fallback: Treat potential land as +1 Generic for total, 
-                         # and +1 Specific Color if we are missing exactly one pip?
-                         pass
-                    
-                    # Revert to simple check compatible with existing code structure
-                    return False, []
-
-                # --- SIMPLIFIED CHECK ---
-                
-                # 1. Standard Check (Existing logic re-implemented)
-                missing_std = []
-                needed_any_std = 0
-                for color, amount in reqs.items():
-                    have = mana_pool.get(color, 0)
-                    if have < amount:
-                        needed_any_std += (amount - have)
-                
-                has_total = total_mana >= cmc
-                has_colors = needed_any_std <= mana_pool["Any"]
-                
+                # OPTIMIZATION: Simple castability check
                 castable = ""
-                reasons = []
-                
-                if has_total and has_colors:
-                    castable = "[CAN CAST]"
-                else:
-                    # Capture reasons for standard failure
-                    if not has_total: reasons.append(f"{cmc - total_mana} mana")
-                    # Color reasons
-                    # logic...
-                    reason_str = ", ".join(reasons) if reasons else "colors" 
-                    if not reasons: reason_str = "colors" # Fallback
-                    
-                    castable = f"[NEED {reason_str}]"
-                    
-                    # 2. Potential Land Check
-                    if possible_extra_mana > 0 and not (has_total and has_colors):
-                         # Try simulating +1 mana
-                         # Assume land can fix our biggest color problem or just add generic
-                         
-                         # Check Total
-                         has_total_with_land = (total_mana + 1) >= cmc
-                         
-                         # Check Colors
-                         # Reducing needed_any_std by 1?
-                         # Only if the land provides the needed color or Any
-                         
-                         covered_color_deficit = False
-                         if needed_any_std <= mana_pool["Any"]:
-                             # Colors were already fine, just lacked total
-                             covered_color_deficit = True
-                         else:
-                             # We lacked specific colors (covered by Any deficit)
-                             # If deficit is 1, and land provides it
-                             needed_remaining = needed_any_std - mana_pool["Any"]
-                             if needed_remaining <= 1:
-                                 # We need 1 more pip.
-                                 # Does land provide relevant colors?
-                                 # We need to know WHICH colors are missing.
-                                 # Iterate again
-                                 missing_cols = []
-                                 for color, amount in reqs.items():
-                                     if mana_pool.get(color,0) < amount:
-                                         missing_cols.append(color)
-                                 
-                                 # If land provides ANY of the missing colors, or Any
-                                 if "Any" in possible_extra_colors:
-                                     covered_color_deficit = True
-                                 else:
-                                     # Intersection
-                                     if any(c in possible_extra_colors for c in missing_cols):
-                                         covered_color_deficit = True
-                         
-                         if has_total_with_land and covered_color_deficit:
-                             castable = "[CAN CAST WITH LAND DROP]"
-                
-                # Special Override for Lands
                 if "land" in type_line:
-                    if can_play_land:
-                        castable = "[LAND DROP AVAILABLE]"
-                    else:
-                        castable = "[HOLD]"
-                
-                if castable == "": # Should not happen if logic is tight
-                     castable = f"[NEED {cmc - total_mana} mana]" if total_mana < cmc else "[NEED COLORS]"
+                    castable = "LAND" if can_play_land else "HOLD"
+                elif total_mana >= cmc:
+                    # Color check (simplified - just check if we have any colored pips we can't pay)
+                    color_ok = all(mana_pool.get(c, 0) + mana_pool.get("Any", 0) >= reqs[c]
+                                   for c in "WUBRGC" if reqs[c] > 0)
+                    castable = "OK" if color_ok else f"NEED:{cmc - total_mana}"
+                else:
+                    castable = f"NEED:{cmc - total_mana}"
 
-                # Removal analysis - pre-calculate what this spell can kill
+                # OPTIMIZATION: Terse removal analysis - show kill RANGE, not every target
                 removal_info = ""
-                oracle_lower = oracle_text.lower()
-
-                # Check for damage-based removal
-                damage_match = re.search(r'deals?\s+(\d+)\s+damage\s+to\s+(?:target\s+)?(?:any\s+target|creature|player)', oracle_lower)
-
-                # Check for -X/-X effects
+                damage_match = re.search(r'deals?\s+(\d+)\s+damage', oracle_lower)
                 minus_match = re.search(r'gets?\s+(-\d+)/(-\d+)', oracle_lower)
-
-                # Check for destroy effects
-                is_destroy = "destroy target creature" in oracle_lower or "destroy target permanent" in oracle_lower
-
-                # Check for exile effects
-                is_exile = "exile target creature" in oracle_lower or "exile target permanent" in oracle_lower
+                is_destroy = "destroy target creature" in oracle_lower
+                is_exile = "exile target creature" in oracle_lower
 
                 if damage_match or minus_match or is_destroy or is_exile:
-                    kills = []
-                    wont_kill = []
+                    if is_destroy or is_exile:
+                        removal_info = " [RM:any]"
+                    elif damage_match:
+                        dmg = int(damage_match.group(1))
+                        removal_info = f" [RM:<={dmg}T]"
+                    elif minus_match:
+                        tough_reduction = abs(int(minus_match.group(2)))
+                        removal_info = f" [RM:<={tough_reduction}T]"
 
-                    for creature in opp_creatures:
-                        c_name = creature.get("name", "Unknown")
-                        c_tough = creature.get("toughness", 0)
+                # OPTIMIZATION: Only show oracle text for non-basic, non-land cards with relevant text
+                is_basic_land = "land" in type_line and ("basic" in type_line or
+                                                         name in ["Plains", "Island", "Swamp", "Mountain", "Forest"])
+                show_oracle = oracle_text and not is_basic_land and len(oracle_text) < 150
 
-                        if is_destroy or is_exile:
-                            # Unconditional removal (ignoring indestructible/hexproof for now)
-                            kills.append(c_name)
-                        elif damage_match:
-                            damage = int(damage_match.group(1))
-                            if damage >= c_tough:
-                                kills.append(c_name)
-                            else:
-                                wont_kill.append(f"{c_name}(T={c_tough})")
-                        elif minus_match:
-                            toughness_reduction = abs(int(minus_match.group(2)))
-                            if toughness_reduction >= c_tough:
-                                kills.append(c_name)
-                            else:
-                                wont_kill.append(f"{c_name}(T={c_tough})")
-
-                    if kills:
-                        removal_info = f" [KILLS: {', '.join(kills)}]"
-                    if wont_kill:
-                        removal_info += f" [WON'T KILL: {', '.join(wont_kill)}]"
-
-                lines.append(f"  - {name} {cost} {timing} {castable}{removal_info}")
-                if card.get("oracle_text"):
-                    lines.append(f"      {card['oracle_text']}")
+                # OPTIMIZATION: Compact card display
+                lines.append(f"  {name} {cost} [{timing},{castable}]{removal_info}")
+                if show_oracle:
+                    # OPTIMIZATION: Remove reminder text to save tokens
+                    oracle_compact = self._remove_reminder_text(oracle_text)
+                    if len(oracle_compact) > 100:
+                        oracle_compact = oracle_compact[:97] + "..."
+                    lines.append(f"    {oracle_compact}")
         else:
             lines.append("  (empty)")
 
-        # Stack with owner labels
+        # OPTIMIZATION: Compact stack display
         stack = game_state.get("stack", [])
         if stack:
-            lines.append("")
-            lines.append("STACK:")
+            stack_items = []
             for card in stack:
                 name = card.get("name", "Unknown")
-                owner_seat = card.get("owner_seat_id")
-                owner_label = "Your" if owner_seat == local_seat else "Opp's"
-                lines.append(f"  - {owner_label} {name}")
+                owner = "Y" if card.get("owner_seat_id") == local_seat else "O"
+                stack_items.append(f"{owner}:{name}")
+            lines.append(f"Stack: {' > '.join(stack_items)}")
 
-        # Graveyards with counts per player
+        # OPTIMIZATION: Compact graveyard counts
         graveyard = game_state.get("graveyard", [])
         if graveyard:
-            your_gy = [c for c in graveyard if c.get("owner_seat_id") == local_seat]
-            opp_gy = [c for c in graveyard if c.get("owner_seat_id") != local_seat]
-            lines.append("")
-            lines.append(f"GRAVEYARDS: Your={len(your_gy)}, Opponent={len(opp_gy)}")
+            your_gy = len([c for c in graveyard if c.get("owner_seat_id") == local_seat])
+            opp_gy = len([c for c in graveyard if c.get("owner_seat_id") != local_seat])
+            if your_gy > 0 or opp_gy > 0:
+                lines.append(f"GY: Y={your_gy} O={opp_gy}")
 
         return "\n".join(lines)
 
@@ -1355,6 +1246,15 @@ class CoachEngine:
             system_prompt += f"\n\nIMPORTANT: Avoid using these overused words: {avoid_list}. Use different phrasing."
             logger.debug(f"Blacklisted words: {blacklisted}")
 
+        # PHASE 2: Inject decision-specific guidance when a decision is pending
+        decision_context = game_state.get("decision_context")
+        if decision_context:
+            dec_type = decision_context.get("type", "unknown")
+            decision_guidance = DECISION_PROMPTS.get(dec_type)
+            if decision_guidance:
+                system_prompt += f"\n\n{decision_guidance}"
+                logger.debug(f"Injected decision prompt for type: {dec_type}")
+
         # Build user message
         if question:
             user_message = f"{context}\n\nThe player asks: {question}"
@@ -1375,8 +1275,11 @@ class CoachEngine:
         else:
             user_message = f"{context}\n\nWhat's the best play right now?"
 
-        prompt_len = len(system_prompt) + len(user_message)
-        logger.info(f"[TIMING] Context built in {context_time:.1f}ms, prompt size: {prompt_len} chars")
+        # OPTIMIZATION: Log prompt size with token estimate
+        prompt_chars = len(system_prompt) + len(user_message)
+        prompt_tokens_est = self._estimate_tokens(system_prompt + user_message)
+        context_lines = context.count('\n') + 1
+        logger.info(f"[PROMPT] {context_lines} lines, {prompt_chars} chars, ~{prompt_tokens_est} tokens | context: {context_time:.1f}ms")
 
         # Select system prompt based on style
         # Priority: explicit arg > object property > default
