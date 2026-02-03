@@ -257,6 +257,15 @@ class MTGALogWatcher:
 
         logger.info("Watcher stopped")
 
+    def poll(self) -> None:
+        """Manually poll for new log content.
+
+        Call this periodically as a backup when watchdog events are missed.
+        Safe to call even if watcher isn't running.
+        """
+        if self._handler:
+            self._handler._read_new_content()
+
     def __enter__(self) -> "MTGALogWatcher":
         """Context manager entry."""
         self.start()

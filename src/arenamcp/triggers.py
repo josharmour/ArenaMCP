@@ -76,7 +76,10 @@ class PTTHandler:
             return
 
         if self._hook is not None:
-            keyboard.unhook(self._hook)
+            try:
+                keyboard.unhook(self._hook)
+            except (ValueError, KeyError):
+                pass  # Hook already removed
             self._hook = None
         self._active = False
 

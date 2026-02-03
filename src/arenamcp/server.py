@@ -19,6 +19,11 @@ from arenamcp.gamestate import GameState, ZoneType, create_game_state_handler
 from arenamcp.parser import LogParser
 from arenamcp.scryfall import ScryfallCache
 from arenamcp.draftstats import DraftStatsCache
+from arenamcp.draftstate import DraftState, create_draft_handler
+from arenamcp.draft_eval import evaluate_pack, format_pick_recommendation
+from arenamcp.sealed_eval import analyze_sealed_pool, format_sealed_recommendation, format_sealed_detailed
+from arenamcp.mtgadb import MTGADatabase
+from arenamcp.mtgjson import MTGJSONDatabase, get_mtgjson
 from arenamcp.watcher import MTGALogWatcher
 from arenamcp.voice import VoiceInput
 from arenamcp.tts import VoiceOutput
@@ -30,12 +35,14 @@ mcp = FastMCP("mtga")
 
 # Module-level state instances
 game_state: GameState = GameState()
+draft_state: DraftState = DraftState()
 parser: LogParser = LogParser()
 watcher: Optional[MTGALogWatcher] = None
 
 # Lazy-loaded caches (avoid blocking startup with bulk downloads)
 _scryfall: Optional[ScryfallCache] = None
 _draft_stats: Optional[DraftStatsCache] = None
+_mtgadb: Optional[MTGADatabase] = None
 
 # Lazy-loaded voice components
 _voice_input: Optional[VoiceInput] = None
@@ -50,6 +57,12 @@ _coaching_enabled: bool = False
 _coaching_backend: Optional[str] = None
 _coaching_model: Optional[str] = None
 _coaching_auto_speak: bool = False
+
+# Background draft helper state
+_draft_helper_thread: Optional[threading.Thread] = None
+_draft_helper_enabled: bool = False
+_draft_helper_last_pack: int = 0
+_draft_helper_last_pick: int = 0
 
 
 def _get_scryfall() -> ScryfallCache:
@@ -68,6 +81,15 @@ def _get_draft_stats() -> DraftStatsCache:
         logger.info("Initializing 17lands draft stats cache...")
         _draft_stats = DraftStatsCache()
     return _draft_stats
+
+
+def _get_mtgadb() -> MTGADatabase:
+    """Get or initialize the MTGA local database (lazy loading)."""
+    global _mtgadb
+    if _mtgadb is None:
+        logger.info("Initializing MTGA local database...")
+        _mtgadb = MTGADatabase()
+    return _mtgadb
 
 
 def _get_voice_input(mode: Literal["ptt", "vox"] = "ptt") -> VoiceInput:
@@ -118,10 +140,16 @@ def _background_coaching_loop(
             # Get current game state
             curr_state = get_game_state()
 
-            # Check for triggers (skip on first iteration when prev_state empty)
+            # Check for triggers (skip on first iteration when prev_state empty, unless vital state exists)
+            triggers = []
             if prev_state:
                 triggers = trigger_detector.check_triggers(prev_state, curr_state)
+            elif curr_state.get("pending_decision"):
+                 # Force trigger on first run if we are stuck in a decision
+                 logger.info("Detected pending decision on startup - forcing trigger")
+                 triggers = ["decision_required"]
 
+            if triggers:
                 for trigger in triggers:
                     logger.debug(f"Trigger fired: {trigger}")
                     try:
@@ -209,20 +237,211 @@ def stop_background_coaching() -> None:
     logger.info("Stopped background coaching")
 
 
+# Draft evaluation now uses shared module: arenamcp.draft_eval
+
+
+def _draft_helper_loop() -> None:
+    """Background loop that monitors draft state and speaks recommendations.
+
+    Polls draft state rapidly and speaks top 2 picks with reasons.
+    Uses shared draft_eval module for evaluation logic.
+    """
+    global _draft_helper_enabled, _draft_helper_last_pack, _draft_helper_last_pick
+
+    logger.info("Draft helper loop started")
+
+    # Pre-load caches for speed
+    scryfall = _get_scryfall()
+    draft_stats_cache = _get_draft_stats()
+    mtgadb = _get_mtgadb()
+    voice = _get_voice_output()
+
+    while _draft_helper_enabled:
+        try:
+            # Check if pack changed
+            if (draft_state.is_active and
+                draft_state.cards_in_pack and
+                (draft_state.pack_number != _draft_helper_last_pack or
+                 draft_state.pick_number != _draft_helper_last_pick)):
+
+                _draft_helper_last_pack = draft_state.pack_number
+                _draft_helper_last_pick = draft_state.pick_number
+
+                # Use shared evaluation logic
+                evaluations = evaluate_pack(
+                    cards_in_pack=draft_state.cards_in_pack,
+                    picked_cards=draft_state.picked_cards,
+                    set_code=draft_state.set_code,
+                    scryfall=scryfall,
+                    draft_stats=draft_stats_cache,
+                    mtgadb=mtgadb,
+                )
+
+                # Format and speak recommendation
+                advice = format_pick_recommendation(
+                    evaluations,
+                    _draft_helper_last_pack,
+                    _draft_helper_last_pick,
+                )
+
+                try:
+                    voice.speak(advice, blocking=False)
+                    logger.info(f"Draft advice: {advice}")
+                except Exception as e:
+                    logger.error(f"TTS error: {e}")
+
+        except Exception as e:
+            logger.error(f"Draft helper error: {e}")
+
+        # Fast polling - 300ms
+        time.sleep(0.3)
+
+    logger.info("Draft helper loop stopped")
+
+
+def start_draft_helper(set_code: Optional[str] = None) -> None:
+    """Start background draft helper that auto-speaks pick recommendations.
+
+    Args:
+        set_code: Optional set code override (e.g., "MH3", "BLB"). If provided,
+                  uses this instead of auto-detection for 17lands lookups.
+    """
+    global _draft_helper_thread, _draft_helper_enabled
+    global _draft_helper_last_pack, _draft_helper_last_pick
+
+    if _draft_helper_enabled:
+        raise RuntimeError("Draft helper already running")
+
+    # Auto-start watcher
+    if watcher is None:
+        start_watching()
+
+    # Set manual set code if provided
+    if set_code:
+        draft_state.set_code = set_code.upper()
+        logger.info(f"Using manual set code: {draft_state.set_code}")
+
+    # Reset tracking
+    _draft_helper_last_pack = draft_state.pack_number
+    _draft_helper_last_pick = draft_state.pick_number
+    _draft_helper_enabled = True
+
+    # Start daemon thread
+    _draft_helper_thread = threading.Thread(
+        target=_draft_helper_loop,
+        daemon=True,
+        name="draft-helper"
+    )
+    _draft_helper_thread.start()
+    logger.info("Started draft helper")
+
+
+def stop_draft_helper() -> None:
+    """Stop background draft helper."""
+    global _draft_helper_thread, _draft_helper_enabled
+
+    if not _draft_helper_enabled:
+        raise RuntimeError("Draft helper not running")
+
+    _draft_helper_enabled = False
+
+    if _draft_helper_thread is not None:
+        _draft_helper_thread.join(timeout=2.0)
+        _draft_helper_thread = None
+
+    logger.info("Stopped draft helper")
+
+
+def _handle_match_created(payload: dict) -> None:
+    """Handle MatchCreated events to capture local seat ID.
+
+    The MatchCreated message contains systemSeatId which definitively
+    identifies the local player's seat.
+    """
+    # Try to extract match ID to detect new matches
+    match_id = (
+        payload.get("matchId") or 
+        payload.get("matchGameRoomInfo", {}).get("gameRoomConfig", {}).get("matchId") or
+        payload.get("gameRoomConfig", {}).get("matchId")
+    )
+
+    if match_id:
+        if game_state.match_id != match_id:
+            logger.info(f"New match detected (ID: {match_id}). Resetting game state.")
+            game_state.reset()
+            game_state.match_id = match_id
+            
+            # Since we reset state, notify draft helper effectively if needed
+            # (though draft state is separate)
+    
+    # Try various known locations for seat ID in match messages
+    seat_id = (
+        payload.get("systemSeatId") or
+        payload.get("systemSeatNumber") or
+        payload.get("localPlayerSeatId")
+    )
+
+    # Also check nested structures
+    if seat_id is None:
+        match_info = payload.get("matchGameRoomInfo", {})
+        seat_id = match_info.get("systemSeatId")
+
+    if seat_id is None:
+        game_room_config = payload.get("gameRoomConfig", {})
+        reserved_players = game_room_config.get("reservedPlayers", [])
+        
+        # We need to know WHICH player is us. scanning reservedPlayers blindly is wrong if both are listed.
+        # Use log_utils to find our local userId from AuthenticateResponse
+        from arenamcp.log_utils import get_local_player_id
+        local_user_id = get_local_player_id()
+        
+        if local_user_id:
+            logger.info(f"Using Local User ID: {local_user_id}")
+            for rp in reserved_players:
+                if rp.get("userId") == local_user_id:
+                    seat_id = rp.get("systemSeatId")
+                    logger.info(f"Found matching seat {seat_id} for user {local_user_id}")
+                    break
+        
+        # Fallback if ID lookup failed (or logic is different): pick the first one with a userId?
+        # No, that's dangerous. Let's try log_utils full detection if still None.
+        if seat_id is None and not local_user_id:
+             # Try legacy heuristic: First one with a userId (often works if logs are filtered to client?)
+             # But Player.log contains opponent metadata too.
+             # Better to use the robust scanner.
+             from arenamcp.log_utils import detect_local_seat
+             seat_id = detect_local_seat()
+
+    if seat_id is not None:
+        # Use System (2) priority for match messages
+        # This will automatically be ignored if User (3) has already set the seat
+        game_state.set_local_seat_id(seat_id, source=2)
+        logger.info(f"Captured local seat ID {seat_id} from match message")
+
+
 def start_watching() -> None:
     """Start watching the MTGA log file for game events.
 
     Creates and starts the watcher if not already running.
-    Watcher feeds log chunks to the parser, which updates game_state.
+    Watcher feeds log chunks to the parser, which updates game_state and draft_state.
     """
     global watcher
     if watcher is not None:
         logger.debug("Watcher already running")
         return
 
-    # Wire up the event handler
+    # Wire up the game state event handler
     handler = create_game_state_handler(game_state)
     parser.register_handler("GreToClientEvent", handler)
+
+    # Wire up match creation handler to capture local seat ID
+    parser.register_handler("MatchCreated", _handle_match_created)
+    parser.register_handler("MatchGameRoomStateChangedEvent", _handle_match_created)
+    parser.register_handler("ClientToMatchServiceMessage", _handle_match_created)
+
+    # Wire up the draft handler as default to catch all draft events
+    draft_handler = create_draft_handler(draft_state)
+    parser.set_default_handler(draft_handler)
 
     # Create and start the watcher
     watcher = MTGALogWatcher(callback=parser.process_chunk)
@@ -240,8 +459,22 @@ def stop_watching() -> None:
     logger.info("Stopped MTGA log watcher")
 
 
+def poll_log() -> None:
+    """Manually poll for new log content.
+
+    Call this periodically as a backup when watchdog misses file events.
+    """
+    if watcher is not None:
+        watcher.poll()
+
+
 def enrich_with_oracle_text(grp_id: int) -> dict[str, Any]:
-    """Look up card data from Scryfall and return enriched dict.
+    """Look up card data and return enriched dict.
+
+    Uses multiple sources with fallback chain:
+    1. MTGJSON by arena_id (if available)
+    2. MTGA local DB for name -> MTGJSON by name (for new sets without arena_id mapping)
+    3. Scryfall as last resort
 
     Args:
         grp_id: MTGA arena_id for the card
@@ -253,6 +486,79 @@ def enrich_with_oracle_text(grp_id: int) -> dict[str, Any]:
     if grp_id == 0:
         return {"grp_id": 0, "name": "Unknown", "oracle_text": "", "type_line": "", "mana_cost": ""}
 
+    mtgjson = get_mtgjson()
+
+    # Try MTGJSON by arena_id first (most complete, updated daily)
+    if mtgjson.available:
+        mtgjson_card = mtgjson.get_card(grp_id)
+        if mtgjson_card:
+            return {
+                "grp_id": grp_id,
+                "name": mtgjson_card.name,
+                "oracle_text": mtgjson_card.oracle_text,
+                "type_line": mtgjson_card.type_line,
+                "mana_cost": mtgjson_card.mana_cost,
+            }
+
+    # Try MTGA local DB for name, then look up oracle text by name from MTGJSON
+    mtgadb = _get_mtgadb()
+    if mtgadb.available:
+        mtga_card = mtgadb.get_card(grp_id)
+        if mtga_card:
+            # Got simple card data from MTGA DB. 
+            # Ideally we enrich it with Scryfall/MTGJSON for formatted mana costs and clean text.
+            
+            # Try MTGJSON by name
+            if mtgjson.available:
+                mtgjson_card = mtgjson.get_card_by_name(mtga_card.name)
+                if mtgjson_card:
+                    return {
+                        "grp_id": grp_id,
+                        "name": mtga_card.name,
+                        "oracle_text": mtgjson_card.oracle_text,
+                        "type_line": mtgjson_card.type_line,
+                        "mana_cost": mtgjson_card.mana_cost,
+                    }
+
+            # Try Scryfall for oracle text - first by arena_id, then by name
+            scryfall = _get_scryfall()
+            scryfall_card = scryfall.get_card_by_arena_id(grp_id)
+
+            # If arena_id lookup fails (new sets), try by name
+            if scryfall_card is None:
+                scryfall_card = scryfall.get_card_by_name(mtga_card.name)
+
+            if scryfall_card:
+                return {
+                    "grp_id": grp_id,
+                    "name": mtga_card.name,
+                    "oracle_text": scryfall_card.oracle_text,
+                    "type_line": scryfall_card.type_line,
+                    "mana_cost": scryfall_card.mana_cost,
+                }
+            else:
+                # MTGA DB Fallback: Use the text we resolved from AbilityIds
+                # This handles digital-only cards (Alchemy) or new sets not yet in Scryfall
+                return {
+                    "grp_id": grp_id,
+                    "name": mtga_card.name,
+                    "oracle_text": mtga_card.oracle_text,  # Now populated via local DB!
+                    "type_line": mtga_card.types,          # Use raw types from DB
+                    "mana_cost": "", # TODO: Parse OldSchoolManaText if needed
+                }
+        
+        # If not found as a card, check if it's an ABILITY (e.g. on stack)
+        ability_text = mtgadb.get_ability_text(grp_id)
+        if ability_text:
+            return {
+                "grp_id": grp_id,
+                "name": f"Ability (ID: {grp_id})",
+                "oracle_text": ability_text,
+                "type_line": "Ability",
+                "mana_cost": "",
+            }
+
+    # Last resort: Scryfall only (legacy path)
     scryfall = _get_scryfall()
     card = scryfall.get_card_by_arena_id(grp_id)
 
@@ -275,9 +581,30 @@ def enrich_with_oracle_text(grp_id: int) -> dict[str, Any]:
 
 
 def _serialize_game_object(obj) -> dict[str, Any]:
-    """Serialize a GameObject with oracle text enrichment."""
+    """Serialize a GameObject with oracle text enrichment.
+
+    For abilities on the stack (objects with parent_instance_id), resolves the
+    source card to provide context about what triggered or activated.
+    """
     enriched = enrich_with_oracle_text(obj.grp_id)
-    return {
+
+    # Resolve source card for abilities (triggered/activated abilities on stack)
+    source_card = None
+    if obj.parent_instance_id is not None:
+        parent_obj = game_state.game_objects.get(obj.parent_instance_id)
+        if parent_obj:
+            source_enriched = enrich_with_oracle_text(parent_obj.grp_id)
+            source_card = {
+                "instance_id": parent_obj.instance_id,
+                "grp_id": parent_obj.grp_id,
+                "name": source_enriched["name"],
+                "oracle_text": source_enriched["oracle_text"],
+            }
+            # If the ability name is unknown, label it with the source
+            if enriched["name"].startswith("Unknown"):
+                enriched["name"] = f"Ability of {source_enriched['name']}"
+
+    result = {
         "instance_id": obj.instance_id,
         "grp_id": obj.grp_id,
         "name": enriched["name"],
@@ -289,7 +616,13 @@ def _serialize_game_object(obj) -> dict[str, Any]:
         "power": obj.power,
         "toughness": obj.toughness,
         "is_tapped": obj.is_tapped,
+        "turn_entered_battlefield": getattr(obj, "turn_entered_battlefield", -1),
     }
+
+    if source_card:
+        result["source_card"] = source_card
+
+    return result
 
 
 # MCP Tools
@@ -329,6 +662,7 @@ def get_game_state() -> dict[str, Any]:
         "priority_player": game_state.turn_info.priority_player,
         "phase": game_state.turn_info.phase,
         "step": game_state.turn_info.step,
+        "pending_combat_steps": game_state.get_pending_combat_steps(),
     }
 
     # Serialize players
@@ -339,6 +673,7 @@ def get_game_state() -> dict[str, Any]:
             "life_total": player.life_total,
             "mana_pool": player.mana_pool,
             "is_local": player.seat_id == game_state.local_seat_id,
+            "lands_played": player.lands_played,
         })
 
     # Serialize zones with oracle text enrichment
@@ -356,7 +691,16 @@ def get_game_state() -> dict[str, Any]:
         "graveyard": graveyard,
         "stack": stack,
         "exile": exile,
+        "pending_decision": game_state.pending_decision if game_state.decision_seat_id == game_state.local_seat_id else None,
     }
+
+
+def clear_pending_combat_steps() -> None:
+    """Clear pending combat steps after they've been processed.
+
+    Call this after checking triggers to prevent duplicate combat triggers.
+    """
+    game_state.clear_pending_combat_steps()
 
 
 @mcp.tool()
@@ -455,6 +799,185 @@ def get_draft_rating(card_name: str, set_code: str) -> dict[str, Any]:
         "alsa": stats.alsa,
         "iwd": stats.iwd,
         "games_in_hand": stats.games_in_hand,
+    }
+
+
+@mcp.tool()
+def get_draft_pack() -> dict[str, Any]:
+    """Get the current draft pack contents with card details and 17lands ratings.
+
+    Reads the MTGA log to determine what cards are currently in the draft pack.
+    Returns card names, types, and 17lands statistics for each card.
+
+    Use this during a draft to see what cards are available and their ratings.
+
+    Returns:
+        Dict with:
+        - is_active: Whether a draft is currently in progress
+        - event_name: The draft event name (e.g., "PremierDraft_MH3")
+        - set_code: The set being drafted (e.g., "MH3")
+        - pack_number: Current pack number (1-3)
+        - pick_number: Current pick within the pack (1-15)
+        - cards: List of card dicts with:
+          - grp_id: Arena card ID
+          - name: Card name
+          - type_line: Card type
+          - mana_cost: Mana cost
+          - gih_wr: Games in Hand Win Rate (0.0-1.0)
+          - alsa: Average Last Seen At
+          - iwd: Improvement When Drawn
+        - picked_cards: List of cards already picked this draft
+
+        or {"is_active": False, "message": "..."} if no draft in progress.
+    """
+    # Auto-start watcher if not running
+    if watcher is None:
+        start_watching()
+
+    if not draft_state.is_active or not draft_state.cards_in_pack:
+        return {
+            "is_active": False,
+            "message": "No active draft pack detected. Make sure you're in a draft and a pack is open."
+        }
+
+    # Get draft stats cache
+    draft_stats_cache = _get_draft_stats()
+
+    # Build card list with details and ratings
+    cards = []
+    for grp_id in draft_state.cards_in_pack:
+        # Use robust enrichment (MTGJSON -> MTGADb -> Scryfall)
+        card_info = enrich_with_oracle_text(grp_id)
+
+        # Get 17lands stats if we have a set code and valid name
+        if draft_state.set_code and "Unknown" not in card_info["name"]:
+            stats = draft_stats_cache.get_draft_rating(
+                card_info["name"], draft_state.set_code
+            )
+            if stats:
+                card_info["gih_wr"] = stats.gih_wr
+                card_info["alsa"] = stats.alsa
+                card_info["iwd"] = stats.iwd
+
+        cards.append(card_info)
+
+    # Sort by GIH win rate (highest first)
+    cards.sort(key=lambda c: c.get("gih_wr") or 0, reverse=True)
+
+    # Get picked card details
+    picked = []
+    for grp_id in draft_state.picked_cards:
+        enriched = enrich_with_oracle_text(grp_id)
+        picked.append(enriched)
+
+    return {
+        "is_active": True,
+        "is_sealed": draft_state.is_sealed,
+        "event_name": draft_state.event_name,
+        "set_code": draft_state.set_code,
+        "pack_number": draft_state.pack_number,
+        "pick_number": draft_state.pick_number,
+        "cards": cards,
+        "picked_cards": picked,
+    }
+
+
+def get_sealed_pool() -> dict[str, Any]:
+    """Get sealed pool analysis with deck building recommendations.
+
+    Analyzes the sealed pool using 17lands win rate data to suggest
+    the best color combinations and cards to build around.
+
+    Returns:
+        Dict with:
+        - is_sealed: True if this is a sealed event
+        - set_code: The set code
+        - pool_size: Number of cards in pool
+        - analysis: Detailed analysis dict with:
+          - recommended_colors: Best color pair (e.g., "White/Green")
+          - recommended_wr: Average win rate of recommended build
+          - playable_count: Number of playable cards in recommended colors
+          - creature_count: Number of creatures in recommended colors
+          - top_cards: List of best cards to build around
+          - splash_candidates: High WR off-color cards to consider
+          - alternatives: Other viable color pairs
+        - spoken_advice: Short spoken recommendation
+        - detailed_text: Full text breakdown for display
+
+        or {"is_sealed": False} if not in a sealed event.
+    """
+    if not draft_state.is_active or not draft_state.is_sealed:
+        return {"is_sealed": False, "message": "No active sealed event detected."}
+
+    # In sealed, picked_cards contains the full pool after opening packs
+    pool_grp_ids = draft_state.picked_cards
+    if not pool_grp_ids:
+        return {"is_sealed": True, "message": "Sealed pool not yet opened. Open your packs first."}
+
+    # Get card details with 17lands ratings
+    draft_stats_cache = _get_draft_stats()
+    pool_cards = []
+
+    for grp_id in pool_grp_ids:
+        card_info = enrich_with_oracle_text(grp_id)
+        card_info["grp_id"] = grp_id
+
+        # Parse colors from mana cost
+        mana_cost = card_info.get("mana_cost", "")
+        colors = []
+        for color in ["W", "U", "B", "R", "G"]:
+            if f"{{{color}}}" in mana_cost:
+                colors.append(color)
+        card_info["colors"] = colors
+
+        # Get 17lands stats
+        if draft_state.set_code and card_info.get("name"):
+            stats = draft_stats_cache.get_draft_rating(
+                card_info["name"], draft_state.set_code
+            )
+            if stats:
+                card_info["gih_wr"] = stats.gih_wr
+                card_info["alsa"] = stats.alsa
+                card_info["iwd"] = stats.iwd
+
+        pool_cards.append(card_info)
+
+    # Run analysis
+    analysis = analyze_sealed_pool(pool_cards, draft_state.set_code, draft_stats_cache)
+
+    # Format recommendations
+    spoken = format_sealed_recommendation(analysis)
+    detailed = format_sealed_detailed(analysis)
+
+    # Build response
+    rec = analysis.recommended_build
+    color_names = {
+        "W": "White", "U": "Blue", "B": "Black", "R": "Red", "G": "Green"
+    }
+    rec_colors = "/".join(color_names.get(c, c) for c in rec.colors) if rec.colors else "Unknown"
+
+    return {
+        "is_sealed": True,
+        "set_code": draft_state.set_code,
+        "pool_size": len(pool_cards),
+        "analysis": {
+            "recommended_colors": rec_colors,
+            "recommended_wr": rec.avg_win_rate,
+            "playable_count": rec.playable_count,
+            "creature_count": rec.creature_count,
+            "top_cards": [{"name": c.get("name"), "gih_wr": c.get("gih_wr")} for c in rec.best_cards],
+            "splash_candidates": [{"name": c.get("name"), "colors": c.get("colors"), "gih_wr": c.get("gih_wr")} for c in analysis.splash_candidates],
+            "alternatives": [
+                {
+                    "colors": "/".join(color_names.get(c, c) for c in ca.colors),
+                    "playable_count": ca.playable_count,
+                    "avg_wr": ca.avg_win_rate,
+                }
+                for ca in analysis.color_analyses[1:4]  # Top 3 alternatives
+            ],
+        },
+        "spoken_advice": spoken,
+        "detailed_text": detailed,
     }
 
 
@@ -627,7 +1150,7 @@ def start_coaching(
             Options: "claude" (default), "gemini", "ollama"
         model: Optional model name to use. Defaults vary by backend:
             - claude: claude-sonnet-4-20250514
-            - gemini: gemini-1.5-flash
+            - gemini: gemini-2.0-flash
             - ollama: llama3.2
         auto_speak: If True, automatically speak advice via TTS when generated.
             Default False - retrieve advice manually with get_pending_advice().
@@ -687,6 +1210,74 @@ def get_coaching_status() -> dict[str, Any]:
         "backend": _coaching_backend,
         "model": _coaching_model,
         "auto_speak": _coaching_auto_speak,
+    }
+
+
+@mcp.tool()
+def start_draft_helper_tool(set_code: Optional[str] = None) -> dict[str, Any]:
+    """Start background draft helper that auto-speaks pick recommendations.
+
+    Monitors draft state in real-time and automatically speaks the top pick
+    (by 17lands GIH win rate) whenever a new pack is detected. No LLM needed -
+    pure data lookup for maximum speed.
+
+    Use this at the start of a draft for hands-free pick recommendations.
+
+    Args:
+        set_code: Set code for 17lands lookups (e.g., "MH3", "BLB", "DSK").
+                  Required for accurate win rate data.
+
+    Returns:
+        Dict with:
+        - started: True if helper started successfully
+        - message: Status message
+
+        or {"error": message} if already running.
+    """
+    try:
+        start_draft_helper(set_code=set_code)
+        return {
+            "started": True,
+            "set_code": set_code.upper() if set_code else None,
+            "message": f"Draft helper started for {set_code.upper() if set_code else 'unknown set'}. Will auto-speak top pick for each pack."
+        }
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def stop_draft_helper_tool() -> dict[str, Any]:
+    """Stop background draft helper.
+
+    Stops the automatic pick recommendation announcements.
+
+    Returns:
+        Dict with:
+        - stopped: True if helper was stopped
+
+        or {"error": message} if not running.
+    """
+    try:
+        stop_draft_helper()
+        return {"stopped": True}
+    except RuntimeError:
+        return {"error": "Draft helper not running"}
+
+
+@mcp.tool()
+def get_draft_helper_status() -> dict[str, Any]:
+    """Check if draft helper is active.
+
+    Returns:
+        Dict with:
+        - active: True if draft helper is running
+        - current_pack: Current pack number being tracked
+        - current_pick: Current pick number being tracked
+    """
+    return {
+        "active": _draft_helper_enabled,
+        "current_pack": _draft_helper_last_pack,
+        "current_pick": _draft_helper_last_pick,
     }
 
 

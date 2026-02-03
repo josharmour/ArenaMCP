@@ -1,1 +1,10 @@
 .env
+tmpclaude-*
+__pycache__/
+*.pyc
+debug_log.txt
+log_tail.txt
+last_match_event.txt
+build/
+dist/
+*.egg-info/
