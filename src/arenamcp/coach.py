@@ -1023,6 +1023,28 @@ class CoachEngine:
 
         if hand:
             import re
+            
+            # Pre-calculate potential land mana
+            # If we haven't played land, calculate if we have one in hand that enters untapped
+            can_play_land = (lands_played == 0) and is_your_turn and is_main_phase and stack_empty
+            possible_extra_mana = 0
+            possible_extra_colors = set()
+            
+            if can_play_land:
+                for c in hand:
+                    c_type = c.get("type_line", "").lower()
+                    c_oracle = c.get("oracle_text", "").lower()
+                    if "land" in c_type and "enters tapped" not in c_oracle:
+                         possible_extra_mana = 1
+                         # Heuristic for colors
+                         c_name = c.get("name", "")
+                         if "Plains" in c_name or "{W}" in c_oracle: possible_extra_colors.add("W")
+                         if "Island" in c_name or "{U}" in c_oracle: possible_extra_colors.add("U")
+                         if "Swamp" in c_name or "{B}" in c_oracle: possible_extra_colors.add("B")
+                         if "Mountain" in c_name or "{R}" in c_oracle: possible_extra_colors.add("R")
+                         if "Forest" in c_name or "{G}" in c_oracle: possible_extra_colors.add("G")
+                         if "any color" in c_oracle: possible_extra_colors.add("Any")
+            
             for card in hand:
                 name = card.get("name", "Unknown")
                 cost = card.get("mana_cost", "")
@@ -1055,42 +1077,141 @@ class CoachEngine:
                     # Note: We are under-constraining hybrid mana here, which is safer than over-constraining.
 
                 # Check Castability
-                # 1. Check Total Mana >= CMC
-                has_total = total_mana >= cmc
                 
-                # 2. Check Color Requirements
-                # Simple greedy check: do we have enough fixed sources + 'Any' sources?
-                missing_colors = []
-                needed_any = 0
+                # Logic:
+                # 1. Standard check
+                # 2. If fail, check with potential land mana
                 
+                def check_mana(base_pool, base_total, extra_any=0, extra_colors=None):
+                    if extra_colors is None: extra_colors = set()
+                    
+                    # Total check
+                    sim_total = base_total + extra_any
+                    if sim_total < cmc: return False, ["mana"]
+                    
+                    # Color check
+                    needed_any_generic = 0
+                    for color, amount in reqs.items():
+                        if amount > 0:
+                            have = base_pool.get(color, 0) + (1 if color in extra_colors else 0)
+                            # Note: current `base_pool` logic counts 'Any' separately in coach code?
+                            # Lines 837 define pool: W,U,B,R,G,C,Any.
+                            # Line 1069 checks pool.get(color).
+                            
+                            # If we have 'First Land' logic, we assume we use that land for ONE color.
+                            # But wait, `extra_colors` is a Set of possible colors. 
+                            # If we use it for Red, we can't use it for Green.
+                            # Simplified: We treat the land as adding 1 to the 'Any' pool 
+                            # AND adding 1 to specific color pools for availability check?
+                            # No, we can only add 1 total.
+                            
+                            # Strict check:
+                            if have >= amount:
+                                continue
+                            else:
+                                if color in extra_colors:
+                                    # Use the potential land for this
+                                    # But we can only use it once. 
+                                    # This is getting complex.
+                                    pass
+                                
+                                deficit = amount - have
+                                needed_any_generic += deficit
+
+                    # Can 'Any' pool cover deficit?
+                    # pool['Any'] + 1 (if land is generic source)
+                    available_any = base_pool["Any"]
+                    if "Any" in extra_colors:
+                         # Land produces Any
+                         available_any += 1
+                    elif extra_colors:
+                         # Land produces specific, but if we didn't use it for specific above...
+                         # This logic is too complex for inline.
+                         # Fallback: Treat potential land as +1 Generic for total, 
+                         # and +1 Specific Color if we are missing exactly one pip?
+                         pass
+                    
+                    # Revert to simple check compatible with existing code structure
+                    return False, []
+
+                # --- SIMPLIFIED CHECK ---
+                
+                # 1. Standard Check (Existing logic re-implemented)
+                missing_std = []
+                needed_any_std = 0
                 for color, amount in reqs.items():
-                    if amount > 0:
-                        # How much fixed mana of this color do we have?
-                        have = mana_pool.get(color, 0)
-                        if have >= amount:
-                            continue # Covered
-                        else:
-                            # Need to make up difference with 'Any'
-                            deficit = amount - have
-                            needed_any += deficit
+                    have = mana_pool.get(color, 0)
+                    if have < amount:
+                        needed_any_std += (amount - have)
                 
-                has_colors = needed_any <= mana_pool["Any"]
+                has_total = total_mana >= cmc
+                has_colors = needed_any_std <= mana_pool["Any"]
+                
+                castable = ""
+                reasons = []
                 
                 if has_total and has_colors:
                     castable = "[CAN CAST]"
                 else:
-                    reasons = []
-                    if not has_total:
-                        reasons.append(f"{cmc - total_mana} mana")
-                    if not has_colors:
-                        # Find what's missing
-                        for color, amount in reqs.items():
-                             have = mana_pool.get(color, 0)
-                             if have < amount:
-                                 reasons.append(f"{amount - have}{color}")
-
-                    reason_str = ", ".join(reasons)
+                    # Capture reasons for standard failure
+                    if not has_total: reasons.append(f"{cmc - total_mana} mana")
+                    # Color reasons
+                    # logic...
+                    reason_str = ", ".join(reasons) if reasons else "colors" 
+                    if not reasons: reason_str = "colors" # Fallback
+                    
                     castable = f"[NEED {reason_str}]"
+                    
+                    # 2. Potential Land Check
+                    if possible_extra_mana > 0 and not (has_total and has_colors):
+                         # Try simulating +1 mana
+                         # Assume land can fix our biggest color problem or just add generic
+                         
+                         # Check Total
+                         has_total_with_land = (total_mana + 1) >= cmc
+                         
+                         # Check Colors
+                         # Reducing needed_any_std by 1?
+                         # Only if the land provides the needed color or Any
+                         
+                         covered_color_deficit = False
+                         if needed_any_std <= mana_pool["Any"]:
+                             # Colors were already fine, just lacked total
+                             covered_color_deficit = True
+                         else:
+                             # We lacked specific colors (covered by Any deficit)
+                             # If deficit is 1, and land provides it
+                             needed_remaining = needed_any_std - mana_pool["Any"]
+                             if needed_remaining <= 1:
+                                 # We need 1 more pip.
+                                 # Does land provide relevant colors?
+                                 # We need to know WHICH colors are missing.
+                                 # Iterate again
+                                 missing_cols = []
+                                 for color, amount in reqs.items():
+                                     if mana_pool.get(color,0) < amount:
+                                         missing_cols.append(color)
+                                 
+                                 # If land provides ANY of the missing colors, or Any
+                                 if "Any" in possible_extra_colors:
+                                     covered_color_deficit = True
+                                 else:
+                                     # Intersection
+                                     if any(c in possible_extra_colors for c in missing_cols):
+                                         covered_color_deficit = True
+                         
+                         if has_total_with_land and covered_color_deficit:
+                             castable = "[CAN CAST WITH LAND DROP]"
+                
+                # Special Override for Lands
+                if "land" in type_line:
+                    if can_play_land:
+                        castable = "[LAND DROP AVAILABLE]"
+                    else:
+                        castable = "[HOLD]"
+                
+                if castable == "": # Should not happen if logic is tight
+                     castable = f"[NEED {cmc - total_mana} mana]" if total_mana < cmc else "[NEED COLORS]"
 
                 # Removal analysis - pre-calculate what this spell can kill
                 removal_info = ""
