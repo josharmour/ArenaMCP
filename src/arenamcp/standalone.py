@@ -71,10 +71,12 @@ logging.getLogger("google").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(logging.Formatter('%(message)s'))
-root_logger.addHandler(console_handler)
+# Console handler disabled when using TUI to prevent log bleed-through
+# Logs still go to file (standalone.log)
+# console_handler = logging.StreamHandler()
+# console_handler.setLevel(logging.INFO)
+# console_handler.setFormatter(logging.Formatter('%(message)s'))
+# root_logger.addHandler(console_handler)
 
 logger = logging.getLogger(__name__)
 
@@ -555,6 +557,9 @@ class StandaloneCoach:
                     last_advice_turn = 0
                     last_advice_phase = ""
                     seat_announced = False  # Re-announce seat for new game
+                    # Clear advice history for new match
+                    self._advice_history = []
+                    logger.info("Cleared advice history for new match")
 
                 # Announce seat detection when game starts
                 if not seat_announced and turn_num > 0:
@@ -707,6 +712,8 @@ class StandaloneCoach:
                     continue
 
                 if self._coach and self._mcp:
+                    # Force a log poll to get freshest state before advice
+                    self._mcp.poll_log()
                     game_state = self._mcp.get_game_state()
 
                     # Get current seat and mana for display
@@ -1176,6 +1183,8 @@ NOT: "Play a land and a creature." """
                                 last_advice_phase = ""
                                 prev_state = {}
                                 game_announced = False
+                                # Clear advice history for new match
+                                self._advice_history = []
 
                                 # Update instructions for new game
                                 client.update_instructions(get_instructions())
@@ -1271,57 +1280,112 @@ NOT: "Play a land and a creature." """
                                     # CRITICAL: If filtering suppressed advice, stop now
                                     if not should_advise:
                                         continue
-
-                                        # Build prompt based on trigger
-                                        pending_decision = curr_state.get("pending_decision")
-
-                                        if pending_decision:
-                                             prompt = f"DECISION: Game is asking '{pending_decision}'.\nContext: {phase} phase.\nMy board: {', '.join(my_creatures) or 'none'}\nWhat do I choose?"
-                                        elif trig == "new_turn":
-                                            if is_my_turn:
-                                                prompt = f"Turn {turn_num} - MY TURN ({phase}).\nMy hand: {hand_str}\nMy board: {', '.join(my_creatures) or 'empty'}\nTheir board: {', '.join(opp_creatures) or 'empty'}\nWhat should I play?"
-                                            else:
-                                                prompt = f"Turn {turn_num} - OPPONENT'S TURN ({phase}).\nMy instant options: {', '.join(instant_options)}\nAnything to watch for?"
-                                        elif trig == "stack_spell" or (stack and trig == "priority_gained"):
-                                            stack_cards = [c.get("name") for c in stack]
-                                            prompt = f"RESPONSE: Stack has {', '.join(stack_cards)}.\nPhase: {phase}\nMy instants: {', '.join(instant_options) or 'none'}\nDo I resolve, respond, or pass?"
-                                        elif trig == "low_life":
-                                            my_life = local_player.get("life_total", 20)
-                                            prompt = f"WARNING: I'm at {my_life} life!\nMy hand: {hand_str}\nHow do I survive?"
-                                        elif trig == "opponent_low_life":
-                                            opp = next((p for p in curr_state.get("players", []) if not p.get("is_local")), {})
-                                            opp_life = opp.get("life_total", 20)
-                                            prompt = f"Opponent at {opp_life} life!\nMy attackers: {', '.join(my_creatures) or 'none'}\nDo I have lethal?"
-                                        elif trig == "combat_attackers":
-                                            if is_my_turn:
-                                                prompt = f"Combat - declaring attackers.\nMy creatures: {', '.join(my_creatures) or 'none'}\nTheir blockers: {', '.join(opp_creatures) or 'none'}\nWhat should attack?"
-                                            else:
-                                                prompt = f"Opponent entering combat.\nTheir creatures: {', '.join(opp_creatures) or 'none'}\nMy creatures: {', '.join(my_creatures) or 'none'}\nAny pre-combat responses?"
-                                        elif trig == "combat_blockers":
-                                            if is_my_turn:
-                                                prompt = f"Combat - opponents blocking.\nMy attackers: {', '.join(my_creatures) or 'none'}\nTheir blockers: {', '.join(opp_creatures) or 'none'}\nAny combat tricks?"
-                                            else:
-                                                prompt = f"Combat - declaring blockers.\nMy creatures: {', '.join(my_creatures) or 'none'}\nAttackers: {', '.join(opp_creatures) or 'none'}\nHow should I block?"
-                                        else:
-                                            # Enriched fallback for priority_gained
-                                            stack_ids = [c.get("name") for c in stack]
-                                            stack_str = ", ".join(stack_ids) if stack_ids else "empty"
-                                            prompt = f"Priority passed to me in {phase} phase ({step}).\nStack: {stack_str}\nMy hand: {hand_str}\nCorrect technical play?"
-
-                                        logger.info(f"TRIGGER: {trig} -> interrupting and sending prompt")
-                                        stop_playback() # Ensure we stop any outdated advice
-                                        if self.backend_name == "gemini-live":
-                                            prompt = f"[SYSTEM: INTERRUPT - NEW GAME STATE] {prompt}"
-
-                                        self.ui.log(f"[yellow]>>> Sending {trig} prompt to {self.backend_name}...[/]")
-                                        client.send_text(prompt)
-
-                                        last_advice_turn = turn_num
-                                        last_advice_phase = phase
-                                        last_proactive_advice = time.time()
+                                    
+                                    # STATE CONSISTENCY CHECK: Re-fetch fresh state before sending advice
+                                    # This ensures advice matches the CURRENT game situation, not a stale snapshot
+                                    fresh_state = self._mcp.get_full_game_state()
+                                    if fresh_state:
+                                        fresh_turn = fresh_state.get("turn", {})
+                                        fresh_turn_num = fresh_turn.get("turn_number", 0)
+                                        fresh_phase = fresh_turn.get("phase", "").replace("Phase_", "")
+                                        fresh_active = fresh_turn.get("active_player", 0)
+                                        fresh_priority = fresh_turn.get("priority_player", 0)
                                         
-                                        # CRITICAL: Break loop to process only one trigger per cycle
-                                        break
+                                        # Validate trigger is still relevant
+                                        if trig == "new_turn" and fresh_turn_num != turn_num:
+                                            logger.info(f"STATE DRIFT: Turn changed from {turn_num} to {fresh_turn_num}, skipping stale trigger")
+                                            continue
+                                        
+                                        # For turn-based advice, ensure it's still my turn
+                                        if trig == "new_turn" and fresh_active != my_seat:
+                                            logger.info(f"STATE DRIFT: Active player changed, no longer my turn (was {my_seat}, now {fresh_active})")
+                                            continue
+                                        
+                                        # Use fresh state for prompt building
+                                        curr_state = fresh_state
+                                        turn = fresh_turn
+                                        turn_num = fresh_turn_num
+                                        phase = fresh_phase
+                                        step = fresh_turn.get("step", "").replace("Step_", "")
+                                        is_my_turn = fresh_active == my_seat
+                                        stack = curr_state.get("stack", [])
+                                        
+                                        # Re-fetch hand and board from fresh state
+                                        hand = curr_state.get("hand", [])
+                                        hand_cards = [f"{c.get('name')} ({c.get('mana_cost', '')})" for c in hand]
+                                        hand_str = ", ".join(hand_cards) if hand_cards else "empty"
+                                        
+                                        instant_options = []
+                                        for c in hand:
+                                            type_line = c.get("type_line", "").lower()
+                                            oracle = c.get("oracle_text", "").lower()
+                                            if "instant" in type_line or "flash" in oracle:
+                                                instant_options.append(c.get("name"))
+                                        
+                                        battlefield = curr_state.get("battlefield", [])
+                                        local_player = next((p for p in curr_state.get("players", []) if p.get("is_local")), {})
+                                        my_seat = local_player.get("seat_id", 1)
+                                        my_creatures = [c.get("name") for c in battlefield
+                                                       if c.get("owner_seat_id") == my_seat and c.get("power") is not None]
+                                        opp_creatures = [c.get("name") for c in battlefield
+                                                        if c.get("owner_seat_id") != my_seat and c.get("power") is not None]
+                                        
+                                        logger.debug(f"STATE VERIFIED: Turn {turn_num}, Phase {phase}, Active={fresh_active}, My seat={my_seat}, is_my_turn={is_my_turn}")
+
+                                    # Build prompt based on trigger
+                                    pending_decision = curr_state.get("pending_decision")
+                                    
+                                    # Determine sorcery-speed eligibility
+                                    can_cast_sorcery = is_my_turn and "Main" in phase and len(stack) == 0
+                                    speed_context = "SORCERY-SPEED OK (can play lands/creatures/sorceries)" if can_cast_sorcery else "INSTANT-SPEED ONLY"
+
+                                    if pending_decision:
+                                        prompt = f"DECISION: Game is asking '{pending_decision}'.\nContext: {phase} phase.\nMy board: {', '.join(my_creatures) or 'none'}\nWhat do I choose?"
+                                    elif trig == "new_turn":
+                                        if is_my_turn:
+                                            prompt = f"Turn {turn_num} - MY TURN ({phase}). [{speed_context}]\nMy hand: {hand_str}\nMy board: {', '.join(my_creatures) or 'empty'}\nTheir board: {', '.join(opp_creatures) or 'empty'}\nWhat should I play?"
+                                        else:
+                                            prompt = f"Turn {turn_num} - OPPONENT'S TURN ({phase}). [{speed_context}]\nMy instant options: {', '.join(instant_options) or 'none'}\nAnything to watch for?"
+                                    elif trig == "stack_spell" or (stack and trig == "priority_gained"):
+                                        stack_cards = [c.get("name") for c in stack]
+                                        prompt = f"RESPONSE: Stack has {', '.join(stack_cards)}.\nPhase: {phase}\nMy instants: {', '.join(instant_options) or 'none'}\nDo I resolve, respond, or pass?"
+                                    elif trig == "low_life":
+                                        my_life = local_player.get("life_total", 20)
+                                        prompt = f"WARNING: I'm at {my_life} life!\nMy hand: {hand_str}\nHow do I survive?"
+                                    elif trig == "opponent_low_life":
+                                        opp = next((p for p in curr_state.get("players", []) if not p.get("is_local")), {})
+                                        opp_life = opp.get("life_total", 20)
+                                        prompt = f"Opponent at {opp_life} life!\nMy attackers: {', '.join(my_creatures) or 'none'}\nDo I have lethal?"
+                                    elif trig == "combat_attackers":
+                                        if is_my_turn:
+                                            prompt = f"Combat - declaring attackers.\nMy creatures: {', '.join(my_creatures) or 'none'}\nTheir blockers: {', '.join(opp_creatures) or 'none'}\nWhat should attack?"
+                                        else:
+                                            prompt = f"Opponent entering combat.\nTheir creatures: {', '.join(opp_creatures) or 'none'}\nMy creatures: {', '.join(my_creatures) or 'none'}\nAny pre-combat responses?"
+                                    elif trig == "combat_blockers":
+                                        if is_my_turn:
+                                            prompt = f"Combat - opponents blocking.\nMy attackers: {', '.join(my_creatures) or 'none'}\nTheir blockers: {', '.join(opp_creatures) or 'none'}\nAny combat tricks?"
+                                        else:
+                                            prompt = f"Combat - declaring blockers.\nMy creatures: {', '.join(my_creatures) or 'none'}\nAttackers: {', '.join(opp_creatures) or 'none'}\nHow should I block?"
+                                    else:
+                                        # Enriched fallback for priority_gained
+                                        stack_ids = [c.get("name") for c in stack]
+                                        stack_str = ", ".join(stack_ids) if stack_ids else "empty"
+                                        prompt = f"Priority passed to me in {phase} phase ({step}).\nStack: {stack_str}\nMy hand: {hand_str}\nCorrect technical play?"
+
+                                    logger.info(f"TRIGGER: {trig} -> interrupting and sending prompt")
+                                    stop_playback() # Ensure we stop any outdated advice
+                                    if self.backend_name == "gemini-live":
+                                        prompt = f"[SYSTEM: INTERRUPT - NEW GAME STATE] {prompt}"
+
+                                    self.ui.log(f"[yellow]>>> Sending {trig} prompt to {self.backend_name}...[/]")
+                                    client.send_text(prompt)
+
+                                    last_advice_turn = turn_num
+                                    last_advice_phase = phase
+                                    last_proactive_advice = time.time()
+                                    
+                                    # CRITICAL: Break loop to process only one trigger per cycle
+                                    break
 
                             # Periodic proactive advice if no triggers fired
                             now = time.time()
@@ -1593,21 +1657,50 @@ NOT: "Play a land and a creature." """
         return []
 
     def _record_advice(self, advice: str, trigger: str, game_context: str = None) -> None:
-        """Record advice for debug history."""
+        """Record advice for debug history with full game state."""
         if not hasattr(self, '_advice_history'):
             self._advice_history = []
+
+        # Auto-capture game context if not provided
+        game_state = None
+        if game_context is None and self._coach and self._mcp:
+            try:
+                game_state = self._mcp.get_game_state()
+                if hasattr(self._coach, '_format_game_context'):
+                    game_context = self._coach._format_game_context(game_state)
+            except Exception:
+                pass
 
         entry = {
             "timestamp": datetime.now().isoformat(),
             "trigger": trigger,
             "advice": advice,
-            "game_context_snippet": game_context[:500] if game_context else None,
+            "game_context": game_context[:2000] if game_context else None,  # Store more context
         }
         self._advice_history.append(entry)
 
         # Keep only last 20 entries
         if len(self._advice_history) > 20:
             self._advice_history = self._advice_history[-20:]
+        
+        # Also record to match recording for post-match analysis
+        try:
+            from arenamcp.match_validator import get_current_recording
+            current = get_current_recording()
+            if current:
+                # Extract turn/phase from game state
+                turn_info = game_state.get("turn", {}) if game_state else {}
+                parsed_turn = turn_info.get("turn_number", 0)
+                parsed_phase = turn_info.get("phase", "")
+                current.add_advice_event(
+                    trigger=trigger,
+                    advice=advice,
+                    game_context=game_context or "",
+                    parsed_turn=parsed_turn,
+                    parsed_phase=parsed_phase
+                )
+        except Exception:
+            pass  # Don't fail if recording isn't active
 
     def _record_error(self, error: str, context: str = None) -> None:
         """Record error for debug history."""

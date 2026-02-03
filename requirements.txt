@@ -40,3 +40,7 @@ websocket-client>=1.6.0
 
 # Audio resampling (optional, improves quality for GPT-Realtime)
 scipy>=1.10.0
+
+# Screenshots (for debug reports)
+pygetwindow>=0.0.9
+Pillow>=10.0.0
