@@ -709,14 +709,32 @@ def get_card_info(arena_id: int) -> dict[str, Any]:
 
     Use this to get oracle text, mana cost, and other card details
     when you need to understand what a specific card does.
+    
+    Tries MTGA's local database first (for newest cards), then Scryfall.
 
     Args:
         arena_id: The MTGA arena ID (grp_id) of the card
 
     Returns:
         Dict with name, oracle_text, type_line, mana_cost, cmc, colors, scryfall_uri
-        or {"error": "Card not found"} if the card isn't in Scryfall data.
+        or {"error": "Card not found"} if the card isn't in any database.
     """
+    # Try MTGA local database first (has newest cards like Final Fantasy crossover)
+    mtgadb = _get_mtgadb()
+    if mtgadb.available:
+        mtga_card = mtgadb.get_card(arena_id)
+        if mtga_card:
+            return {
+                "name": mtga_card.name,
+                "oracle_text": mtga_card.oracle_text or "",
+                "type_line": mtga_card.types or "",
+                "mana_cost": "",  # MTGA DB doesn't store mana cost
+                "cmc": 0,
+                "colors": mtga_card.colors.split(",") if mtga_card.colors else [],
+                "scryfall_uri": None,
+            }
+    
+    # Fall back to Scryfall
     scryfall = _get_scryfall()
     card = scryfall.get_card_by_arena_id(arena_id)
 

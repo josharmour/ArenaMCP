@@ -53,6 +53,7 @@ class ScryfallCache:
         self._arena_index: dict[int, dict[str, Any]] = {}
         self._last_api_call: float = 0.0
         self._not_found_cache: set[int] = set()  # Negative cache for 404s
+        self._name_cache: dict[str, Optional[dict[str, Any]]] = {}  # Session cache for name lookups
 
         self._load_or_download_bulk_data()
 
@@ -241,6 +242,13 @@ class ScryfallCache:
         if not name or name.startswith("Unknown"):
             return None
 
+        # Check session cache first
+        if name in self._name_cache:
+            card_data = self._name_cache[name]
+            if card_data:
+                return self._card_dict_to_scryfall_card(card_data)
+            return None
+
         self._rate_limit_api()
 
         # Use fuzzy search which handles minor variations
@@ -252,10 +260,15 @@ class ScryfallCache:
             response = requests.get(url, params=params, timeout=10)
             if response.status_code == 404:
                 logger.debug(f"Card not found by name: {name}")
+                self._name_cache[name] = None  # Cache negative result
                 return None
             response.raise_for_status()
             card_data = response.json()
+            
+            # Cache the result
+            self._name_cache[name] = card_data
             return self._card_dict_to_scryfall_card(card_data)
         except requests.RequestException as e:
             logger.warning(f"API request failed for name '{name}': {e}")
             return None
+
