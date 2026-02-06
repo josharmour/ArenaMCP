@@ -1,7 +1,7 @@
 
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
-from textual.widgets import Header, Footer, Log, RichLog, Input, Button, Label, Select, Switch, Checkbox, Static, Markdown
+from textual.widgets import Header, Footer, Log, RichLog, Input, Button, Select, Static
 from textual.binding import Binding
 from textual.message import Message
 
@@ -15,6 +15,7 @@ import logging
 from arenamcp.standalone import StandaloneCoach, UIAdapter, LOG_FILE, LOG_DIR, copy_to_clipboard
 from arenamcp.tts import VoiceOutput
 from arenamcp.match_validator import MatchRecording, MatchValidator, start_recording, stop_recording, get_current_recording
+from arenamcp.mtgadb import MTGADatabase
 
 
 class TextualLogHandler(logging.Handler):
@@ -200,21 +201,17 @@ class GameStateDisplay(Static):
 class Sidebar(Vertical):
     """Sidebar for settings and actions."""
 
-    # Model options for different modes
+    # Model options
     # NOTE: Azure requires you to CREATE deployments in Azure Portal first!
     # The deployment NAME you create is what you use here, not the base model name.
-    STANDARD_OPTIONS = [
+    MODEL_OPTIONS = [
         ("Gemini 2.5 Flash", "gemini/gemini-2.5-flash"),
+        ("Gemini 3 Pro", "gemini/gemini-3-pro-preview"),
         ("Azure GPT-5.2", "azure/gpt-5.2"),
         ("Llama 3.2", "ollama/llama3.2:latest"),
         ("Gemma 3N", "ollama/gemma3n:latest"),
         ("DeepSeek R1", "ollama/deepseek-r1:14b"),
         ("GLM-4 Flash", "ollama/glm-4.7-flash:latest"),
-    ]
-
-    REALTIME_OPTIONS = [
-        ("Gemini Live", "gemini-live/gemini-2.0-flash-exp-image-generation"),
-        ("GPT-Realtime", "gpt-realtime/gpt-realtime"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -225,21 +222,15 @@ class Sidebar(Vertical):
             yield Static("Voice: Initializing...", id="status-voice", classes="status-line")
 
         with Vertical(id="controls-panel"):
-            yield Label("Standard", id="lbl-local", classes="toggle-label toggle-label-active")
-            yield Switch(value=False, id="switch-realtime")
-            yield Label("Realtime", id="lbl-realtime", classes="toggle-label")
-            yield Select(self.STANDARD_OPTIONS, id="select-provider", allow_blank=False)
+            yield Select(self.MODEL_OPTIONS, id="select-provider", allow_blank=False)
             yield Select([(desc, vid) for vid, desc in VoiceOutput.VOICES], id="select-voice", prompt="Voice")
 
         with Vertical(id="actions-panel"):
             yield Button("Mute (F5)", id="btn-mute", variant="default")
-            yield Button("Speed Test", id="btn-speed", variant="default")
-            yield Button("Debug Report", id="btn-debug-report", variant="default")
-            yield Button("Screenshot (F3)", id="btn-screenshot", variant="primary")
+            yield Button("Copy Debug (F7)", id="btn-debug", variant="default")
+            yield Button("Analyze Screen (F3)", id="btn-screenshot", variant="primary")
+            yield Button("Analyze Match", id="btn-analyze", variant="warning")
             yield Button("Restart (F9)", id="btn-restart", variant="error")
-            # Match validation buttons
-            yield Button("🔴 Record Match", id="btn-record-start", variant="warning")
-            yield Button("⏹ Stop & Analyze", id="btn-record-stop", variant="default")
 
 
 class ArenaApp(App):
@@ -276,23 +267,6 @@ class ArenaApp(App):
         border: solid $primary;
         padding: 0 1;
         margin-top: 1;
-    }
-
-    .mode-row {
-        height: 1;
-        align-vertical: middle;
-        layout: horizontal;
-    }
-
-    .toggle-label {
-        width: 1fr;
-        content-align: center middle;
-        color: $text-muted;
-    }
-
-    .toggle-label-active {
-        color: $success;
-        text-style: bold;
     }
 
     Select {
@@ -340,13 +314,11 @@ class ArenaApp(App):
     BINDINGS = [
         ("ctrl+q", "quit", "Quit"),
         ("f2", "toggle_style", "Style"),
-        ("f3", "screenshot", "Screenshot"),
+        ("f3", "analyze_screen", "Screen"),
         ("f5", "toggle_mute", "Mute"),
         ("f6", "cycle_voice", "Voice"),
-        ("f7", "bug_report", "Bug"),
+        ("f7", "copy_debug", "Debug"),
         ("f9", "restart", "Restart"),
-        ("f10", "speed_test", "Speed"),
-        ("f11", "toggle_realtime", "Mode"),
         ("f12", "cycle_model", "Model"),
     ]
 
@@ -431,23 +403,7 @@ class ArenaApp(App):
         current_backend = self.coach.backend_name
         current_model = self.coach.model_name
 
-        # Determine if we're in realtime mode based on current backend
-        is_realtime = current_backend in ("gpt-realtime", "gemini-live")
-
-        # Update the realtime switch and mode labels
-        try:
-            realtime_switch = self.query_one("#switch-realtime", Switch)
-            if realtime_switch.value != is_realtime:
-                with self.prevent(Switch.Changed):
-                    realtime_switch.value = is_realtime
-            self.update_mode_labels(is_realtime)
-        except Exception:
-            pass
-
-        # Update provider select options based on mode
-        self._update_provider_options(is_realtime)
-
-        # Try to match current state to dropdown options
+        # Try to match current state to provider dropdown
         combo = f"{current_backend}/{current_model}" if current_model else current_backend
 
         try:
@@ -466,12 +422,12 @@ class ArenaApp(App):
         except Exception:
             pass
 
-        # Sync states
-        self.update_status("MODEL", self.coach.model_name or "Default")
+        # Sync model status
+        model_display = f"{current_backend}/{current_model}" if current_model else current_backend
+        self.update_status("MODEL", model_display)
         self.update_status("STYLE", self.coach.advice_style.upper())
 
         # Sync voice output
-            # Sync voice output
         if self.coach._voice_output:
             curr_id, desc = self.coach._voice_output.current_voice
             self.update_status("VOICE_ID", desc)
@@ -529,10 +485,52 @@ class ArenaApp(App):
 
     def write_advice(self, text: str, seat_info: str) -> None:
         """Write specialized advice block."""
+        # Auto-start recording when advice is given and no recording is active
+        self._auto_start_recording_if_needed()
+
         if self.log_widget:
             self.log_widget.write(f"\n[bold magenta]--- COACH ({seat_info}) ---[/]")
             self.log_widget.write(f"[bold white]{text}[/]")
             self.log_widget.write("[magenta]-----------------------[/]\n")
+
+    def _auto_start_recording_if_needed(self) -> None:
+        """Auto-start recording if advisor is running and no recording active."""
+        from datetime import datetime
+
+        current = get_current_recording()
+        if current:
+            return  # Already recording
+
+        # Check if we have an active game
+        if not self.coach or not hasattr(self.coach, '_mcp') or not self.coach._mcp:
+            return
+
+        try:
+            gs = self.coach._mcp.get_game_state()
+            if not gs:
+                return
+
+            turn_num = gs.get("turn", {}).get("turn_number", 0)
+            if turn_num < 1:
+                return  # No active game yet
+
+            # We have an active game - auto-start recording
+            match_id = gs.get("match_id") or f"auto_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            start_recording(match_id)
+
+            # Update analyze button to show recording is active
+            try:
+                btn = self.query_one("#btn-analyze", Button)
+                btn.label = "Recording..."
+                btn.variant = "error"
+            except:
+                pass
+
+            if self.log_widget:
+                self.log_widget.write("[dim]Match recording started automatically[/]")
+
+        except Exception as e:
+            pass  # Don't fail advice delivery if auto-record fails
 
     def update_status(self, key: str, value: str) -> None:
         """Update status labels."""
@@ -556,20 +554,14 @@ class ArenaApp(App):
         btn_id = event.button.id
         if btn_id == "btn-mute":
             self.action_toggle_mute()
-        elif btn_id == "btn-speed":
-            self.action_speed_test()
-        elif btn_id == "btn-bug":
-            self.action_bug_report()
-        elif btn_id == "btn-debug-report":
-            self.action_take_debug_report()
+        elif btn_id == "btn-debug":
+            self.action_copy_debug()
         elif btn_id == "btn-screenshot":
-            self.action_screenshot()
+            self.action_analyze_screen()
+        elif btn_id == "btn-analyze":
+            self.action_stop_recording()
         elif btn_id == "btn-restart":
             self.action_restart()
-        elif btn_id == "btn-record-start":
-            self.action_start_recording()
-        elif btn_id == "btn-record-stop":
-            self.action_stop_recording()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle chat input."""
@@ -658,244 +650,96 @@ class ArenaApp(App):
         # Proceed with switch
         self.coach.set_backend(provider, model)
 
-
-    def on_switch_changed(self, event: Switch.Changed) -> None:
-        if event.switch.id == "switch-realtime":
-            is_realtime = event.value
-            self._update_realtime_mode(is_realtime)
-
-    def _update_realtime_mode(self, is_realtime: bool) -> None:
-        """Update mode labels and provider options when toggling Local/Realtime."""
-        try:
-            self.update_mode_labels(is_realtime)
-            self._update_provider_options(is_realtime)
-
-            # Auto-select first option and switch backend
-            options = Sidebar.REALTIME_OPTIONS if is_realtime else Sidebar.STANDARD_OPTIONS
-            if options:
-                select = self.query_one("#select-provider", Select)
-                select.value = options[0][1]
-
-            mode_name = "Realtime" if is_realtime else "Local"
-            self.write_log(f"[yellow]Switched to {mode_name} mode[/]")
-        except Exception as e:
-            self.write_log(f"[red]Mode switch error: {e}[/]")
-
-    def update_mode_labels(self, is_realtime: bool) -> None:
-        """Update the active class on Local/Realtime labels."""
-        try:
-            lbl_local = self.query_one("#lbl-local", Label)
-            lbl_realtime = self.query_one("#lbl-realtime", Label)
-
-            if is_realtime:
-                lbl_realtime.add_class("toggle-label-active")
-                lbl_local.remove_class("toggle-label-active")
-            else:
-                lbl_local.add_class("toggle-label-active")
-                lbl_realtime.remove_class("toggle-label-active")
-        except Exception:
-            pass
-
-    def _update_provider_options(self, is_realtime: bool) -> None:
-        """Update provider select options based on current mode."""
-        try:
-            select = self.query_one("#select-provider", Select)
-            options = Sidebar.REALTIME_OPTIONS if is_realtime else Sidebar.STANDARD_OPTIONS
-            select.set_options(options)
-        except Exception:
-            pass
-
-
     # --- Hotkey Actions ---
-    
-    def action_screenshot(self) -> None:
-        """Take screenshot for mulligan analysis."""
+
+    def action_analyze_screen(self) -> None:
+        """Analyze the current screen (F3) - mulligan, board state, etc."""
         if self.coach:
             threading.Thread(target=self.coach.take_screenshot_analysis, daemon=True).start()
 
-    def action_bug_report(self) -> None:
-        """Alias for F7 binding."""
-        self.action_take_debug_report()
+    def action_copy_debug(self) -> None:
+        """Copy current debug state to clipboard (F7)."""
+        if not self.coach:
+            self.write_log("[yellow]Coach not initialized[/]")
+            return
 
-    def action_take_debug_report(self) -> None:
-        """Generate bug report and copy path."""
-        if self.coach:
-            # We wrap the existing logic but ensure we get the path
-            threading.Thread(target=self._do_debug_report_copy, daemon=True).start()
+        threading.Thread(target=self._do_copy_debug, daemon=True).start()
 
-    def _do_debug_report_copy(self):
-        """Generate bug report, take screenshots, and copy path to clipboard."""
-        import datetime
-        import os
-        from pathlib import Path
-        
-        # Trigger report generation
-        report_path = self.coach.save_bug_report(reason="Manual Debug Report")
-        
-        if report_path:
-            # Copy report path to clipboard
-            from arenamcp.clipboard_utils import copy_to_clipboard
-            copy_to_clipboard(str(report_path))
-            
-            # Take screenshots
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            desktop = Path.home() / "Desktop"
-            desktop.mkdir(exist_ok=True)
-            
-            tui_screenshot = desktop / f"tui_screenshot_{timestamp}.png"
-            arena_screenshot = desktop / f"arena_screenshot_{timestamp}.png"
-            
-            screenshots_taken = []
-            
-            # Screenshot the TUI window
-            try:
-                import pygetwindow as gw
-                from PIL import ImageGrab
-                
-                # Find TUI window (title contains "MTGA Coach")
-                tui_windows = [w for w in gw.getWindowsWithTitle("MTGA Coach")]
-                if tui_windows:
-                    tui_win = tui_windows[0]
-                    tui_win.activate()
-                    import time
-                    time.sleep(0.1)  # Let window come to front
-                    
-                    bbox = (tui_win.left, tui_win.top, tui_win.left + tui_win.width, tui_win.top + tui_win.height)
-                    img = ImageGrab.grab(bbox)
-                    img.save(tui_screenshot)
-                    screenshots_taken.append(f"TUI: {tui_screenshot.name}")
-            except Exception as e:
-                self.call_from_thread(self.write_log, f"[yellow]TUI screenshot failed: {e}[/]")
-            
-            # Screenshot the Arena window
-            try:
-                import pygetwindow as gw
-                from PIL import ImageGrab
-                
-                # Find Arena window (title contains "MTGA" or "Magic: The Gathering Arena")
-                arena_windows = [w for w in gw.getAllWindows() if "MTGA" in w.title or "Magic" in w.title]
-                if arena_windows:
-                    arena_win = arena_windows[0]
-                    arena_win.activate()
-                    import time
-                    time.sleep(0.1)
-                    
-                    bbox = (arena_win.left, arena_win.top, arena_win.left + arena_win.width, arena_win.top + arena_win.height)
-                    img = ImageGrab.grab(bbox)
-                    img.save(arena_screenshot)
-                    screenshots_taken.append(f"Arena: {arena_screenshot.name}")
-            except Exception as e:
-                self.call_from_thread(self.write_log, f"[yellow]Arena screenshot failed: {e}[/]")
-            
-            # Generate validation report if recording is in progress
-            validation_summary = None
-            try:
-                current = get_current_recording()
-                if current and len(current.frames) > 0:
-                    from arenamcp.match_validator import MatchValidator
-                    validator = MatchValidator()
-                    
-                    # Build a recording object for validation
-                    from arenamcp.match_validator import MatchRecording
-                    recording = MatchRecording(
-                        match_id=current.match_id,
-                        start_time=current.start_time,
-                        frames=current.frames
-                    )
-                    
-                    results = validator.validate_recording(recording)
-                    
-                    # Summarize results
-                    errors = len([r for r in results if r.severity == "error"])
-                    warnings = len([r for r in results if r.severity == "warning"])
-                    infos = len([r for r in results if r.severity == "info"])
-                    
-                    validation_summary = f"Validation: {errors} errors, {warnings} warnings, {infos} timing ({len(current.frames)} frames)"
-                    
-                    # Save a quick validation report alongside the bug report
-                    val_report = validator.generate_report(recording)
-                    val_path = report_path.parent / f"validation_{report_path.stem}.txt"
-                    val_path.write_text(val_report)
-                    validation_summary += f"\n[dim]Saved: {val_path.name}[/]"
-            except Exception as e:
-                self.call_from_thread(self.write_log, f"[yellow]Validation failed: {e}[/]")
-            
-            # Report success
-            msg_parts = [f"[bold green]✓ Debug Report:[/] {report_path.name}", "[green]Path copied to clipboard[/]"]
-            if screenshots_taken:
-                msg_parts.append(f"[green]Screenshots: {', '.join(screenshots_taken)}[/]")
-            if validation_summary:
-                msg_parts.append(f"[cyan]{validation_summary}[/]")
-            
-            self.call_from_thread(self.write_log, "\n".join(msg_parts))
+    def _do_copy_debug(self):
+        """Save debug report to file and copy file path to clipboard."""
+        # Delegate to coach's comprehensive bug report (saves file, copies path)
+        if self.coach and hasattr(self.coach, 'save_bug_report'):
+            bug_path = self.coach.save_bug_report("Copy Debug (F7)")
+            if bug_path:
+                self.call_from_thread(
+                    self.write_log,
+                    f"[green]Debug report saved. Path copied to clipboard.[/]"
+                )
+            else:
+                self.call_from_thread(
+                    self.write_log,
+                    "[red]Failed to save debug report[/]"
+                )
         else:
-            self.call_from_thread(self.write_log, "[red]Failed to generate debug report[/]")
+            self.call_from_thread(
+                self.write_log,
+                "[yellow]Coach not available for debug report[/]"
+            )
 
     def action_restart(self) -> None:
         """Handle restart request - cleanly stops coach and exits app for restart."""
-        if self.coach:
-            self.write_log("[yellow]Restarting coach...[/]")
-            # Stop the coach cleanly in a thread to avoid blocking
-            def do_restart():
-                self.coach.stop()
-                # Signal restart via exit with special result
-                self._restart_requested = True
-                self.call_from_thread(self.exit, "restart")
-            threading.Thread(target=do_restart, daemon=True).start()
+        self._restart_requested = True
 
-    def action_start_recording(self) -> None:
-        """Start recording match for post-game validation."""
-        from datetime import datetime
-        
-        current = get_current_recording()
-        if current:
-            self.write_log("[yellow]⚠ Recording already in progress. Stop it first.[/]")
-            return
-        
-        # Generate a match ID based on timestamp if we don't have one from Arena
-        match_id = f"manual_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        if self.coach and hasattr(self.coach, '_mcp') and self.coach._mcp:
-            try:
-                gs = self.coach._mcp.get_game_state()
-                if gs and gs.get("match_id"):
-                    match_id = gs["match_id"]
-            except:
-                pass
-        
-        recording = start_recording(match_id)
-        
-        # Update button appearance
-        try:
-            btn = self.query_one("#btn-record-start", Button)
-            btn.label = "🔴 RECORDING..."
-            btn.variant = "error"
-        except:
-            pass
-        
-        self.write_log(f"[bold red]🔴 MATCH RECORDING STARTED[/]")
-        self.write_log(f"[dim]Match ID: {match_id}[/]")
-        self.write_log("[dim]Click 'Stop & Analyze' when match ends.[/]")
+        if self.coach:
+            self.write_log("[yellow]Restarting...[/]")
+            # Stop the coach cleanly in a thread, then signal exit
+            def do_restart():
+                try:
+                    self.coach.stop()
+                except Exception as e:
+                    logger.error(f"Error stopping coach during restart: {e}")
+
+                # Clear __pycache__ to ensure fresh module imports during development
+                import shutil
+                import pathlib
+                src_dir = pathlib.Path(__file__).parent
+                pycache_dir = src_dir / "__pycache__"
+                if pycache_dir.exists():
+                    try:
+                        shutil.rmtree(pycache_dir)
+                        logger.info(f"Cleared pycache: {pycache_dir}")
+                    except Exception as e:
+                        logger.warning(f"Failed to clear pycache: {e}")
+
+            thread = threading.Thread(target=do_restart, daemon=True)
+            thread.start()
+            # Wait briefly for cleanup, then force exit (don't rely on thread completing)
+            thread.join(timeout=3.0)
+
+        # Exit on the main thread directly — more reliable than call_from_thread
+        self.exit("restart")
 
     def action_stop_recording(self) -> None:
-        """Stop recording and run validation analysis."""
+        """Stop recording and run match analysis."""
         recording = get_current_recording()
         if not recording:
-            self.write_log("[yellow]⚠ No recording in progress.[/]")
+            self.write_log("[yellow]No match recording in progress.[/]")
+            self.write_log("[dim]Recording starts automatically when advisor gives advice during a game.[/]")
             return
-        
+
         # Stop recording
         recording = stop_recording()
-        
-        # Reset button
+
+        # Reset analyze button
         try:
-            btn = self.query_one("#btn-record-start", Button)
-            btn.label = "🔴 Record Match"
+            btn = self.query_one("#btn-analyze", Button)
+            btn.label = "Analyze Match"
             btn.variant = "warning"
         except:
             pass
-        
-        self.write_log(f"[bold green]⏹ RECORDING STOPPED[/]")
-        self.write_log(f"[dim]Recorded {len(recording.frames)} frames[/]")
+
+        self.write_log(f"[bold green]Match analysis started[/]")
+        self.write_log(f"[dim]Recorded {len(recording.frames)} frames, {len(recording.advice_events)} advice events[/]")
         
         # Run validation in background thread
         threading.Thread(
@@ -973,12 +817,301 @@ class ArenaApp(App):
             copy_to_clipboard(str(recording_path))
             self.call_from_thread(self.write_log, "[green]Path copied to clipboard[/]")
             self.call_from_thread(self.write_log, "[bold cyan]═══════════════════════════[/]")
-            
+
+            # Run advisor comparison analysis
+            self._run_advisor_comparison(recording)
+
         except Exception as e:
             self.call_from_thread(self.write_log, f"[red]Validation error: {e}[/]")
             import traceback
             traceback.print_exc()
 
+    def _run_advisor_comparison(self, recording: MatchRecording) -> None:
+        """Compare advice given during the match vs what player actually did."""
+        self.call_from_thread(self.write_log, "")
+        self.call_from_thread(self.write_log, "[bold magenta]═══ ADVISOR vs PLAYER ANALYSIS ═══[/]")
+
+        try:
+            import json
+
+            # Load card database for name resolution
+            card_db = None
+            try:
+                card_db = MTGADatabase()
+            except:
+                pass
+
+            def get_card_name(grp_id):
+                if card_db and grp_id:
+                    try:
+                        card = card_db.get_card(grp_id)
+                        if card:
+                            return card.name
+                    except:
+                        pass
+                return f"Card#{grp_id}"
+
+            # Get advice that was actually given during the match
+            advice_events = recording.advice_events
+            self.call_from_thread(
+                self.write_log,
+                f"[dim]Advice events recorded: {len(advice_events)}[/]"
+            )
+
+            if not advice_events:
+                self.call_from_thread(
+                    self.write_log,
+                    "[yellow]No advice was recorded during this match.[/]"
+                )
+                self.call_from_thread(
+                    self.write_log,
+                    "[dim]Make sure recording is started before advice is given.[/]"
+                )
+                self.call_from_thread(self.write_log, "[bold magenta]════════════════════════════════[/]")
+                return
+
+            # Detect player actions by comparing consecutive frames
+            player_actions = self._detect_player_actions(recording.frames, card_db)
+            self.call_from_thread(
+                self.write_log,
+                f"[dim]Player actions detected: {len(player_actions)}[/]"
+            )
+
+            # Group advice and actions by turn
+            turns_data = {}
+            for event in advice_events:
+                turn = event.get('parsed_turn', 0)
+                if turn not in turns_data:
+                    turns_data[turn] = {'advice': [], 'actions': []}
+                turns_data[turn]['advice'].append(event)
+
+            for action in player_actions:
+                turn = action.get('turn', 0)
+                if turn not in turns_data:
+                    turns_data[turn] = {'advice': [], 'actions': []}
+                turns_data[turn]['actions'].append(action)
+
+            # Analyze each turn for deviations
+            deviations = []
+            for turn in sorted(turns_data.keys()):
+                if turn == 0:
+                    continue
+                data = turns_data[turn]
+                advice_list = data['advice']
+                actions_list = data['actions']
+
+                self.call_from_thread(self.write_log, "")
+                self.call_from_thread(
+                    self.write_log,
+                    f"[bold]Turn {turn}[/]"
+                )
+
+                # Show advice given
+                for adv in advice_list:
+                    advice_text = adv.get('advice', '')[:100]
+                    trigger = adv.get('trigger', 'unknown')
+                    self.call_from_thread(
+                        self.write_log,
+                        f"  [cyan]Advice ({trigger}):[/] {advice_text}..."
+                    )
+
+                # Show actions taken
+                if actions_list:
+                    for act in actions_list:
+                        self.call_from_thread(
+                            self.write_log,
+                            f"  [green]Action:[/] {act.get('description', 'unknown')}"
+                        )
+                else:
+                    self.call_from_thread(
+                        self.write_log,
+                        f"  [dim]Action: (no detected action)[/]"
+                    )
+
+                # Flag potential deviations
+                if advice_list and actions_list:
+                    deviation = self._check_deviation(advice_list, actions_list, card_db)
+                    if deviation:
+                        deviations.append({
+                            'turn': turn,
+                            'advice': advice_list[0].get('advice', ''),
+                            'action': actions_list[0].get('description', ''),
+                            'analysis': deviation
+                        })
+                        self.call_from_thread(
+                            self.write_log,
+                            f"  [yellow]>>> DEVIATION: {deviation}[/]"
+                        )
+
+            # Summary
+            self.call_from_thread(self.write_log, "")
+            if deviations:
+                self.call_from_thread(
+                    self.write_log,
+                    f"[yellow]Found {len(deviations)} potential deviations[/]"
+                )
+            else:
+                self.call_from_thread(
+                    self.write_log,
+                    "[green]No significant deviations detected[/]"
+                )
+
+            # Save detailed comparison report
+            validation_dir = LOG_DIR / "match_validations"
+            comparison_path = validation_dir / f"advisor_comparison_{recording.match_id}.json"
+
+            with open(comparison_path, 'w') as f:
+                json.dump({
+                    'match_id': recording.match_id,
+                    'advice_events': advice_events,
+                    'player_actions': player_actions,
+                    'deviations': deviations,
+                    'turns_analyzed': len([t for t in turns_data if t > 0]),
+                }, f, indent=2, default=str)
+
+            self.call_from_thread(self.write_log, "")
+            self.call_from_thread(
+                self.write_log,
+                f"[bold]Comparison saved:[/] {comparison_path.name}"
+            )
+            self.call_from_thread(self.write_log, "[bold magenta]════════════════════════════════[/]")
+
+        except Exception as e:
+            self.call_from_thread(self.write_log, f"[red]Advisor comparison error: {e}[/]")
+            import traceback
+            traceback.print_exc()
+
+    def _detect_player_actions(self, frames: list, card_db) -> list:
+        """Detect player actions by comparing consecutive frames."""
+        actions = []
+
+        def get_card_name(grp_id):
+            if card_db and grp_id:
+                try:
+                    card = card_db.get_card(grp_id)
+                    if card:
+                        return card.name
+                except:
+                    pass
+            return f"Card#{grp_id}"
+
+        prev_snap = None
+        for frame in frames:
+            snap = frame.parsed_snapshot or {}
+            if not prev_snap:
+                prev_snap = snap
+                continue
+
+            turn_info = snap.get('turn_info', {})
+            turn = turn_info.get('turn_number', 0)
+            phase = turn_info.get('phase', '')
+            local_seat = snap.get('local_seat_id', 1)
+
+            # Get previous and current zones
+            prev_hand = {c.get('instance_id'): c for c in prev_snap.get('zones', {}).get('my_hand', [])}
+            curr_hand = {c.get('instance_id'): c for c in snap.get('zones', {}).get('my_hand', [])}
+            prev_bf = prev_snap.get('zones', {}).get('battlefield', [])
+            curr_bf = snap.get('zones', {}).get('battlefield', [])
+
+            # Detect cards played from hand (left hand, appeared on battlefield)
+            for inst_id, card in prev_hand.items():
+                if inst_id and inst_id not in curr_hand:
+                    # Card left hand - check if it went to battlefield
+                    name = get_card_name(card.get('grp_id'))
+                    # Check if it appeared on battlefield
+                    bf_match = [c for c in curr_bf if c.get('instance_id') == inst_id]
+                    if bf_match:
+                        actions.append({
+                            'turn': turn,
+                            'phase': phase,
+                            'type': 'play_permanent',
+                            'card_name': name,
+                            'grp_id': card.get('grp_id'),
+                            'description': f"Played {name}"
+                        })
+                    else:
+                        # Might be a spell that resolved
+                        actions.append({
+                            'turn': turn,
+                            'phase': phase,
+                            'type': 'cast_spell',
+                            'card_name': name,
+                            'grp_id': card.get('grp_id'),
+                            'description': f"Cast {name}"
+                        })
+
+            # Detect attacks (creatures marked as attacking)
+            prev_attackers = set()
+            curr_attackers = set()
+            for c in prev_bf:
+                if c.get('is_attacking'):
+                    prev_attackers.add(c.get('instance_id'))
+            for c in curr_bf:
+                if c.get('is_attacking'):
+                    curr_attackers.add(c.get('instance_id'))
+
+            new_attackers = curr_attackers - prev_attackers
+            if new_attackers and 'Combat' in phase:
+                attacker_names = []
+                for inst_id in new_attackers:
+                    for c in curr_bf:
+                        if c.get('instance_id') == inst_id:
+                            attacker_names.append(get_card_name(c.get('grp_id')))
+                if attacker_names:
+                    actions.append({
+                        'turn': turn,
+                        'phase': phase,
+                        'type': 'attack',
+                        'description': f"Attacked with {', '.join(attacker_names)}"
+                    })
+
+            prev_snap = snap
+
+        return actions
+
+    def _check_deviation(self, advice_list: list, actions_list: list, card_db) -> str:
+        """Check if player action deviated from advice."""
+        if not advice_list or not actions_list:
+            return None
+
+        advice_text = advice_list[0].get('advice', '').lower()
+        action = actions_list[0]
+        action_type = action.get('type', '')
+        card_name = action.get('card_name', '').lower()
+
+        # Check if the action was a spell/permanent
+        if action_type in ('play_permanent', 'cast_spell') and card_name:
+            # If the card was mentioned in the advice, it's NOT a deviation
+            # This handles "Play Mountain. Cast Gene Pollinator. Pass." correctly
+            if card_name in advice_text:
+                return None  # Card was suggested, no deviation
+
+            # Check if advice was ONLY to pass/wait (not "play X then pass")
+            # Look for pass/wait at the START of advice, or advice that's very short
+            advice_stripped = advice_text.strip()
+            is_pass_only = (
+                advice_stripped.startswith('pass') or
+                advice_stripped.startswith('wait') or
+                advice_stripped == 'pass.' or
+                advice_stripped == 'pass priority.' or
+                'let it resolve' in advice_stripped or
+                ('pass' in advice_stripped and 'play' not in advice_stripped and 'cast' not in advice_stripped)
+            )
+
+            if is_pass_only:
+                return f"Advisor suggested waiting, but player cast {action.get('card_name')}"
+
+            # Card wasn't mentioned and advice wasn't just "pass"
+            return f"Played {action.get('card_name')} but advisor didn't suggest this card"
+
+        # Check if advice said to attack but player didn't
+        if 'attack' in advice_text and action_type != 'attack':
+            # Look through all actions for an attack
+            has_attack = any(a.get('type') == 'attack' for a in actions_list)
+            if not has_attack and 'don\'t attack' not in advice_text and 'no attack' not in advice_text:
+                return "Advisor suggested attacking, but no attack detected"
+
+        return None
 
     def action_toggle_style(self) -> None:
         if self.coach:
@@ -993,34 +1126,25 @@ class ArenaApp(App):
         if self.coach:
             threading.Thread(target=self.coach._on_mute_hotkey, daemon=True).start()
 
-    def action_speed_test(self) -> None:
-        """Run API speed test."""
-        if self.coach:
-            threading.Thread(target=self.coach.run_speed_test, daemon=True).start()
-
-        if self.coach:
-            threading.Thread(target=self.coach.run_speed_test, daemon=True).start()
-
     def action_cycle_voice(self) -> None:
         if self.coach:
             threading.Thread(target=self.coach._on_voice_cycle_hotkey, daemon=True).start()
 
     def action_cycle_model(self) -> None:
-        """Cycle through available models for the current mode."""
+        """Cycle through available models (F12)."""
         if not self.coach:
             return
-            
+
         current_backend = self.coach.backend_name
         current_model = self.coach.model_name
-        is_realtime = current_backend in ("gpt-realtime", "gemini-live")
-        
-        options = Sidebar.REALTIME_OPTIONS if is_realtime else Sidebar.STANDARD_OPTIONS
+
+        options = Sidebar.MODEL_OPTIONS
         if not options:
             return
-            
+
         # Find current index
         current_combo = f"{current_backend}/{current_model}" if current_model else current_backend
-        
+
         try:
             # 1. Try exact match
             idx = -1
@@ -1028,37 +1152,28 @@ class ArenaApp(App):
                 if str(val) == current_combo:
                     idx = i
                     break
-            
-            # 2. If no exact match (custom model?), try prefix match strictly for fallback at index 0
+
+            # 2. If no exact match, try prefix match
             if idx == -1:
                 for i, (_, val) in enumerate(options):
                     if str(val).startswith(current_backend):
                         idx = i
                         break
-            
-            # 3. Default to 0 if totally lost
+
+            # 3. Default to 0 if not found
             if idx == -1:
                 idx = 0
-            
+
             # Next index
             next_idx = (idx + 1) % len(options)
             _, next_val = options[next_idx]
-            
-            # Switch via the UI method to ensure everything updates cleanly
+
+            # Switch via the UI
             select = self.query_one("#select-provider", Select)
             select.value = next_val
-            
+
         except Exception as e:
             self.write_log(f"[red]Model cycle error: {e}[/]")
-
-    def action_toggle_realtime(self) -> None:
-        """Toggle between Local and Realtime mode (F11)."""
-        try:
-            switch = self.query_one("#switch-realtime", Switch)
-            switch.value = not switch.value
-            # The switch change handler will update the model list
-        except Exception as e:
-            self.write_log(f"[red]Toggle error: {e}[/]")
 
     def action_quit(self) -> None:
         if self.coach:
