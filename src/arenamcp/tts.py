@@ -32,6 +32,70 @@ MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model
 VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
 
 
+def _extract_audio_from_response(response) -> bytes | None:
+    """Extract audio bytes from a Gemini API response.
+
+    Searches through response candidates and parts to find inline_data
+    with audio content. Returns the raw bytes, or None if not found.
+    """
+    try:
+        if not hasattr(response, 'candidates') or not response.candidates:
+            return None
+        for candidate in response.candidates:
+            if not hasattr(candidate, 'content') or not candidate.content:
+                continue
+            if not hasattr(candidate.content, 'parts') or not candidate.content.parts:
+                continue
+            for part in candidate.content.parts:
+                if hasattr(part, 'inline_data') and part.inline_data:
+                    if hasattr(part.inline_data, 'data') and part.inline_data.data:
+                        return part.inline_data.data
+    except Exception as e:
+        logger.error(f"Error extracting audio from response: {e}")
+    return None
+
+
+def _decode_audio_bytes(audio_data: bytes, default_rate: int = 24000) -> tuple[np.ndarray, int]:
+    """Decode audio bytes (WAV or raw PCM) to numpy float32 array.
+
+    Tries WAV format first. If that fails (not RIFF header), falls back
+    to interpreting as raw 16-bit PCM at the default sample rate.
+
+    Returns:
+        Tuple of (samples as float32, sample_rate).
+    """
+    import io
+    import wave
+
+    # Try WAV first
+    if audio_data[:4] == b'RIFF':
+        try:
+            with wave.open(io.BytesIO(audio_data), "rb") as wf:
+                sample_rate = wf.getframerate()
+                n_channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                raw_frames = wf.readframes(wf.getnframes())
+
+            if sampwidth == 2:
+                samples = np.frombuffer(raw_frames, dtype=np.int16).astype(np.float32) / 32768.0
+            elif sampwidth == 4:
+                samples = np.frombuffer(raw_frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+            else:
+                samples = np.frombuffer(raw_frames, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
+
+            if n_channels > 1:
+                samples = samples.reshape(-1, n_channels).mean(axis=1)
+
+            return samples, sample_rate
+        except Exception as e:
+            logger.warning(f"WAV decode failed despite RIFF header: {e}, trying raw PCM")
+
+    # Fallback: raw 16-bit PCM at default sample rate
+    logger.info(f"Decoding as raw PCM16 ({len(audio_data)} bytes, {default_rate}Hz)")
+    samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+    return samples, default_rate
+
+
 class KokoroTTS:
     """Text-to-speech synthesizer using Kokoro ONNX.
 
@@ -228,6 +292,65 @@ class AzureTTS:
             return np.array([], dtype=np.float32), 24000
 
 
+class GeminiTTS:
+    """Text-to-speech using Gemini's native TTS model."""
+
+    def __init__(self, voice: str = "Kore", speed: float = 1.0):
+        self._voice = voice.replace("gemini/", "")
+        self._speed = speed
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            from google import genai
+            api_key = os.environ.get("GOOGLE_API_KEY")
+            if not api_key:
+                logger.error("GOOGLE_API_KEY not set, Gemini TTS unavailable")
+                return None
+            self._client = genai.Client(api_key=api_key)
+        return self._client
+
+    def synthesize(self, text: str) -> tuple[np.ndarray, int]:
+        """Synthesize text using Gemini TTS."""
+        if not text or not text.strip():
+            return np.array([], dtype=np.float32), 24000
+
+        try:
+            client = self._get_client()
+            if client is None:
+                return np.array([], dtype=np.float32), 24000
+
+            from google.genai import types
+
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-preview-tts",
+                contents=text,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=self._voice,
+                            )
+                        )
+                    ),
+                ),
+            )
+
+            # Extract audio data from response (robust parsing)
+            audio_data = _extract_audio_from_response(response)
+            if audio_data is None:
+                logger.error("Gemini TTS: no audio data in response")
+                return np.array([], dtype=np.float32), 24000
+
+            samples, sample_rate = _decode_audio_bytes(audio_data)
+            return samples, sample_rate
+
+        except Exception as e:
+            logger.error(f"Gemini TTS failed: {e}")
+            return np.array([], dtype=np.float32), 24000
+
+
 class VoiceOutput:
     """Unified voice output interface for TTS playback.
 
@@ -266,6 +389,11 @@ class VoiceOutput:
         ("azure/onyx", "Azure - Onyx (Deep Male)"),
         ("azure/nova", "Azure - Nova (Female)"),
         ("azure/shimmer", "Azure - Shimmer (Female)"),
+        ("gemini/Kore", "Gemini - Kore (Female)"),
+        ("gemini/Puck", "Gemini - Puck (Male)"),
+        ("gemini/Charon", "Gemini - Charon (Male)"),
+        ("gemini/Fenrir", "Gemini - Fenrir (Male)"),
+        ("gemini/Aoede", "Gemini - Aoede (Female)"),
     ]
 
     def __init__(
@@ -312,7 +440,9 @@ class VoiceOutput:
     def _ensure_tts(self) -> None:
         """Initialize TTS on first use."""
         if self._tts_engine is None:
-            if self._voice.startswith("azure/"):
+            if self._voice.startswith("gemini/"):
+                self._tts_engine = GeminiTTS(voice=self._voice, speed=self._speed)
+            elif self._voice.startswith("azure/"):
                 self._tts_engine = AzureTTS(voice=self._voice, speed=self._speed)
             else:
                 self._tts_engine = KokoroTTS(voice=self._voice, speed=self._speed)

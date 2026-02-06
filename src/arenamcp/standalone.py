@@ -556,7 +556,7 @@ class StandaloneCoach:
                         self._deck_analyzed = True
                         logger.info(f"Starting deck analysis for {len(deck_cards)} cards")
 
-                        def _analyze_deck_bg(coach, mcp, card_ids, ui):
+                        def _analyze_deck_bg(coach, mcp, card_ids, ui, speak_fn):
                             try:
                                 # Enrich grpIds to (name, type) tuples
                                 enriched = []
@@ -575,12 +575,14 @@ class StandaloneCoach:
                                     first_line = strategy.split("\n")[0].strip()
                                     ui.status("DECK", first_line[:60])
                                     logger.info(f"Deck strategy stored: {len(strategy)} chars")
+                                    # Announce deck archetype via TTS
+                                    speak_fn(f"Deck detected: {first_line}")
                             except Exception as e:
                                 logger.error(f"Background deck analysis failed: {e}")
 
                         t = threading.Thread(
                             target=_analyze_deck_bg,
-                            args=(self._coach, self._mcp, deck_cards, self.ui),
+                            args=(self._coach, self._mcp, deck_cards, self.ui, self.speak_advice),
                             daemon=True,
                         )
                         t.start()
