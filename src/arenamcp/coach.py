@@ -750,6 +750,13 @@ CRITICAL BLOCKING RULES:
 - Do NOT suggest blocking a [FLYING] creature with a ground creature (no [FLYING]/[REACH]).
 - If enemy attackers have [FLYING] and you have no flyers/reach, you CANNOT block them.
 
+CRITICAL STRATEGY RULES:
+- LETHAL CHECK: Before anything else, count your total attack power vs opponent life and blockers.
+  If you can deal lethal, go aggressive — remove a blocker or just attack. Don't play defensively!
+- Bounce/removal spells can target OPPONENT creatures too. Bouncing a blocker for lethal > saving your creature.
+- When opponent has a removal spell on the stack, weigh "save my creature" vs "ignore it and go for the kill."
+- Creatures have power/toughness (e.g. 5/5). Don't call creatures "planeswalkers."
+
 Analyze: phase (critical for timing!), board state, life totals, cards in hand, mana available.
 Output directly as the coach. No preamble, no meta-commentary."""
 
@@ -773,11 +780,18 @@ Examples:
 "Let it resolve. Nothing worth countering."
 "Pass priority."
 
+STRATEGY:
+- LETHAL CHECK: Before anything else, count your total attack power vs opponent life and blockers.
+  If you can deal lethal, go aggressive — remove a blocker or just attack. Don't play defensively!
+- Bounce/removal spells can target OPPONENT creatures too. Bouncing a blocker for lethal > saving your creature.
+- When opponent has a removal spell on the stack, weigh "save my creature" vs "ignore it and go for the kill."
+
 RULES:
 - Only suggest cards tagged [CAN CAST] or [OK]. Cards tagged [NEED X mana] CANNOT be cast!
 - Use exact FULL card names from the game state. Never abbreviate.
 - Only suggest lands shown in HAND. If no land in hand, don't suggest playing one.
 - Say "pass priority" not just "pass" to avoid sounding like a card name.
+- Creatures have power/toughness (e.g. 5/5). Don't call creatures "planeswalkers."
 - This is spoken aloud — keep it natural and under 30 words.
 """
 
