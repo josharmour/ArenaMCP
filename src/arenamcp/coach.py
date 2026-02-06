@@ -100,7 +100,7 @@ class GeminiBackend:
                 raise ImportError("google-genai package required: pip install google-genai")
         return self._client
 
-    def complete(self, system_prompt: str, user_message: str, max_tokens: int = 150) -> str:
+    def complete(self, system_prompt: str, user_message: str, max_tokens: int = 500) -> str:
         """Get completion from Gemini API."""
         import time
 
@@ -240,7 +240,7 @@ class GeminiBackend:
                 contents=[user_message, audio_part],
                 config=genai.types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    max_output_tokens=150,
+                    max_output_tokens=500,
                     temperature=0.0,
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                     safety_settings=[
@@ -264,7 +264,7 @@ class GeminiBackend:
                 )
             )
             request_time = (time.perf_counter() - request_start) * 1000
-            
+
             # Log finish reason
             finish_reason = "UNKNOWN"
             safety_ratings = "UNKNOWN"
@@ -941,9 +941,11 @@ class CoachEngine:
             deck_text = "\n".join(deck_lines)
             user_message = f"DECK LIST ({len(deck_cards)} cards):\n{deck_text}"
 
-            # Deck analysis needs more tokens than the default 150 for game advice
+            # Deck analysis needs far more tokens than the default 150 for game advice.
+            # Thinking models (gemini-2.5-flash) consume tokens on internal reasoning,
+            # so max_output_tokens must be high enough for thinking + visible output.
             try:
-                strategy = self._backend.complete(DECK_ANALYSIS_PROMPT, user_message, max_tokens=400)
+                strategy = self._backend.complete(DECK_ANALYSIS_PROMPT, user_message, max_tokens=2048)
             except TypeError:
                 # Backend doesn't support max_tokens parameter
                 strategy = self._backend.complete(DECK_ANALYSIS_PROMPT, user_message)
