@@ -80,11 +80,11 @@ class ClaudeBackend:
 class GeminiBackend:
     """LLM backend using Google's Gemini API (new google.genai SDK)."""
 
-    def __init__(self, model: str = "gemini-2.0-flash-lite"):
+    def __init__(self, model: str = "gemini-2.5-flash"):
         """Initialize Gemini backend with lazy client creation.
 
         Args:
-            model: The Gemini model to use (default: gemini-2.0-flash-lite)
+            model: The Gemini model to use (default: gemini-2.5-flash)
         """
         self.model = model
         self._client = None
@@ -122,7 +122,9 @@ class GeminiBackend:
                 contents=user_message,
                 config=genai.types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    max_output_tokens=1000,
+                    max_output_tokens=150,
+                    temperature=0.0,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                     safety_settings=[
                         types.SafetySetting(
                             category="HARM_CATEGORY_HARASSMENT",
@@ -141,8 +143,6 @@ class GeminiBackend:
                             threshold="BLOCK_NONE",
                         ),
                     ],
-                    # Disable thinking for now as it causes massive verbosity leakage in standard Flash models
-                    # thinking_config=types.ThinkingConfig(include_thoughts=True) if "thinking" in self.model else None
                 )
             )
             request_time = (time.perf_counter() - request_start) * 1000
@@ -240,7 +240,9 @@ class GeminiBackend:
                 contents=[user_message, audio_part],
                 config=genai.types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    max_output_tokens=1000,
+                    max_output_tokens=150,
+                    temperature=0.0,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                     safety_settings=[
                         types.SafetySetting(
                             category="HARM_CATEGORY_HARASSMENT",
@@ -285,6 +287,111 @@ class GeminiBackend:
             logger.error(f"Gemini audio API error: {e}")
             return f"Error getting advice from Gemini with audio: {e}"
 
+    def complete_audio(
+        self,
+        system_prompt: str,
+        user_message: str,
+        voice: str = "Kore"
+    ) -> "tuple[np.ndarray, int] | None":
+        """Get audio completion from Gemini API (model generates speech directly).
+
+        Uses the same model as text path but with response_modalities=["AUDIO"]
+        so the model reasons about the game state AND speaks the advice in one call.
+
+        Args:
+            system_prompt: The system prompt setting up the assistant role
+            user_message: The game context and trigger description
+            voice: Gemini voice name (default: Kore)
+
+        Returns:
+            Tuple of (samples as float32 numpy array, sample_rate) on success,
+            None on any error.
+        """
+        import io
+        import time
+        import wave
+
+        import numpy as np
+
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            logger.error("GOOGLE_API_KEY not set for audio generation")
+            return None
+
+        try:
+            from google import genai
+            from google.genai import types
+
+            client_start = time.perf_counter()
+            client = self._get_client()
+            client_time = (time.perf_counter() - client_start) * 1000
+
+            request_start = time.perf_counter()
+            response = client.models.generate_content(
+                model=self.model,
+                contents=user_message,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=voice,
+                            )
+                        )
+                    ),
+                    temperature=0.0,
+                    safety_settings=[
+                        types.SafetySetting(
+                            category="HARM_CATEGORY_HARASSMENT",
+                            threshold="BLOCK_NONE",
+                        ),
+                        types.SafetySetting(
+                            category="HARM_CATEGORY_HATE_SPEECH",
+                            threshold="BLOCK_NONE",
+                        ),
+                        types.SafetySetting(
+                            category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                            threshold="BLOCK_NONE",
+                        ),
+                        types.SafetySetting(
+                            category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                            threshold="BLOCK_NONE",
+                        ),
+                    ],
+                )
+            )
+            request_time = (time.perf_counter() - request_start) * 1000
+
+            # Extract WAV audio data from response
+            audio_data = response.candidates[0].content.parts[0].inline_data.data
+
+            # Decode WAV bytes to numpy array (same pattern as GeminiTTS.synthesize())
+            with wave.open(io.BytesIO(audio_data), "rb") as wf:
+                sample_rate = wf.getframerate()
+                n_channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                raw_frames = wf.readframes(wf.getnframes())
+
+            if sampwidth == 2:
+                samples = np.frombuffer(raw_frames, dtype=np.int16).astype(np.float32) / 32768.0
+            elif sampwidth == 4:
+                samples = np.frombuffer(raw_frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+            else:
+                samples = np.frombuffer(raw_frames, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
+
+            # Mix to mono if stereo
+            if n_channels > 1:
+                samples = samples.reshape(-1, n_channels).mean(axis=1)
+
+            logger.info(f"[GEMINI+AUDIO_OUT] API: {request_time:.0f}ms, client: {client_time:.1f}ms, model: {self.model}, voice: {voice}, samples: {len(samples)}, rate: {sample_rate}")
+
+            return (samples, sample_rate)
+
+        except Exception as e:
+            logger.error(f"Gemini audio output error: {e}")
+            return None
+
     def complete_with_image(
         self,
         system_prompt: str,
@@ -312,7 +419,8 @@ class GeminiBackend:
                 contents=[user_message, image_part],
                 config=genai.types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    max_output_tokens=1000,
+                    max_output_tokens=500,
+                    temperature=0.0,
                     safety_settings=[
                          types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
                          types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
@@ -372,6 +480,41 @@ class OllamaBackend:
             logger.error(f"Ollama error: {e}")
             return f"Error getting advice from Ollama: {e}"
 
+    def complete_with_image(self, system_prompt: str, user_message: str, image_data: bytes) -> str:
+        """Get completion from Ollama with image input (vision models like gemma3n, llava, etc.)."""
+        import requests
+        import base64
+
+        try:
+            # Encode image as base64
+            img_b64 = base64.b64encode(image_data).decode('utf-8')
+
+            response = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": user_message,
+                    "system": system_prompt,
+                    "images": [img_b64],  # Ollama expects list of base64 images
+                    "stream": False,
+                },
+                timeout=120,  # Vision requests may take longer
+            )
+
+            if response.status_code == 404:
+                return f"Error: Model '{self.model}' not found. Run: ollama pull {self.model}"
+
+            response.raise_for_status()
+            return response.json().get("response", "No response from Ollama")
+
+        except requests.exceptions.ConnectionError:
+            return "Error: Cannot connect to Ollama. Is it running? Start with: ollama serve"
+        except requests.exceptions.Timeout:
+            return "Error: Ollama vision request timed out"
+        except Exception as e:
+            logger.error(f"Ollama vision error: {e}")
+            return f"Error getting vision advice from Ollama: {e}"
+
 
 class AzureBackend:
     """LLM backend using Azure OpenAI."""
@@ -423,7 +566,6 @@ class AzureBackend:
             content = response.choices[0].message.content
             logger.info(f"[AZURE] API: {request_time:.0f}ms, model: {self.model}")
 
-            return content
             return content
         except Exception as e:
             # Try to handle "DeploymentNotFound" gracefully
@@ -570,10 +712,7 @@ def create_backend(backend_type: str, model: Optional[str] = None) -> LLMBackend
         # Fallback to a standard model if the live model isn't supported for text generation
         text_model = model
         if "live" in (text_model or ""):
-             text_model = "gemini-2.0-flash-lite" # Live models might not support generateContent text-only? 
-             # Actually gemini-2.0-flash-exp supports both. 
-             # But safely default to standard flash for text advice.
-             text_model = "gemini-2.0-flash" 
+             text_model = "gemini-2.5-flash"
         
         return GeminiBackend(model=text_model)
     else:
@@ -628,6 +767,9 @@ Examples:
 "No attacks. Hold mana for Counterspell."
 
 RULE: Only suggest cards marked [CAN CAST]. Cards marked [NEED X mana] are unplayable!
+RULE: Use exact card names (e.g. "Attack with Sazh's Chocobo", NOT "Attack with Bird").
+RULE: ONLY suggest playing lands that appear in the HAND section! If no land is shown in HAND, do NOT say "Play Forest/Island/etc".
+RULE: If HAND is empty or has no playable cards, just say "Pass."
 
 Style: Military/Pro player. Imperative. No fluff.
 Do NOT explain "why". Just say "what".
@@ -675,6 +817,15 @@ Compare each mode's impact:
 Answer: "Choose mode [X]" with brief reason (1 sentence).
 """,
 }
+
+DECK_ANALYSIS_PROMPT = """Analyze this Magic: The Gathering deck list. Provide a brief strategic summary:
+1. ARCHETYPE: One-line description (e.g. "Mono-Red Aggro", "Dimir Control")
+2. WIN CONDITION: How does this deck win?
+3. KEY CARDS: 3-5 most important cards and why
+4. PLAY PATTERN: Ideal curve and sequencing (e.g. "Play threats T1-T3, hold up removal T4+")
+5. WATCH OUT: Key weaknesses or cards to play around
+
+Keep the entire analysis under 300 characters. Be specific to THIS deck, not generic advice."""
 
 
 # Words that tend to be overused by LLMs in coaching contexts
@@ -761,7 +912,55 @@ class CoachEngine:
         self._backend = backend if backend is not None else ClaudeBackend()
         self._system_prompt = system_prompt if system_prompt is not None else DEFAULT_SYSTEM_PROMPT
         self._word_tracker = WordUsageTracker()
+        self._deck_strategy: Optional[str] = None
+        self._deck_strategy_pending = False
     
+    def clear_deck_strategy(self) -> None:
+        """Reset deck strategy for a new match."""
+        self._deck_strategy = None
+        self._deck_strategy_pending = False
+
+    def analyze_deck(self, deck_cards: list[tuple[str, str]]) -> Optional[str]:
+        """Analyze a deck list and store the strategy summary.
+
+        Args:
+            deck_cards: List of (card_name, card_type) tuples
+
+        Returns:
+            Strategy string, or None on failure
+        """
+        import time
+        start = time.perf_counter()
+        self._deck_strategy_pending = True
+
+        try:
+            # Group duplicates compactly: "4x Mountain (Basic Land)"
+            from collections import Counter
+            card_counts = Counter(deck_cards)
+            deck_lines = []
+            for (name, card_type), count in card_counts.most_common():
+                type_short = card_type.split("—")[0].strip() if card_type else "Unknown"
+                deck_lines.append(f"{count}x {name} ({type_short})")
+
+            deck_text = "\n".join(deck_lines)
+            user_message = f"DECK LIST ({len(deck_cards)} cards):\n{deck_text}"
+
+            strategy = self._backend.complete(DECK_ANALYSIS_PROMPT, user_message)
+
+            # Truncate if too long
+            if len(strategy) > 400:
+                strategy = strategy[:397] + "..."
+
+            self._deck_strategy = strategy
+            elapsed = (time.perf_counter() - start) * 1000
+            logger.info(f"Deck analysis complete: {elapsed:.0f}ms, {len(strategy)} chars")
+            return strategy
+        except Exception as e:
+            logger.error(f"Deck analysis failed: {e}")
+            return None
+        finally:
+            self._deck_strategy_pending = False
+
     @staticmethod
     def _estimate_tokens(text: str) -> int:
         """Rough token estimate for logging: ~4 chars per token.
@@ -918,19 +1117,30 @@ class CoachEngine:
         
         for card in your_cards:
             type_line = card.get("type_line", "").lower()
-            if "land" in type_line and not card.get("is_tapped"):
-                total_mana += 1
-                name = card.get("name", "")
-                oracle = card.get("oracle_text", "")
-                
-                # Color detection (simplified)
-                if "Plains" in name or "{W}" in oracle: mana_pool["W"] += 1
-                if "Island" in name or "{U}" in oracle: mana_pool["U"] += 1
-                if "Swamp" in name or "{B}" in oracle: mana_pool["B"] += 1
-                if "Mountain" in name or "{R}" in oracle: mana_pool["R"] += 1
-                if "Forest" in name or "{G}" in oracle: mana_pool["G"] += 1
-                if "{C}" in oracle: mana_pool["C"] += 1
-                if "any color" in oracle.lower(): mana_pool["Any"] += 1
+            oracle = card.get("oracle_text", "")
+            is_creature = "creature" in type_line
+            # Check for casting sickness (unless it has haste)
+            has_haste = "haste" in self._remove_reminder_text(oracle).lower()
+            is_summoning_sick = is_creature and card.get("turn_entered_battlefield") == turn_num and not has_haste
+            
+            # Count mana sources (Lands AND Creatures)
+            # Logic: Untapped AND (Land OR (Creature AND "add {" in oracle AND not summoning sick))
+            # Relaxed check: Just looking for "Add " or "{T}: Add" is surprisingly robust for dorks
+            has_mana_ability = "add {" in oracle.lower() or "add one mana" in oracle.lower()
+            
+            if not card.get("is_tapped"):
+                if "land" in type_line or (is_creature and has_mana_ability and not is_summoning_sick):
+                    total_mana += 1
+                    name = card.get("name", "")
+                    
+                    # Color detection (simplified)
+                    if "Plains" in name or "{W}" in oracle: mana_pool["W"] += 1
+                    if "Island" in name or "{U}" in oracle: mana_pool["U"] += 1
+                    if "Swamp" in name or "{B}" in oracle: mana_pool["B"] += 1
+                    if "Mountain" in name or "{R}" in oracle: mana_pool["R"] += 1
+                    if "Forest" in name or "{G}" in oracle: mana_pool["G"] += 1
+                    if "{C}" in oracle: mana_pool["C"] += 1
+                    if "any color" in oracle.lower(): mana_pool["Any"] += 1
 
         logger.info(f"Mana: {mana_pool} (Total: {total_mana})")
         
@@ -1174,6 +1384,12 @@ class CoachEngine:
             if your_gy > 0 or opp_gy > 0:
                 lines.append(f"GY: Y={your_gy} O={opp_gy}")
 
+        # Command zone (Commander/Brawl)
+        command = game_state.get("command", [])
+        if command:
+            cmd_names = [c.get("name", "Unknown") for c in command]
+            lines.append(f"CMD: {', '.join(cmd_names)}")
+
         return "\n".join(lines)
 
     def _extract_card_name_words(self, game_state: dict[str, Any]) -> set[str]:
@@ -1185,7 +1401,7 @@ class CoachEngine:
         card_words: set[str] = set()
 
         # Collect card names from all zones
-        for zone in ["battlefield", "hand", "graveyard", "stack", "exile"]:
+        for zone in ["battlefield", "hand", "graveyard", "stack", "exile", "command"]:
             for card in game_state.get(zone, []):
                 name = card.get("name", "")
                 # Extract words from card name
@@ -1258,17 +1474,22 @@ class CoachEngine:
         # Build user message
         if question:
             user_message = f"{context}\n\nThe player asks: {question}"
-        if trigger:
+        elif trigger:
             trigger_descriptions = {
-                "new_turn": "A new turn has started.",
+                "new_turn": "Your turn started. Tell the player which land to play (be specific about which one).",
+                "land_played": "Player just played a land. Now tell them which spell to cast next, or to move to combat.",
+                "spell_resolved": "Player's spell just resolved. Tell them what to do next - cast another spell, attack, or pass.",
                 "priority_gained": "You just gained priority.",
-                "combat_attackers": "You're declaring attackers.",
+                "combat_attackers": "Declare your attackers - which creatures should attack?",
                 "combat_blockers": "Opponent attacked, declare blockers.",
                 "low_life": "Your life total is dangerously low!",
                 "opponent_low_life": "Opponent's life is low - chance to win!",
                 "stack_spell": "Something was just cast - do you want to respond?",
+                "stack_spell_yours": "You just cast a spell. Pass priority to let it resolve.",
+                "stack_spell_opponent": "Opponent just cast a spell! Respond or let it resolve?",
                 "user_request": "Give quick strategic advice.",
-                "decision_required": "Game is waiting for a decision (e.g. Mulligan).",
+                "decision_required": "You need to make a decision (scry, discard, target, mulligan, etc). What should the player choose?",
+                "threat_detected": "ALERT: A dangerous card just hit the battlefield!",
             }
             trigger_desc = trigger_descriptions.get(trigger, f"Trigger: {trigger}")
             user_message = f"{context}\n\n{trigger_desc} What should the player do?"
@@ -1295,11 +1516,29 @@ class CoachEngine:
         }
         
         effective_system_prompt = prompts.get(style_key, CONCISE_SYSTEM_PROMPT)
-        
+
+        # Inject deck strategy if available
+        if self._deck_strategy:
+            effective_system_prompt += f"\n\nDECK STRATEGY:\n{self._deck_strategy}"
+
+        # Re-inject blacklisted words and decision guidance into effective prompt
+        if blacklisted:
+            avoid_list = ", ".join(blacklisted)
+            effective_system_prompt += f"\n\nIMPORTANT: Avoid using these overused words: {avoid_list}. Use different phrasing."
+
+        if decision_context:
+            dec_type = decision_context.get("type", "unknown")
+            decision_guidance = DECISION_PROMPTS.get(dec_type)
+            if decision_guidance:
+                effective_system_prompt += f"\n\n{decision_guidance}"
+
         # Get response and track word usage (excluding card names)
         api_start = time.perf_counter()
         response = self._backend.complete(effective_system_prompt, user_message)
         api_time = (time.perf_counter() - api_start) * 1000
+
+        # POST-PROCESSING: Validate and fix common LLM issues (especially for smaller models)
+        response = self._postprocess_advice(response, game_state)
 
         self._word_tracker.record(response, exclude_words=card_words)
 
@@ -1307,6 +1546,245 @@ class CoachEngine:
         logger.info(f"[TIMING] API call: {api_time:.0f}ms, total: {total_time:.0f}ms, response: {len(response)} chars")
 
         return response
+
+    def get_advice_audio(
+        self,
+        game_state: dict[str, Any],
+        trigger: Optional[str] = None,
+        style: str = "concise",
+        voice: str = "Kore"
+    ) -> "tuple[np.ndarray, int] | None":
+        """Get coaching advice as direct audio from the LLM backend.
+
+        Uses the same prompt-building logic as get_advice() but calls
+        complete_audio() to get audio output directly from the model.
+        No postprocessing or word tracking (can't modify audio).
+
+        Args:
+            game_state: Dict from get_game_state() MCP tool
+            trigger: Optional trigger name (e.g., "new_turn", "combat_attackers")
+            style: Advice style ("concise" or "verbose")
+            voice: Gemini voice name (default: Kore)
+
+        Returns:
+            Tuple of (samples as float32 numpy array, sample_rate) on success,
+            None on any error (caller should fall back to text + TTS).
+        """
+        import time
+        total_start = time.perf_counter()
+
+        # Build context (same as get_advice)
+        context = self._format_game_context(game_state)
+
+        # Get card name words to exclude from overuse tracking
+        card_words = self._extract_card_name_words(game_state)
+
+        # Check for overused words
+        blacklisted = self._word_tracker.get_blacklisted(exclude_words=card_words)
+
+        # Build user message (same logic as get_advice)
+        if trigger:
+            trigger_descriptions = {
+                "new_turn": "Your turn started. Tell the player which land to play (be specific about which one).",
+                "land_played": "Player just played a land. Now tell them which spell to cast next, or to move to combat.",
+                "spell_resolved": "Player's spell just resolved. Tell them what to do next - cast another spell, attack, or pass.",
+                "priority_gained": "You just gained priority.",
+                "combat_attackers": "Declare your attackers - which creatures should attack?",
+                "combat_blockers": "Opponent attacked, declare blockers.",
+                "low_life": "Your life total is dangerously low!",
+                "opponent_low_life": "Opponent's life is low - chance to win!",
+                "stack_spell": "Something was just cast - do you want to respond?",
+                "stack_spell_yours": "You just cast a spell. Pass priority to let it resolve.",
+                "stack_spell_opponent": "Opponent just cast a spell! Respond or let it resolve?",
+                "user_request": "Give quick strategic advice.",
+                "decision_required": "You need to make a decision (scry, discard, target, mulligan, etc). What should the player choose?",
+                "threat_detected": "ALERT: A dangerous card just hit the battlefield!",
+            }
+            trigger_desc = trigger_descriptions.get(trigger, f"Trigger: {trigger}")
+            user_message = f"{context}\n\n{trigger_desc} What should the player do?"
+        else:
+            user_message = f"{context}\n\nWhat's the best play right now?"
+
+        # Select system prompt based on style (same as get_advice)
+        style_key = style.lower()
+        prompts = {
+            "concise": CONCISE_SYSTEM_PROMPT,
+            "normal": DEFAULT_SYSTEM_PROMPT,
+            "explain": DEFAULT_SYSTEM_PROMPT.replace("Keep responses concise (2-3 sentences max)", "Explain your reasoning clearly but briefly.") + "\nInclude a short explanation of WHY this is the best line.",
+            "pirate": "You are a ruthless pirate captain coaching a swabby! Speak like a pirate! Yarr! Keep it short!",
+        }
+        effective_system_prompt = prompts.get(style_key, CONCISE_SYSTEM_PROMPT)
+
+        # Inject deck strategy if available
+        if self._deck_strategy:
+            effective_system_prompt += f"\n\nDECK STRATEGY:\n{self._deck_strategy}"
+
+        # Inject blacklisted words
+        if blacklisted:
+            avoid_list = ", ".join(blacklisted)
+            effective_system_prompt += f"\n\nIMPORTANT: Avoid using these overused words: {avoid_list}. Use different phrasing."
+
+        # Inject decision guidance
+        decision_context = game_state.get("decision_context")
+        if decision_context:
+            dec_type = decision_context.get("type", "unknown")
+            decision_guidance = DECISION_PROMPTS.get(dec_type)
+            if decision_guidance:
+                effective_system_prompt += f"\n\n{decision_guidance}"
+
+        # Log prompt size
+        prompt_chars = len(effective_system_prompt) + len(user_message)
+        prompt_tokens_est = self._estimate_tokens(effective_system_prompt + user_message)
+        logger.info(f"[PROMPT+AUDIO] {prompt_chars} chars, ~{prompt_tokens_est} tokens")
+
+        # Call the audio backend
+        result = self._backend.complete_audio(effective_system_prompt, user_message, voice=voice)
+
+        total_time = (time.perf_counter() - total_start) * 1000
+        if result is not None:
+            logger.info(f"[TIMING+AUDIO] total: {total_time:.0f}ms, samples: {len(result[0])}")
+        else:
+            logger.warning(f"[TIMING+AUDIO] total: {total_time:.0f}ms, result: None (will fallback)")
+
+        return result
+
+    def _postprocess_advice(self, advice: str, game_state: dict[str, Any]) -> str:
+        """Post-process LLM advice to fix common issues with smaller models.
+        
+        1. Remove 'Play [Land]' suggestions when no land is in hand
+        2. Fix typos in card names using fuzzy matching
+        """
+        import re
+        
+        # Get cards in hand
+        hand_cards = game_state.get("hand", [])
+        hand_names = {c.get("name", "").lower() for c in hand_cards}
+        
+        # Get all card names in game state for fuzzy matching
+        all_cards = []
+        for zone in ["hand", "battlefield", "graveyard", "stack", "exile"]:
+            all_cards.extend(game_state.get(zone, []))
+        all_card_names = {c.get("name", "") for c in all_cards if c.get("name")}
+        
+        # Check for land names in hand
+        land_types = {"forest", "island", "swamp", "mountain", "plains"}
+        lands_in_hand = {name for name in hand_names if any(lt in name for lt in land_types)}
+        
+        # 1. Remove "Play [Land]" if no land in hand
+        if not lands_in_hand:
+            # Remove patterns like "Play Forest.", "Play Island,", "Play a land."
+            advice = re.sub(r"Play\s+(Forest|Island|Swamp|Mountain|Plains|a land)[.,]?\s*", "", advice, flags=re.IGNORECASE)
+            # Clean up any resulting double spaces or leading/trailing spaces
+            advice = re.sub(r"\s+", " ", advice).strip()
+        
+        # 2. Fix typos in card names using simple fuzzy matching
+        # Common typos seen from Gemma 3N:
+        typo_fixes = {
+            "brerak out": "Break Out",
+            "braimble familiar": "Bramble Familiar",
+            "llanowar eves": "Llanowar Elves",
+            "llanowar elfs": "Llanowar Elves",
+            "craterhood behemoth": "Craterhoof Behemoth",
+            "creterhoof behemoth": "Craterhoof Behemoth",
+            "crterhoof behemoth": "Craterhoof Behemoth",
+            "baadgermole cub": "Badgermole Cub",
+            "badgremole cub": "Badgermole Cub",
+        }
+        
+        advice_lower = advice.lower()
+        for typo, correct in typo_fixes.items():
+            if typo in advice_lower:
+                # Case-insensitive replacement
+                pattern = re.compile(re.escape(typo), re.IGNORECASE)
+                advice = pattern.sub(correct, advice)
+        
+        # Also try to match against actual card names in game state
+        # Split advice into words and check for near-matches
+        for card_name in all_card_names:
+            if len(card_name) < 4:
+                continue  # Skip short names to avoid false matches
+            # Check if card name appears with typos (simple Levenshtein-like check)
+            card_words = card_name.lower().split()
+            for word in card_words:
+                if len(word) < 4:
+                    continue
+                # Look for similar words in advice
+                advice_words = advice.lower().split()
+                for i, advice_word in enumerate(advice_words):
+                    if len(advice_word) >= 4 and self._is_similar(word, advice_word):
+                        # Replace the typo with correct spelling
+                        # Find the actual word in original advice and replace
+                        original_words = advice.split()
+                        if i < len(original_words):
+                            # Only replace if first letter matches (to avoid false positives)
+                            if original_words[i][0].lower() == word[0].lower():
+                                original_words[i] = word.capitalize() if original_words[i][0].isupper() else word
+                                advice = " ".join(original_words)
+        
+        # 3. Remove Cast suggestions for cards that cost more mana than available
+        # Calculate available mana (lands on battlefield + land drop potential)
+        battlefield = game_state.get("battlefield", [])
+        local_seat = None
+        for p in game_state.get("players", []):
+            if p.get("is_local"):
+                local_seat = p.get("seat_id")
+                break
+        
+        # Count untapped lands we control
+        untapped_lands = 0
+        for card in battlefield:
+            if card.get("controller_seat_id") == local_seat or card.get("owner_seat_id") == local_seat:
+                type_line = card.get("type_line", "").lower()
+                if "land" in type_line and not card.get("is_tapped"):
+                    untapped_lands += 1
+        
+        # Check if we have a land in hand (potential +1 mana)
+        has_land_in_hand = lands_in_hand  # already computed above
+        potential_mana = untapped_lands + (1 if has_land_in_hand else 0)
+        
+        # Check each card in hand for mana cost violations
+        for card in hand_cards:
+            card_name = card.get("name", "")
+            mana_cost = card.get("mana_cost", "")
+            if not card_name or not mana_cost:
+                continue
+            
+            # Parse CMC from mana cost (simple heuristic)
+            cmc = 0
+            import re as re_inner
+            # Count {X} symbols
+            symbols = re_inner.findall(r'\{([^}]+)\}', mana_cost)
+            for sym in symbols:
+                if sym.isdigit():
+                    cmc += int(sym)
+                elif sym in ['W', 'U', 'B', 'R', 'G', 'C']:
+                    cmc += 1
+                elif '/' in sym:  # Hybrid like {R/G}
+                    cmc += 1
+            
+            # If this card costs more than we can have, remove Cast suggestions for it
+            if cmc > potential_mana:
+                # Remove "Cast [Card Name]" from advice
+                pattern = re.compile(rf"Cast\s+{re.escape(card_name)}[.,]?\s*", re.IGNORECASE)
+                if pattern.search(advice):
+                    advice = pattern.sub("", advice)
+                    logger.debug(f"Removed uncastable suggestion: {card_name} (needs {cmc}, have {potential_mana})")
+        
+        # Clean up double spaces
+        advice = re.sub(r"\s+", " ", advice).strip()
+        
+        return advice
+    
+    def _is_similar(self, a: str, b: str, threshold: float = 0.7) -> bool:
+        """Check if two strings are similar using simple character overlap."""
+        if a == b:
+            return True
+        if abs(len(a) - len(b)) > 3:
+            return False
+        # Count matching characters
+        matches = sum(1 for c1, c2 in zip(a.lower(), b.lower()) if c1 == c2)
+        similarity = matches / max(len(a), len(b))
+        return similarity >= threshold
 
     def complete_with_image(self, system_prompt: str, user_message: str, image_data: bytes) -> str:
         """Call complete_with_image on backend if supported."""
@@ -1319,6 +1797,46 @@ class CoachEngine:
 class GameStateTrigger:
     """Detects trigger conditions by comparing game states."""
 
+    # Tier list of dangerous cards that warrant immediate warning
+    # Format: card_name -> brief description of the threat
+    THREAT_CARDS = {
+        # Board wipes
+        "Wrath of God": "Board wipe! Destroys all creatures.",
+        "Damnation": "Board wipe! Destroys all creatures.",
+        "Farewell": "Exiles ALL permanents of chosen types!",
+        "Sunfall": "Exiles all creatures, makes a big token.",
+        "Depopulate": "Board wipe, draws if you have multicolor.",
+        "Temporary Lockdown": "Exiles all permanents MV 2 or less!",
+        "Meticulous Archive": "Can find board wipes or removal.",
+        
+        # Combo pieces / Must-answer threats
+        "Sheoldred, the Apocalypse": "Drains 2 on your draws, heals on theirs!",
+        "Atraxa, Grand Unifier": "Draws 10+ cards on ETB, lifelink flyer.",
+        "Raffine, Scheming Seer": "Grows attackers and filters cards.",
+        "The Wandering Emperor": "Flash! Can exile or make blockers anytime.",
+        "Teferi, Time Raveler": "Shuts off your instant-speed plays!",
+        "Narset, Parter of Veils": "You can only draw 1 card per turn!",
+        "Omnath, Locus of Creation": "Massive value engine, gains life.",
+        "Vorinclex, Voice of Hunger": "Doubles their counters, halves yours.",
+        
+        # Powerful planeswalkers
+        "Oko, Thief of Crowns": "Elks your best creatures!",
+        "Karn, the Great Creator": "Shuts off artifacts, grabs from sideboard.",
+        "Wrenn and Six": "Recurring lands and pinging creatures.",
+        
+        # Lock pieces
+        "Drannith Magistrate": "You can't cast from graveyard/exile!",
+        "Archon of Emeria": "Only 1 spell per turn, lands ETB tapped.",
+        "Thalia, Guardian of Thraben": "Noncreature spells cost 1 more.",
+        "Authority of the Consuls": "Your creatures ETB tapped.",
+        "High Noon": "Only 1 spell per turn for everyone.",
+        
+        # Removal magnets
+        "Questing Beast": "Can't be chumped, damages walkers!",
+        "Elder Gargaroth": "Massive value every combat.",
+        "Cruelty of Gix": "3-mode saga, steals creatures!",
+    }
+    
     def __init__(self, life_threshold: int = 5):
         """Initialize trigger detector.
 
@@ -1326,6 +1844,8 @@ class GameStateTrigger:
             life_threshold: Life total below which "low_life" triggers (default: 5)
         """
         self.life_threshold = life_threshold
+        # Track threats we've already warned about (by instance_id)
+        self._seen_threats: set[int] = set()
 
     def _get_local_player(self, state: dict[str, Any]) -> Optional[dict]:
         """Get the local player dict from game state."""
@@ -1410,7 +1930,6 @@ class GameStateTrigger:
         """
         triggers = []
 
-
         prev_turn = prev_state.get("turn", {})
         curr_turn = curr_state.get("turn", {})
 
@@ -1423,10 +1942,25 @@ class GameStateTrigger:
         curr_local = self._get_local_player(curr_state)
         local_seat = curr_local.get("seat_id") if curr_local else None
 
-        # New turn detection - only on YOUR turn
+        # FIRST CONNECTION: If prev_state has no turn info but curr_state does,
+        # we just connected mid-game. Fire a trigger to give immediate advice.
         prev_turn_num = prev_turn.get("turn_number", 0)
         curr_turn_num = curr_turn.get("turn_number", 0)
         curr_active = curr_turn.get("active_player", 0)
+        
+        if prev_turn_num == 0 and curr_turn_num > 0:
+            # Just connected to an active game
+            is_your_turn = curr_active == local_seat
+            if is_your_turn:
+                logger.info(f"First connection mid-game, triggering new_turn (turn {curr_turn_num})")
+                triggers.append("new_turn")
+            # Also check for pending decision on first connection
+            pending = curr_state.get("pending_decision")
+            if pending:
+                logger.info(f"First connection with pending decision: {pending}")
+                triggers.append("decision_required")
+
+        # New turn detection
         if curr_turn_num > prev_turn_num:
             triggers.append("new_turn")
 
@@ -1471,13 +2005,15 @@ class GameStateTrigger:
             step_active = step_info.get("active_player", 0)
             step_is_your_turn = step_active == local_seat
 
-            logger.debug(f"Processing pending combat step: {step}, active={step_active}, is_your_turn={step_is_your_turn}")
+            logger.debug(f"Processing pending combat step: {step}, active={step_active}, step_is_your_turn={step_is_your_turn}, current_is_your_turn={is_your_turn}")
 
-            if "DeclareAttack" in step and step_is_your_turn:
+            # Double-check both the step's active player AND current turn state
+            # This prevents stale pending steps from firing triggers after turn changes
+            if "DeclareAttack" in step and step_is_your_turn and is_your_turn:
                 if "combat_attackers" not in triggers:
                     logger.info(f"Combat attackers trigger from pending: {step}")
                     triggers.append("combat_attackers")
-            elif "DeclareBlock" in step and not step_is_your_turn:
+            elif "DeclareBlock" in step and not step_is_your_turn and not is_your_turn:
                 if "combat_blockers" not in triggers:
                     logger.info(f"Combat blockers trigger from pending: {step}")
                     triggers.append("combat_blockers")
@@ -1512,10 +2048,68 @@ class GameStateTrigger:
             if curr_opp_life < self.life_threshold and prev_opp_life >= self.life_threshold:
                 triggers.append("opponent_low_life")
 
-        # Stack spell detection - always trigger so coach can advise (even if just "let it resolve")
+        # Stack spell detection - differentiate between your spells and opponent's
         prev_stack = prev_state.get("stack", [])
         curr_stack = curr_state.get("stack", [])
         if len(curr_stack) > len(prev_stack):
-            triggers.append("stack_spell")
+            # Check who owns the newest spell on the stack
+            newest_spell = curr_stack[-1] if curr_stack else None
+            if newest_spell:
+                spell_owner = newest_spell.get("owner_seat_id")
+                if spell_owner == local_seat:
+                    triggers.append("stack_spell_yours")
+                else:
+                    triggers.append("stack_spell_opponent")
+
+        # Land played detection - only on your turn, only in main phases
+        if is_your_turn and "Main" in curr_phase:
+            prev_battlefield = prev_state.get("battlefield", [])
+            curr_battlefield = curr_state.get("battlefield", [])
+
+            # Count YOUR lands before and after
+            prev_land_count = sum(1 for obj in prev_battlefield
+                                  if obj.get("owner_seat_id") == local_seat
+                                  and "land" in obj.get("type_line", "").lower())
+            curr_land_count = sum(1 for obj in curr_battlefield
+                                  if obj.get("owner_seat_id") == local_seat
+                                  and "land" in obj.get("type_line", "").lower())
+
+            if curr_land_count > prev_land_count:
+                logger.info(f"Land played trigger: {prev_land_count} -> {curr_land_count}")
+                triggers.append("land_played")
+
+        # Spell resolved detection - your spell left the stack on your turn
+        if is_your_turn and len(curr_stack) < len(prev_stack):
+            # Check if a spell you owned just resolved
+            prev_your_spells = [s for s in prev_stack if s.get("owner_seat_id") == local_seat]
+            curr_your_spells = [s for s in curr_stack if s.get("owner_seat_id") == local_seat]
+            if len(curr_your_spells) < len(prev_your_spells):
+                # Your spell resolved - what's next?
+                logger.info("Spell resolved trigger: your spell left the stack")
+                triggers.append("spell_resolved")
+
+        # THREAT DETECTION - warn about dangerous opponent cards
+        opp_seat = curr_opp.get("seat_id") if curr_opp else None
+        if opp_seat:
+            curr_battlefield = curr_state.get("battlefield", [])
+            for card in curr_battlefield:
+                # Only check opponent's permanents
+                controller = card.get("controller_seat_id") or card.get("owner_seat_id")
+                if controller != opp_seat:
+                    continue
+                
+                instance_id = card.get("instance_id")
+                card_name = card.get("name", "")
+                
+                # Check if this is a threat card we haven't warned about
+                if card_name in self.THREAT_CARDS and instance_id not in self._seen_threats:
+                    self._seen_threats.add(instance_id)
+                    # Store threat info for the standalone coach to retrieve
+                    self._last_threat = {
+                        "name": card_name,
+                        "warning": self.THREAT_CARDS[card_name]
+                    }
+                    logger.info(f"Threat detected: {card_name} - {self.THREAT_CARDS[card_name]}")
+                    triggers.append("threat_detected")
 
         return triggers

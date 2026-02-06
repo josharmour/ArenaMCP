@@ -35,7 +35,6 @@ import argparse
 import json
 import logging
 import os
-import queue
 import signal
 import subprocess
 import sys
@@ -125,6 +124,7 @@ class UIAdapter:
     def advice(self, text: str, seat_info: str) -> None: pass
     def status(self, key: str, value: str) -> None: pass
     def error(self, message: str) -> None: pass
+    def speak(self, text: str) -> None: pass
 
 class CLIAdapter(UIAdapter):
     """Default adapter for CLI output."""
@@ -136,6 +136,7 @@ class CLIAdapter(UIAdapter):
         print(f"[{key}] {value}")
     def error(self, message: str) -> None:
         print(f"ERROR: {message}")
+    def speak(self, text: str) -> None: pass
 
 class MCPClient:
     """Simple in-process MCP client that calls server tools directly.
@@ -191,21 +192,13 @@ class MCPClient:
         return self._server.get_sealed_pool()
 
 
-class UIAdapter:
-    """Interface for UI feedback."""
-    def log(self, message: str) -> None: ...
-    def advice(self, text: str, seat_info: str) -> None: ...
-    def status(self, key: str, value: str) -> None: ...
-    def error(self, message: str) -> None: ...
-    def speak(self, text: str) -> None: ...
-
 class ConsoleAdapter(UIAdapter):
     """Fallback for CLI mode."""
     def log(self, message: str) -> None: print(message, end='')
     def advice(self, text: str, seat_info: str) -> None: print(f"\n[COACH|{seat_info}] {text}\n")
     def status(self, key: str, value: str) -> None: pass
     def error(self, message: str) -> None: print(f"ERROR: {message}")
-    def speak(self, text: str) -> None: pass 
+    def speak(self, text: str) -> None: pass
 
 
 class StandaloneCoach:
@@ -238,7 +231,7 @@ class StandaloneCoach:
         self.advice_style = "concise"
         self._advice_frequency = self.settings.get("advice_frequency", "start_of_turn")
 
-        # TTS always enabled for non-realtime backends (GPT-realtime has native audio)
+        # TTS always enabled
         self._auto_speak = True
 
         self.ui = ui_adapter or CLIAdapter()
@@ -252,14 +245,12 @@ class StandaloneCoach:
 
         self._running = False
         self._restart_requested = False
+        self._deck_analyzed = False
         self._mcp: Optional[MCPClient] = None
 
         # Voice components
         self._voice_input = None
         self._voice_output = None
-
-        # GPT-realtime client (for realtime voice mode)
-        self._realtime_client = None
 
         # LLM backend
         self._coach = None
@@ -270,11 +261,7 @@ class StandaloneCoach:
         self._voice_thread: Optional[threading.Thread] = None
 
     def speak_advice(self, text: str, blocking: bool = True) -> None:
-        """Speak advice using the appropriate TTS method.
-
-        For GPT-realtime: sends text to realtime API and plays audio response
-        For other backends: uses local Kokoro TTS
-        """
+        """Speak advice using local Kokoro TTS."""
         if not text:
             return
 
@@ -282,56 +269,29 @@ class StandaloneCoach:
         # We silence: Wait, Pass, No actions
         clean_text = text.lower().strip(" .!")
         silence_triggers = [
-            "wait", 
-            "pass", 
-            "pass priority", 
-            "no actions", 
+            "wait",
+            "pass",
+            "pass priority",
+            "no actions",
             "wait for opponent",
             "opponent has priority"
         ]
-        
+
         # Check if text starts with or is substantially just these phrases
         # We use a simple heuristic: if it contains no active verbs (Cast, Attack, Block, Play),
         # and matches a silence trigger, we skip it.
         is_passive = any(trigger in clean_text for trigger in silence_triggers)
         has_action = any(verb in clean_text for verb in ["cast", "play", "attack", "block", "activate", "kill", "destroy"])
-        
+
         if is_passive and not has_action and len(text) < 60:
             return
 
-        if self.backend_name == "gpt-realtime":
-            # Use GPT-realtime's TTS
+        # Use local Kokoro TTS
+        if self._voice_output:
             try:
-                from arenamcp.realtime import GPTRealtimeClient, RealtimeConfig, play_audio_pcm16
-
-                # Lazy init realtime client for TTS
-                if self._realtime_client is None:
-                    config = RealtimeConfig(
-                        turn_detection_type="none",  # Manual mode for TTS-only
-                    )
-                    config.instructions = "You are an English-speaking voice assistant. Read the following text exactly as provided in English, with natural intonation. Always respond in English only."
-                    self._realtime_client = GPTRealtimeClient(config)
-                    if not self._realtime_client.connect():
-                        logger.error("Failed to connect GPT-realtime for TTS")
-                        self._realtime_client = None
-                        return
-
-                # Send text and get audio response
-                self._realtime_client.send_text(text)
-                response = self._realtime_client.get_response(timeout=15.0)
-
-                if response and response.get("audio"):
-                    play_audio_pcm16(response["audio"])
-
+                self._voice_output.speak(text, blocking=blocking)
             except Exception as e:
-                logger.error(f"GPT-realtime TTS error: {e}")
-        else:
-            # Use local Kokoro TTS
-            if self._voice_output:
-                try:
-                    self._voice_output.speak(text, blocking=blocking)
-                except Exception as e:
-                    logger.error(f"Kokoro TTS error: {e}")
+                logger.error(f"Kokoro TTS error: {e}")
 
     @property
     def backend_name(self) -> str:
@@ -406,26 +366,28 @@ class StandaloneCoach:
     def _init_voice(self) -> None:
         """Initialize voice I/O components."""
         logger.info(f"_init_voice called, backend_name={self.backend_name}")
-        # GPT-realtime handles its own STT/TTS - skip local initialization
-        if self.backend_name == "gpt-realtime":
-            logger.info("Using GPT-Realtime for voice I/O (no local TTS/Whisper)")
-            self._voice_output = None
-            self._voice_input = None
-            return
 
         from arenamcp.tts import VoiceOutput
-        from arenamcp.voice import VoiceInput
 
-        # Initialize local TTS (Kokoro)
-        logger.info("Initializing TTS (Kokoro)...")
+        # Initialize local TTS
+        logger.info("Initializing TTS...")
         self._voice_output = VoiceOutput()
+
+        # Auto-select Gemini TTS voice when using Gemini backend
+        if self._backend_name == "gemini" and not self._voice_output._voice.startswith("gemini/"):
+            self._voice_output.set_voice("gemini/Kore")
+
         voice_id, voice_desc = self._voice_output.current_voice
         logger.info(f"TTS voice: {voice_desc}")
         self.ui.status("VOICE", f"TTS Voice: {voice_desc}")
 
-        # Initialize local STT (Whisper via VoiceInput)
-        logger.info(f"Initializing voice input ({self.voice_mode})...")
-        self._voice_input = VoiceInput(mode=self.voice_mode)
+        # Initialize local STT (Whisper via VoiceInput) only if PTT/VOX mode
+        if self._voice_mode in ("ptt", "vox"):
+            from arenamcp.voice import VoiceInput
+            logger.info(f"Initializing voice input ({self.voice_mode})...")
+            self._voice_input = VoiceInput(mode=self.voice_mode)
+        else:
+            logger.info(f"Voice input disabled (mode={self._voice_mode})")
 
     def _coaching_loop(self) -> None:
         """Poll MCP for game state and provide coaching, with auto-draft detection."""
@@ -437,7 +399,8 @@ class StandaloneCoach:
         last_advice_phase = ""
         # Critical triggers that always fire regardless of frequency setting
         # Combat triggers removed - too noisy for "start_of_turn" mode
-        CRITICAL_PRIORITY = {"stack_spell", "low_life", "opponent_low_life"}
+        # decision_required added - scry, discard, target choices need immediate advice
+        CRITICAL_PRIORITY = {"stack_spell", "stack_spell_yours", "stack_spell_opponent", "low_life", "opponent_low_life", "decision_required", "threat_detected"}
 
         # Draft/Sealed detection state
         in_draft_mode = False
@@ -449,6 +412,9 @@ class StandaloneCoach:
 
         while self._running:
             try:
+                # Poll for new log content (watchdog backup - Windows often misses events)
+                self._mcp.poll_log()
+
                 # Check for active draft/sealed first
                 draft_pack = self._mcp.get_draft_pack()
 
@@ -550,6 +516,14 @@ class StandaloneCoach:
                 turn = curr_state.get("turn", {})
                 turn_num = turn.get("turn_number", 0)
                 phase = turn.get("phase", "")
+                
+                # Debug: Log if turn_num is 0 (every 30 seconds)
+                if turn_num == 0:
+                    if not hasattr(self, '_last_turn0_log'):
+                        self._last_turn0_log = 0
+                    if time.time() - self._last_turn0_log > 30:
+                        logger.debug(f"turn_num=0, players={len(curr_state.get('players', []))}, battlefield={len(curr_state.get('battlefield', []))}")
+                        self._last_turn0_log = time.time()
 
                 # Detect new game (turn number decreased) and reset advice tracking
                 if turn_num > 0 and turn_num < last_advice_turn:
@@ -559,6 +533,9 @@ class StandaloneCoach:
                     seat_announced = False  # Re-announce seat for new game
                     # Clear advice history for new match
                     self._advice_history = []
+                    self._deck_analyzed = False
+                    if self._coach:
+                        self._coach.clear_deck_strategy()
                     logger.info("Cleared advice history for new match")
 
                 # Announce seat detection when game starts
@@ -572,7 +549,47 @@ class StandaloneCoach:
                             seat_announced = True
                             break
 
-                if prev_state and self._trigger and turn_num > 0:
+                # Deck strategy analysis (once per match)
+                if not self._deck_analyzed and self._coach and turn_num > 0:
+                    deck_cards = curr_state.get("deck_cards", [])
+                    if deck_cards:
+                        self._deck_analyzed = True
+                        logger.info(f"Starting deck analysis for {len(deck_cards)} cards")
+
+                        def _analyze_deck_bg(coach, mcp, card_ids, ui):
+                            try:
+                                # Enrich grpIds to (name, type) tuples
+                                enriched = []
+                                for grp_id in card_ids:
+                                    try:
+                                        info = mcp.get_card_info(grp_id)
+                                        name = info.get("name", f"Unknown({grp_id})")
+                                        card_type = info.get("type_line", "")
+                                        enriched.append((name, card_type))
+                                    except Exception:
+                                        enriched.append((f"Unknown({grp_id})", ""))
+
+                                strategy = coach.analyze_deck(enriched)
+                                if strategy:
+                                    # Extract first line as archetype for status bar
+                                    first_line = strategy.split("\n")[0].strip()
+                                    ui.status("DECK", first_line[:60])
+                                    logger.info(f"Deck strategy stored: {len(strategy)} chars")
+                            except Exception as e:
+                                logger.error(f"Background deck analysis failed: {e}")
+
+                        t = threading.Thread(
+                            target=_analyze_deck_bg,
+                            args=(self._coach, self._mcp, deck_cards, self.ui),
+                            daemon=True,
+                        )
+                        t.start()
+
+                # FORCE CHECK: Always check triggers if trigger detector exists.
+                # prev_state starts as {} (falsy) but check_triggers handles empty
+                # prev_state gracefully via .get() defaults — this allows mulligan
+                # triggers to fire on the very first poll cycle.
+                if self._trigger:
                     # Auto-detect draft mode
                     try:
                         draft_state = self._mcp.get_draft_pack()
@@ -590,17 +607,43 @@ class StandaloneCoach:
                         logger.debug(f"Draft detection error: {e}")
 
                     triggers = self._trigger.check_triggers(prev_state, curr_state)
+                    
+                    # Debug: Log trigger results
+                    if triggers:
+                        logger.info(f"Triggers detected: {triggers}")
+                    else:
+                        # Log why no triggers (every 30 seconds to avoid spam)
+                        if not hasattr(self, '_last_no_trigger_log'):
+                            self._last_no_trigger_log = 0
+                        if time.time() - self._last_no_trigger_log > 30:
+                            local_s = curr_state.get("turn", {}).get("active_player", 0)
+                            priority = curr_state.get("turn", {}).get("priority_player", 0)
+                            logger.debug(f"No triggers: turn={turn_num}, active={local_s}, priority={priority}, phase={phase}")
+                            self._last_no_trigger_log = time.time()
 
                     # Clear pending combat steps after checking (they're now processed)
                     self._mcp.clear_pending_combat_steps()
 
+                    # Determine if it's our turn (for filtering turn-specific triggers)
+                    local_seat = None
+                    for p in curr_state.get("players", []):
+                        if p.get("is_local"):
+                            local_seat = p.get("seat_id")
+                            break
+                    active_seat = curr_state.get("turn", {}).get("active_player", 0)
+                    is_my_turn = (active_seat == local_seat) if local_seat else False
+
                     # Sort triggers by priority to ensure we handle the most critical one only
-                    # Priority order: Critical > Combat > Turn > Priority
+                    # Priority order: Critical > Action > Combat > Turn > Priority
                     trigger_priorities = {
                         "stack_spell": 10,
+                        "stack_spell_yours": 10,
+                        "stack_spell_opponent": 10,
                         "low_life": 9,
                         "opponent_low_life": 8,
-                        "combat_attackers": 7,
+                        "land_played": 7,      # After land drop, what's next?
+                        "spell_resolved": 7,   # After spell resolves, what's next?
+                        "combat_attackers": 6,
                         "combat_blockers": 6,
                         "new_turn": 5,
                         "priority_gained": 1
@@ -609,11 +652,59 @@ class StandaloneCoach:
                     triggers.sort(key=lambda x: trigger_priorities.get(x, 0), reverse=True)
 
                     for trigger in triggers:
+                        # CRITICAL: Filter turn-specific triggers based on whose turn it is
+                        # "new_turn" advice only makes sense on YOUR turn (play lands, cast spells)
+                        # "combat_attackers" only on YOUR turn (you declare attackers)
+                        # "combat_blockers" only on OPPONENT's turn (you declare blockers)
+                        if trigger == "new_turn" and not is_my_turn:
+                            logger.debug(f"Suppressing new_turn trigger (opponent's turn)")
+                            continue
+                        if trigger == "combat_attackers" and not is_my_turn:
+                            logger.debug(f"Suppressing combat_attackers trigger (opponent's turn)")
+                            continue
+                        if trigger == "combat_blockers" and is_my_turn:
+                            logger.debug(f"Suppressing combat_blockers trigger (my turn, not blocking)")
+                            continue
                         # Critical triggers always fire (stack spells, low life)
                         is_critical = trigger in CRITICAL_PRIORITY
 
                         # New turn triggers once per turn
                         is_new_turn = trigger == "new_turn" and turn_num > last_advice_turn
+                        
+                        # DELAY BUFFER: For new_turn triggers, wait briefly for Hand zone to update
+                        # This prevents "missing draw" bugs where we advise before the drawn card arrives
+                        if is_new_turn:
+                            # Reset seen threats on new game (turn 1)
+                            if turn_num == 1 and hasattr(self._trigger, '_seen_threats'):
+                                self._trigger._seen_threats.clear()
+                                logger.info("New game detected - cleared seen threats")
+                            time.sleep(0.4)  # 400ms to allow Draw Step zone update
+                            # Force a log poll to ensure we have latest updates
+                            try:
+                                self._mcp.poll_log()
+                            except Exception:
+                                pass
+                            # Re-fetch game state to get updated hand
+                            try:
+                                curr_state = self._mcp.get_game_state()
+                            except Exception as e:
+                                logger.debug(f"Failed to re-fetch state after new_turn delay: {e}")
+
+                        # Check if there's a pending decision (scry, discard, target, etc.)
+                        # If so, suppress step-by-step "what's next" triggers until decision resolves
+                        pending_decision = curr_state.get("pending_decision")
+                        has_pending_decision = pending_decision is not None
+
+                        # Step-by-step triggers: land_played, spell_resolved, and combat
+                        # BUT suppress if there's a pending decision - wait for it to resolve first
+                        is_step_by_step = (
+                            trigger in ("land_played", "spell_resolved", "combat_attackers", "combat_blockers")
+                            and not has_pending_decision
+                        )
+
+                        # Log when we're waiting for a decision
+                        if trigger in ("land_played", "spell_resolved") and has_pending_decision:
+                            logger.debug(f"Suppressing {trigger} - waiting for decision: {pending_decision}")
 
                         # Combat and priority triggers only in "every_priority" mode
                         is_frequent = (
@@ -621,64 +712,135 @@ class StandaloneCoach:
                             trigger in ("priority_gained", "combat_attackers", "combat_blockers") and
                             (turn_num > last_advice_turn or phase != last_advice_phase)
                         )
-                        
+
                         # Additional check: Don't spam priority triggers if we just advised on new_turn
                         # unless distinct phase
                         if trigger == "priority_gained" and is_new_turn:
                             continue
 
-                        should_advise = is_critical or is_new_turn or is_frequent
+                        should_advise = is_critical or is_new_turn or is_step_by_step or is_frequent
 
                         if not should_advise:
                             continue
 
                         logger.info(f"TRIGGER: {trigger}")
-                        
-                        # CRITICAL FIX: Only process ONE trigger per poll cycle for Realtime
-                        # To prevent "active response in progress" errors from rapid-fire triggers
-                        if self.backend_name in ("gemini-live", "gpt-realtime"):
-                            # If we decided to advise, we stop processing other triggers
-                            # We already prioritized the list above
-                            # Note: filtering logic is done, we just proceed to advise generation below
-                            pass # logic continues to existing advice block
 
-                        # We will break AFTER advice is generated (lines 609+)
-                        
+                        # THREAT DETECTION: Direct speaking for instant response (no LLM needed)
+                        if trigger == "threat_detected" and hasattr(self._trigger, '_last_threat'):
+                            threat = self._trigger._last_threat
+                            advice = f"Warning! {threat['name']}. {threat['warning']}"
+                            logger.info(f"THREAT ALERT: {advice}")
+                            self._record_advice(advice, trigger, game_state=curr_state)
+                            last_advice_turn = turn_num
+                            last_advice_phase = phase
+                            
+                            # Speak immediately and display
+                            self.ui.advice(advice, "THREAT")
+                            self.speak_advice(advice)
+                            continue  # Don't send to LLM
+
                         if self._coach:
-                            advice = self._coach.get_advice(
-                                curr_state,
-                                trigger=trigger,
-                                style=self.advice_style
+                            # Snapshot turn state BEFORE the (slow) LLM call
+                            pre_advice_turn = turn_num
+                            pre_advice_active = active_seat
+
+                            # Check if we can use direct audio (Gemini backend with audio output)
+                            use_direct_audio = (
+                                hasattr(self._coach._backend, 'complete_audio')
+                                and self._voice_output
+                                and not self._voice_output.muted
+                                and self._voice_output._voice.startswith("gemini/")
                             )
-                            logger.info(f"ADVICE: {advice}")
 
-                            # Record for debug history
-                            self._record_advice(advice, trigger)
+                            audio_result = None
+                            advice = None
 
-                            # CRITICAL: Break loop for Realtime backends
-                            if self.backend_name in ("gemini-live", "gpt-realtime"):
-                                break
+                            if use_direct_audio:
+                                voice_name = self._voice_output._voice.replace("gemini/", "")
+                                audio_result = self._coach.get_advice_audio(
+                                    curr_state,
+                                    trigger=trigger,
+                                    style=self.advice_style,
+                                    voice=voice_name
+                                )
+
+                            if audio_result is None:
+                                # Fallback: text advice (+ TTS later)
+                                advice = self._coach.get_advice(
+                                    curr_state,
+                                    trigger=trigger,
+                                    style=self.advice_style
+                                )
+                                logger.info(f"ADVICE: {advice}")
+
+                            # STALENESS CHECK: Re-poll game state after the LLM call.
+                            # If the turn or active player changed while waiting for
+                            # the API response (~7s), the advice is stale and would
+                            # confuse the player (e.g. "attack!" during opponent's turn).
+                            fresh_state = self._mcp.get_game_state()
+                            fresh_turn = fresh_state.get("turn", {})
+                            fresh_turn_num = fresh_turn.get("turn_number", 0)
+                            fresh_active = fresh_turn.get("active_player", 0)
+
+                            if fresh_turn_num != pre_advice_turn or fresh_active != pre_advice_active:
+                                stale_label = "[STALE - discarded]"
+                                if audio_result is not None:
+                                    logger.info(
+                                        f"Discarding stale audio advice: turn {pre_advice_turn}->{fresh_turn_num}, "
+                                        f"active {pre_advice_active}->{fresh_active}"
+                                    )
+                                    self._record_advice(
+                                        f"{stale_label} [Audio: {trigger}]", trigger, game_state=curr_state
+                                    )
+                                else:
+                                    logger.info(
+                                        f"Discarding stale advice: turn {pre_advice_turn}->{fresh_turn_num}, "
+                                        f"active {pre_advice_active}->{fresh_active}"
+                                    )
+                                    self._record_advice(
+                                        f"{stale_label} {advice}", trigger, game_state=curr_state
+                                    )
+                                last_advice_turn = turn_num
+                                last_advice_phase = phase
+                                continue
 
                             last_advice_turn = turn_num
                             last_advice_phase = phase
 
-                            # Show seat info with advice
+                            # Build seat info for display
                             local_seat = None
                             for p in curr_state.get("players", []):
                                 if p.get("is_local"):
                                     local_seat = p.get("seat_id")
                                     break
 
-                            # Count untapped lands for mana display
                             battlefield = curr_state.get("battlefield", [])
                             your_cards = [c for c in battlefield if c.get("owner_seat_id") == local_seat]
                             untapped_lands = sum(1 for c in your_cards
                                                  if "land" in c.get("type_line", "").lower()
                                                  and not c.get("is_tapped"))
-
                             seat_info = f"Seat {local_seat}|{untapped_lands} mana|{self.backend_name}" if local_seat else "Seat ?"
-                            self.ui.advice(advice, seat_info)
-                            self.speak_advice(advice)
+
+                            if audio_result is not None:
+                                # Direct audio path - play audio from model
+                                samples, sample_rate = audio_result
+                                if len(samples) > 0:
+                                    trigger_label = trigger or "advice"
+                                    self.ui.advice(f"[Audio: {trigger_label}]", seat_info)
+                                    self._record_advice(f"[Audio: {trigger_label}]", trigger, game_state=curr_state)
+                                    try:
+                                        import sounddevice as sd
+                                        sd.play(samples, sample_rate, device=self._voice_output._device_index)
+                                        sd.wait()
+                                    except Exception as e:
+                                        logger.error(f"Audio playback error: {e}")
+                                else:
+                                    logger.warning("Direct audio returned empty samples")
+                            else:
+                                # Text path - display and speak via TTS
+                                self._record_advice(advice, trigger, game_state=curr_state)
+                                self.ui.advice(advice, seat_info)
+                                self.speak_advice(advice)
 
                 prev_state = curr_state
 
@@ -774,9 +936,9 @@ class StandaloneCoach:
                     self.ui.advice(advice, seat_info)
                     self.speak_advice(advice)
 
-                    # Record for debug history
+                    # Record for debug history with the same game state
                     trigger = "voice_audio" if use_direct_audio else ("voice_question" if text else "voice_quick")
-                    self._record_advice(advice, trigger)
+                    self._record_advice(advice, trigger, game_state=game_state)
 
             except Exception as e:
                 if self._running:
@@ -785,673 +947,6 @@ class StandaloneCoach:
 
         self._voice_input.stop()
         logger.info("Voice loop stopped")
-
-    def _realtime_voice_loop(self) -> None:
-        """Handle voice I/O for GPT-realtime with proactive coaching.
-
-        This creates a persistent connection that:
-        - Streams user audio continuously (server VAD detects speech)
-        - Sends proactive prompts on game triggers
-        - Plays back audio responses
-        - Allows natural interruption by either party
-        """
-        logger.info(">>> _realtime_voice_loop ENTERED <<<")
-        try:
-            import sounddevice as sd
-            import numpy as np
-            from arenamcp.realtime import GPTRealtimeClient, RealtimeConfig, play_audio_pcm16, stop_audio
-            from arenamcp.gemini_live import GeminiLiveClient
-            from arenamcp.coach import GameStateTrigger
-        except ImportError as e:
-            logger.error(f"Failed to import realtime dependencies: {e}")
-            self.ui.error(f"Realtime import error: {e}")
-            return
-
-        logger.info(f"{self.backend_name} voice loop starting...")
-        self.ui.log(f"\n[REALTIME] Connecting to {self.backend_name}...\n")
-
-        # Configure for server-side VAD with interruption support
-        config = RealtimeConfig(
-            turn_detection_type="server_vad",
-            vad_threshold=0.5,
-            vad_prefix_padding_ms=300,
-            vad_silence_duration_ms=600,  # Shorter silence = faster responses
-        )
-        
-        if self.model_name:
-            config.deployment = self.model_name
-
-        # Build system instructions with game context
-        def get_instructions():
-            base = """LANGUAGE: You MUST respond in ENGLISH only. No other languages.
-
-You are an expert Magic: The Gathering Arena coach providing real-time voice advice.
-
-CRITICAL RULES:
-- ALWAYS respond in ENGLISH. Never use any other language.
-- ALWAYS use the EXACT card names from the game state
-- Keep responses to 1-2 sentences max - you're speaking aloud
-- Be decisive and specific - name the EXACT card to play
-- If you have nothing useful to say, stay SILENT - don't fill time with chatter
-
-CARD SYNERGIES - Read oracle text carefully:
-- Lifegain triggers: Cards like "Ajani's Pridemate" or "Twinblade Paladin" say "Whenever you gain life" - these combo with lifelink creatures, lifegain lands (Scoured Barrens), and spells that gain life
-- ETB triggers: "When this creature enters" effects - sequence plays to maximize value
-- Death triggers: "When this creature dies" - consider sacrifice synergies
-- +1/+1 counters: Stack with other counter effects for exponential growth
-
-TIMING & PRIORITY:
-- On YOUR turn: Recommend plays in order - land drop first, then creatures/spells
-- On OPPONENT'S turn: Only speak if you have INSTANT-speed options (instants, flash, activated abilities) or something is on the stack to respond to. Otherwise stay SILENT.
-- Stack responses: If opponent casts something threatening, suggest responses from hand
-- Combat math: Calculate if attacks are profitable considering blocks
-
-PRIORITIES:
-1. Lethal detection - can you or opponent win THIS turn?
-2. Stack interactions - should you respond to what's happening?
-3. Combat math - attacks/blocks that are favorable trades
-4. Curve plays - what's the best use of available mana?
-5. Synergy setups - plays that enable future combos
-
-Example: "Play Scoured Barrens, then cast Ajani's Pridemate - it'll get a counter from the land's lifegain."
-NOT: "Play a land and a creature." """
-
-            if self._mcp:
-                try:
-                    game_state = self._mcp.get_game_state()
-                    if game_state.get("turn", {}).get("turn_number", 0) > 0:
-                        context = self._coach._format_game_context(game_state) if self._coach else ""
-                        return f"{base}\n\nCURRENT GAME STATE:\n{context}"
-                except Exception:
-                    pass
-            return base
-
-        config.instructions = get_instructions()
-
-        config.instructions = get_instructions()
-
-        # Instantiate appropriate client
-        if self.backend_name == "gemini-live":
-            self.ui.log("[yellow]Initializing Gemini Live client...[/]")
-            client = GeminiLiveClient(config)
-        else:
-            client = GPTRealtimeClient(config)
-            
-        self._realtime_client = client  # Store reference for cleanup
-
-        # Track if we're currently playing audio (to avoid overlapping)
-        is_playing = threading.Event()
-        playback_queue = queue.Queue()  # Queue for streaming audio chunks
-
-        def stop_playback():
-            """Stop current audio playback and clear client buffers."""
-            # Clear internal queue
-            while not playback_queue.empty():
-                try:
-                    playback_queue.get_nowait()
-                    playback_queue.task_done()
-                except queue.Empty:
-                    break
-            
-            is_playing.clear()
-            
-            # Interrupt client generation if possible
-            if hasattr(client, 'interrupt'):
-                client.interrupt()
-            else:
-                client.clear_audio_buffer()
-
-        def play_audio_callback(audio: bytes):
-            """Queue audio chunk for playback."""
-            if audio:
-                playback_queue.put(audio)
-
-        def on_response_done(transcript: str, audio: bytes):
-            if transcript:
-                self.ui.advice(transcript, self.backend_name)
-                logger.info(f"REALTIME RESPONSE: {transcript}")
-                self._record_advice(transcript, "gpt_realtime")
-            # Note: Audio is handled by on_audio streaming callback
-
-        def on_error(error: str):
-            self.ui.log(f"[red]REALTIME ERROR: {error}[/]")
-            logger.error(f"Realtime error: {error}")
-            self._record_error(error, f"{self.backend_name}_callback")
-
-        client.set_callbacks(
-            on_response_done=on_response_done,
-            on_error=on_error,
-            on_audio=play_audio_callback,  # Use the queue-based callback
-        )
-
-        if self.backend_name == "gemini-live":
-            self.ui.log(f"[yellow]Attempting Gemini Live connection ({self.model_name})...[/]")
-        else:
-            self.ui.log("[yellow]Attempting GPT-Realtime connection...[/]")
-            
-        if not client.connect():
-            self.ui.log(f"[red]Failed to connect to {self.backend_name}[/]")
-            if self.backend_name == "gemini-live":
-                self.ui.log("[red]Check GOOGLE_API_KEY in .env[/]")
-            else:
-                self.ui.log("[red]Check AZURE_REALTIME_API_KEY and endpoint[/]")
-            return
-
-        self.ui.log(f"[green]{self.backend_name} connected![/]")
-        self.ui.log("[green]I'm listening - speak anytime to ask questions.[/]")
-        self.ui.log("[green]I'll give proactive advice as the game progresses.[/]\n")
-
-        # Initialize trigger detector for proactive advice
-        trigger = GameStateTrigger()
-        prev_state: dict = {}
-        last_advice_turn = 0
-        last_advice_phase = ""
-
-        # Critical triggers that warrant interruption
-        URGENT_TRIGGERS = {"stack_spell", "low_life", "opponent_low_life", "decision_required"}
-        NORMAL_TRIGGERS = {"new_turn", "combat_attackers", "combat_blockers", "priority_gained"}
-
-        # Start continuous audio capture
-        sample_rate = 16000
-
-        def audio_callback(indata, frames, time_info, status):
-            if status:
-                logger.debug(f"Audio status: {status}")
-            # Don't send audio while we're playing back (prevents feedback loop)
-            if is_playing.is_set():
-                return
-            
-            # Check PTT state
-            if self._voice_mode == "ptt":
-                try:
-                    import keyboard
-                    # Hardcoded F4 for now, consistent with other PTT usage
-                    if not keyboard.is_pressed('f4'):
-                        return
-                except ImportError:
-                    pass
-
-            # Send audio to GPT-realtime / Gemini continuously
-            audio_chunk = indata.copy().flatten()
-            client.send_audio(audio_chunk, sample_rate)
-
-        try:
-            # Use system default device
-            device_name = "System Default"
-
-            self.ui.log(f"[yellow]Starting audio capture on: {device_name}[/]")
-            logger.info(f"Using audio input device: {device_name}")
-
-            # Initialize Persistent Output Stream (24kHz is standard for Gemini/GPT Realtime)
-            # persistent stream avoids heap corruption from repeated sd.play() calls
-            # FORCE SYSTEM DEFAULT ON STARTUP (Ignore saved index to prevent stale device mapping)
-            device_idx = None 
-            if self.settings.get("device_index") is not None:
-                logger.info("Ignoring saved audio device index - forcing System Default as requested")
-
-            # Log default devices
-            try:
-                defaults = sd.default.device
-                device_info_in = sd.query_devices(defaults[0])
-                device_info_out = sd.query_devices(defaults[1])
-                logger.info(f"Default Audio Input: {device_info_in['name']} (idx {defaults[0]})")
-                logger.info(f"Default Audio Output: {device_info_out['name']} (idx {defaults[1]})")
-            except Exception as e:
-                logger.error(f"Failed to query default devices: {e}")
-
-            # Force default device explicit selection if none provided
-            if device_idx is None:
-                 try:
-                     # Explicitly query default output device index
-                     default_out_idx = sd.default.device[1]
-                     device_info = sd.query_devices(default_out_idx)
-                     logger.info(f"Forcing default output device: {device_info['name']} (idx {default_out_idx})")
-                     device_idx = default_out_idx
-                 except Exception as e:
-                     logger.warning(f"Could not determine default device explicitly: {e}")
-
-            output_stream = sd.OutputStream(
-                samplerate=24000, 
-                channels=1, 
-                dtype='int16',
-                blocksize=4096, # Increased buffer size
-                latency=0.2,    # Higher latency (200ms) to prevent underrun/stuttering
-                device=device_idx
-            )
-            output_stream.start()
-            
-            actual_out_idx = device_idx if device_idx is not None else sd.default.device[1]
-            try:
-                actual_device = sd.query_devices(actual_out_idx)
-                self.ui.log(f"[dim]Audio Output: {actual_device['name']}[/]")
-                logger.info(f"Using Audio Output Device: {actual_device['name']} (idx {actual_out_idx})")
-            except:
-                pass
-
-            # --- THREAD-SAFE AUDIO PLAYBACK ---
-            # Decouple network thread from audio hardware blocking
-
-            def playback_worker():
-                logger.info(f"Playback worker started on thread {threading.current_thread().name}")
-                while not self._stop_event.is_set():
-                    try:
-                        # Blocking wait for first chunk
-                        chunk = playback_queue.get(timeout=0.1)
-                        if chunk is None:
-                            break
-                        
-                        # Set flag to suppress mic input (Echo Cancellation)
-                        is_playing.set()
-                        
-                        # Batching: Try to grab more chunks if available to smooth playback
-                        buffer = [chunk]
-                        try:
-                            while True:
-                                # Non-blocking get for subsequent chunks
-                                extra = playback_queue.get_nowait()
-                                if extra is None:
-                                    break
-                                buffer.append(extra)
-                                playback_queue.task_done()
-                                if len(buffer) >= 10: # Limit batch size
-                                    break
-                        except queue.Empty:
-                            pass
-                            
-                        # Play batched audio
-                        try:
-                            # Verify we have data
-                            total_bytes = sum(len(b) for b in buffer)
-                            # logger.debug(f"Writing {total_bytes} bytes to audio stream") 
-                            
-                            full_data = b"".join(buffer)
-                            audio_data = np.frombuffer(full_data, dtype=np.int16)
-                            output_stream.write(audio_data)
-                        except Exception as e:
-                            logger.error(f"Playback write error: {e}")
-                            self.ui.log(f"[red]Audio write error: {e}[/]")
-                        finally:
-                            # Mark the initial chunk as done
-                            playback_queue.task_done()
-                            
-                            # If queue is empty, we are done playing for now
-                            if playback_queue.empty():
-                                is_playing.clear()
-                                
-                    except queue.Empty:
-                        is_playing.clear()
-                    except Exception as e:
-                         logger.error(f"Playback worker fatal error: {e}")
-
-            # Start playback thread
-            threading.Thread(target=playback_worker, daemon=True, name="AudioPlayback").start()
-
-            # (Removed redundant definitions: play_audio_async, stop_playback)
-                
-
-            with sd.InputStream(
-                device=None,  # None = Windows system default input
-                samplerate=sample_rate,
-                channels=1,
-                dtype='float32',
-                callback=audio_callback,
-                blocksize=int(sample_rate * 0.1),  # 100ms chunks
-            ):
-                self.ui.log("[green]Audio capture started - speak anytime![/]")
-                logger.info("Audio stream started - listening for speech")
-
-                last_context_update = 0
-                game_announced = False
-                last_proactive_advice = 0  # Timer for periodic proactive advice
-                PROACTIVE_INTERVAL = 60.0  # Give proactive advice every 60 seconds if no triggers
-
-                # Debug: show we're in the loop
-                loop_count = 0
-
-                while self._running:
-                    # Auto-reconnection for stability (e.g. handling 1011 keepalive timeouts)
-                    if hasattr(client, "_connected") and not client._connected:
-                        self.ui.log("[bold red]Connection lost! Attempting reconnect...[/]")
-                        logger.warning("Realtime client disconnected. Reconnecting...")
-                        time.sleep(1) # Brief cooldown
-                        
-                        if client.connect():
-                            self.ui.log("[green]Reconnected successfully.[/]")
-                            # Force immediate context refresh
-                            last_context_update = 0
-                            # Reset advice triggers so full context is resent
-                            game_announced = False 
-                            last_advice_turn = 0
-                            prev_state = {}
-                            
-                            # Re-send instructions to ensure session has them
-                            try:
-                                client.update_instructions(get_instructions())
-                            except Exception as e:
-                                logger.error(f"Failed to restore instructions: {e}")
-                        else:
-                            self.ui.log("[red]Reconnect failed. Retrying in 5s...[/]")
-                            time.sleep(5)
-                            continue
-
-                    loop_count += 1
-                    if loop_count == 1:
-                        self.ui.log(f"[dim]Loop verified (Connected: {getattr(client, '_connected', 'Unknown')})[/]")
-
-                    try:
-                        # Poll for new log content (backup for missed watchdog events)
-                        if self._mcp:
-                            self._mcp.poll_log()
-
-                        # Get current game state
-                        if self._mcp:
-                            curr_state = self._mcp.get_game_state()
-                            turn = curr_state.get("turn", {})
-                            turn_num = turn.get("turn_number", 0)
-                            phase = turn.get("phase", "")
-                            step = turn.get("step", "")
-
-                            # Debug: show current turn status occasionally
-                            if loop_count % 20 == 0 and turn_num > 0:  # Every 10 seconds if in game
-                                hand_count = len(curr_state.get("hand", []))
-                                self.ui.log(f"[dim]Turn {turn_num}, Phase: {phase}, Hand: {hand_count} cards[/]")
-
-                            # Detect active game and announce if not yet done
-                            if turn_num > 0 and not game_announced:
-                                logger.info("Game detected, sending initial state")
-                                game_announced = True
-                                last_advice_turn = turn_num
-                                last_advice_phase = phase
-
-                                # Build game context
-                                hand = curr_state.get("hand", [])
-                                hand_names = [c.get("name", "?") for c in hand]
-                                logger.info(f"HAND CONTENTS: {hand_names}")
-                                self.ui.log(f"[cyan]Your hand: {', '.join(hand_names) if hand_names else '(empty)'}[/]")
-
-                                context = self._coach._format_game_context(curr_state) if self._coach else str(curr_state)
-                                logger.info(f"CONTEXT BEING SENT:\n{context[:500]}...")  # Log first 500 chars
-                                self.ui.log(f"[green]>>> Game detected! Sending state to GPT...[/]")
-                                self.ui.log(f"[dim]Context: {len(context)} chars[/]")
-                                client.update_instructions(get_instructions())
-                                client.send_text(f"Game in progress at turn {turn_num}. Here's the current state:\n{context}\n\nGive me advice on what to do.")
-
-                            # Detect new game (turn reset)
-                            if turn_num > 0 and turn_num < last_advice_turn:
-                                logger.info("New game detected, resetting")
-                                last_advice_turn = 0
-                                last_advice_phase = ""
-                                prev_state = {}
-                                game_announced = False
-                                # Clear advice history for new match
-                                self._advice_history = []
-
-                                # Update instructions for new game
-                                client.update_instructions(get_instructions())
-
-                                # Announce new game with context
-                                context = self._coach._format_game_context(curr_state) if self._coach else str(curr_state)
-                                client.send_text(f"A new game has started!\n{context}\n\nAnalyze the opening hand and give initial advice.")
-
-                            # Check for triggers
-                            if prev_state and turn_num > 0:
-                                triggers = trigger.check_triggers(prev_state, curr_state)
-                                self._mcp.clear_pending_combat_steps()
-
-                                # Debug: log detected triggers
-                                if triggers:
-                                    # Sort triggers by priority to ensure we handle the most critical one only
-                                    trigger_priorities = {
-                                        "decision_required": 20,
-                                        "stack_spell": 10,
-                                        "low_life": 9,
-                                        "opponent_low_life": 8,
-                                        "combat_attackers": 7,
-                                        "combat_blockers": 6,
-                                        "new_turn": 5,
-                                        "priority_gained": 1
-                                    }
-                                    triggers.sort(key=lambda x: trigger_priorities.get(x, 0), reverse=True)
-                                    
-                                    logger.info(f"TRIGGERS DETECTED (Sorted): {triggers}")
-                                    self.ui.log(f"[dim]Triggers: {triggers}[/]")
-
-                                for trig in triggers:
-                                    is_urgent = trig in URGENT_TRIGGERS
-                                    # Allow new_turn advice if turn increased OR if we haven't given advice this turn yet
-                                    is_new_turn = trig == "new_turn" and turn_num >= last_advice_turn
-                                    is_phase_change = trig in NORMAL_TRIGGERS and phase != last_advice_phase
-                                    is_priority = trig == "priority_gained"  # Always advise on priority
-
-                                    should_advise = is_urgent or is_new_turn or is_phase_change or is_priority
-
-                                    # Debug: log trigger evaluation
-                                    logger.debug(f"Trigger {trig}: urgent={is_urgent}, new_turn={is_new_turn}, phase_change={is_phase_change}, priority={is_priority} -> advise={should_advise}")
-
-                                    # Don't interrupt if already speaking (unless urgent)
-                                    # Don't skip just because we're speaking. New phase/turn = new context.
-                                    # We will call stop_playback() below if we proceed.
-                                    
-                                    if should_advise:
-                                        # Get hand card names for explicit reference
-                                        hand = curr_state.get("hand", [])
-                                        hand_cards = [f"{c.get('name')} ({c.get('mana_cost', '')})" for c in hand]
-                                        hand_str = ", ".join(hand_cards) if hand_cards else "empty"
-
-                                        # Check for instant-speed options in hand
-                                        instant_options = []
-                                        for c in hand:
-                                            type_line = c.get("type_line", "").lower()
-                                            oracle = c.get("oracle_text", "").lower()
-                                            if "instant" in type_line or "flash" in oracle:
-                                                instant_options.append(c.get("name"))
-
-                                        # Get battlefield summary
-                                        battlefield = curr_state.get("battlefield", [])
-                                        local_player = next((p for p in curr_state.get("players", []) if p.get("is_local")), {})
-                                        my_seat = local_player.get("seat_id", 1)
-                                        my_creatures = [c.get("name") for c in battlefield
-                                                       if c.get("owner_seat_id") == my_seat and c.get("power") is not None]
-                                        opp_creatures = [c.get("name") for c in battlefield
-                                                        if c.get("owner_seat_id") != my_seat and c.get("power") is not None]
-
-                                        # Determine if it's our turn
-                                        is_my_turn = turn.get("active_player") == my_seat
-                                        stack = curr_state.get("stack", [])
-
-                                    # Smart Filtering: Reduce "weird times" advice
-                                    if trig == "priority_gained":
-                                        # 1. Opponent's Turn Silence
-                                        if not is_my_turn:
-                                            has_stack = len(stack) > 0
-                                            is_combat = "Combat" in phase
-                                            has_decision = curr_state.get("pending_decision")
-                                            
-                                            if not has_stack and not is_combat and not has_decision:
-                                                logger.debug("Suppressing priority_gained (opponent's turn, no immediate threat)")
-                                                should_advise = False
-
-                                        # 2. My Turn Flow
-                                        # Don't say "Priority gained" immediately after "New Turn" advice
-                                        elif is_new_turn or (turn_num == last_advice_turn and phase in ("Beginning", "Untap", "Upkeep", "Draw")):
-                                            logger.debug("Suppressing priority_gained (redundant with new_turn)")
-                                            should_advise = False
-
-                                    # CRITICAL: If filtering suppressed advice, stop now
-                                    if not should_advise:
-                                        continue
-                                    
-                                    # STATE CONSISTENCY CHECK: Re-fetch fresh state before sending advice
-                                    # This ensures advice matches the CURRENT game situation, not a stale snapshot
-                                    fresh_state = self._mcp.get_full_game_state()
-                                    if fresh_state:
-                                        fresh_turn = fresh_state.get("turn", {})
-                                        fresh_turn_num = fresh_turn.get("turn_number", 0)
-                                        fresh_phase = fresh_turn.get("phase", "").replace("Phase_", "")
-                                        fresh_active = fresh_turn.get("active_player", 0)
-                                        fresh_priority = fresh_turn.get("priority_player", 0)
-                                        
-                                        # Validate trigger is still relevant
-                                        if trig == "new_turn" and fresh_turn_num != turn_num:
-                                            logger.info(f"STATE DRIFT: Turn changed from {turn_num} to {fresh_turn_num}, skipping stale trigger")
-                                            continue
-                                        
-                                        # For turn-based advice, ensure it's still my turn
-                                        if trig == "new_turn" and fresh_active != my_seat:
-                                            logger.info(f"STATE DRIFT: Active player changed, no longer my turn (was {my_seat}, now {fresh_active})")
-                                            continue
-                                        
-                                        # Use fresh state for prompt building
-                                        curr_state = fresh_state
-                                        turn = fresh_turn
-                                        turn_num = fresh_turn_num
-                                        phase = fresh_phase
-                                        step = fresh_turn.get("step", "").replace("Step_", "")
-                                        is_my_turn = fresh_active == my_seat
-                                        stack = curr_state.get("stack", [])
-                                        
-                                        # Re-fetch hand and board from fresh state
-                                        hand = curr_state.get("hand", [])
-                                        hand_cards = [f"{c.get('name')} ({c.get('mana_cost', '')})" for c in hand]
-                                        hand_str = ", ".join(hand_cards) if hand_cards else "empty"
-                                        
-                                        instant_options = []
-                                        for c in hand:
-                                            type_line = c.get("type_line", "").lower()
-                                            oracle = c.get("oracle_text", "").lower()
-                                            if "instant" in type_line or "flash" in oracle:
-                                                instant_options.append(c.get("name"))
-                                        
-                                        battlefield = curr_state.get("battlefield", [])
-                                        local_player = next((p for p in curr_state.get("players", []) if p.get("is_local")), {})
-                                        my_seat = local_player.get("seat_id", 1)
-                                        my_creatures = [c.get("name") for c in battlefield
-                                                       if c.get("owner_seat_id") == my_seat and c.get("power") is not None]
-                                        opp_creatures = [c.get("name") for c in battlefield
-                                                        if c.get("owner_seat_id") != my_seat and c.get("power") is not None]
-                                        
-                                        logger.debug(f"STATE VERIFIED: Turn {turn_num}, Phase {phase}, Active={fresh_active}, My seat={my_seat}, is_my_turn={is_my_turn}")
-
-                                    # Build prompt based on trigger
-                                    pending_decision = curr_state.get("pending_decision")
-                                    
-                                    # Determine sorcery-speed eligibility
-                                    can_cast_sorcery = is_my_turn and "Main" in phase and len(stack) == 0
-                                    speed_context = "SORCERY-SPEED OK (can play lands/creatures/sorceries)" if can_cast_sorcery else "INSTANT-SPEED ONLY"
-
-                                    if pending_decision:
-                                        prompt = f"DECISION: Game is asking '{pending_decision}'.\nContext: {phase} phase.\nMy board: {', '.join(my_creatures) or 'none'}\nWhat do I choose?"
-                                    elif trig == "new_turn":
-                                        if is_my_turn:
-                                            prompt = f"Turn {turn_num} - MY TURN ({phase}). [{speed_context}]\nMy hand: {hand_str}\nMy board: {', '.join(my_creatures) or 'empty'}\nTheir board: {', '.join(opp_creatures) or 'empty'}\nWhat should I play?"
-                                        else:
-                                            prompt = f"Turn {turn_num} - OPPONENT'S TURN ({phase}). [{speed_context}]\nMy instant options: {', '.join(instant_options) or 'none'}\nAnything to watch for?"
-                                    elif trig == "stack_spell" or (stack and trig == "priority_gained"):
-                                        stack_cards = [c.get("name") for c in stack]
-                                        prompt = f"RESPONSE: Stack has {', '.join(stack_cards)}.\nPhase: {phase}\nMy instants: {', '.join(instant_options) or 'none'}\nDo I resolve, respond, or pass?"
-                                    elif trig == "low_life":
-                                        my_life = local_player.get("life_total", 20)
-                                        prompt = f"WARNING: I'm at {my_life} life!\nMy hand: {hand_str}\nHow do I survive?"
-                                    elif trig == "opponent_low_life":
-                                        opp = next((p for p in curr_state.get("players", []) if not p.get("is_local")), {})
-                                        opp_life = opp.get("life_total", 20)
-                                        prompt = f"Opponent at {opp_life} life!\nMy attackers: {', '.join(my_creatures) or 'none'}\nDo I have lethal?"
-                                    elif trig == "combat_attackers":
-                                        if is_my_turn:
-                                            prompt = f"Combat - declaring attackers.\nMy creatures: {', '.join(my_creatures) or 'none'}\nTheir blockers: {', '.join(opp_creatures) or 'none'}\nWhat should attack?"
-                                        else:
-                                            prompt = f"Opponent entering combat.\nTheir creatures: {', '.join(opp_creatures) or 'none'}\nMy creatures: {', '.join(my_creatures) or 'none'}\nAny pre-combat responses?"
-                                    elif trig == "combat_blockers":
-                                        if is_my_turn:
-                                            prompt = f"Combat - opponents blocking.\nMy attackers: {', '.join(my_creatures) or 'none'}\nTheir blockers: {', '.join(opp_creatures) or 'none'}\nAny combat tricks?"
-                                        else:
-                                            prompt = f"Combat - declaring blockers.\nMy creatures: {', '.join(my_creatures) or 'none'}\nAttackers: {', '.join(opp_creatures) or 'none'}\nHow should I block?"
-                                    else:
-                                        # Enriched fallback for priority_gained
-                                        stack_ids = [c.get("name") for c in stack]
-                                        stack_str = ", ".join(stack_ids) if stack_ids else "empty"
-                                        prompt = f"Priority passed to me in {phase} phase ({step}).\nStack: {stack_str}\nMy hand: {hand_str}\nCorrect technical play?"
-
-                                    logger.info(f"TRIGGER: {trig} -> interrupting and sending prompt")
-                                    stop_playback() # Ensure we stop any outdated advice
-                                    if self.backend_name == "gemini-live":
-                                        prompt = f"[SYSTEM: INTERRUPT - NEW GAME STATE] {prompt}"
-
-                                    self.ui.log(f"[yellow]>>> Sending {trig} prompt to {self.backend_name}...[/]")
-                                    client.send_text(prompt)
-
-                                    last_advice_turn = turn_num
-                                    last_advice_phase = phase
-                                    last_proactive_advice = time.time()
-                                    
-                                    # CRITICAL: Break loop to process only one trigger per cycle
-                                    break
-
-                            # Periodic proactive advice if no triggers fired
-                            now = time.time()
-                            if turn_num > 0 and not is_playing.is_set():
-                                time_since_advice = now - last_proactive_advice
-                                if time_since_advice >= PROACTIVE_INTERVAL:
-                                    # Get current game context
-                                    hand = curr_state.get("hand", [])
-                                    hand_cards = [f"{c.get('name')}" for c in hand]
-                                    hand_str = ", ".join(hand_cards) if hand_cards else "empty"
-
-                                    local_player = next((p for p in curr_state.get("players", []) if p.get("is_local")), {})
-                                    my_life = local_player.get("life_total", 20)
-                                    opp_player = next((p for p in curr_state.get("players", []) if not p.get("is_local")), {})
-                                    opp_life = opp_player.get("life_total", 20)
-
-                                    prompt = f"[Periodic check] Turn {turn_num}, {phase}. My life: {my_life}, Opponent: {opp_life}. My hand: {hand_str}. What should I be thinking about?"
-
-                                    logger.info(f"PROACTIVE: Periodic advice prompt")
-                                    self.ui.log(f"[cyan]>>> Proactive advice...[/]")
-                                    client.send_text(prompt)
-                                    last_proactive_advice = now
-
-                            # Update context if state changed significantly
-                            state_changed = False
-                            if prev_state:
-                                old_hand = len(prev_state.get("hand", []))
-                                new_hand = len(curr_state.get("hand", []))
-                                old_turn = prev_state.get("turn", {}).get("turn_number", 0)
-                                new_turn = curr_state.get("turn", {}).get("turn_number", 0)
-                                old_phase = prev_state.get("turn", {}).get("phase", "")
-                                new_phase = curr_state.get("turn", {}).get("phase", "")
-                                state_changed = (old_hand != new_hand or old_turn != new_turn or old_phase != new_phase)
-
-                            prev_state = curr_state
-
-                            # Refresh context on state change or every 5 seconds
-                            now = time.time()
-                            if state_changed or now - last_context_update > 5.0:
-                                client.update_instructions(get_instructions())
-                                last_context_update = now
-                                if state_changed:
-                                    logger.info("State changed - updated GPT context")
-
-                    except Exception as e:
-                        logger.error(f"Realtime loop error: {e}")
-                        import traceback
-                        logger.debug(traceback.format_exc())
-                        self.ui.log(f"[red]Loop error: {e}[/]")
-                        self._record_error(str(e), "realtime_loop")
-
-                    time.sleep(0.5)  # Check for triggers every 500ms
-
-        except Exception as e:
-            logger.error(f"Realtime audio error: {e}")
-            self._record_error(str(e), "realtime_audio")
-        finally:
-            client.disconnect()
-            try:
-                output_stream.stop()
-                output_stream.close()
-            except:
-                pass
-            self._realtime_client = None
-            self.ui.log("\n[REALTIME] Disconnected\n")
-            logger.info("GPT-Realtime voice loop stopped")
 
     def _on_mute_hotkey(self) -> None:
         """F5 - Toggle TTS mute."""
@@ -1515,9 +1010,22 @@ NOT: "Play a land and a creature." """
 
     def take_screenshot_analysis(self) -> None:
         """Capture screen and request visual analysis (e.g. Mulligan)."""
-        if "gemini" not in self.backend_name.lower():
-             self.ui.log("[red]Visual analysis requires Gemini backend.[/]")
-             return
+        # Check if backend supports vision
+        # Gemini always supports vision
+        # Ollama supports vision for specific models (gemma3n, llava, etc.)
+        vision_capable = False
+        if "gemini" in self.backend_name.lower():
+            vision_capable = True
+        elif "ollama" in self.backend_name.lower():
+            # Vision-capable Ollama models
+            vision_models = ["gemma3n", "llava", "bakllava", "moondream", "llama3.2-vision"]
+            model_lower = (self.model_name or "").lower()
+            if any(vm in model_lower for vm in vision_models):
+                vision_capable = True
+        
+        if not vision_capable:
+            self.ui.log("[red]Visual analysis requires a vision-capable backend (Gemini or Ollama with gemma3n/llava).[/]")
+            return
              
         try:
             from PIL import ImageGrab
@@ -1541,14 +1049,35 @@ NOT: "Play a land and a creature." """
             except:
                 game_state = {}
                 
-            system_prompt = "You are an expert Magic: The Gathering coach. Analyze this screenshot. If this is a Mulligan decision, start with 'KEEP' or 'MULLIGAN' immediately. Give a confidence score (0-10). Do NOT list the cards in the hand. Focus on the decision: curve, land count, and color fixing. If mid-game, analyze valid attacks or blocks explicitly."
-            
+            system_prompt = """You are an expert Magic: The Gathering Arena coach. Look at this screenshot and give immediate, actionable advice based on what you see.
+
+DETECT THE SITUATION AND RESPOND:
+- If showing a hand before game starts (7 cards, "Keep/Mulligan" buttons): Start with "KEEP" or "MULLIGAN", then brief reason.
+- If showing a Scry prompt (card with TOP/BOTTOM options): Say "TOP" or "BOTTOM" with one-sentence reasoning.
+- If showing Surveil: Say "GRAVEYARD" or "LIBRARY" based on card value and graveyard synergies.
+- If showing a modal spell or choice (multiple options highlighted): Recommend which option and why.
+- If showing target selection (arrows, glowing borders): Say which target to pick.
+- If showing combat with attackers/blockers: Give combat math and optimal blocks/attacks.
+- If showing the game board during your turn: Recommend the best play sequence.
+- If opponent is acting: Note if you should respond or let it resolve.
+
+BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentences spoken aloud."""
+
             # We can optionally format game state into the prompt if available
             ctx = ""
             if game_state:
-                 ctx = f" Turn {game_state.get('turn',{}).get('turn_number','?')}."
-            
-            user_msg = f"Analyze this screen state.{ctx} What is the best move?"
+                turn_num = game_state.get('turn', {}).get('turn_number', '?')
+                phase = game_state.get('turn', {}).get('phase', '')
+                life_you = 20
+                life_opp = 20
+                for p in game_state.get('players', []):
+                    if p.get('is_local'):
+                        life_you = p.get('life_total', 20)
+                    else:
+                        life_opp = p.get('life_total', 20)
+                ctx = f" Turn {turn_num}. Life: You {life_you}, Opp {life_opp}."
+
+            user_msg = f"What should I do here?{ctx}"
             
             if hasattr(self._coach, 'complete_with_image'):
                 advice = self._coach.complete_with_image(system_prompt, user_msg, png_bytes)
@@ -1589,7 +1118,7 @@ NOT: "Play a land and a creature." """
                 "advice_frequency": self.advice_frequency,
                 "draft_mode": self.draft_mode,
                 "set_code": self.set_code,
-                "auto_speak": True if self.backend_name == "gemini-live" else self._auto_speak,
+                "auto_speak": self._auto_speak,
             },
 
             # Settings from disk
@@ -1607,7 +1136,6 @@ NOT: "Play a land and a creature." """
                 "tts_muted": self._voice_output._muted if self._voice_output else None,
                 "tts_voice": self._voice_output.current_voice if self._voice_output else None,
                 "stt_enabled": self._voice_input is not None,
-                "realtime_connected": self._realtime_client is not None,
             },
 
             # Recent advice history
@@ -1635,6 +1163,7 @@ NOT: "Play a land and a creature." """
         try:
             if self._coach:
                 context["system_prompt"] = getattr(self._coach, '_system_prompt', None)
+                context["deck_strategy"] = getattr(self._coach, '_deck_strategy', None)
                 if self._mcp:
                     game_state = self._mcp.get_game_state()
                     if hasattr(self._coach, '_format_game_context'):
@@ -1656,17 +1185,26 @@ NOT: "Play a land and a creature." """
             return [f"Error reading logs: {e}"]
         return []
 
-    def _record_advice(self, advice: str, trigger: str, game_context: str = None) -> None:
-        """Record advice for debug history with full game state."""
+    def _record_advice(self, advice: str, trigger: str, game_context: str = None, game_state: dict = None) -> None:
+        """Record advice for debug history with full game state.
+
+        Args:
+            advice: The advice text that was given
+            trigger: What triggered this advice
+            game_context: Pre-formatted context string (optional)
+            game_state: Game state dict to use for context (optional, avoids re-polling)
+        """
         if not hasattr(self, '_advice_history'):
             self._advice_history = []
 
-        # Auto-capture game context if not provided
-        game_state = None
-        if game_context is None and self._coach and self._mcp:
+        # Use provided game_state, or fetch fresh if needed
+        # IMPORTANT: If game_state is provided, use it to avoid timing issues
+        # where the game state changes between advice generation and recording
+        if game_context is None and self._coach:
             try:
-                game_state = self._mcp.get_game_state()
-                if hasattr(self._coach, '_format_game_context'):
+                if game_state is None and self._mcp:
+                    game_state = self._mcp.get_game_state()
+                if game_state and hasattr(self._coach, '_format_game_context'):
                     game_context = self._coach._format_game_context(game_state)
             except Exception:
                 pass
@@ -1755,41 +1293,8 @@ NOT: "Play a land and a creature." """
             self.ui.status("PROVIDER", "Not available in draft mode")
             return
 
-        old_backend = self.backend_name
-        switching_realtime = (old_backend == "gpt-realtime") != (provider == "gpt-realtime")
-
         try:
             from arenamcp.coach import CoachEngine, create_backend
-
-            # If switching to/from gpt-realtime, need to restart voice threads
-            if switching_realtime and self._running:
-                logger.info(f"Switching realtime mode: {old_backend} -> {provider}")
-                self.ui.log(f"\n[yellow]Restarting voice system for {provider}...[/]\n")
-
-                # Stop current threads
-                self._running = False
-
-                if self._voice_thread and self._voice_thread.is_alive():
-                    self._voice_thread.join(timeout=3.0)
-                if self._coaching_thread and self._coaching_thread.is_alive():
-                    self._coaching_thread.join(timeout=3.0)
-
-                # Cleanup old resources
-                if self._voice_input:
-                    try:
-                        self._voice_input.stop()
-                    except Exception:
-                        pass
-                    self._voice_input = None
-
-                if self._realtime_client:
-                    try:
-                        self._realtime_client.disconnect()
-                    except Exception:
-                        pass
-                    self._realtime_client = None
-
-                self._running = True
 
             # Update backend
             self.backend_name = provider
@@ -1799,37 +1304,11 @@ NOT: "Play a land and a creature." """
 
             actual_model = getattr(llm_backend, 'model', 'default')
 
-            # Reinitialize voice system if we switched realtime modes
-            if switching_realtime and self._running:
-                self._init_voice()
-
-                # Start appropriate threads
-                # Start appropriate threads
-                if provider in ("gpt-realtime", "gemini-live"):
-                    # Realtime: single thread handles proactive + voice
-                    self._voice_thread = threading.Thread(
-                        target=self._realtime_voice_loop, daemon=True, name="voice-realtime"
-                    )
-                    self._voice_thread.start()
-                    self.ui.log(f"[green]{provider} mode active - speak naturally![/]\n")
-                else:
-                    # Other backends: separate coaching and voice threads
-                    self._coaching_thread = threading.Thread(
-                        target=self._coaching_loop, daemon=True, name="coaching"
-                    )
-                    self._coaching_thread.start()
-
-                    self._voice_thread = threading.Thread(
-                        target=self._voice_loop, daemon=True, name="voice"
-                    )
-                    self._voice_thread.start()
-                    self.ui.log("[green]PTT mode active - press F4 to speak[/]\n")
-            else:
-                # Just reconfigure voice input if needed
-                if self._voice_input:
-                    enable_transcription = (provider != "gemini")
-                    self._voice_input.transcription_enabled = enable_transcription
-                    logger.info(f"Voice transcription enabled: {enable_transcription}")
+            # Reconfigure voice input if needed
+            if self._voice_input:
+                enable_transcription = (provider != "gemini")
+                self._voice_input.transcription_enabled = enable_transcription
+                logger.info(f"Voice transcription enabled: {enable_transcription}")
 
             self.ui.status("PROVIDER", f"Switched to {provider.upper()} ({actual_model})")
             logger.info(f"Switched to {provider} backend, model: {actual_model}")
@@ -1848,6 +1327,7 @@ NOT: "Play a land and a creature." """
         # Unified logic: Cycle through the same list as the TUI dropdown
         # Format: (provider, model_name)
         combo_list = [
+            ("gemini", "gemini-2.5-flash"),
             ("gemini", "gemini-3-flash-preview"),
             ("gemini", "gemini-3-pro-preview"),
             ("ollama", "llama3.2:latest"),
@@ -1855,7 +1335,6 @@ NOT: "Play a land and a creature." """
             ("ollama", "deepseek-r1:14b"),
             ("claude", "claude-sonnet-4-20250514"),
             ("claude", "claude-haiku-4-5-20251001"),
-            ("gpt-realtime", "gpt-realtime"),
         ]
 
         # Find current index
@@ -1871,24 +1350,6 @@ NOT: "Play a land and a creature." """
         
         # Switch
         self.set_backend(new_provider, new_model)
-        
-        # Update TUI manually if needed (though set_backend logs it)
-        # self.ui.status("MODEL", f"{new_provider}/{new_model}")
-        try:
-            # If current model is None or not in list, start at -1 so next is 0
-            current_idx = current_list.index(self.model_name) if self.model_name in current_list else -1
-        except ValueError:
-            current_idx = -1
-        
-        next_idx = (current_idx + 1) % len(current_list)
-        new_model = current_list[next_idx]
-        
-        self.model_name = new_model
-        
-        # Recreate coach
-        self._reinit_coach()
-        self.ui.status("MODEL", new_model)
-        self.ui.log(f"\n[MODEL] Switched to {new_model}\n")
 
 
     def _on_style_toggle_hotkey(self) -> None:
@@ -1986,16 +1447,6 @@ NOT: "Play a land and a creature." """
                     self.ui.error("ANTHROPIC_API_KEY not set")
                     self.ui.log("Set it in .env file or: set ANTHROPIC_API_KEY=your_key")
                     sys.exit(1)
-            elif self.backend_name == "gemini-live":
-                if not os.environ.get("GOOGLE_API_KEY"):
-                    self.ui.error("GOOGLE_API_KEY not set")
-                    self.ui.log("Set it in .env file or: set GOOGLE_API_KEY=your_key")
-                    sys.exit(1)
-            elif self.backend_name == "gpt-realtime":
-                if not os.environ.get("AZURE_REALTIME_API_KEY"):
-                    self.ui.error("AZURE_REALTIME_API_KEY not set")
-                    self.ui.log("Set it in .env file or: set AZURE_REALTIME_API_KEY=your_key")
-                    sys.exit(1)
 
         self._running = True
 
@@ -2018,25 +1469,16 @@ NOT: "Play a land and a creature." """
             if self._coach and hasattr(self._coach, '_backend'):
                 actual_model = getattr(self._coach._backend, 'model', self.model_name)
 
-            # Start threads based on backend
+            # Start coaching and voice threads
             logger.info(f"Starting threads for backend: {self.backend_name}")
-            if self.backend_name in ("gpt-realtime", "gemini-live"):
-                # Realtime streaming backends: single thread handles both proactive advice and voice I/O
-                logger.info(f"Starting {self.backend_name} voice loop (no separate coaching thread)")
-                self._voice_thread = threading.Thread(
-                    target=self._realtime_voice_loop, daemon=True, name="voice-realtime"
-                )
-                self._voice_thread.start()
-                logger.info(f"{self.backend_name} thread started")
-                # No separate coaching thread - realtime loop handles triggers
-            else:
-                # Other backends: separate coaching and voice threads
-                logger.info("Starting PTT voice loop + coaching loop")
-                self._coaching_thread = threading.Thread(
-                    target=self._coaching_loop, daemon=True, name="coaching"
-                )
-                self._coaching_thread.start()
+            logger.info("Starting PTT voice loop + coaching loop")
+            self._coaching_thread = threading.Thread(
+                target=self._coaching_loop, daemon=True, name="coaching"
+            )
+            self._coaching_thread.start()
 
+            # Only launch voice thread if PTT/VOX is wanted
+            if self._voice_mode in ("ptt", "vox"):
                 self._voice_thread = threading.Thread(
                     target=self._voice_loop, daemon=True, name="voice"
                 )
@@ -2055,10 +1497,7 @@ NOT: "Play a land and a creature." """
             self.ui.log("MTGA STANDALONE COACH")
             self.ui.log("="*50)
             self.ui.status("BACKEND", f"{self.backend_name} ({actual_model or 'default'})")
-            if self.backend_name in ("gpt-realtime", "gemini-live"):
-                self.ui.status("VOICE", "REALTIME (continuous)")
-            else:
-                self.ui.status("VOICE", f"PTT (F4) + Kokoro")
+            self.ui.status("VOICE", f"PTT (F4) + Kokoro")
         self.ui.log("-"*50)
         self.ui.log("F5=mute F6=voice F7=bug F8=seat F9=restart F10=speed F12=model")
         self.ui.log("="*50)
@@ -2071,9 +1510,8 @@ NOT: "Play a land and a creature." """
         This method ensures proper termination of all threads and resources:
         1. Signals threads to stop via _running flag
         2. Stops voice input/output
-        3. Disconnects realtime client
-        4. Stops MCP server watcher
-        5. Waits for threads to terminate
+        3. Stops MCP server watcher
+        4. Waits for threads to terminate
         """
         if not self._running:
             return
@@ -2102,16 +1540,7 @@ NOT: "Play a land and a creature." """
                 logger.debug(f"Voice output stop error (non-fatal): {e}")
             self._voice_output = None
 
-        # 4. Disconnect GPT-realtime client (WebSocket cleanup)
-        if self._realtime_client:
-            try:
-                logger.debug("Disconnecting realtime client...")
-                self._realtime_client.disconnect()
-            except Exception as e:
-                logger.debug(f"Realtime disconnect error (non-fatal): {e}")
-            self._realtime_client = None
-
-        # 5. Stop draft helper if active
+        # 4. Stop draft helper if active
         if self.draft_mode and self._mcp:
             try:
                 logger.debug("Stopping draft helper...")
@@ -2163,8 +1592,9 @@ NOT: "Play a land and a creature." """
         from arenamcp.coach import GeminiBackend, ClaudeBackend, OllamaBackend
         
         tests = [
-            ("Gemini Flash", GeminiBackend, "gemini-3-flash-preview"),
-            ("Gemini Pro 3.0", GeminiBackend, "gemini-3-pro-preview"),
+            ("Gemini 2.5 Flash", GeminiBackend, "gemini-2.5-flash"),
+            ("Gemini 3 Flash", GeminiBackend, "gemini-3-flash-preview"),
+            ("Gemini 3 Pro", GeminiBackend, "gemini-3-pro-preview"),
             ("Claude Haiku", ClaudeBackend, "claude-haiku-4-5-20251001"),
             ("Ollama Local", OllamaBackend, "llama3.2:latest"),
         ]
@@ -2236,7 +1666,7 @@ Environment variables:
         """
     )
 
-    parser.add_argument("--backend", "-b", choices=["claude", "gemini", "ollama", "gpt-realtime", "gemini-live"],
+    parser.add_argument("--backend", "-b", choices=["claude", "gemini", "ollama"],
                         default=None, help="LLM backend (default: gemini)")
     parser.add_argument("--model", "-m", help="Model name override")
     parser.add_argument("--voice", "-v", choices=["ptt", "vox"], default=None,
@@ -2278,9 +1708,6 @@ Environment variables:
             sys.exit(1)
         if args.backend == "claude" and not os.environ.get("ANTHROPIC_API_KEY"):
             print("Error: ANTHROPIC_API_KEY not set")
-            sys.exit(1)
-        if args.backend == "gpt-realtime" and not os.environ.get("AZURE_REALTIME_API_KEY"):
-            print("Error: AZURE_REALTIME_API_KEY not set")
             sys.exit(1)
 
     logger.info(f"Starting: backend={args.backend}, draft={args.draft}")
