@@ -727,6 +727,28 @@ class StandaloneCoach:
 
                         logger.info(f"TRIGGER: {trigger}")
 
+                        # NOISE SUPPRESSION: Skip LLM call when player has no meaningful options.
+                        # Saves ~3-5s API call + TTS for obvious "pass priority" situations.
+                        QUIET_TRIGGERS = {"stack_spell_yours", "stack_spell_opponent", "priority_gained", "spell_resolved"}
+                        if trigger in QUIET_TRIGGERS:
+                            has_instants = self._trigger._has_castable_instants(curr_state)
+                            stack = curr_state.get("stack", [])
+
+                            # Own spell on stack with no instants to respond → auto-pass
+                            if trigger == "stack_spell_yours" and not has_instants:
+                                logger.info(f"Quiet: {trigger} (own spell, no responses)")
+                                continue
+
+                            # Opponent's action or priority with no instant-speed options → quiet
+                            if not is_my_turn and not has_instants:
+                                logger.info(f"Quiet: {trigger} (opp turn, no instants)")
+                                continue
+
+                            # Spell resolved but nothing castable in hand and not my main phase
+                            if trigger == "spell_resolved" and not has_instants and not is_my_turn:
+                                logger.info(f"Quiet: {trigger} (resolved, no options)")
+                                continue
+
                         # THREAT DETECTION: Direct speaking for instant response (no LLM needed)
                         if trigger == "threat_detected" and hasattr(self._trigger, '_last_threat'):
                             threat = self._trigger._last_threat
@@ -735,7 +757,7 @@ class StandaloneCoach:
                             self._record_advice(advice, trigger, game_state=curr_state)
                             last_advice_turn = turn_num
                             last_advice_phase = phase
-                            
+
                             # Speak immediately and display
                             self.ui.advice(advice, "THREAT")
                             self.speak_advice(advice)
