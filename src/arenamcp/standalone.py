@@ -745,6 +745,7 @@ class StandaloneCoach:
                             # Snapshot turn state BEFORE the (slow) LLM call
                             pre_advice_turn = turn_num
                             pre_advice_active = active_seat
+                            pre_advice_phase = phase
 
                             # Check if we can use direct audio (Gemini backend with audio output)
                             use_direct_audio = (
@@ -776,20 +777,21 @@ class StandaloneCoach:
                                 logger.info(f"ADVICE: {advice}")
 
                             # STALENESS CHECK: Re-poll game state after the LLM call.
-                            # If the turn or active player changed while waiting for
-                            # the API response (~7s), the advice is stale and would
-                            # confuse the player (e.g. "attack!" during opponent's turn).
+                            # If the turn, active player, or phase changed while waiting
+                            # for the API response (~7s), the advice is stale and would
+                            # confuse the player (e.g. "attack!" after combat is over).
                             fresh_state = self._mcp.get_game_state()
                             fresh_turn = fresh_state.get("turn", {})
                             fresh_turn_num = fresh_turn.get("turn_number", 0)
                             fresh_active = fresh_turn.get("active_player", 0)
+                            fresh_phase = fresh_turn.get("phase", "")
 
-                            if fresh_turn_num != pre_advice_turn or fresh_active != pre_advice_active:
+                            if fresh_turn_num != pre_advice_turn or fresh_active != pre_advice_active or fresh_phase != pre_advice_phase:
                                 stale_label = "[STALE - discarded]"
                                 if audio_result is not None:
                                     logger.info(
                                         f"Discarding stale audio advice: turn {pre_advice_turn}->{fresh_turn_num}, "
-                                        f"active {pre_advice_active}->{fresh_active}"
+                                        f"active {pre_advice_active}->{fresh_active}, phase {pre_advice_phase}->{fresh_phase}"
                                     )
                                     self._record_advice(
                                         f"{stale_label} [Audio: {trigger}]", trigger, game_state=curr_state
@@ -797,7 +799,7 @@ class StandaloneCoach:
                                 else:
                                     logger.info(
                                         f"Discarding stale advice: turn {pre_advice_turn}->{fresh_turn_num}, "
-                                        f"active {pre_advice_active}->{fresh_active}"
+                                        f"active {pre_advice_active}->{fresh_active}, phase {pre_advice_phase}->{fresh_phase}"
                                     )
                                     self._record_advice(
                                         f"{stale_label} {advice}", trigger, game_state=curr_state
