@@ -752,24 +752,32 @@ CRITICAL BLOCKING RULES:
 Analyze: phase (critical for timing!), board state, life totals, cards in hand, mana available.
 Output directly as the coach. No preamble, no meta-commentary."""
 
-CONCISE_SYSTEM_PROMPT = """You are an expert MTG coach.
-Your goal is to give a concise, sequential plan for the entire turn.
-Chain your actions clearly. Cover Main 1, Combat, and Main 2 if relevant.
+CONCISE_SYSTEM_PROMPT = """You are an expert MTG coach giving real-time spoken advice.
+Give ONE action for the CURRENT phase only. You will be re-consulted as the turn progresses.
+
+PHASE GUIDE:
+- Main phase: Suggest ONE play (land OR spell). You'll advise again after it resolves.
+- Combat/DeclareAttack: Say who to attack with (or "don't attack").
+- Combat/DeclareBlock: Say how to block (or "don't block, take the damage").
+- Opponent's turn: React to what's happening (instants/abilities only).
+- Stack: Say whether to respond or let it resolve.
+
+After your ONE action, you may add a brief reason or hint at the next step.
 
 Examples:
-"Play Forest. Cast Llanowar Elves. Pass."
-"Attack with all. If they block, cast Giant Growth."
-"Main 1: Cast Removal on their flyer. Combat: Swing with 5/5."
-"No attacks. Hold mana for Counterspell."
+"Play Mountain. Sets up Geological Appraiser next turn."
+"Cast Etali's Favor on Laelia — triggers discover for the cascade chain."
+"Attack with Laelia, the Blade Reforged. She exiles and grows."
+"Don't block. Take the 3 damage, you're at 20."
+"Let it resolve. Nothing worth countering."
+"Pass priority."
 
-RULE: Only suggest cards marked [CAN CAST]. Cards marked [NEED X mana] are unplayable!
-RULE: Use exact card names (e.g. "Attack with Sazh's Chocobo", NOT "Attack with Bird").
-RULE: ONLY suggest playing lands that appear in the HAND section! If no land is shown in HAND, do NOT say "Play Forest/Island/etc".
-RULE: If HAND is empty or has no playable cards, just say "Pass."
-
-Style: Military/Pro player. Imperative. No fluff.
-Do NOT explain "why". Just say "what".
-Keep it under 30 words total.
+RULES:
+- Only suggest cards tagged [CAN CAST] or [OK]. Cards tagged [NEED X mana] CANNOT be cast!
+- Use exact FULL card names from the game state. Never abbreviate.
+- Only suggest lands shown in HAND. If no land in hand, don't suggest playing one.
+- Say "pass priority" not just "pass" to avoid sounding like a card name.
+- This is spoken aloud — keep it natural and under 30 words.
 """
 
 # PHASE 2: Decision-specific prompt guidance
@@ -1479,23 +1487,23 @@ class CoachEngine:
             user_message = f"{context}\n\nThe player asks: {question}"
         elif trigger:
             trigger_descriptions = {
-                "new_turn": "Your turn started. Tell the player which land to play (be specific about which one).",
-                "land_played": "Player just played a land. Now tell them which spell to cast next, or to move to combat.",
-                "spell_resolved": "Player's spell just resolved. Tell them what to do next - cast another spell, attack, or pass.",
-                "priority_gained": "You just gained priority.",
-                "combat_attackers": "Declare your attackers - which creatures should attack?",
-                "combat_blockers": "Opponent attacked, declare blockers.",
-                "low_life": "Your life total is dangerously low!",
-                "opponent_low_life": "Opponent's life is low - chance to win!",
-                "stack_spell": "Something was just cast - do you want to respond?",
-                "stack_spell_yours": "You just cast a spell. Pass priority to let it resolve.",
-                "stack_spell_opponent": "Opponent just cast a spell! Respond or let it resolve?",
-                "user_request": "Give quick strategic advice.",
-                "decision_required": "You need to make a decision (scry, discard, target, mulligan, etc). What should the player choose?",
+                "new_turn": "Your turn just started (Main 1). What is the ONE best play right now?",
+                "land_played": "A land was just played. What is the ONE next play?",
+                "spell_resolved": "A spell just resolved. What is the ONE next play?",
+                "priority_gained": "You have priority. Respond or pass?",
+                "combat_attackers": "Combat: Declare attackers. Which creatures should attack?",
+                "combat_blockers": "Combat: Opponent is attacking. How should you block?",
+                "low_life": "Your life is dangerously low! What's the survival plan?",
+                "opponent_low_life": "Opponent's life is low — can you finish them?",
+                "stack_spell": "Something was just cast. Respond or let it resolve?",
+                "stack_spell_yours": "Your spell is on the stack. Pass priority or hold?",
+                "stack_spell_opponent": "Opponent just cast something. Respond or let it resolve?",
+                "user_request": "Give quick strategic advice for this moment.",
+                "decision_required": "Decision required (scry, discard, target, mulligan, etc). What should the player choose?",
                 "threat_detected": "ALERT: A dangerous card just hit the battlefield!",
             }
             trigger_desc = trigger_descriptions.get(trigger, f"Trigger: {trigger}")
-            user_message = f"{context}\n\n{trigger_desc} What should the player do?"
+            user_message = f"{context}\n\n{trigger_desc}"
         else:
             user_message = f"{context}\n\nWhat's the best play right now?"
 
@@ -1592,23 +1600,23 @@ class CoachEngine:
         # Build user message (same logic as get_advice)
         if trigger:
             trigger_descriptions = {
-                "new_turn": "Your turn started. Tell the player which land to play (be specific about which one).",
-                "land_played": "Player just played a land. Now tell them which spell to cast next, or to move to combat.",
-                "spell_resolved": "Player's spell just resolved. Tell them what to do next - cast another spell, attack, or pass.",
-                "priority_gained": "You just gained priority.",
-                "combat_attackers": "Declare your attackers - which creatures should attack?",
-                "combat_blockers": "Opponent attacked, declare blockers.",
-                "low_life": "Your life total is dangerously low!",
-                "opponent_low_life": "Opponent's life is low - chance to win!",
-                "stack_spell": "Something was just cast - do you want to respond?",
-                "stack_spell_yours": "You just cast a spell. Pass priority to let it resolve.",
-                "stack_spell_opponent": "Opponent just cast a spell! Respond or let it resolve?",
-                "user_request": "Give quick strategic advice.",
-                "decision_required": "You need to make a decision (scry, discard, target, mulligan, etc). What should the player choose?",
+                "new_turn": "Your turn just started (Main 1). What is the ONE best play right now?",
+                "land_played": "A land was just played. What is the ONE next play?",
+                "spell_resolved": "A spell just resolved. What is the ONE next play?",
+                "priority_gained": "You have priority. Respond or pass?",
+                "combat_attackers": "Combat: Declare attackers. Which creatures should attack?",
+                "combat_blockers": "Combat: Opponent is attacking. How should you block?",
+                "low_life": "Your life is dangerously low! What's the survival plan?",
+                "opponent_low_life": "Opponent's life is low — can you finish them?",
+                "stack_spell": "Something was just cast. Respond or let it resolve?",
+                "stack_spell_yours": "Your spell is on the stack. Pass priority or hold?",
+                "stack_spell_opponent": "Opponent just cast something. Respond or let it resolve?",
+                "user_request": "Give quick strategic advice for this moment.",
+                "decision_required": "Decision required (scry, discard, target, mulligan, etc). What should the player choose?",
                 "threat_detected": "ALERT: A dangerous card just hit the battlefield!",
             }
             trigger_desc = trigger_descriptions.get(trigger, f"Trigger: {trigger}")
-            user_message = f"{context}\n\n{trigger_desc} What should the player do?"
+            user_message = f"{context}\n\n{trigger_desc}"
         else:
             user_message = f"{context}\n\nWhat's the best play right now?"
 
