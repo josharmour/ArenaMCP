@@ -864,9 +864,14 @@ class StandaloneCoach:
                                     logger.warning("Direct audio returned empty samples")
                             else:
                                 # Text path - display and speak via TTS
-                                self._record_advice(advice, trigger, game_state=curr_state)
-                                self.ui.advice(advice, seat_info)
-                                self.speak_advice(advice)
+                                # Don't speak error messages aloud
+                                if advice and advice.startswith("Error"):
+                                    logger.warning(f"Suppressing error advice from TTS: {advice[:80]}")
+                                    self.ui.error(advice)
+                                else:
+                                    self._record_advice(advice, trigger, game_state=curr_state)
+                                    self.ui.advice(advice, seat_info)
+                                    self.speak_advice(advice)
 
                 prev_state = curr_state
 

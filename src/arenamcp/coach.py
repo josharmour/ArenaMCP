@@ -100,7 +100,7 @@ class GeminiBackend:
                 raise ImportError("google-genai package required: pip install google-genai")
         return self._client
 
-    def complete(self, system_prompt: str, user_message: str, max_tokens: int = 500) -> str:
+    def complete(self, system_prompt: str, user_message: str, max_tokens: int = 1024) -> str:
         """Get completion from Gemini API."""
         import time
 
@@ -161,17 +161,18 @@ class GeminiBackend:
             # Extract text, handling potential thought blocks if present
             text = ""
             if hasattr(response, 'candidates') and response.candidates:
-                # Iterate through parts to find the actual text response, ignoring "thought" parts if distinct
-                # Note: The google-genai SDK maps parts. If there are thoughts, they might be in a separate part.
-                for part in response.candidates[0].content.parts:
-                    # In some versions, thoughts are just text parts. In others, they might be distinct.
-                    # We'll just grab everything for now, but if thinking is enabled, we might need to parse.
-                    # Assuming .text returns the concatenated text which is what we usually want.
-                    if hasattr(part, 'text') and part.text:
-                         text += part.text
-            
+                candidate = response.candidates[0]
+                parts = getattr(candidate.content, 'parts', None) if candidate.content else None
+                if parts:
+                    for part in parts:
+                        if hasattr(part, 'text') and part.text:
+                            text += part.text
+
             if not text:
-                 text = response.text # Fallback
+                try:
+                    text = response.text  # Fallback
+                except (AttributeError, ValueError):
+                    text = ""
                  
             if not text or text.strip() == "...":
                 logger.warning(f"Empty/Ellipsis response from Gemini. Reason: {finish_reason}")
@@ -240,7 +241,7 @@ class GeminiBackend:
                 contents=[user_message, audio_part],
                 config=genai.types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    max_output_tokens=500,
+                    max_output_tokens=1024,
                     temperature=0.0,
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                     safety_settings=[
@@ -415,7 +416,7 @@ class GeminiBackend:
                 contents=[user_message, image_part],
                 config=genai.types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    max_output_tokens=500,
+                    max_output_tokens=1024,
                     temperature=0.0,
                     safety_settings=[
                          types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
