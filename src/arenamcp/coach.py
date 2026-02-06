@@ -287,8 +287,11 @@ class GeminiBackend:
             logger.error(f"Gemini audio API error: {e}")
             return f"Error getting advice from Gemini with audio: {e}"
 
-    # Models known to support response_modalities=["AUDIO"]
-    AUDIO_CAPABLE_MODELS = {"gemini-2.5-flash", "gemini-2.5-pro"}
+    # Models known to support response_modalities=["AUDIO"] via generate_content.
+    # NOTE: As of 2026-02, no standard Gemini model supports this — only the
+    # dedicated TTS model (gemini-2.5-flash-preview-tts) and Live API do.
+    # Keep this set for future models; the text+GeminiTTS fallback works well.
+    AUDIO_CAPABLE_MODELS: set[str] = set()
 
     def complete_audio(
         self,
