@@ -100,7 +100,7 @@ class GeminiBackend:
                 raise ImportError("google-genai package required: pip install google-genai")
         return self._client
 
-    def complete(self, system_prompt: str, user_message: str) -> str:
+    def complete(self, system_prompt: str, user_message: str, max_tokens: int = 150) -> str:
         """Get completion from Gemini API."""
         import time
 
@@ -122,7 +122,7 @@ class GeminiBackend:
                 contents=user_message,
                 config=genai.types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    max_output_tokens=150,
+                    max_output_tokens=max_tokens,
                     temperature=0.0,
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                     safety_settings=[
@@ -287,6 +287,9 @@ class GeminiBackend:
             logger.error(f"Gemini audio API error: {e}")
             return f"Error getting advice from Gemini with audio: {e}"
 
+    # Models known to support response_modalities=["AUDIO"]
+    AUDIO_CAPABLE_MODELS = {"gemini-2.5-flash", "gemini-2.5-pro"}
+
     def complete_audio(
         self,
         system_prompt: str,
@@ -307,11 +310,12 @@ class GeminiBackend:
             Tuple of (samples as float32 numpy array, sample_rate) on success,
             None on any error.
         """
-        import io
         import time
-        import wave
 
-        import numpy as np
+        # Only attempt audio on models known to support it
+        if self.model not in self.AUDIO_CAPABLE_MODELS:
+            logger.debug(f"Model {self.model} not in audio-capable list, skipping complete_audio")
+            return None
 
         api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
@@ -363,26 +367,15 @@ class GeminiBackend:
             )
             request_time = (time.perf_counter() - request_start) * 1000
 
-            # Extract WAV audio data from response
-            audio_data = response.candidates[0].content.parts[0].inline_data.data
+            # Extract audio data from response (robust parsing)
+            from arenamcp.tts import _extract_audio_from_response, _decode_audio_bytes
 
-            # Decode WAV bytes to numpy array (same pattern as GeminiTTS.synthesize())
-            with wave.open(io.BytesIO(audio_data), "rb") as wf:
-                sample_rate = wf.getframerate()
-                n_channels = wf.getnchannels()
-                sampwidth = wf.getsampwidth()
-                raw_frames = wf.readframes(wf.getnframes())
+            audio_data = _extract_audio_from_response(response)
+            if audio_data is None:
+                logger.error(f"[GEMINI+AUDIO_OUT] No audio data in response (model={self.model})")
+                return None
 
-            if sampwidth == 2:
-                samples = np.frombuffer(raw_frames, dtype=np.int16).astype(np.float32) / 32768.0
-            elif sampwidth == 4:
-                samples = np.frombuffer(raw_frames, dtype=np.int32).astype(np.float32) / 2147483648.0
-            else:
-                samples = np.frombuffer(raw_frames, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
-
-            # Mix to mono if stereo
-            if n_channels > 1:
-                samples = samples.reshape(-1, n_channels).mean(axis=1)
+            samples, sample_rate = _decode_audio_bytes(audio_data)
 
             logger.info(f"[GEMINI+AUDIO_OUT] API: {request_time:.0f}ms, client: {client_time:.1f}ms, model: {self.model}, voice: {voice}, samples: {len(samples)}, rate: {sample_rate}")
 
@@ -945,7 +938,12 @@ class CoachEngine:
             deck_text = "\n".join(deck_lines)
             user_message = f"DECK LIST ({len(deck_cards)} cards):\n{deck_text}"
 
-            strategy = self._backend.complete(DECK_ANALYSIS_PROMPT, user_message)
+            # Deck analysis needs more tokens than the default 150 for game advice
+            try:
+                strategy = self._backend.complete(DECK_ANALYSIS_PROMPT, user_message, max_tokens=400)
+            except TypeError:
+                # Backend doesn't support max_tokens parameter
+                strategy = self._backend.complete(DECK_ANALYSIS_PROMPT, user_message)
 
             # Truncate if too long
             if len(strategy) > 400:
