@@ -1520,9 +1520,13 @@ class CoachEngine:
         
         effective_system_prompt = prompts.get(style_key, CONCISE_SYSTEM_PROMPT)
 
-        # Inject deck strategy if available
+        # Inject deck strategy if available — instruct model to reference it
         if self._deck_strategy:
-            effective_system_prompt += f"\n\nDECK STRATEGY:\n{self._deck_strategy}"
+            effective_system_prompt += (
+                f"\n\nDECK STRATEGY:\n{self._deck_strategy}"
+                "\n\nConnect your advice to this strategy — briefly explain WHY a play "
+                "matters for the deck's game plan (e.g. 'Cast X to trigger cascade into combo pieces')."
+            )
 
         # Re-inject blacklisted words and decision guidance into effective prompt
         if blacklisted:
@@ -1618,9 +1622,13 @@ class CoachEngine:
         }
         effective_system_prompt = prompts.get(style_key, CONCISE_SYSTEM_PROMPT)
 
-        # Inject deck strategy if available
+        # Inject deck strategy if available — instruct model to reference it
         if self._deck_strategy:
-            effective_system_prompt += f"\n\nDECK STRATEGY:\n{self._deck_strategy}"
+            effective_system_prompt += (
+                f"\n\nDECK STRATEGY:\n{self._deck_strategy}"
+                "\n\nConnect your advice to this strategy — briefly explain WHY a play "
+                "matters for the deck's game plan (e.g. 'Cast X to trigger cascade into combo pieces')."
+            )
 
         # Inject blacklisted words
         if blacklisted:
