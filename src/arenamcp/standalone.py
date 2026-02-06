@@ -1332,7 +1332,6 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
         # Format: (provider, model_name)
         combo_list = [
             ("gemini", "gemini-2.5-flash"),
-            ("gemini", "gemini-3-flash-preview"),
             ("gemini", "gemini-3-pro-preview"),
             ("ollama", "llama3.2:latest"),
             ("ollama", "gemma3n:latest"),
@@ -1597,7 +1596,6 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
         
         tests = [
             ("Gemini 2.5 Flash", GeminiBackend, "gemini-2.5-flash"),
-            ("Gemini 3 Flash", GeminiBackend, "gemini-3-flash-preview"),
             ("Gemini 3 Pro", GeminiBackend, "gemini-3-pro-preview"),
             ("Claude Haiku", ClaudeBackend, "claude-haiku-4-5-20251001"),
             ("Ollama Local", OllamaBackend, "llama3.2:latest"),
