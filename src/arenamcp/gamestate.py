@@ -63,7 +63,6 @@ class GameObject:
             "power": self.power,
             "toughness": self.toughness,
             "is_tapped": self.is_tapped,
-            "is_tapped": self.is_tapped,
             "turn_entered_battlefield": self.turn_entered_battlefield,
             "is_attacking": self.is_attacking,
             "is_blocking": self.is_blocking,
@@ -149,6 +148,12 @@ class GameState:
         # This ensures fast combat phases aren't missed
         self._pending_combat_steps: list[str] = []
 
+        # Untap prevention tracking: instance_ids that MTGA explicitly kept tapped
+        # during the untap step (e.g., creatures with Blossombind "can't become untapped").
+        # These are skipped during blanket untap on subsequent turns.
+        self._untap_prevention: set[int] = set()
+        self._in_untap_step: bool = False  # True during first message of a turn change
+
         # Decision tracking (for Mulligan advice, etc.)
         self.pending_decision: Optional[str] = None  # e.g. "Mulligan"
         self.decision_seat_id: Optional[int] = None
@@ -158,6 +163,9 @@ class GameState:
         
         # Match tracking (to avoid stale state across matches)
         self.match_id: Optional[str] = None
+
+        # Deck list captured from ConnectResp
+        self.deck_cards: list[int] = []
 
     def reset(self) -> None:
         """Reset the game state to essentially empty (for new match)."""
@@ -184,10 +192,13 @@ class GameState:
         self.played_cards.clear()
         self._seen_instances.clear()
         self._pending_combat_steps.clear()
+        self._untap_prevention.clear()
+        self._in_untap_step = False
         self.pending_decision = None
         self.decision_seat_id = None
         self.decision_context = None
         self.decision_timestamp = 0
+        self.deck_cards = []
 
     # Backward compatibility for _seat_manually_set
     @property
@@ -227,7 +238,13 @@ class GameState:
                 continue
             for instance_id in zone.object_instance_ids:
                 if instance_id in self.game_objects:
-                    result.append(self.game_objects[instance_id])
+                    obj = self.game_objects[instance_id]
+                    # Cross-check: object's zone_id must match this zone.
+                    # Arena diff updates may update the object's zone_id before
+                    # the zone's member list, causing stale entries (e.g. resolved
+                    # spells appearing on both stack and battlefield).
+                    if obj.zone_id == zone.zone_id:
+                        result.append(obj)
         return result
 
     def get_player_objects(self, seat_id: int) -> list[GameObject]:
@@ -243,6 +260,25 @@ class GameState:
             obj for obj in self.game_objects.values()
             if obj.owner_seat_id == seat_id
         ]
+
+    def _cleanup_stale_objects(self) -> None:
+        """Remove game objects that are no longer in any zone.
+        
+        This prevents memory accumulation during long games where many
+        tokens are created and destroyed.
+        """
+        # Collect all instance IDs currently in zones
+        live_ids: set[int] = set()
+        for zone in self.zones.values():
+            live_ids.update(zone.object_instance_ids)
+        
+        # Find and remove stale objects
+        stale_ids = [oid for oid in self.game_objects if oid not in live_ids]
+        for oid in stale_ids:
+            del self.game_objects[oid]
+        
+        if stale_ids:
+            logger.debug(f"Cleaned up {len(stale_ids)} stale game objects")
 
     @property
     def battlefield(self) -> list[GameObject]:
@@ -272,6 +308,11 @@ class GameState:
     def stack(self) -> list[GameObject]:
         """Get all objects on the stack."""
         return self.get_objects_in_zone(ZoneType.STACK)
+
+    @property
+    def command(self) -> list[GameObject]:
+        """Get all objects in the command zone."""
+        return self.get_objects_in_zone(ZoneType.COMMAND)
 
     def get_opponent_played_cards(self) -> list[int]:
         """Get list of grp_ids of cards opponent has revealed.
@@ -335,6 +376,7 @@ class GameState:
                 "stack": [enrich_obj(obj) for obj in self.stack],
                 "graveyard": [enrich_obj(obj) for obj in self.graveyard],
                 "exile": [enrich_obj(obj) for obj in self.get_objects_in_zone(ZoneType.EXILE)],
+                "command": [enrich_obj(obj) for obj in self.command],
             },
             "pending_decision": self.pending_decision,
             "decision_seat_id": self.decision_seat_id,
@@ -458,6 +500,14 @@ class GameState:
         players = message.get("players", [])
         for player_data in players:
             self._update_player(player_data)
+        
+        # Clear untap step flag after processing all objects in this message
+        self._in_untap_step = False
+
+        # MEMORY OPTIMIZATION: Periodically clean up stale objects
+        # Objects can accumulate when tokens die or cards are exiled from exile
+        if len(self.game_objects) > 200:  # Only cleanup when dict gets large
+            self._cleanup_stale_objects()
 
     def _update_game_object(self, obj_data: dict) -> None:
         """Update or create a game object from message data.
@@ -528,7 +578,16 @@ class GameState:
              t = obj_data["toughness"]
              toughness = t.get("value") if isinstance(t, dict) else t
 
-        if "isTapped" in obj_data: is_tapped = obj_data["isTapped"]
+        if "isTapped" in obj_data:
+            is_tapped = obj_data["isTapped"]
+            # Track untap prevention: if MTGA says a permanent is still tapped
+            # during the untap step, it has an untap restriction (e.g. Blossombind).
+            # Skip blanket-untapping it on future turns.
+            if self._in_untap_step:
+                if is_tapped:
+                    self._untap_prevention.add(instance_id)
+                else:
+                    self._untap_prevention.discard(instance_id)
         if "parentId" in obj_data: parent_instance_id = obj_data["parentId"]
 
         if "isAttacking" in obj_data: is_attacking = bool(obj_data["isAttacking"])
@@ -627,15 +686,48 @@ class GameState:
         if zone_id is None:
             return
 
-        zone_type_str = zone_data.get("type", "Unknown")
-        try:
-            zone_type = ZoneType(zone_type_str)
-        except ValueError:
-            zone_type = ZoneType.UNKNOWN
-            logger.debug(f"Unknown zone type: {zone_type_str}")
+        existing_zone = self.zones.get(zone_id)
 
-        owner_seat_id = zone_data.get("ownerSeatId")
-        object_instance_ids = zone_data.get("objectInstanceIds", [])
+        # Helper to get value from update or preserve existing
+        def get_val(key, default, existing_attr=None):
+            if key in zone_data:
+                return zone_data[key]
+            if existing_zone and existing_attr is not None:
+                return getattr(existing_zone, existing_attr)
+            return default
+
+        # Zone Type
+        if "type" in zone_data:
+            zone_type_str = zone_data["type"]
+            try:
+                zone_type = ZoneType(zone_type_str)
+            except ValueError:
+                zone_type = ZoneType.UNKNOWN
+                logger.debug(f"Unknown zone type: {zone_type_str}")
+        elif existing_zone:
+            zone_type = existing_zone.zone_type
+        else:
+            zone_type = ZoneType.UNKNOWN
+
+        # Owner Seat ID
+        # Note: ownerSeatId can be None in JSON or missing.
+        # If explicit null in JSON -> we set to None.
+        # If missing -> we preserve existing.
+        if "ownerSeatId" in zone_data:
+            owner_seat_id = zone_data["ownerSeatId"]
+        elif existing_zone:
+            owner_seat_id = existing_zone.owner_seat_id
+        else:
+            owner_seat_id = None
+
+        # Object Instance IDs
+        # Critical: If missing, must preserve existing list to avoid wiping zone
+        if "objectInstanceIds" in zone_data:
+            object_instance_ids = zone_data["objectInstanceIds"]
+        elif existing_zone:
+            object_instance_ids = existing_zone.object_instance_ids
+        else:
+            object_instance_ids = []
 
         zone = Zone(
             zone_id=zone_id,
@@ -677,6 +769,9 @@ class GameState:
     def _update_player(self, player_data: dict) -> None:
         """Update or create a player from message data.
 
+        Handles incremental updates by preserving existing values when
+        fields are not present in the update message.
+
         Args:
             player_data: Player dict from GameStateMessage.
         """
@@ -684,8 +779,25 @@ class GameState:
         if seat_id is None:
             return
 
-        life_total = player_data.get("lifeTotal", 20)
-        lands_played = player_data.get("landsPlayedThisTurn", 0)
+        # Get existing player to preserve values not in this update
+        existing = self.players.get(seat_id)
+
+        # Only update life_total if explicitly provided in the message
+        # This fixes the bug where diff messages without lifeTotal would reset to 20
+        if "lifeTotal" in player_data:
+            life_total = player_data["lifeTotal"]
+        elif existing:
+            life_total = existing.life_total
+        else:
+            life_total = 20  # Default for new players
+
+        # Same for lands_played - preserve if not in update
+        if "landsPlayedThisTurn" in player_data:
+            lands_played = player_data["landsPlayedThisTurn"]
+        elif existing:
+            lands_played = existing.lands_played
+        else:
+            lands_played = 0
 
         # FALLBACK: Arena doesn't always track landsPlayedThisTurn correctly
         # Infer by counting lands that entered battlefield this turn
@@ -694,28 +806,30 @@ class GameState:
             inferred_lands = 0
             for obj in self.battlefield:
                 # Check card_types for "Land" (stored as "CardType_Land" from Arena)
-                is_land_by_type = any("Land" in ct for ct in obj.card_types) if obj.card_types else False
-                # Fallback: check type_line (e.g., "Basic Land — Forest")
-                is_land_by_line = "land" in obj.type_line.lower() if obj.type_line else False
-                is_land = is_land_by_type or is_land_by_line
-                
-                if (obj.owner_seat_id == seat_id and 
+                is_land = any("Land" in ct for ct in obj.card_types) if obj.card_types else False
+
+                if (obj.owner_seat_id == seat_id and
                     obj.controller_seat_id == seat_id and
                     is_land and
                     obj.turn_entered_battlefield == current_turn):
                     inferred_lands += 1
-                    logger.debug(f"Inferred land: {obj.name} entered turn {current_turn} for seat {seat_id}")
-            
+                    logger.debug(f"Inferred land: grp_id={obj.grp_id} entered turn {current_turn} for seat {seat_id}")
+
             if inferred_lands > 0:
                 lands_played = inferred_lands
                 logger.info(f"Inferred lands_played={lands_played} for seat {seat_id} (Arena reported 0)")
 
-        # Extract mana pool if present
-        mana_pool = {}
-        for mana_data in player_data.get("manaPool", []):
-            mana_type = mana_data.get("type", "unknown")
-            mana_count = mana_data.get("count", 0)
-            mana_pool[mana_type] = mana_count
+        # Extract mana pool if present, otherwise preserve existing
+        if "manaPool" in player_data:
+            mana_pool = {}
+            for mana_data in player_data["manaPool"]:
+                mana_type = mana_data.get("type", "unknown")
+                mana_count = mana_data.get("count", 0)
+                mana_pool[mana_type] = mana_count
+        elif existing:
+            mana_pool = existing.mana_pool
+        else:
+            mana_pool = {}
 
         player = Player(
             seat_id=seat_id,
@@ -736,7 +850,6 @@ class GameState:
         new_turn = turn_data.get("turnNumber", self.turn_info.turn_number)
 
         # Detect new game: turn number resets to 1 or decreases significantly
-        # Detect new game: turn number resets to 1 or decreases significantly
         if self.turn_info.turn_number > 3 and new_turn <= 1:
             logger.info(f"New game detected (turn {self.turn_info.turn_number} -> {new_turn}) - Performing Search & Destroy on old state.")
             
@@ -745,8 +858,27 @@ class GameState:
             
             # reset() makes turn_number 0, which is fine as we overwrite it below
 
-        new_active = turn_data.get("activePlayer", self.turn_info.active_player)
+        # Check if active player is explicitly in the update
+        explicit_active = "activePlayer" in turn_data
         
+        if new_turn != self.turn_info.turn_number:
+            # Turn changed
+            if explicit_active:
+                new_active = turn_data["activePlayer"]
+            else:
+                # Turn changed without active player update.
+                # This implies either:
+                # 1. Active player didn't change (Extra Turn) -> Diff omission
+                # 2. Partial update race condition (Turn sent before Active)
+                #
+                # Case 2 causes "Wrong Turn Advice" (reporting Turn N with Turn N-1's owner).
+                # We invalidate to 0 to prevent this hallucination.
+                new_active = 0
+                logger.debug(f"Turn change ({self.turn_info.turn_number}->{new_turn}) without activePlayer. Invalidating active_player to 0.")
+        else:
+            # Turn didn't change, use update or keep existing
+            new_active = turn_data.get("activePlayer", self.turn_info.active_player)
+
         # Clear stale pending combat steps when turn or active player changes
         # Must check BEFORE updating turn_info
         if new_turn != self.turn_info.turn_number or new_active != self.turn_info.active_player:
@@ -754,27 +886,77 @@ class GameState:
                 logger.debug(f"Clearing {len(self._pending_combat_steps)} stale pending combat steps (turn/active changed)")
                 self._pending_combat_steps.clear()
         
+        # UNTAP STEP: When turn changes, untap all permanents controlled by the new active player.
+        # Skip permanents in _untap_prevention — those that MTGA explicitly kept tapped last turn
+        # (e.g. creatures with "can't become untapped" from Blossombind-style effects).
+        # After blanket untap, _in_untap_step is set so that object diffs in this same message
+        # can update _untap_prevention for the NEXT turn's blanket untap.
+        if new_turn != self.turn_info.turn_number and new_active != 0:
+            self._in_untap_step = True
+            # Clean up _untap_prevention: remove instance_ids no longer on battlefield
+            battlefield_ids = set()
+            for obj in self.game_objects.values():
+                zone = self.zones.get(obj.zone_id)
+                if zone and zone.zone_type == ZoneType.BATTLEFIELD:
+                    battlefield_ids.add(obj.instance_id)
+            self._untap_prevention &= battlefield_ids
+
+            untapped_count = 0
+            skipped_count = 0
+            for obj in self.game_objects.values():
+                controller = obj.controller_seat_id if obj.controller_seat_id else obj.owner_seat_id
+                if controller == new_active and obj.is_tapped:
+                    zone = self.zones.get(obj.zone_id)
+                    if zone and zone.zone_type == ZoneType.BATTLEFIELD:
+                        if obj.instance_id in self._untap_prevention:
+                            skipped_count += 1
+                        else:
+                            obj.is_tapped = False
+                            untapped_count += 1
+            if untapped_count > 0 or skipped_count > 0:
+                msg = f"Untap step: untapped {untapped_count} permanents for seat {new_active}"
+                if skipped_count > 0:
+                    msg += f" (skipped {skipped_count} with untap prevention)"
+                logger.info(msg)
+        
+        turn_changed = new_turn != self.turn_info.turn_number
         self.turn_info.turn_number = new_turn
         self.turn_info.active_player = new_active
         self.turn_info.priority_player = turn_data.get("priorityPlayer", self.turn_info.priority_player)
-        new_phase = turn_data.get("phase", self.turn_info.phase)
-        new_step = turn_data.get("step", self.turn_info.step)
+        if turn_changed:
+            # Turn changed, reset phase/step if not provided (prevent stale phase leakage)
+            if "phase" in turn_data:
+                new_phase = turn_data["phase"]
+            else:
+                new_phase = "Phase_Beginning"
+                logger.debug(f"Turn change ({self.turn_info.turn_number}->{new_turn}) without phase. Resetting to Phase_Beginning.")
+            
+            if "step" in turn_data:
+                new_step = turn_data["step"]
+            else:
+                new_step = "Step_Untap"
+        else:
+            # Same turn, preserve existing if missing
+            new_phase = turn_data.get("phase", self.turn_info.phase)
+            new_step = turn_data.get("step", self.turn_info.step)
 
-        # Safety: auto-clear mulligan decision once game proceeds past turn 1
-        # This handles cases where SubmitDeckResp message was missed
-        if self.pending_decision == "Mulligan" and new_turn > 1:
-            logger.info(f"Auto-clearing stale Mulligan decision (now turn {new_turn})")
+        # Safety: auto-clear mulligan decision once the game has started (turn >= 1)
+        # SubmitDeckResp is client→server so it never reaches the GRE handler;
+        # this auto-clear is the primary mechanism for clearing mulligans.
+        if self.pending_decision == "Mulligan" and new_turn >= 1:
+            logger.info(f"Auto-clearing Mulligan decision (game started, turn {new_turn})")
             self.pending_decision = None
             self.decision_seat_id = None
             self.decision_context = None
             self.decision_timestamp = 0
 
-        # Detect phase change
+        # Detect phase change within same turn (or handled by reset above)
         if new_phase != self.turn_info.phase:
             logger.debug(f"Phase change: {self.turn_info.phase} -> {new_phase}")
-            # If step is not explicitly in the update, reset it to avoid stale steps
-            # (e.g., Step_Draw appearing in Phase_Main1)
-            if "step" not in turn_data:
+            # If step is not explicitly in the update AND we didn't just reset it above,
+            # we should clear it to avoid stale steps (e.g. Step_Draw in Phase_Main1)
+            # But if we just set it to Untap above, keep it.
+            if "step" not in turn_data and new_turn == self.turn_info.turn_number:
                 new_step = ""
                 logger.debug("Resetting step due to phase change")
 
@@ -826,22 +1008,37 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                 if game_state_msg:
                     game_state.update_from_message(game_state_msg)
             
-            # Handle Mulligan/Decision Requests
-            elif msg_type == "GREMessageType_SubmitDeckReq" or msg_type == "GREMessageType_IntermissionReq":
-                # This explicitly asks for a deck submission, usually mulligan phase
+            # Handle Mulligan (MulliganReq or legacy SubmitDeckReq)
+            elif msg_type in ("GREMessageType_MulliganReq", "GREMessageType_SubmitDeckReq"):
+                # MulliganReq = MTGA asking a player to keep/mulligan.
+                # Even if systemSeatIds targets the opponent, both players decide
+                # simultaneously — so always set the mulligan decision.
                 logger.info(f"Captured Decision: Mulligan Check ({msg_type})")
-                
-                # If we get a Mulligan request while deeply into a game (Turn > 1), 
+
+                # If we get a Mulligan request while deeply into a game (Turn > 1),
                 # it implies a restart/rematch that happened before the 'Turn 1' update arrived.
                 if game_state.turn_info.turn_number > 1:
                      logger.info(f"Mulligan Request detected at Turn {game_state.turn_info.turn_number} -> Resetting Ghost State.")
                      game_state.reset()
-                
+
                 game_state.pending_decision = "Mulligan"
                 game_state.decision_seat_id = game_state.local_seat_id
                 import time
                 game_state.decision_timestamp = time.time()
                 game_state.decision_context = {"type": "mulligan"}
+
+            # Handle IntermissionReq (end-of-game / sideboard transition)
+            elif msg_type == "GREMessageType_IntermissionReq":
+                # IntermissionReq = game over / BO3 sideboard. Reset state but do NOT
+                # set a Mulligan decision — the actual mulligan SubmitDeckReq will come
+                # later if a new game starts.
+                logger.info(f"IntermissionReq received (turn {game_state.turn_info.turn_number}) - game over/transition")
+                game_state.reset()
+                # Clear any stale decision from the finished game
+                game_state.pending_decision = None
+                game_state.decision_seat_id = None
+                game_state.decision_context = None
+                game_state.decision_timestamp = 0
                 
             elif msg_type == "GREMessageType_PromptReq":
                 import time
@@ -861,7 +1058,12 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                     # Try to find the source card on the stack
                     for obj in game_state.stack:
                         if obj.instance_id == source_id:
-                            source_card = game_state._card_db.get_card_name(obj.grp_id)
+                            try:
+                                from arenamcp import server
+                                card_info = server.get_card_info(obj.grp_id)
+                                source_card = card_info.get("name", f"Unknown ({obj.grp_id})")
+                            except Exception:
+                                source_card = f"Unknown ({obj.grp_id})"
                             break
                 
                 logger.info(f"Captured Decision: Select Targets (source: {source_card or 'unknown'})")
@@ -920,6 +1122,13 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                     "options": options,
                 }
 
+            elif msg_type == "GREMessageType_ConnectResp":
+                connect_resp = msg.get("connectResp", {})
+                deck_cards = connect_resp.get("deckMessage", {}).get("deckCards", [])
+                if deck_cards:
+                    game_state.deck_cards = deck_cards
+                    logger.info(f"Captured deck list from ConnectResp: {len(deck_cards)} cards")
+
             elif "Resp" in msg_type:
                 # PHASE 3: Only clear decisions on actual decision responses, not generic responses
                 # Only clear on explicit decision submission responses
@@ -944,15 +1153,6 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
 
             elif msg_type == "GREMessageType_TimerStateMessage":
                 pass
-                
-            elif msg_type == "GREMessageType_SubmitDeckResp":
-                # We answered the mulligan, clear it
-                if game_state.pending_decision == "Mulligan":
-                    logger.info("Decision Cleared: Mulligan")
-                    game_state.pending_decision = None
-                    game_state.decision_seat_id = None
-                    game_state.decision_context = None
-                    game_state.decision_timestamp = 0
 
         # Also handle direct GameStateMessage events (legacy format)
         if "gameObjects" in payload or "zones" in payload or "players" in payload:

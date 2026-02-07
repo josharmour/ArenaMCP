@@ -28,6 +28,7 @@ class DraftState:
         is_sealed: Whether this is a sealed event (not draft)
         sealed_pool: List of grpIds for all cards in sealed pool
         sealed_analyzed: Whether sealed pool has been analyzed this session
+        picks_per_pack: Number of cards picked per pack (1 for normal, 2 for PickTwo)
     """
     event_name: str = ""
     set_code: str = ""
@@ -39,6 +40,7 @@ class DraftState:
     is_sealed: bool = False
     sealed_pool: list[int] = field(default_factory=list)
     sealed_analyzed: bool = False
+    picks_per_pack: int = 1
 
     def reset(self) -> None:
         """Reset draft state for a new draft."""
@@ -52,6 +54,7 @@ class DraftState:
         self.is_sealed = False
         self.sealed_pool = []
         self.sealed_analyzed = False
+        self.picks_per_pack = 1
 
 
 def extract_set_code(event_name: str) -> str:
@@ -138,7 +141,7 @@ def create_draft_handler(draft_state: DraftState) -> Callable[[str, dict], None]
 
 
 def _find_nested_value(d: dict, key: str) -> Any:
-    """Recursively search for a key in nested dicts."""
+    """Recursively search for a key in nested dicts and JSON-encoded strings."""
     if key in d:
         return d[key]
     for v in d.values():
@@ -152,6 +155,15 @@ def _find_nested_value(d: dict, key: str) -> Any:
                     result = _find_nested_value(item, key)
                     if result is not None:
                         return result
+        elif isinstance(v, str) and v.startswith("{"):
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, dict):
+                    result = _find_nested_value(parsed, key)
+                    if result is not None:
+                        return result
+            except (json.JSONDecodeError, ValueError):
+                pass
     return None
 
 
@@ -163,6 +175,7 @@ def _handle_event_start(draft_state: DraftState, payload: dict) -> None:
         draft_state.set_code = extract_set_code(event_name)
         draft_state.is_active = True
         draft_state.is_sealed = "Sealed" in event_name
+        draft_state.picks_per_pack = 2 if "PickTwo" in event_name else 1
         draft_state.cards_in_pack = []
         draft_state.picked_cards = []
         draft_state.sealed_pool = []
@@ -278,7 +291,19 @@ def _handle_quick_draft_pack(draft_state: DraftState, payload: dict) -> None:
 
 def _handle_draft_pick(draft_state: DraftState, payload: dict) -> None:
     """Handle player pick events to track picked cards."""
-    # Try different field names used by different draft types
+    # Handle PickTwo drafts: GrpIds is an array of picked card IDs
+    grp_ids = _find_nested_value(payload, "GrpIds")
+    if isinstance(grp_ids, list):
+        for gid in grp_ids:
+            gid = int(gid)
+            if gid not in draft_state.picked_cards:
+                draft_state.picked_cards.append(gid)
+                logger.debug(f"Picked card: {gid}")
+            if gid in draft_state.cards_in_pack:
+                draft_state.cards_in_pack.remove(gid)
+        return
+
+    # Single pick: try different field names used by different draft types
     grp_id = (
         _find_nested_value(payload, "GrpId") or
         _find_nested_value(payload, "cardId") or

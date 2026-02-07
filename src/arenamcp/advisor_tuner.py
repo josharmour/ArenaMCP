@@ -79,33 +79,39 @@ class AdvisorTuner:
             given_advice = self._load_advice_log(advice_log)
         
         comparisons = []
-        
+
         for frame in recording.frames:
-            if not frame.trigger:
+            # Extract trigger from raw_message (may be stored as _trigger by converter)
+            trigger = frame.raw_message.get("_trigger") if frame.raw_message else None
+
+            if not trigger:
                 continue  # Skip non-decision frames
-            
-            logger.info(f"Frame {frame.frame_number}: {frame.trigger}")
-            
+
+            # Use parsed_snapshot for game state
+            game_state = frame.parsed_snapshot or {}
+
+            logger.info(f"Frame {frame.frame_number}: {trigger}")
+
             # Get what advice was given (if available)
-            advice_given = given_advice.get(frame.frame_number) or frame.advice_given
-            
+            advice_given = given_advice.get(frame.frame_number)
+
             # Re-run advisor with current prompts to get optimal advice
             try:
                 optimal_advice = self.coach.get_advice(
-                    frame.our_game_state,
-                    trigger=frame.trigger,
+                    game_state,
+                    trigger=trigger,
                     style="concise"
                 )
             except Exception as e:
                 logger.error(f"Failed to generate optimal advice: {e}")
                 optimal_advice = None
-            
+
             # Create comparison
             comparison = AdviceComparison(
                 frame_number=frame.frame_number,
                 timestamp=frame.timestamp,
-                game_state=frame.our_game_state,
-                trigger=frame.trigger,
+                game_state=game_state,
+                trigger=trigger,
                 advice_given=advice_given,
                 action_taken=self._extract_action_taken(frame),
                 optimal_advice=optimal_advice,

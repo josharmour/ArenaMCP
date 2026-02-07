@@ -22,43 +22,83 @@ class ArenaReplay:
     
     def __init__(self, replay_path: Path):
         """Initialize replay parser.
-        
+
         Args:
             replay_path: Path to .rply file
         """
         self.replay_path = Path(replay_path)
         self._messages: list[dict] = []
         self._loaded = False
+        self._format: str = "unknown"
+        self._metadata: dict = {}
         
     def load(self) -> bool:
         """Load and parse the replay file.
-        
+
+        Supports both formats:
+        - NDJSON: Each line is a JSON message
+        - Version2: #Version2 header, metadata line, then IN-/OUT- prefixed messages
+
         Returns:
             True if loaded successfully
         """
         if self._loaded:
             return True
-            
+
         try:
-            # .rply files are newline-delimited JSON (NDJSON/JSONL format)
-            # Each line is a message object
             with open(self.replay_path, 'r', encoding='utf-8') as f:
-                for line_num, line in enumerate(f, 1):
+                lines = f.readlines()
+
+            if not lines:
+                logger.error("Empty replay file")
+                return False
+
+            # Detect format from first line
+            first_line = lines[0].strip()
+
+            if first_line.startswith("#Version"):
+                # Version2 format: #Version2 header, metadata, then IN-/OUT- messages
+                self._format = "version2"
+                self._metadata = json.loads(lines[1].strip()) if len(lines) > 1 else {}
+
+                for line in lines[2:]:
                     line = line.strip()
                     if not line:
                         continue
-                        
+
+                    # Parse IN- (server) and OUT- (client) messages
+                    if line.startswith("IN-") or line.startswith("OUT-"):
+                        colon_idx = line.find(':')
+                        if colon_idx > 0:
+                            direction = "in" if line.startswith("IN-") else "out"
+                            try:
+                                msg = json.loads(line[colon_idx+1:])
+                                msg["_direction"] = direction  # Tag direction
+                                self._messages.append(msg)
+                            except json.JSONDecodeError:
+                                continue
+
+                logger.info(f"Loaded {len(self._messages)} messages from {self.replay_path.name} (Version2 format)")
+            else:
+                # NDJSON format: each line is a JSON message
+                self._format = "ndjson"
+                for line_num, line in enumerate(lines, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+
                     try:
                         msg = json.loads(line)
                         self._messages.append(msg)
                     except json.JSONDecodeError as e:
                         logger.warning(f"Skipping malformed JSON at line {line_num}: {e}")
                         continue
-            
-            logger.info(f"Loaded {len(self._messages)} messages from {self.replay_path.name}")
+
+                logger.info(f"Loaded {len(self._messages)} messages from {self.replay_path.name} (NDJSON format)")
+
             self._loaded = True
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to load replay file: {e}")
             return False

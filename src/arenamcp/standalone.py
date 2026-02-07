@@ -191,6 +191,10 @@ class MCPClient:
         """Get sealed pool analysis."""
         return self._server.get_sealed_pool()
 
+    def analyze_draft_pool(self) -> dict[str, Any]:
+        """Analyze drafted cards for deck building."""
+        return self._server.analyze_draft_pool()
+
 
 class ConsoleAdapter(UIAdapter):
     """Fallback for CLI mode."""
@@ -373,10 +377,6 @@ class StandaloneCoach:
         logger.info("Initializing TTS...")
         self._voice_output = VoiceOutput()
 
-        # Auto-select Gemini TTS voice when using Gemini backend
-        if self._backend_name == "gemini" and not self._voice_output._voice.startswith("gemini/"):
-            self._voice_output.set_voice("gemini/Kore")
-
         voice_id, voice_desc = self._voice_output.current_voice
         logger.info(f"TTS voice: {voice_desc}")
         self.ui.status("VOICE", f"TTS Voice: {voice_desc}")
@@ -469,25 +469,36 @@ class StandaloneCoach:
 
                             last_draft_pack = pack_num
                             last_draft_pick = pick_num
+                            picks_per_pack = draft_pack.get("picks_per_pack", 1)
 
-                            # Find best pick by GIH win rate
-                            best_card = None
-                            best_wr = 0.0
-                            for card in cards:
-                                gih_wr = card.get("gih_wr", 0) or 0
-                                if gih_wr > best_wr:
-                                    best_wr = gih_wr
-                                    best_card = card
+                            # Sort cards by GIH win rate descending
+                            ranked = sorted(
+                                cards,
+                                key=lambda c: c.get("gih_wr", 0) or 0,
+                                reverse=True,
+                            )
+                            top_picks = [
+                                c for c in ranked[:picks_per_pack]
+                                if (c.get("gih_wr", 0) or 0) > 0
+                            ]
 
-                            if best_card:
-                                name = best_card.get("name", "Unknown")
-                                wr_pct = f"{best_wr * 100:.1f}%" if best_wr else "N/A"
-                                advice = f"Pick {name}, {wr_pct} win rate"
+                            if top_picks:
+                                if len(top_picks) == 1:
+                                    c = top_picks[0]
+                                    wr_pct = f"{(c.get('gih_wr', 0) or 0) * 100:.1f}%"
+                                    advice = f"Pick {c.get('name', 'Unknown')}, {wr_pct} win rate"
+                                else:
+                                    parts = []
+                                    for c in top_picks:
+                                        wr_pct = f"{(c.get('gih_wr', 0) or 0) * 100:.1f}%"
+                                        parts.append(f"{c.get('name', 'Unknown')} at {wr_pct}")
+                                    advice = f"Pick {' and '.join(parts)}"
 
                                 self.ui.log(f"\n[DRAFT P{pack_num}P{pick_num}] {advice}\n")
                                 logger.info(f"DRAFT: P{pack_num}P{pick_num} - {advice}")
                                 self.speak_advice(advice)
                             else:
+                                best_wr = (ranked[0].get("gih_wr", 0) or 0) if ranked else 0.0
                                 msg = f"No recommended pick found (Cards: {len(cards)}, Best WR: {best_wr})"
                                 self.ui.log(f"\n[DRAFT] {msg}\n")
                                 logger.warning(msg)
@@ -504,6 +515,7 @@ class StandaloneCoach:
                 # Not in draft/sealed - regular game coaching
                 if in_draft_mode or in_sealed_mode:
                     mode_name = "Sealed" if in_sealed_mode else "Draft"
+                    was_draft = in_draft_mode
                     in_draft_mode = False
                     in_sealed_mode = False
                     sealed_analyzed = False
@@ -511,6 +523,24 @@ class StandaloneCoach:
                     logger.info(f"{mode_name} ended, resuming game coaching")
                     last_draft_pack = 0
                     last_draft_pick = 0
+
+                    # Analyze drafted pool and suggest a deck build
+                    if was_draft:
+                        try:
+                            pool_result = self._mcp.analyze_draft_pool()
+                            pool_size = pool_result.get("pool_size", 0)
+                            if pool_size > 0:
+                                detailed = pool_result.get("detailed_text", "")
+                                spoken = pool_result.get("spoken_advice", "")
+                                if detailed:
+                                    self.ui.log(f"\n{detailed}\n")
+                                if spoken:
+                                    logger.info(f"Draft deck suggestion: {spoken}")
+                                    self.speak_advice(spoken)
+                            else:
+                                logger.warning("No picked cards found for post-draft analysis")
+                        except Exception as e:
+                            logger.error(f"Post-draft deck analysis failed: {e}")
 
                 curr_state = self._mcp.get_game_state()
                 turn = curr_state.get("turn", {})
@@ -575,8 +605,8 @@ class StandaloneCoach:
                                     first_line = strategy.split("\n")[0].strip()
                                     ui.status("DECK", first_line[:60])
                                     logger.info(f"Deck strategy stored: {len(strategy)} chars")
-                                    # Announce deck archetype via TTS
-                                    speak_fn(f"Deck detected: {first_line}")
+                                    # Don't TTS the deck — it races with the first
+                                    # turn advice and they talk over each other.
                             except Exception as e:
                                 logger.error(f"Background deck analysis failed: {e}")
 
@@ -656,11 +686,12 @@ class StandaloneCoach:
                     for trigger in triggers:
                         # CRITICAL: Filter turn-specific triggers based on whose turn it is
                         # "new_turn" advice only makes sense on YOUR turn (play lands, cast spells)
+                        # On opponent's turn, rename to "opponent_turn" for strategy analysis
                         # "combat_attackers" only on YOUR turn (you declare attackers)
                         # "combat_blockers" only on OPPONENT's turn (you declare blockers)
                         if trigger == "new_turn" and not is_my_turn:
-                            logger.debug(f"Suppressing new_turn trigger (opponent's turn)")
-                            continue
+                            trigger = "opponent_turn"
+                            logger.info(f"Opponent's turn started (turn {turn_num})")
                         if trigger == "combat_attackers" and not is_my_turn:
                             logger.debug(f"Suppressing combat_attackers trigger (opponent's turn)")
                             continue
@@ -672,6 +703,9 @@ class StandaloneCoach:
 
                         # New turn triggers once per turn
                         is_new_turn = trigger == "new_turn" and turn_num > last_advice_turn
+
+                        # Opponent turn triggers once per opponent turn
+                        is_opponent_turn = trigger == "opponent_turn" and turn_num > last_advice_turn
                         
                         # DELAY BUFFER: For new_turn triggers, wait briefly for Hand zone to update
                         # This prevents "missing draw" bugs where we advise before the drawn card arrives
@@ -691,6 +725,19 @@ class StandaloneCoach:
                                 curr_state = self._mcp.get_game_state()
                             except Exception as e:
                                 logger.debug(f"Failed to re-fetch state after new_turn delay: {e}")
+
+                        # DELAY BUFFER: For mulligan decisions, wait for hand zone to populate.
+                        # SubmitDeckReq arrives before the GameStateMessage with hand cards.
+                        if trigger == "decision_required" and curr_state.get("pending_decision") == "Mulligan":
+                            time.sleep(0.5)  # 500ms to allow hand zone update
+                            try:
+                                self._mcp.poll_log()
+                            except Exception:
+                                pass
+                            try:
+                                curr_state = self._mcp.get_game_state()
+                            except Exception as e:
+                                logger.debug(f"Failed to re-fetch state after mulligan delay: {e}")
 
                         # Check if there's a pending decision (scry, discard, target, etc.)
                         # If so, suppress step-by-step "what's next" triggers until decision resolves
@@ -720,16 +767,28 @@ class StandaloneCoach:
                         if trigger == "priority_gained" and is_new_turn:
                             continue
 
-                        should_advise = is_critical or is_new_turn or is_step_by_step or is_frequent
+                        should_advise = is_critical or is_new_turn or is_opponent_turn or is_step_by_step or is_frequent
 
                         if not should_advise:
                             continue
 
                         logger.info(f"TRIGGER: {trigger}")
 
+                        # NOISE SUPPRESSION: Skip advice when something is on the stack
+                        # and player can't respond. Prevents confusing "let it resolve" advice
+                        # when an ETB trigger (yours or opponent's) is just passing through.
+                        # NOTE: "new_turn" is excluded — when the player's turn starts, they
+                        # always need advice even if a stale ability is still on the stack.
+                        stack = curr_state.get("stack", [])
+                        if stack and trigger in ("land_played", "spell_resolved", "priority_gained"):
+                            has_instants = self._trigger._has_castable_instants(curr_state)
+                            if not has_instants:
+                                logger.info(f"Quiet: {trigger} (stack active, no responses)")
+                                continue
+
                         # NOISE SUPPRESSION: Skip LLM call when player has no meaningful options.
                         # Saves ~3-5s API call + TTS for obvious "pass priority" situations.
-                        QUIET_TRIGGERS = {"stack_spell_yours", "stack_spell_opponent", "priority_gained", "spell_resolved"}
+                        QUIET_TRIGGERS = {"stack_spell_yours", "stack_spell_opponent", "priority_gained", "spell_resolved", "opponent_turn"}
                         if trigger in QUIET_TRIGGERS:
                             has_instants = self._trigger._has_castable_instants(curr_state)
                             stack = curr_state.get("stack", [])
@@ -737,6 +796,12 @@ class StandaloneCoach:
                             # Own spell on stack with no instants to respond → auto-pass
                             if trigger == "stack_spell_yours" and not has_instants:
                                 logger.info(f"Quiet: {trigger} (own spell, no responses)")
+                                continue
+
+                            # Opponent spell/ability on stack with no instant-speed responses → quiet
+                            # This covers both opponent's turn AND your turn (e.g. opponent ETB triggers)
+                            if trigger == "stack_spell_opponent" and not has_instants:
+                                logger.info(f"Quiet: {trigger} (no instant-speed responses)")
                                 continue
 
                             # Opponent's action or priority with no instant-speed options → quiet
@@ -768,64 +833,48 @@ class StandaloneCoach:
                             pre_advice_turn = turn_num
                             pre_advice_active = active_seat
                             pre_advice_phase = phase
+                            pre_advice_step = turn.get("step", "")
 
-                            # Check if we can use direct audio (Gemini backend with audio output)
-                            use_direct_audio = (
-                                hasattr(self._coach._backend, 'complete_audio')
-                                and self._voice_output
-                                and not self._voice_output.muted
-                                and self._voice_output._voice.startswith("gemini/")
+                            advice = self._coach.get_advice(
+                                curr_state,
+                                trigger=trigger,
+                                style=self.advice_style
                             )
-
-                            audio_result = None
-                            advice = None
-
-                            if use_direct_audio:
-                                voice_name = self._voice_output._voice.replace("gemini/", "")
-                                audio_result = self._coach.get_advice_audio(
-                                    curr_state,
-                                    trigger=trigger,
-                                    style=self.advice_style,
-                                    voice=voice_name
-                                )
-
-                            if audio_result is None:
-                                # Fallback: text advice (+ TTS later)
-                                advice = self._coach.get_advice(
-                                    curr_state,
-                                    trigger=trigger,
-                                    style=self.advice_style
-                                )
-                                logger.info(f"ADVICE: {advice}")
+                            logger.info(f"ADVICE: {advice}")
 
                             # STALENESS CHECK: Re-poll game state after the LLM call.
-                            # If the turn, active player, or phase changed while waiting
-                            # for the API response (~7s), the advice is stale and would
-                            # confuse the player (e.g. "attack!" after combat is over).
+                            # If the turn, active player, phase, or combat step changed
+                            # while waiting for the API response (~5s), the advice is
+                            # stale and would confuse the player (e.g. "attack!" after
+                            # combat is over).
                             fresh_state = self._mcp.get_game_state()
                             fresh_turn = fresh_state.get("turn", {})
                             fresh_turn_num = fresh_turn.get("turn_number", 0)
                             fresh_active = fresh_turn.get("active_player", 0)
                             fresh_phase = fresh_turn.get("phase", "")
+                            fresh_step = fresh_turn.get("step", "")
 
-                            if fresh_turn_num != pre_advice_turn or fresh_active != pre_advice_active or fresh_phase != pre_advice_phase:
+                            # For opponent_turn analysis, allow turn to advance by 1
+                            # (opponent's turn → your turn is expected progression)
+                            if trigger == "opponent_turn":
+                                is_stale = fresh_turn_num > pre_advice_turn + 1
+                            else:
+                                is_stale = (
+                                    fresh_turn_num != pre_advice_turn
+                                    or fresh_active != pre_advice_active
+                                    or fresh_phase != pre_advice_phase
+                                    or fresh_step != pre_advice_step
+                                )
+                            if is_stale:
                                 stale_label = "[STALE - discarded]"
-                                if audio_result is not None:
-                                    logger.info(
-                                        f"Discarding stale audio advice: turn {pre_advice_turn}->{fresh_turn_num}, "
-                                        f"active {pre_advice_active}->{fresh_active}, phase {pre_advice_phase}->{fresh_phase}"
-                                    )
-                                    self._record_advice(
-                                        f"{stale_label} [Audio: {trigger}]", trigger, game_state=curr_state
-                                    )
-                                else:
-                                    logger.info(
-                                        f"Discarding stale advice: turn {pre_advice_turn}->{fresh_turn_num}, "
-                                        f"active {pre_advice_active}->{fresh_active}, phase {pre_advice_phase}->{fresh_phase}"
-                                    )
-                                    self._record_advice(
-                                        f"{stale_label} {advice}", trigger, game_state=curr_state
-                                    )
+                                logger.info(
+                                    f"Discarding stale advice: turn {pre_advice_turn}->{fresh_turn_num}, "
+                                    f"active {pre_advice_active}->{fresh_active}, phase {pre_advice_phase}->{fresh_phase}, "
+                                    f"step {pre_advice_step}->{fresh_step}"
+                                )
+                                self._record_advice(
+                                    f"{stale_label} {advice}", trigger, game_state=curr_state
+                                )
                                 last_advice_turn = turn_num
                                 last_advice_phase = phase
                                 continue
@@ -847,31 +896,22 @@ class StandaloneCoach:
                                                  and not c.get("is_tapped"))
                             seat_info = f"Seat {local_seat}|{untapped_lands} mana|{self.backend_name}" if local_seat else "Seat ?"
 
-                            if audio_result is not None:
-                                # Direct audio path - play audio from model
-                                samples, sample_rate = audio_result
-                                if len(samples) > 0:
-                                    trigger_label = trigger or "advice"
-                                    self.ui.advice(f"[Audio: {trigger_label}]", seat_info)
-                                    self._record_advice(f"[Audio: {trigger_label}]", trigger, game_state=curr_state)
-                                    try:
-                                        import sounddevice as sd
-                                        sd.play(samples, sample_rate, device=self._voice_output._device_index)
-                                        sd.wait()
-                                    except Exception as e:
-                                        logger.error(f"Audio playback error: {e}")
-                                else:
-                                    logger.warning("Direct audio returned empty samples")
+                            # Skip empty responses (e.g. from timeout)
+                            if not advice or not advice.strip():
+                                logger.warning("Empty advice response (model timeout?), skipping")
+                                continue
+
+                            # Don't speak error/fallback messages aloud
+                            if advice.startswith("Error") or "didn't catch that" in advice:
+                                logger.warning(f"Suppressing error advice from TTS: {advice[:80]}")
+                                self.ui.error(advice)
                             else:
-                                # Text path - display and speak via TTS
-                                # Don't speak error messages aloud
-                                if advice and advice.startswith("Error"):
-                                    logger.warning(f"Suppressing error advice from TTS: {advice[:80]}")
-                                    self.ui.error(advice)
-                                else:
-                                    self._record_advice(advice, trigger, game_state=curr_state)
-                                    self.ui.advice(advice, seat_info)
-                                    self.speak_advice(advice)
+                                self._record_advice(advice, trigger, game_state=curr_state)
+                                self.ui.advice(advice, seat_info)
+                                # Non-blocking TTS: lets the loop poll for new
+                                # game states (e.g. Select Targets) immediately.
+                                # New advice will interrupt stale speech.
+                                self.speak_advice(advice, blocking=False)
 
                 prev_state = curr_state
 
@@ -1000,6 +1040,18 @@ class StandaloneCoach:
             self.ui.status("VOICE", "TTS not enabled")
 
 
+    def _on_speed_hotkey(self) -> None:
+        """F8 - Cycle TTS speed."""
+        if self._voice_output:
+            speed = self._voice_output.cycle_speed()
+            self.ui.status("SPEED", f"{speed}x")
+            try:
+                self._voice_output.speak("Speed changed.", blocking=False)
+            except Exception:
+                pass
+        else:
+            self.ui.status("SPEED", "TTS not enabled")
+
     def save_bug_report(self, reason: str = "User Request") -> Optional["Path"]:
         """Save comprehensive bug report and return path."""
         bug_dir = LOG_DIR / "bug_reports"
@@ -1028,16 +1080,57 @@ class StandaloneCoach:
                 self.ui.log("[BUG] Path copied to clipboard!\n")
             else:
                 self.ui.log(f"\n[BUG] Saved: {clickable}\n")
-                
+
             return bug_file
         except Exception as e:
             self.ui.error(f"\n[BUG] Failed: {e}\n")
             logger.exception("Bug report failed")
             return None
 
+    @staticmethod
+    def spawn_debug_session(bug_file: Path) -> bool:
+        """Spawn a new terminal with Claude Code for debugging a bug report.
+
+        Writes a temp .cmd file and opens it via os.startfile, which reliably
+        opens a new console window on Windows (even from within a Textual TUI).
+        """
+        import tempfile
+
+        try:
+            # Project root is three levels up from this file
+            project_root = Path(__file__).parent.parent.parent
+
+            prompt = (
+                f"{bug_file} "
+                "Read this ArenaMCP bug report and help me debug the issue. "
+                "Check the advice_history, llm_context, and game_state fields "
+                "for what the advisor saw and said."
+            )
+
+            # Write a temp batch file — most reliable way to open a new
+            # console window on Windows, especially from within a TUI.
+            bat_file = Path(tempfile.gettempdir()) / "arenamcp_debug.cmd"
+            # Use pushd instead of cd — it auto-maps UNC paths to a temp drive letter
+            # Unset ANTHROPIC_API_KEY so Claude Code uses its own auth (not the coach's key)
+            bat_file.write_text(
+                f'@set ANTHROPIC_API_KEY=\n'
+                f'@pushd "{project_root}"\n'
+                f'@claude --dangerously-skip-permissions "{prompt}"\n'
+                f'@popd\n',
+                encoding="utf-8",
+            )
+            os.startfile(str(bat_file))
+            logger.info(f"Spawned Claude Code debug session for {bug_file}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to spawn debug session: {e}")
+            return False
+
     def _on_bug_report_hotkey(self) -> None:
-        """F7 - Save comprehensive bug report for debugging."""
-        self.save_bug_report("Hotkey F7")
+        """F7 - Save comprehensive bug report and open Claude Code debug session."""
+        bug_path = self.save_bug_report("Hotkey F7")
+        if bug_path:
+            self.spawn_debug_session(bug_path)
 
     def take_screenshot_analysis(self) -> None:
         """Capture screen and request visual analysis (e.g. Mulligan)."""
@@ -1185,7 +1278,12 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
         return report
 
     def _get_llm_context(self) -> dict:
-        """Get the current LLM context/prompt for debugging."""
+        """Get the LLM context from the most recent advice (what the LLM actually saw).
+
+        IMPORTANT: This captures the game state that was sent to the LLM during the last
+        advice generation, NOT the current game state. This prevents timing bugs where
+        the game state changes between advice generation and bug report generation.
+        """
         context = {
             "system_prompt": None,
             "formatted_game_state": None,
@@ -1195,10 +1293,15 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             if self._coach:
                 context["system_prompt"] = getattr(self._coach, '_system_prompt', None)
                 context["deck_strategy"] = getattr(self._coach, '_deck_strategy', None)
-                if self._mcp:
+
+                # Use the game_context from the last advice_history entry instead of
+                # regenerating it, to avoid timing issues where game state has changed
+                if hasattr(self, '_advice_history') and self._advice_history:
+                    context["formatted_game_state"] = self._advice_history[-1].get("game_context")
+                # Fallback: if no advice history, generate from current state
+                elif self._mcp and hasattr(self._coach, '_format_game_context'):
                     game_state = self._mcp.get_game_state()
-                    if hasattr(self._coach, '_format_game_context'):
-                        context["formatted_game_state"] = self._coach._format_game_context(game_state)
+                    context["formatted_game_state"] = self._coach._format_game_context(game_state)
         except Exception as e:
             context["error"] = str(e)
 
@@ -1358,6 +1461,7 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
         # Unified logic: Cycle through the same list as the TUI dropdown
         # Format: (provider, model_name)
         combo_list = [
+            ("gemini", "gemini-2.0-flash"),
             ("gemini", "gemini-2.5-flash"),
             ("gemini", "gemini-3-pro-preview"),
             ("ollama", "llama3.2:latest"),
@@ -1622,6 +1726,7 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
         from arenamcp.coach import GeminiBackend, ClaudeBackend, OllamaBackend
         
         tests = [
+            ("Gemini 2.0 Flash", GeminiBackend, "gemini-2.0-flash"),
             ("Gemini 2.5 Flash", GeminiBackend, "gemini-2.5-flash"),
             ("Gemini 3 Pro", GeminiBackend, "gemini-3-pro-preview"),
             ("Claude Haiku", ClaudeBackend, "claude-haiku-4-5-20251001"),

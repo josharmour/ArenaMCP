@@ -1,5 +1,6 @@
 
 import logging
+import re
 from typing import List, Dict, Any
 
 logger = logging.getLogger(__name__)
@@ -11,20 +12,70 @@ class RulesEngine:
     """
 
     @staticmethod
+    def _count_available_mana(game_state: Dict[str, Any], local_seat: int) -> int:
+        """Count total available mana from untapped lands and mana creatures."""
+        battlefield = game_state.get("battlefield", [])
+        total = 0
+        turn_num = game_state.get("turn", {}).get("turn_number", 0)
+        for card in battlefield:
+            if card.get("owner_seat_id") != local_seat:
+                continue
+            if card.get("is_tapped"):
+                continue
+            type_line = card.get("type_line", "").lower()
+            oracle = card.get("oracle_text", "")
+            is_land = "land" in type_line
+            is_creature = "creature" in type_line
+            has_mana_ability = bool(re.search(r'\{T\}.*[Aa]dd\s+\{', oracle))
+            entered = card.get("turn_entered_battlefield", -1)
+            has_haste = "haste" in oracle.lower()
+            is_sick = is_creature and (entered == turn_num) and not has_haste
+            if is_land or (is_creature and has_mana_ability and not is_sick):
+                total += 1
+        return total
+
+    @staticmethod
+    def _parse_cmc(mana_cost: str) -> int:
+        """Parse converted mana cost from a mana cost string like '{3}{R}{R}'."""
+        if not mana_cost:
+            return 0
+        cmc = 0
+        generic = re.findall(r'\{(\d+)\}', mana_cost)
+        cmc += sum(int(g) for g in generic)
+        for color in "WUBRGC":
+            cmc += len(re.findall(rf"\{{{color}\}}", mana_cost))
+        # Hybrid mana symbols like {U/R} count as 1 each
+        hybrid = re.findall(r'\{[^}]+/[^}]+\}', mana_cost)
+        cmc += len(hybrid)
+        return cmc
+
+    @staticmethod
+    def _disambiguate_names(names: List[str]) -> List[str]:
+        """Add #1, #2 suffixes to duplicate names in a list."""
+        from collections import Counter
+        counts = Counter(names)
+        seen = {}
+        result = []
+        for name in names:
+            if counts[name] > 1:
+                seen[name] = seen.get(name, 0) + 1
+                result.append(f"{name} #{seen[name]}")
+            else:
+                result.append(name)
+        return result
+
+    @staticmethod
     def get_legal_actions(game_state: Dict[str, Any]) -> List[str]:
         actions = []
-        
+
         turn = game_state.get("turn", {})
         phase = turn.get("phase", "")
-        is_my_turn = (turn.get("active_player") == turn.get("priority_player")) # Simplified approximation
-        # Better is_my_turn check: active_player is me.
-        # We need to know 'local_seat_id'.
-        
+
         players = game_state.get("players", [])
         local_player = next((p for p in players if p.get("is_local")), None)
         if not local_player:
             return ["Wait (Game State Syncing)"]
-            
+
         local_seat = local_player.get("seat_id")
         is_active_player = (turn.get("active_player") == local_seat)
         has_priority = (turn.get("priority_player") == local_seat)
@@ -33,20 +84,13 @@ class RulesEngine:
              # Exception: We can declare blockers if it's the DeclareBlock step and we are defender
              step = turn.get("step", "")
              is_blocking_step = (step == "Step_DeclareBlock") and (not is_active_player)
-             
+
              if not is_blocking_step:
                  return ["Wait (Opponent has priority)"]
-        
-        # Parse Mana
-        # Note: This is an estimation. 
-        # For a true engine, we'd need complex mana fixing logic.
-        # We will assume the 'mana_pool' passed in gamestate is accurate OR use a simple counter.
-        # Currently the game_state parsing logic is:
-        # YOUR MANA: X available.
-        # We'll rely on the simple heuristics used in coach.py for now, or just logic checks.
-        
-        # For now, let's focus on PHASING and SICKNESS which were the bugs.
-        
+
+        # Calculate available mana
+        available_mana = RulesEngine._count_available_mana(game_state, local_seat)
+
         # 1. LAND DROPS
         # Legal if: Main Phase, Stack Empty, Lands Played < 1, Active Player
         stack = game_state.get("stack", [])
@@ -70,24 +114,24 @@ class RulesEngine:
         for card in hand:
             type_line = card.get("type_line", "")
             name = card.get("name", "")
-            
+
             # Skip lands handled above
             if "Land" in type_line:
                 continue
-                
+
             is_instant_speed = "Instant" in type_line or "Flash" in card.get("oracle_text", "")
-            
+
             can_cast_timing = False
             if is_instant_speed:
                 can_cast_timing = True
             elif is_active_player and is_main_phase and is_stack_empty:
                 can_cast_timing = True
-                
-            # Mana Check (Simplified: relies on client heuristics [CAN CAST] tag presence in prompts? 
-            # No, we don't have tags here. We can only do coarse filtering or pass-through).
-            # Grounding Step 1: Just Timing.
-            
-            if can_cast_timing:
+
+            # Mana check: ensure player can afford the spell
+            cmc = RulesEngine._parse_cmc(card.get("mana_cost", ""))
+            can_afford = available_mana >= cmc
+
+            if can_cast_timing and can_afford:
                 actions.append(f"Cast {name}")
 
         # 3. ATTACKING
@@ -114,28 +158,31 @@ class RulesEngine:
                  entered = c.get("turn_entered_battlefield", -1)
                  has_haste = "haste" in c.get("oracle_text", "").lower()
                  is_tapped = c.get("is_tapped", False)
-                 
+
                  is_sick = (entered == current_turn_int) and not has_haste
-                 
+
                  if not is_sick and not is_tapped:
                      potential_attackers.append(c.get("name"))
-            
+
              if potential_attackers:
-                 actions.append(f"Declare Attackers: {', '.join(potential_attackers)}")
+                 actions.append(f"Declare Attackers: {', '.join(RulesEngine._disambiguate_names(potential_attackers))}")
         
         # 4. BLOCKING
         # Legal if: Combat Phase, Defending Player
         if not is_active_player and "Combat" in phase:
              untapped_blockers = [c.get("name") for c in my_creatures if not c.get("is_tapped")]
              if untapped_blockers:
-                 actions.append(f"Block with: {', '.join(untapped_blockers)}")
+                 actions.append(f"Block with: {', '.join(RulesEngine._disambiguate_names(untapped_blockers))}")
 
         # 5. ABILITIES
         # Activated abilities on battlefield
+        ability_names = []
         for c in my_creatures: # And lands/artifacts
             if ": " in c.get("oracle_text", ""): # Crude check for activated ability
                  if not c.get("is_tapped"): # Assuming tap cost? Dangerous assumption.
-                     actions.append(f"Activate {c.get('name')}")
+                     ability_names.append(c.get("name"))
+        for aname in RulesEngine._disambiguate_names(ability_names):
+            actions.append(f"Activate {aname}")
 
         return actions
 
