@@ -15,9 +15,9 @@ from watchdog.events import FileSystemEventHandler, FileModifiedEvent, FileCreat
 
 logger = logging.getLogger(__name__)
 
-# Pattern to identify match start in logs (MatchCreated event or match game room)
+# Pattern to identify match start in logs
 MATCH_START_PATTERN = re.compile(
-    r'\[UnityCrossThreadLogger\].*(?:MatchCreated|Event_Join|"matchId":|MatchGameRoomStateChangedEvent)'
+    r'\[UnityCrossThreadLogger\].*(?:MatchGameRoomStateChanged|MatchCreated|Event_Join)'
 )
 
 # Default MTGA log path on Windows
@@ -175,38 +175,56 @@ class MTGALogWatcher:
     def find_last_match_start(self) -> int:
         """Find the byte position of the last match start in the log file.
 
-        Scans the log file to find the most recent MatchCreated or similar
-        match start indicator. This allows catching up on in-progress games.
+        Scans the LAST 5MB of the log file to find the most recent MatchCreated 
+        indicator. This prevents reading entire 1GB+ log files into memory which
+        causes massive stuttering.
 
         Returns:
-            Byte position to start reading from, or 0 if no match found.
+            Byte position to start reading from.
+            If no match found in last 5MB, returns current file size (start from end/live).
         """
         if not self.log_path.exists():
             return 0
 
         try:
-            # Read as bytes to get accurate byte positions for seek()
+            file_size = self.log_path.stat().st_size
+
+            # Scan last 5MB for match start — enough to find the most recent game
+            MAX_SCAN_BYTES = 5 * 1024 * 1024
+            read_size = min(file_size, MAX_SCAN_BYTES)
+            start_offset = max(0, file_size - read_size)
+
+            if read_size == 0:
+                return 0
+
+            # Read tail of file as bytes
             with open(self.log_path, 'rb') as f:
-                content_bytes = f.read()
+                f.seek(start_offset)
+                content_bytes = f.read(read_size)
 
             # Decode for regex matching, tracking byte positions
             content = content_bytes.decode('utf-8', errors='replace')
 
             # Find all match start positions (character positions)
-            last_char_pos = 0
+            last_char_pos = -1
             for match in MATCH_START_PATTERN.finditer(content):
                 # Find the start of this line (search backward for newline)
                 line_start = content.rfind('\n', 0, match.start())
                 last_char_pos = line_start + 1 if line_start != -1 else 0
 
-            if last_char_pos > 0:
-                # Convert character position to byte position
-                last_byte_pos = len(content[:last_char_pos].encode('utf-8'))
-                logger.info(f"Found last match start at byte position {last_byte_pos}")
-                return last_byte_pos
+            if last_char_pos >= 0:
+                # Convert character position back to byte position relative to read chunk
+                relevant_substring = content[:last_char_pos]
+                relative_byte_pos = len(relevant_substring.encode('utf-8'))
+
+                final_pos = start_offset + relative_byte_pos
+                logger.info(f"Found last match start at byte position {final_pos} (scanned last {read_size/1024/1024:.1f}MB)")
+                return final_pos
             else:
-                logger.info("No match start found in log, will read from beginning")
-                return 0
+                # No match found — start from end (live mode). Parsing the entire
+                # log file (can be 40MB+) causes massive startup delay for no benefit.
+                logger.info(f"No match start found in last {read_size/1024/1024:.1f}MB — starting from end (live mode)")
+                return file_size
 
         except OSError as e:
             logger.warning(f"Error scanning log for match start: {e}")

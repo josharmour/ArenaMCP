@@ -682,6 +682,7 @@ def get_game_state() -> dict[str, Any]:
     graveyard = [_serialize_game_object(obj) for obj in game_state.graveyard]
     stack = [_serialize_game_object(obj) for obj in game_state.stack]
     exile = [_serialize_game_object(obj) for obj in game_state.get_objects_in_zone(ZoneType.EXILE)]
+    command = [_serialize_game_object(obj) for obj in game_state.command]
 
     return {
         "turn": turn,
@@ -691,7 +692,10 @@ def get_game_state() -> dict[str, Any]:
         "graveyard": graveyard,
         "stack": stack,
         "exile": exile,
+        "command": command,
         "pending_decision": game_state.pending_decision if game_state.decision_seat_id == game_state.local_seat_id else None,
+        "decision_context": game_state.decision_context if game_state.decision_seat_id == game_state.local_seat_id else None,
+        "deck_cards": game_state.deck_cards,
     }
 
 
@@ -895,6 +899,7 @@ def get_draft_pack() -> dict[str, Any]:
         "set_code": draft_state.set_code,
         "pack_number": draft_state.pack_number,
         "pick_number": draft_state.pick_number,
+        "picks_per_pack": draft_state.picks_per_pack,
         "cards": cards,
         "picked_cards": picked,
     }
@@ -994,6 +999,59 @@ def get_sealed_pool() -> dict[str, Any]:
                 for ca in analysis.color_analyses[1:4]  # Top 3 alternatives
             ],
         },
+        "spoken_advice": spoken,
+        "detailed_text": detailed,
+    }
+
+
+def analyze_draft_pool() -> dict[str, Any]:
+    """Analyze drafted cards and recommend a deck build.
+
+    Uses the same color-pair analysis as sealed pools to suggest
+    the best build from the cards picked during a draft.
+
+    Returns:
+        Dict with pool_size, spoken_advice, detailed_text,
+        or {"pool_size": 0} if no picked cards.
+    """
+    pool_grp_ids = draft_state.picked_cards
+    if not pool_grp_ids:
+        return {"pool_size": 0, "message": "No picked cards to analyze."}
+
+    draft_stats_cache = _get_draft_stats()
+    pool_cards = []
+
+    for grp_id in pool_grp_ids:
+        card_info = enrich_with_oracle_text(grp_id)
+        card_info["grp_id"] = grp_id
+
+        # Parse colors from mana cost
+        mana_cost = card_info.get("mana_cost", "")
+        colors = []
+        for color in ["W", "U", "B", "R", "G"]:
+            if f"{{{color}}}" in mana_cost:
+                colors.append(color)
+        card_info["colors"] = colors
+
+        # Get 17lands stats
+        if draft_state.set_code and card_info.get("name"):
+            stats = draft_stats_cache.get_draft_rating(
+                card_info["name"], draft_state.set_code
+            )
+            if stats:
+                card_info["gih_wr"] = stats.gih_wr
+                card_info["alsa"] = stats.alsa
+                card_info["iwd"] = stats.iwd
+
+        pool_cards.append(card_info)
+
+    analysis = analyze_sealed_pool(pool_cards, draft_state.set_code, draft_stats_cache)
+    spoken = format_sealed_recommendation(analysis)
+    detailed = format_sealed_detailed(analysis)
+
+    return {
+        "pool_size": len(pool_cards),
+        "set_code": draft_state.set_code,
         "spoken_advice": spoken,
         "detailed_text": detailed,
     }

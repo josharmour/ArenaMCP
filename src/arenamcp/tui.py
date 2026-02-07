@@ -2,8 +2,10 @@
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
 from textual.widgets import Header, Footer, Log, RichLog, Input, Button, Select, Static
+from textual.selection import Selection
 from textual.binding import Binding
 from textual.message import Message
+from textual import events
 
 import threading
 import time
@@ -18,13 +20,128 @@ from arenamcp.match_validator import MatchRecording, MatchValidator, start_recor
 from arenamcp.mtgadb import MTGADatabase
 
 
+class SelectableRichLog(RichLog):
+    """RichLog subclass with proper text selection and scroll-on-drag support.
+
+    Fixes two issues with the base RichLog:
+    1. Text selection/copy grabs content from outside the pane because RichLog
+       does not apply offset metadata to rendered strips (unlike Log).
+    2. The pane does not scroll when highlight-dragging near its edges.
+    """
+
+    # Margin in rows from the top/bottom edge that triggers auto-scroll
+    _SCROLL_MARGIN = 2
+    # How many lines to scroll per tick when dragging near edges
+    _SCROLL_SPEED = 2
+    # Timer interval in seconds for auto-scroll during drag
+    _SCROLL_INTERVAL = 0.05
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._drag_scrolling = False
+        self._drag_scroll_direction = 0  # -1 up, +1 down, 0 none
+        self._scroll_timer = None
+
+    def _render_line(self, y: int, scroll_x: int, width: int) -> "Strip":
+        """Override to apply offset metadata for text selection support.
+
+        The base RichLog._render_line omits the apply_offsets() call that is
+        present in Log._render_line. Without offset metadata, the compositor
+        cannot determine text coordinates for selection.
+        """
+        if y >= len(self.lines):
+            from textual.strip import Strip
+            return Strip.blank(width, self.rich_style)
+
+        key = (y + self._start_line, scroll_x, width, self._widest_line_width)
+        if key in self._line_cache:
+            return self._line_cache[key]
+
+        line = self.lines[y].crop_extend(scroll_x, scroll_x + width, self.rich_style)
+        line = line.apply_offsets(scroll_x, y)
+
+        self._line_cache[key] = line
+        return line
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        """Extract selected text from the log lines.
+
+        The base Widget.get_selection calls _render() which for ScrollView
+        returns a debug panel, not the actual log content. This override
+        extracts text directly from the stored Strip objects.
+        """
+        text = "\n".join(strip.text.rstrip() for strip in self.lines)
+        if not text:
+            return None
+        return selection.extract(text), "\n"
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        """Handle mouse move to auto-scroll when dragging near edges."""
+        # Check if a selection is in progress at the screen level
+        try:
+            if not self.screen._selecting:
+                self._stop_drag_scroll()
+                return
+        except (AttributeError, Exception):
+            self._stop_drag_scroll()
+            return
+
+        # Check if the mouse button is held (dragging)
+        if not event.button:
+            self._stop_drag_scroll()
+            return
+
+        # Determine if the mouse is near the top or bottom edge
+        content_height = self.scrollable_content_region.height
+        local_y = event.y
+
+        if local_y < self._SCROLL_MARGIN and self.scroll_offset.y > 0:
+            self._drag_scroll_direction = -1
+            self._start_drag_scroll()
+        elif local_y >= content_height - self._SCROLL_MARGIN and self.scroll_offset.y < self.max_scroll_y:
+            self._drag_scroll_direction = 1
+            self._start_drag_scroll()
+        else:
+            self._stop_drag_scroll()
+
+    def _start_drag_scroll(self) -> None:
+        """Start the auto-scroll timer for drag selection."""
+        if self._drag_scrolling:
+            return
+        self._drag_scrolling = True
+        self._scroll_timer = self.set_interval(
+            self._SCROLL_INTERVAL, self._do_drag_scroll
+        )
+
+    def _stop_drag_scroll(self) -> None:
+        """Stop the auto-scroll timer."""
+        if not self._drag_scrolling:
+            return
+        self._drag_scrolling = False
+        self._drag_scroll_direction = 0
+        if self._scroll_timer is not None:
+            self._scroll_timer.stop()
+            self._scroll_timer = None
+
+    def _do_drag_scroll(self) -> None:
+        """Perform one tick of auto-scrolling during drag selection."""
+        if self._drag_scroll_direction < 0:
+            self.scroll_up(animate=False)
+        elif self._drag_scroll_direction > 0:
+            self.scroll_down(animate=False)
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        """Stop drag scrolling when mouse button is released."""
+        self._stop_drag_scroll()
+
+
 class TextualLogHandler(logging.Handler):
     """Custom logging handler that writes to a Textual Log widget."""
-    
+
     def __init__(self, widget):
         super().__init__()
         self.widget = widget
-        
+
     def emit(self, record):
         try:
             msg = self.format(record)
@@ -205,6 +322,7 @@ class Sidebar(Vertical):
     # NOTE: Azure requires you to CREATE deployments in Azure Portal first!
     # The deployment NAME you create is what you use here, not the base model name.
     MODEL_OPTIONS = [
+        ("Gemini 2.0 Flash", "gemini/gemini-2.0-flash"),
         ("Gemini 2.5 Flash", "gemini/gemini-2.5-flash"),
         ("Gemini 3 Pro", "gemini/gemini-3-pro-preview"),
         ("Azure GPT-5.2", "azure/gpt-5.2"),
@@ -227,7 +345,8 @@ class Sidebar(Vertical):
 
         with Vertical(id="actions-panel"):
             yield Button("Mute (F5)", id="btn-mute", variant="default")
-            yield Button("Copy Debug (F7)", id="btn-debug", variant="default")
+            yield Button("Speed 1.0x (F8)", id="btn-speed", variant="default")
+            yield Button("Debug (F7)", id="btn-debug", variant="default")
             yield Button("Analyze Screen (F3)", id="btn-screenshot", variant="primary")
             yield Button("Analyze Match", id="btn-analyze", variant="warning")
             yield Button("Restart (F9)", id="btn-restart", variant="error")
@@ -318,6 +437,7 @@ class ArenaApp(App):
         ("f5", "toggle_mute", "Mute"),
         ("f6", "cycle_voice", "Voice"),
         ("f7", "copy_debug", "Debug"),
+        ("f8", "cycle_speed", "Speed"),
         ("f9", "restart", "Restart"),
         ("f12", "cycle_model", "Model"),
     ]
@@ -336,14 +456,15 @@ class ArenaApp(App):
         with Vertical(id="main-area"):
             # Game State Display (Top Right)
             yield GameStateDisplay(id="game-state-display")
-            # Advice Log (Bottom Right)
-            yield RichLog(id="log-view", markup=True, wrap=True)
+            # Advice Log (Bottom Right) - SelectableRichLog enables proper
+            # text selection/copy and scroll-on-drag within the pane
+            yield SelectableRichLog(id="log-view", markup=True, wrap=True)
             yield Input(placeholder="Ask the coach...", id="chat-input")
         yield Footer()
 
     def on_mount(self) -> None:
         """Start the coach thread when the app mounts."""
-        self.log_widget = self.query_one("#log-view", RichLog)
+        self.log_widget = self.query_one("#log-view", SelectableRichLog)
         self.game_state_widget = self.query_one("#game-state-display", GameStateDisplay)
         
         self.write_log("[bold green]Initializing MTGA Coach...[/]")
@@ -437,6 +558,8 @@ class ArenaApp(App):
                     v_select.value = curr_id
             except Exception as e:
                 self.write_log(f"[yellow]Voice Sync Warning: {e}[/]")
+            # Sync speed button label
+            self._update_speed_button(self.coach._voice_output._speed)
             self.sub_title = desc
 
         # Start seat info polling
@@ -554,6 +677,8 @@ class ArenaApp(App):
         btn_id = event.button.id
         if btn_id == "btn-mute":
             self.action_toggle_mute()
+        elif btn_id == "btn-speed":
+            self.action_cycle_speed()
         elif btn_id == "btn-debug":
             self.action_copy_debug()
         elif btn_id == "btn-screenshot":
@@ -666,15 +791,24 @@ class ArenaApp(App):
         threading.Thread(target=self._do_copy_debug, daemon=True).start()
 
     def _do_copy_debug(self):
-        """Save debug report to file and copy file path to clipboard."""
-        # Delegate to coach's comprehensive bug report (saves file, copies path)
+        """Save debug report and spawn Claude Code debug session."""
+        from arenamcp.standalone import StandaloneCoach
+
         if self.coach and hasattr(self.coach, 'save_bug_report'):
             bug_path = self.coach.save_bug_report("Copy Debug (F7)")
             if bug_path:
-                self.call_from_thread(
-                    self.write_log,
-                    f"[green]Debug report saved. Path copied to clipboard.[/]"
-                )
+                # Spawn Claude Code in a new terminal for debugging
+                spawned = StandaloneCoach.spawn_debug_session(bug_path)
+                if spawned:
+                    self.call_from_thread(
+                        self.write_log,
+                        f"[green]Debug session opened in new terminal.[/]"
+                    )
+                else:
+                    self.call_from_thread(
+                        self.write_log,
+                        f"[yellow]Bug report saved (path copied). Could not launch 'cc' — is it in PATH?[/]"
+                    )
             else:
                 self.call_from_thread(
                     self.write_log,
@@ -1129,6 +1263,26 @@ class ArenaApp(App):
     def action_cycle_voice(self) -> None:
         if self.coach:
             threading.Thread(target=self.coach._on_voice_cycle_hotkey, daemon=True).start()
+
+    def action_cycle_speed(self) -> None:
+        """Cycle TTS speed (1.0x → 1.2x → 1.4x → 1.0x)."""
+        if not self.coach or not self.coach._voice_output:
+            return
+
+        def _do():
+            speed = self.coach._voice_output.cycle_speed()
+            self.call_from_thread(self._update_speed_button, speed)
+            try:
+                self.coach._voice_output.speak("Speed changed.", blocking=False)
+            except Exception:
+                pass
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _update_speed_button(self, speed: float) -> None:
+        """Update the speed button label."""
+        btn = self.query_one("#btn-speed", Button)
+        btn.label = f"Speed {speed}x (F8)"
 
     def action_cycle_model(self) -> None:
         """Cycle through available models (F12)."""

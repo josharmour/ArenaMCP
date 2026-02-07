@@ -54,17 +54,18 @@ class MatchFrame:
     arena_graveyard_cards: list = field(default_factory=list)
 
 
-@dataclass  
+@dataclass
 class MatchRecording:
     """Complete recording of a match for validation."""
     match_id: str
     start_time: datetime
     frames: list[MatchFrame] = field(default_factory=list)
-    
+
     # Match metadata
     your_seat_id: Optional[int] = None
     opponent_name: Optional[str] = None
     result: Optional[str] = None  # "win", "loss", "draw"
+    end_time: Optional[datetime] = None
     
     # Advice tracking for post-match analysis
     advice_events: list[dict] = field(default_factory=list)
@@ -177,7 +178,9 @@ class MatchRecording:
         frame = MatchFrame(
             timestamp=datetime.now(),
             frame_number=frame_num,
-            raw_message=raw_message,
+            # OPTIMIZATION: Only store raw_message every 10 frames to reduce memory
+            # The raw message can be very large and storing it every frame causes memory bloat
+            raw_message=raw_message if frame_num % 10 == 0 else {},
             message_type=msg_type,
             parsed_snapshot=parsed_snapshot,
             arena_turn=turn_info.get("turnNumber", 0),
@@ -217,6 +220,7 @@ class MatchRecording:
             "opponent_name": self.opponent_name,
             "result": self.result,
             "frame_count": len(self.frames),
+            "advice_events": self.advice_events,  # Include recorded advice
             "frames": [
                 {
                     "frame_number": f.frame_number,
@@ -251,6 +255,53 @@ class MatchRecording:
         
         logger.info(f"Saved match recording: {output_path}")
         return output_path
+
+    @classmethod
+    def load(cls, path: Path) -> "MatchRecording":
+        """Load a recording from disk."""
+        with open(path) as f:
+            data = json.load(f)
+
+        recording = cls(
+            match_id=data["match_id"],
+            start_time=datetime.fromisoformat(data["start_time"]),
+            your_seat_id=data.get("your_seat_id"),
+            opponent_name=data.get("opponent_name"),
+            result=data.get("result"),
+        )
+
+        # Load advice events
+        recording.advice_events = data.get("advice_events", [])
+
+        # Load frames
+        for f_data in data.get("frames", []):
+            frame = MatchFrame(
+                timestamp=datetime.fromisoformat(f_data["timestamp"]),
+                frame_number=f_data["frame_number"],
+                raw_message=f_data.get("raw_message", {}),
+                message_type=f_data.get("message_type", ""),
+                parsed_snapshot=f_data.get("parsed_snapshot"),
+                arena_turn=f_data.get("arena_turn", 0),
+                arena_phase=f_data.get("arena_phase", ""),
+                arena_step=f_data.get("arena_step", ""),
+                arena_active_player=f_data.get("arena_active_player", 0),
+                arena_priority_player=f_data.get("arena_priority_player", 0),
+                arena_life_totals=f_data.get("arena_life_totals", {}),
+                arena_battlefield_count=f_data.get("arena_battlefield_count", 0),
+                arena_stack_count=f_data.get("arena_stack_count", 0),
+                arena_hand_counts=f_data.get("arena_hand_counts", {}),
+                arena_graveyard_counts=f_data.get("arena_graveyard_counts", {}),
+                arena_attackers=f_data.get("arena_attackers", []),
+                arena_blockers=f_data.get("arena_blockers", []),
+                arena_available_actions=f_data.get("arena_available_actions", []),
+                arena_battlefield_cards=f_data.get("arena_battlefield_cards", []),
+                arena_hand_cards=f_data.get("arena_hand_cards", []),
+                arena_stack_cards=f_data.get("arena_stack_cards", []),
+                arena_graveyard_cards=f_data.get("arena_graveyard_cards", []),
+            )
+            recording.frames.append(frame)
+
+        return recording
 
 
 @dataclass

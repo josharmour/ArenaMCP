@@ -6,6 +6,7 @@ with support for Claude (Anthropic), Gemini (Google), and local models via Ollam
 
 import logging
 import os
+from collections import Counter
 from typing import Any, Optional, Protocol
 
 logger = logging.getLogger(__name__)
@@ -100,7 +101,7 @@ class GeminiBackend:
                 raise ImportError("google-genai package required: pip install google-genai")
         return self._client
 
-    def complete(self, system_prompt: str, user_message: str, max_tokens: int = 1024) -> str:
+    def complete(self, system_prompt: str, user_message: str, max_tokens: int = 4096) -> str:
         """Get completion from Gemini API."""
         import time
 
@@ -116,6 +117,13 @@ class GeminiBackend:
             client = self._get_client()
             client_time = (time.perf_counter() - client_start) * 1000
 
+            # Configure thinking for thinking models to reduce latency
+            thinking_config = None
+            if "gemini-3" in self.model:
+                thinking_config = types.ThinkingConfig(thinking_level="low")
+            elif "gemini-2.5" in self.model:
+                thinking_config = types.ThinkingConfig(thinking_budget=1024)
+
             request_start = time.perf_counter()
             response = client.models.generate_content(
                 model=self.model,
@@ -124,6 +132,7 @@ class GeminiBackend:
                     system_instruction=system_prompt,
                     max_output_tokens=max_tokens,
                     temperature=0.0,
+                    thinking_config=thinking_config,
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                     safety_settings=[
                         types.SafetySetting(
@@ -158,13 +167,15 @@ class GeminiBackend:
             # CHANGED TO INFO so it appears in standard logs
             logger.info(f"[GEMINI] client: {client_time:.1f}ms, API: {request_time:.0f}ms, model: {self.model}, reason: {finish_reason}, safety: {safety_ratings}")
             
-            # Extract text, handling potential thought blocks if present
+            # Extract visible text only, skipping thinking/thought parts
             text = ""
             if hasattr(response, 'candidates') and response.candidates:
                 candidate = response.candidates[0]
                 parts = getattr(candidate.content, 'parts', None) if candidate.content else None
                 if parts:
                     for part in parts:
+                        if getattr(part, 'thought', False):
+                            continue  # Skip thinking parts
                         if hasattr(part, 'text') and part.text:
                             text += part.text
 
@@ -235,14 +246,22 @@ class GeminiBackend:
             # Create audio part
             audio_part = types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")
 
+            # Configure thinking for thinking models to reduce latency
+            thinking_config = None
+            if "gemini-3" in self.model:
+                thinking_config = types.ThinkingConfig(thinking_level="low")
+            elif "gemini-2.5" in self.model:
+                thinking_config = types.ThinkingConfig(thinking_budget=1024)
+
             request_start = time.perf_counter()
             response = client.models.generate_content(
                 model=self.model,
                 contents=[user_message, audio_part],
                 config=genai.types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    max_output_tokens=1024,
+                    max_output_tokens=4096,
                     temperature=0.0,
+                    thinking_config=thinking_config,
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                     safety_settings=[
                         types.SafetySetting(
@@ -288,106 +307,6 @@ class GeminiBackend:
             logger.error(f"Gemini audio API error: {e}")
             return f"Error getting advice from Gemini with audio: {e}"
 
-    # Models known to support response_modalities=["AUDIO"] via generate_content.
-    # NOTE: As of 2026-02, no standard Gemini model supports this — only the
-    # dedicated TTS model (gemini-2.5-flash-preview-tts) and Live API do.
-    # Keep this set for future models; the text+GeminiTTS fallback works well.
-    AUDIO_CAPABLE_MODELS: set[str] = set()
-
-    def complete_audio(
-        self,
-        system_prompt: str,
-        user_message: str,
-        voice: str = "Kore"
-    ) -> "tuple[np.ndarray, int] | None":
-        """Get audio completion from Gemini API (model generates speech directly).
-
-        Uses the same model as text path but with response_modalities=["AUDIO"]
-        so the model reasons about the game state AND speaks the advice in one call.
-
-        Args:
-            system_prompt: The system prompt setting up the assistant role
-            user_message: The game context and trigger description
-            voice: Gemini voice name (default: Kore)
-
-        Returns:
-            Tuple of (samples as float32 numpy array, sample_rate) on success,
-            None on any error.
-        """
-        import time
-
-        # Only attempt audio on models known to support it
-        if self.model not in self.AUDIO_CAPABLE_MODELS:
-            logger.debug(f"Model {self.model} not in audio-capable list, skipping complete_audio")
-            return None
-
-        api_key = os.environ.get("GOOGLE_API_KEY")
-        if not api_key:
-            logger.error("GOOGLE_API_KEY not set for audio generation")
-            return None
-
-        try:
-            from google import genai
-            from google.genai import types
-
-            client_start = time.perf_counter()
-            client = self._get_client()
-            client_time = (time.perf_counter() - client_start) * 1000
-
-            request_start = time.perf_counter()
-            response = client.models.generate_content(
-                model=self.model,
-                contents=user_message,
-                config=genai.types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=voice,
-                            )
-                        )
-                    ),
-                    temperature=0.0,
-                    safety_settings=[
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_HARASSMENT",
-                            threshold="BLOCK_NONE",
-                        ),
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_HATE_SPEECH",
-                            threshold="BLOCK_NONE",
-                        ),
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                            threshold="BLOCK_NONE",
-                        ),
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                            threshold="BLOCK_NONE",
-                        ),
-                    ],
-                )
-            )
-            request_time = (time.perf_counter() - request_start) * 1000
-
-            # Extract audio data from response (robust parsing)
-            from arenamcp.tts import _extract_audio_from_response, _decode_audio_bytes
-
-            audio_data = _extract_audio_from_response(response)
-            if audio_data is None:
-                logger.error(f"[GEMINI+AUDIO_OUT] No audio data in response (model={self.model})")
-                return None
-
-            samples, sample_rate = _decode_audio_bytes(audio_data)
-
-            logger.info(f"[GEMINI+AUDIO_OUT] API: {request_time:.0f}ms, client: {client_time:.1f}ms, model: {self.model}, voice: {voice}, samples: {len(samples)}, rate: {sample_rate}")
-
-            return (samples, sample_rate)
-
-        except Exception as e:
-            logger.error(f"Gemini audio output error: {e}")
-            return None
 
     def complete_with_image(
         self,
@@ -411,13 +330,21 @@ class GeminiBackend:
             # Create image part
             image_part = types.Part.from_bytes(data=image_data, mime_type=mime_type)
 
+            # Configure thinking for thinking models to reduce latency
+            thinking_config = None
+            if "gemini-3" in self.model:
+                thinking_config = types.ThinkingConfig(thinking_level="low")
+            elif "gemini-2.5" in self.model:
+                thinking_config = types.ThinkingConfig(thinking_budget=1024)
+
             response = client.models.generate_content(
                 model=self.model,
                 contents=[user_message, image_part],
                 config=genai.types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    max_output_tokens=1024,
+                    max_output_tokens=4096,
                     temperature=0.0,
+                    thinking_config=thinking_config,
                     safety_settings=[
                          types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
                          types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
@@ -727,18 +654,27 @@ Do NOT second-guess yourself in the text (e.g., "Wait, I need to check...").
 Be authoritative and decisive. Start your response immediately with the command.
 
 CRITICAL GAME RULES:
+- The "Legal:" line lists ALL valid actions. ONLY suggest actions listed there.
+- NEVER suggest actions not in the Legal: line. If you want to cast a spell, it MUST appear as "Cast [card name]" in Legal:.
+- Do NOT hallucinate actions like "flash in" or "hold up" unless they are explicitly legal actions.
+- Creatures tagged [SS] have SUMMONING SICKNESS — they CANNOT attack or use tap abilities this turn.
+- Do NOT suggest attacking with [SS] creatures. Check the "Declare Attackers:" list for legal attackers.
 - DEFAULT: You can only play ONE LAND per turn unless a card grants additional land drops.
 - Check the LAND DROP status to see if a land can still be played this turn.
-- Cards marked [INSTANT] can be cast anytime you have priority
-- Cards marked [SORCERY SPEED] can ONLY be cast during YOUR Main phase with empty stack
-- During opponent's turn or combat: ONLY suggest instants or abilities
-- If it's not your Main phase, do NOT suggest casting creatures or sorceries
+- LAND DROP PRIORITY: If the LAND status shows 'AVAILABLE' and you have lands in hand, ALWAYS suggest playing a land FIRST before any spell. Land drops are free and should not be skipped. Say 'Play [land name]' as your advice when a land drop is available, UNLESS you specifically need to cast a spell first for strategic reasons (e.g., you need to tap specific lands before playing a new one).
+- Cards marked [INSTANT] or [I] can be cast anytime you have priority
+- Cards marked [SORCERY SPEED] or [S] can ONLY be cast during YOUR Main phase with empty stack
+- During opponent's turn or combat: ONLY suggest instants/flash cards or activated abilities
+- If it's not your Main phase, do NOT suggest casting creatures or sorceries (unless they have flash)
 
 CRITICAL MANA RULES:
-- Cards tagged [CAN CAST] are the ONLY cards you can suggest casting.
-- Cards tagged [NEED X mana] CANNOT be cast - do NOT suggest them!
+- Cards tagged [OK] or [CAN CAST] are castable RIGHT NOW with available mana - no additional mana needed!
+- Cards tagged [NEED X] CANNOT be cast - do NOT suggest them!
 - Do NOT perform your own mana calculations - trust the tags completely.
-- If ALL cards show [NEED X mana], say "pass" - you cannot cast anything.
+- If a card shows [OK], you already have enough mana. Don't suggest paying extra life/resources for more mana.
+- RESOURCE EFFICIENCY: Don't waste life or mana. If you can cast a spell with current mana, don't pay extra.
+- The "sources:" display shows what mana EACH source can produce (e.g., "{U/G}" means one source producing U OR G, not both).
+- If ALL cards show [NEED X], say "pass priority" - you cannot cast anything.
 
 CRITICAL MATH RULES:
 - When suggesting removal, check the creature's TOUGHNESS (second number, e.g., 4/5 has 5 toughness).
@@ -753,6 +689,9 @@ CRITICAL BLOCKING RULES:
 CRITICAL STRATEGY RULES:
 - LETHAL CHECK: Before anything else, count your total attack power vs opponent life and blockers.
   If you can deal lethal, go aggressive — remove a blocker or just attack. Don't play defensively!
+- CRACKBACK CHECK: Before attacking, count opponent's total power on board vs YOUR life total.
+  If opponent can kill you on their next attack and you need creatures to block, do NOT attack with them.
+  Holding back blockers to survive is more important than dealing a few damage.
 - Bounce/removal spells can target OPPONENT creatures too. Bouncing a blocker for lethal > saving your creature.
 - When opponent has a removal spell on the stack, weigh "save my creature" vs "ignore it and go for the kill."
 - Creatures have power/toughness (e.g. 5/5). Don't call creatures "planeswalkers."
@@ -783,11 +722,18 @@ Examples:
 STRATEGY:
 - LETHAL CHECK: Before anything else, count your total attack power vs opponent life and blockers.
   If you can deal lethal, go aggressive — remove a blocker or just attack. Don't play defensively!
+- CRACKBACK CHECK: Before attacking, count opponent's total power vs YOUR life. If they can kill you next turn and you need blockers to survive, do NOT attack with those creatures.
 - Bounce/removal spells can target OPPONENT creatures too. Bouncing a blocker for lethal > saving your creature.
 - When opponent has a removal spell on the stack, weigh "save my creature" vs "ignore it and go for the kill."
 
 RULES:
-- Only suggest cards tagged [CAN CAST] or [OK]. Cards tagged [NEED X mana] CANNOT be cast!
+- The "Legal:" line lists ALL valid actions. ONLY suggest actions listed there. No exceptions!
+- NEVER suggest actions not in Legal:. If you want to "flash in" a creature, it MUST show "Cast [creature]" in Legal:.
+- Creatures tagged [SS] have SUMMONING SICKNESS — they CANNOT attack. Check "Declare Attackers:" for legal attackers.
+- Cards tagged [OK] are castable NOW with current mana - no additional mana needed! Don't waste life for more mana.
+- Cards tagged [NEED X] CANNOT be cast - do NOT suggest them!
+- RESOURCE EFFICIENCY: If a card shows [OK], you already have enough. Don't pay extra life/mana unnecessarily.
+- LAND DROP PRIORITY: If LAND status shows 'AVAILABLE' and you have lands in hand, suggest playing a land FIRST.
 - Use exact FULL card names from the game state. Never abbreviate.
 - Only suggest lands shown in HAND. If no land in hand, don't suggest playing one.
 - Say "pass priority" not just "pass" to avoid sounding like a card name.
@@ -933,6 +879,7 @@ class CoachEngine:
         self._word_tracker = WordUsageTracker()
         self._deck_strategy: Optional[str] = None
         self._deck_strategy_pending = False
+        self._rules_db: Optional["RulesDB"] = None
     
     def clear_deck_strategy(self) -> None:
         """Reset deck strategy for a new match."""
@@ -972,6 +919,11 @@ class CoachEngine:
             except TypeError:
                 # Backend doesn't support max_tokens parameter
                 strategy = self._backend.complete(DECK_ANALYSIS_PROMPT, user_message)
+
+            # Don't store error/fallback messages as deck strategy
+            if not strategy or strategy.startswith("Error") or "didn't catch that" in strategy:
+                logger.warning(f"Deck analysis returned error-like response: {strategy[:80] if strategy else 'empty'}")
+                return None
 
             # Truncate if too long
             if len(strategy) > 400:
@@ -1034,9 +986,12 @@ class CoachEngine:
             from arenamcp.rules_engine import RulesEngine
             valid_moves = RulesEngine.get_legal_actions(game_state)
             # OPTIMIZATION: Join inline instead of list, limit to 8 most important
-            valid_moves_str = ", ".join(valid_moves[:8])
-            if len(valid_moves) > 8:
-                valid_moves_str += f"... (+{len(valid_moves)-8})"
+            if not valid_moves:
+                valid_moves_str = "NONE — say \"pass priority\""
+            else:
+                valid_moves_str = ", ".join(valid_moves[:8])
+                if len(valid_moves) > 8:
+                    valid_moves_str += f"... (+{len(valid_moves)-8})"
         except Exception as e:
             logger.error(f"RulesEngine error: {e}")
             valid_moves_str = "Error"
@@ -1107,13 +1062,32 @@ class CoachEngine:
                 # No context available - generic display
                 lines.append(f"!!! DECISION: {pending_decision} !!!")
                 
-            # Special handling for Mulligan (legacy)
+            # Special handling for Mulligan - show hand summary for LLM
             if pending_decision == "Mulligan":
-                my_hand = game_state.get("zones", {}).get("my_hand", [])
+                my_hand = game_state.get("hand", [])
                 if not my_hand:
                     lines.append("Waiting for hand...")
                 else:
-                    lines.append("Evaluate: lands, colors, curve → KEEP or MULLIGAN")
+                    lands = [c for c in my_hand if "land" in c.get("type_line", "").lower()]
+                    creatures = [c for c in my_hand if "creature" in c.get("type_line", "").lower()]
+                    spells = [c for c in my_hand if c not in lands and c not in creatures]
+                    cmcs = []
+                    for c in my_hand:
+                        cost = c.get("mana_cost", "")
+                        if cost:
+                            import re as _re
+                            generic = sum(int(g) for g in _re.findall(r'\{(\d+)\}', cost))
+                            pips = len(_re.findall(r'\{[WUBRGC]\}', cost))
+                            cmcs.append(generic + pips)
+                        else:
+                            cmcs.append(0)
+                    avg_cmc = sum(cmcs) / len(cmcs) if cmcs else 0
+                    land_names = [c.get("name", "?") for c in lands]
+                    nonland_names = [f"{c.get('name', '?')} ({c.get('mana_cost', '')})" for c in my_hand if c not in lands]
+                    lines.append(f"MULLIGAN HAND: {len(lands)} lands, {len(creatures)} creatures, {len(spells)} spells, avg CMC {avg_cmc:.1f}")
+                    lines.append(f"  Lands: {', '.join(land_names) if land_names else 'NONE'}")
+                    lines.append(f"  Nonland: {', '.join(nonland_names) if nonland_names else 'NONE'}")
+                    lines.append("Decide: KEEP or MULLIGAN based on curve, colors, and land count")
         
         # OPTIMIZATION: Single line for turn/phase/priority
         phase_str = f"{phase}/{step}" if step else phase
@@ -1124,6 +1098,8 @@ class CoachEngine:
             lines.append("Timing: ALL SPELLS")
         elif is_blocking:
             lines.append("ACTION: DECLARE BLOCKERS")
+        elif is_your_turn and is_main_phase and not stack_empty:
+            lines.append("Timing: ALL SPELLS (after stack resolves)")
         else:
             lines.append("Timing: INSTANTS ONLY")
         
@@ -1138,9 +1114,11 @@ class CoachEngine:
         opp_cards = [c for c in battlefield if c.get("owner_seat_id") != local_seat]
 
         # OPTIMIZATION: Compact mana calculation
+        # Track mana sources individually to avoid misleading dual-land displays
         mana_pool = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0, "C": 0, "Any": 0}
+        mana_sources = []  # Track individual sources for clearer display
         total_mana = 0
-        
+
         for card in your_cards:
             type_line = card.get("type_line", "").lower()
             oracle = card.get("oracle_text", "")
@@ -1148,34 +1126,59 @@ class CoachEngine:
             # Check for casting sickness (unless it has haste)
             has_haste = "haste" in self._remove_reminder_text(oracle).lower()
             is_summoning_sick = is_creature and card.get("turn_entered_battlefield") == turn_num and not has_haste
-            
+
             # Count mana sources (Lands AND Creatures)
             # Logic: Untapped AND (Land OR (Creature AND "add {" in oracle AND not summoning sick))
             # Relaxed check: Just looking for "Add " or "{T}: Add" is surprisingly robust for dorks
             has_mana_ability = "add {" in oracle.lower() or "add one mana" in oracle.lower()
-            
+
             if not card.get("is_tapped"):
                 if "land" in type_line or (is_creature and has_mana_ability and not is_summoning_sick):
                     total_mana += 1
                     name = card.get("name", "")
-                    
-                    # Color detection (simplified)
-                    if "Plains" in name or "{W}" in oracle: mana_pool["W"] += 1
-                    if "Island" in name or "{U}" in oracle: mana_pool["U"] += 1
-                    if "Swamp" in name or "{B}" in oracle: mana_pool["B"] += 1
-                    if "Mountain" in name or "{R}" in oracle: mana_pool["R"] += 1
-                    if "Forest" in name or "{G}" in oracle: mana_pool["G"] += 1
-                    if "{C}" in oracle: mana_pool["C"] += 1
-                    if "any color" in oracle.lower(): mana_pool["Any"] += 1
+
+                    # Detect what colors this specific source can produce
+                    source_colors = []
+                    if "Plains" in name or "{W}" in oracle:
+                        mana_pool["W"] += 1
+                        source_colors.append("W")
+                    if "Island" in name or "{U}" in oracle:
+                        mana_pool["U"] += 1
+                        source_colors.append("U")
+                    if "Swamp" in name or "{B}" in oracle:
+                        mana_pool["B"] += 1
+                        source_colors.append("B")
+                    if "Mountain" in name or "{R}" in oracle:
+                        mana_pool["R"] += 1
+                        source_colors.append("R")
+                    if "Forest" in name or "{G}" in oracle:
+                        mana_pool["G"] += 1
+                        source_colors.append("G")
+                    if "{C}" in oracle:
+                        mana_pool["C"] += 1
+                        source_colors.append("C")
+                    if "any color" in oracle.lower():
+                        mana_pool["Any"] += 1
+                        source_colors.append("Any")
+
+                    # Track this source for clearer display
+                    if len(source_colors) > 1:
+                        # Multi-color source (dual land, etc.)
+                        mana_sources.append("/".join(source_colors))
+                    elif len(source_colors) == 1:
+                        mana_sources.append(source_colors[0])
 
         logger.info(f"Mana: {mana_pool} (Total: {total_mana})")
-        
-        # OPTIMIZATION: Compact mana display - only show colors you have
-        mana_colors = [f"{c}:{mana_pool[c]}" for c in "WUBRGC" if mana_pool[c] > 0]
-        if mana_pool["Any"] > 0:
-            mana_colors.append(f"Any:{mana_pool['Any']}")
-        mana_str = " ".join(mana_colors) if mana_colors else "0"
-        lines.append(f"Mana: {total_mana} ({mana_str})")
+
+        # IMPROVED: Show mana sources more clearly to avoid dual-land confusion
+        # Old: "Mana: 1 (U:1 G:1)" - misleading, looks like 2 mana!
+        # New: "Mana: 1 (sources: {U/G})" - clear that it's one source with options
+        if mana_sources:
+            # Group identical sources: ["W", "W", "U/G"] -> "W W {U/G}"
+            source_display = " ".join(f"{{{s}}}" if "/" in s else s for s in mana_sources)
+            lines.append(f"Mana: {total_mana} (sources: {source_display})")
+        else:
+            lines.append(f"Mana: 0")
 
         # OPTIMIZATION: Compact land drop status
         lands_played = local_player.get("lands_played", 0) if local_player else 0
@@ -1192,20 +1195,40 @@ class CoachEngine:
             lines.append("")
             lines.append(f"YOUR BOARD:")
             if your_cards:
+                # Disambiguate duplicate names: "Gene Pollinator #1", "Gene Pollinator #2"
+                your_name_counts = Counter(c.get("name", "Unknown") for c in your_cards)
+                your_name_seen = {}
                 for card in your_cards:
                     name = card.get("name", "Unknown")
                     type_line = card.get("type_line", "").lower()
-                    
+
+                    # Disambiguate duplicate names
+                    if your_name_counts[name] > 1:
+                        your_name_seen[name] = your_name_seen.get(name, 0) + 1
+                        display_name = f"{name} #{your_name_seen[name]}"
+                    else:
+                        display_name = name
+
                     # P/T for creatures
                     pt = f" {card['power']}/{card['toughness']}" if card.get("power") is not None else ""
-                    
+
                     # Status flags (compact symbols)
                     flags = []
+
+                    # Type tags for non-creature non-land permanents
+                    is_creature = "creature" in type_line
+                    is_land = "land" in type_line
+                    if not is_creature and not is_land:
+                        if "equipment" in type_line: flags.append("EQUIPMENT")
+                        elif "artifact" in type_line: flags.append("ARTIFACT")
+                        if "enchantment" in type_line: flags.append("ENCHANT")
+                        if "planeswalker" in type_line: flags.append("PW")
+
                     if card.get("is_tapped"): flags.append("T")
-                    
+
                     oracle_text = self._remove_reminder_text(card.get("oracle_text", "")).lower()
                     is_creature = "creature" in type_line
-                    
+
                     # Keywords that matter for combat
                     if "flying" in oracle_text: flags.append("FLY")
                     if "reach" in oracle_text: flags.append("RCH")
@@ -1214,30 +1237,68 @@ class CoachEngine:
                     if "trample" in oracle_text: flags.append("TRM")
                     if "first strike" in oracle_text: flags.append("FS")
                     if "deathtouch" in oracle_text: flags.append("DTH")
-                    
+
                     # Summoning sickness check
                     if is_creature and card.get("turn_entered_battlefield") == turn_num and "haste" not in oracle_text:
                         flags.append("SS")
-                    
+
                     if card.get("is_attacking"): flags.append("ATK")
                     if card.get("is_blocking"): flags.append("BLK")
-                    
+
                     flag_str = f" [{','.join(flags)}]" if flags else ""
-                    lines.append(f"  {name}{pt}{flag_str}")
+                    lines.append(f"  {display_name}{pt}{flag_str}")
 
             else:
                 lines.append("  (empty)")
 
+            # Pre-compute inferred attackers for DeclareBlock display
+            # MTGA doesn't always send isAttacking on game objects, so we infer
+            # from tapped non-SS creatures during opponent's combat
+            _inferred_atk_ids = set()
+            if "Combat" in phase and not is_your_turn and "DeclareBlock" in step:
+                has_explicit_atk = any(c.get("is_attacking") for c in opp_cards)
+                if not has_explicit_atk:
+                    for c in opp_cards:
+                        c_type = c.get("type_line", "").lower()
+                        c_oracle = self._remove_reminder_text(c.get("oracle_text", "")).lower()
+                        is_ss = (c.get("turn_entered_battlefield") == turn_num
+                                 and "haste" not in c_oracle)
+                        if (c.get("is_tapped")
+                                and c.get("power") is not None
+                                and "land" not in c_type
+                                and not is_ss):
+                            _inferred_atk_ids.add(c.get("instance_id"))
+
             lines.append(f"OPP BOARD:")
             if opp_cards:
+                opp_name_counts = Counter(c.get("name", "Unknown") for c in opp_cards)
+                opp_name_seen = {}
                 for card in opp_cards:
                     name = card.get("name", "Unknown")
                     type_line = card.get("type_line", "").lower()
+
+                    # Disambiguate duplicate names
+                    if opp_name_counts[name] > 1:
+                        opp_name_seen[name] = opp_name_seen.get(name, 0) + 1
+                        display_name = f"{name} #{opp_name_seen[name]}"
+                    else:
+                        display_name = name
+
                     pt = f" {card['power']}/{card['toughness']}" if card.get("power") is not None else ""
-                    
+
                     flags = []
+
+                    # Type tags for non-creature non-land permanents
+                    is_creature = "creature" in type_line
+                    is_land = "land" in type_line
+                    if not is_creature and not is_land:
+                        if "equipment" in type_line: flags.append("EQUIPMENT")
+                        elif "artifact" in type_line: flags.append("ARTIFACT")
+                        if "enchantment" in type_line: flags.append("ENCHANT")
+                        if "planeswalker" in type_line: flags.append("PW")
+
                     if card.get("is_tapped"): flags.append("T")
-                    
+
                     oracle_text = self._remove_reminder_text(card.get("oracle_text", "")).lower()
                     if "flying" in oracle_text: flags.append("FLY")
                     if "reach" in oracle_text: flags.append("RCH")
@@ -1245,12 +1306,17 @@ class CoachEngine:
                     if "trample" in oracle_text: flags.append("TRM")
                     if "first strike" in oracle_text: flags.append("FS")
                     if "deathtouch" in oracle_text: flags.append("DTH")
-                    
-                    if card.get("is_attacking"): flags.append("ATK")
+
+                    # Summoning sickness check for opponent creatures
+                    if is_creature and card.get("turn_entered_battlefield") == turn_num and "haste" not in oracle_text:
+                        flags.append("SS")
+
+                    if card.get("is_attacking") or card.get("instance_id") in _inferred_atk_ids:
+                        flags.append("ATK")
                     if card.get("is_blocking"): flags.append("BLK")
-                    
+
                     flag_str = f" [{','.join(flags)}]" if flags else ""
-                    lines.append(f"  {name}{pt}{flag_str}")
+                    lines.append(f"  {display_name}{pt}{flag_str}")
             else:
                 lines.append("  (empty)")
 
@@ -1284,6 +1350,9 @@ class CoachEngine:
             # OPTIMIZATION: Compact blocking analysis (was 50+ lines, now ~10)
             elif "Combat" in phase and not is_your_turn:
                 attacking = [c for c in opp_cards if c.get("is_attacking")]
+                # Fallback: reuse pre-computed inferred attackers from display section
+                if not attacking and _inferred_atk_ids:
+                    attacking = [c for c in opp_cards if c.get("instance_id") in _inferred_atk_ids]
                 flying_atk = [c for c in attacking if "flying" in self._remove_reminder_text(c.get("oracle_text", "")).lower()]
                 ground_atk = [c for c in attacking if c not in flying_atk]
                 
@@ -1319,10 +1388,14 @@ class CoachEngine:
 
         if hand:
             import re
-            
+
             # OPTIMIZATION: Simplified mana checking - just need to know if castable
             can_play_land = (lands_played == 0) and is_your_turn and is_main_phase and stack_empty
-            
+
+            # Disambiguate duplicate card names in hand
+            hand_name_counts = Counter(c.get("name", "Unknown") for c in hand)
+            hand_name_seen = {}
+
             for card in hand:
                 name = card.get("name", "Unknown")
                 cost = card.get("mana_cost", "")
@@ -1348,11 +1421,18 @@ class CoachEngine:
                     cmc += len(hybrid)
 
                 # OPTIMIZATION: Simple castability check
+                # This logic is CORRECT: it checks total_mana (actual count) first, then colors.
+                # For dual lands: Temple of Mystery counts as 1 total_mana, but mana_pool shows
+                # both U:1 and G:1 since it CAN produce either. The color check ensures you can
+                # pay colored requirements, while total_mana >= cmc ensures you have enough sources.
                 castable = ""
                 if "land" in type_line:
                     castable = "LAND" if can_play_land else "HOLD"
                 elif total_mana >= cmc:
-                    # Color check (simplified - just check if we have any colored pips we can't pay)
+                    # Color check: verify we can meet colored requirements
+                    # Note: mana_pool[color] counts sources that CAN produce that color
+                    # For dual lands, this may overcount, but we check total_mana first to ensure
+                    # we have enough actual mana sources, then verify color requirements can be met.
                     color_ok = all(mana_pool.get(c, 0) + mana_pool.get("Any", 0) >= reqs[c]
                                    for c in "WUBRGC" if reqs[c] > 0)
                     castable = "OK" if color_ok else f"NEED:{cmc - total_mana}"
@@ -1379,14 +1459,41 @@ class CoachEngine:
                 # OPTIMIZATION: Only show oracle text for non-basic, non-land cards with relevant text
                 is_basic_land = "land" in type_line and ("basic" in type_line or
                                                          name in ["Plains", "Island", "Swamp", "Mountain", "Forest"])
-                show_oracle = oracle_text and not is_basic_land and len(oracle_text) < 150
+                is_aura = "enchantment" in type_line and "aura" in type_line
+                # Auras ALWAYS show oracle text — targeting (own vs opponent) depends on effect
+                show_oracle = oracle_text and not is_basic_land and (is_aura or len(oracle_text) < 200)
+
+                # Type tag for non-creature, non-land cards so LLM knows what it is
+                type_tag = ""
+                if "creature" not in type_line and "land" not in type_line:
+                    if "enchantment" in type_line and "aura" in type_line:
+                        type_tag = " (AURA)"
+                    elif "enchantment" in type_line:
+                        type_tag = " (ENCHANT)"
+                    elif "equipment" in type_line:
+                        type_tag = " (EQUIP)"
+                    elif "artifact" in type_line:
+                        type_tag = " (ART)"
+                    elif "planeswalker" in type_line:
+                        type_tag = " (PW)"
+
+                # Disambiguate duplicate names in hand
+                if hand_name_counts[name] > 1:
+                    hand_name_seen[name] = hand_name_seen.get(name, 0) + 1
+                    display_name = f"{name} #{hand_name_seen[name]}"
+                else:
+                    display_name = name
 
                 # OPTIMIZATION: Compact card display
-                lines.append(f"  {name} {cost} [{timing},{castable}]{removal_info}")
+                lines.append(f"  {display_name}{type_tag} {cost} [{timing},{castable}]{removal_info}")
                 if show_oracle:
                     # OPTIMIZATION: Remove reminder text to save tokens
                     oracle_compact = self._remove_reminder_text(oracle_text)
-                    if len(oracle_compact) > 100:
+                    if is_aura:
+                        # Auras: show full text (targeting depends on knowing effect)
+                        if len(oracle_compact) > 160:
+                            oracle_compact = oracle_compact[:157] + "..."
+                    elif len(oracle_compact) > 100:
                         oracle_compact = oracle_compact[:97] + "..."
                     lines.append(f"    {oracle_compact}")
         else:
@@ -1503,6 +1610,12 @@ class CoachEngine:
         elif trigger:
             trigger_descriptions = {
                 "new_turn": "Your turn just started (Main 1). What is the ONE best play right now?",
+                "opponent_turn": (
+                    "Opponent's turn just started. Briefly analyze their board and strategy. "
+                    "What is their game plan? What threats should we prepare for? "
+                    "What should we do on our next turn to counter them? "
+                    "Keep it to 2-3 sentences focused on opponent's strategy and your plan."
+                ),
                 "land_played": "A land was just played. What is the ONE next play?",
                 "spell_resolved": "A spell just resolved. What is the ONE next play?",
                 "priority_gained": "You have priority. Respond or pass?",
@@ -1562,9 +1675,32 @@ class CoachEngine:
             if decision_guidance:
                 effective_system_prompt += f"\n\n{decision_guidance}"
 
-        # Get response and track word usage (excluding card names)
+        # RAG: Inject relevant MTG rules for this situation
+        try:
+            if self._rules_db is None:
+                from arenamcp.rules_db import RulesDB
+                self._rules_db = RulesDB()
+            rules = self._rules_db.get_rules_for_situation(game_state, trigger, limit=5)
+            if rules:
+                rules_lines = [f"- Rule {r['number']}: {r['text']}" for r in rules]
+                effective_system_prompt += (
+                    "\n\nRELEVANT MTG RULES (official — these override any conflicting assumptions):\n"
+                    + "\n".join(rules_lines)
+                )
+                logger.debug(f"Injected {len(rules)} rules: {[r['number'] for r in rules]}")
+        except Exception as e:
+            logger.warning(f"Rules RAG error (non-fatal): {e}")
+
+        # Get response with timeout to prevent hanging on slow models
         api_start = time.perf_counter()
-        response = self._backend.complete(effective_system_prompt, user_message)
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._backend.complete, effective_system_prompt, user_message)
+            try:
+                response = future.result(timeout=12)
+            except concurrent.futures.TimeoutError:
+                logger.warning(f"LLM API call timed out after 12s (model may be too slow for real-time coaching)")
+                response = ""
         api_time = (time.perf_counter() - api_start) * 1000
 
         # POST-PROCESSING: Validate and fix common LLM issues (especially for smaller models)
@@ -1577,110 +1713,6 @@ class CoachEngine:
 
         return response
 
-    def get_advice_audio(
-        self,
-        game_state: dict[str, Any],
-        trigger: Optional[str] = None,
-        style: str = "concise",
-        voice: str = "Kore"
-    ) -> "tuple[np.ndarray, int] | None":
-        """Get coaching advice as direct audio from the LLM backend.
-
-        Uses the same prompt-building logic as get_advice() but calls
-        complete_audio() to get audio output directly from the model.
-        No postprocessing or word tracking (can't modify audio).
-
-        Args:
-            game_state: Dict from get_game_state() MCP tool
-            trigger: Optional trigger name (e.g., "new_turn", "combat_attackers")
-            style: Advice style ("concise" or "verbose")
-            voice: Gemini voice name (default: Kore)
-
-        Returns:
-            Tuple of (samples as float32 numpy array, sample_rate) on success,
-            None on any error (caller should fall back to text + TTS).
-        """
-        import time
-        total_start = time.perf_counter()
-
-        # Build context (same as get_advice)
-        context = self._format_game_context(game_state)
-
-        # Get card name words to exclude from overuse tracking
-        card_words = self._extract_card_name_words(game_state)
-
-        # Check for overused words
-        blacklisted = self._word_tracker.get_blacklisted(exclude_words=card_words)
-
-        # Build user message (same logic as get_advice)
-        if trigger:
-            trigger_descriptions = {
-                "new_turn": "Your turn just started (Main 1). What is the ONE best play right now?",
-                "land_played": "A land was just played. What is the ONE next play?",
-                "spell_resolved": "A spell just resolved. What is the ONE next play?",
-                "priority_gained": "You have priority. Respond or pass?",
-                "combat_attackers": "Combat: Declare attackers. Which creatures should attack?",
-                "combat_blockers": "Combat: Opponent is attacking. How should you block?",
-                "low_life": "Your life is dangerously low! What's the survival plan?",
-                "opponent_low_life": "Opponent's life is low — can you finish them?",
-                "stack_spell": "Something was just cast. Respond or let it resolve?",
-                "stack_spell_yours": "Your spell is on the stack. Pass priority or hold?",
-                "stack_spell_opponent": "Opponent just cast something. Respond or let it resolve?",
-                "user_request": "Give quick strategic advice for this moment.",
-                "decision_required": "Decision required (scry, discard, target, mulligan, etc). What should the player choose?",
-                "threat_detected": "ALERT: A dangerous card just hit the battlefield!",
-            }
-            trigger_desc = trigger_descriptions.get(trigger, f"Trigger: {trigger}")
-            user_message = f"{context}\n\n{trigger_desc}"
-        else:
-            user_message = f"{context}\n\nWhat's the best play right now?"
-
-        # Select system prompt based on style (same as get_advice)
-        style_key = style.lower()
-        prompts = {
-            "concise": CONCISE_SYSTEM_PROMPT,
-            "normal": DEFAULT_SYSTEM_PROMPT,
-            "explain": DEFAULT_SYSTEM_PROMPT.replace("Keep responses concise (2-3 sentences max)", "Explain your reasoning clearly but briefly.") + "\nInclude a short explanation of WHY this is the best line.",
-            "pirate": "You are a ruthless pirate captain coaching a swabby! Speak like a pirate! Yarr! Keep it short!",
-        }
-        effective_system_prompt = prompts.get(style_key, CONCISE_SYSTEM_PROMPT)
-
-        # Inject deck strategy if available — instruct model to reference it
-        if self._deck_strategy:
-            effective_system_prompt += (
-                f"\n\nDECK STRATEGY:\n{self._deck_strategy}"
-                "\n\nConnect your advice to this strategy — briefly explain WHY a play "
-                "matters for the deck's game plan (e.g. 'Cast X to trigger cascade into combo pieces')."
-            )
-
-        # Inject blacklisted words
-        if blacklisted:
-            avoid_list = ", ".join(blacklisted)
-            effective_system_prompt += f"\n\nIMPORTANT: Avoid using these overused words: {avoid_list}. Use different phrasing."
-
-        # Inject decision guidance
-        decision_context = game_state.get("decision_context")
-        if decision_context:
-            dec_type = decision_context.get("type", "unknown")
-            decision_guidance = DECISION_PROMPTS.get(dec_type)
-            if decision_guidance:
-                effective_system_prompt += f"\n\n{decision_guidance}"
-
-        # Log prompt size
-        prompt_chars = len(effective_system_prompt) + len(user_message)
-        prompt_tokens_est = self._estimate_tokens(effective_system_prompt + user_message)
-        logger.info(f"[PROMPT+AUDIO] {prompt_chars} chars, ~{prompt_tokens_est} tokens")
-
-        # Call the audio backend
-        result = self._backend.complete_audio(effective_system_prompt, user_message, voice=voice)
-
-        total_time = (time.perf_counter() - total_start) * 1000
-        if result is not None:
-            logger.info(f"[TIMING+AUDIO] total: {total_time:.0f}ms, samples: {len(result[0])}")
-        else:
-            logger.warning(f"[TIMING+AUDIO] total: {total_time:.0f}ms, result: None (will fallback)")
-
-        return result
 
     def _postprocess_advice(self, advice: str, game_state: dict[str, Any]) -> str:
         """Post-process LLM advice to fix common issues with smaller models.
@@ -1777,9 +1809,13 @@ class CoachEngine:
         potential_mana = untapped_lands + (1 if has_land_in_hand else 0)
         
         # Check each card in hand for mana cost violations
+        seen_card_names = set()
         for card in hand_cards:
             card_name = card.get("name", "")
             mana_cost = card.get("mana_cost", "")
+            if card_name in seen_card_names:
+                continue
+            seen_card_names.add(card_name)
             if not card_name or not mana_cost:
                 continue
             
@@ -1798,11 +1834,26 @@ class CoachEngine:
             
             # If this card costs more than we can have, remove Cast suggestions for it
             if cmc > potential_mana:
-                # Remove "Cast [Card Name]" from advice
-                pattern = re.compile(rf"Cast\s+{re.escape(card_name)}[.,]?\s*", re.IGNORECASE)
-                if pattern.search(advice):
-                    advice = pattern.sub("", advice)
+                # Remove "Cast [Card Name]" as a standalone command (e.g. "Cast X." or "Cast X,")
+                # but NOT when the card name appears mid-sentence (e.g. "find mana to cast X or Y")
+                # to avoid leaving garbled text like "find mana to or Y"
+                standalone_pattern = re.compile(
+                    rf"(?:^|(?<=\.\s)|(?<=\n))Cast\s+{re.escape(card_name)}[.,]?\s*",
+                    re.IGNORECASE
+                )
+                if standalone_pattern.search(advice):
+                    advice = standalone_pattern.sub("", advice)
                     logger.debug(f"Removed uncastable suggestion: {card_name} (needs {cmc}, have {potential_mana})")
+                else:
+                    # Card mentioned mid-sentence — replace name with "[uncastable]" hint
+                    # so the sentence stays grammatical
+                    mid_pattern = re.compile(
+                        rf"(?:cast\s+)?{re.escape(card_name)}",
+                        re.IGNORECASE
+                    )
+                    if mid_pattern.search(advice):
+                        advice = mid_pattern.sub(f"{card_name} (not enough mana)", advice, count=1)
+                        logger.debug(f"Annotated uncastable mid-sentence: {card_name} (needs {cmc}, have {potential_mana})")
         
         # Clean up double spaces
         advice = re.sub(r"\s+", " ", advice).strip()

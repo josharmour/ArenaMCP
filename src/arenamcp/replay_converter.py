@@ -12,8 +12,7 @@ from datetime import datetime
 
 from arenamcp.arena_replay import ArenaReplay
 from arenamcp.match_validator import MatchRecording, MatchFrame
-from arenamcp.gamestate import GameState
-from arenamcp.log_parser import parse_message
+from arenamcp.gamestate import GameState, create_game_state_handler
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +48,14 @@ class ReplayConverter:
             return None
         
         # Create game state tracker
-        game_state = GameState(card_db=self.card_db)
-        
+        game_state = GameState()
+        handler = create_game_state_handler(game_state)
+
         # Create match recording
-        recording = MatchRecording()
-        recording.match_id = f"arena_{arena_replay_path.stem}"
-        recording.start_time = datetime.fromtimestamp(arena_replay_path.stat().st_mtime)
+        recording = MatchRecording(
+            match_id=f"arena_{arena_replay_path.stem}",
+            start_time=datetime.fromtimestamp(arena_replay_path.stat().st_mtime)
+        )
         
         # Process messages and build frames
         frame_number = 0
@@ -71,23 +72,29 @@ class ReplayConverter:
             
             # Update game state
             try:
-                game_state.process_message(msg)
+                handler(msg)
             except Exception as e:
                 logger.debug(f"GameState processing error: {e}")
                 # Continue anyway - we want partial data
             
             # Create frame for important messages
             if self._is_important_message(msg_type):
+                # Get game state snapshot
+                snapshot = game_state.get_snapshot() if game_state else {}
+
                 frame = MatchFrame(
                     timestamp=datetime.now(),  # Arena replays don't include timestamps
                     frame_number=frame_number,
                     raw_message=msg,
                     message_type=msg_type,
-                    our_game_state=game_state.to_dict() if game_state else {},
-                    advice_given=None,  # Filled in later during analysis
-                    trigger=self._detect_trigger(msg_type, msg),
+                    parsed_snapshot=snapshot,
                 )
-                
+
+                # Store trigger info in raw_message for later access
+                trigger = self._detect_trigger(msg_type, msg)
+                if trigger:
+                    frame.raw_message["_trigger"] = trigger
+
                 recording.frames.append(frame)
                 frame_number += 1
         
