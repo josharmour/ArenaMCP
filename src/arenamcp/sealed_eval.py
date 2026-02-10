@@ -189,7 +189,7 @@ def format_sealed_recommendation(analysis: SealedAnalysis) -> str:
         return "Unable to determine best colors."
 
     color_names = "/".join(COLOR_NAMES.get(c, c) for c in rec.colors)
-    wr_pct = f"{rec.avg_win_rate * 100:.1f}%" if rec.avg_win_rate else "N/A"
+    wr_pct = f"{rec.avg_win_rate * 100:.0f}%" if rec.avg_win_rate else "N/A"
 
     lines = [
         f"Build {color_names}.",

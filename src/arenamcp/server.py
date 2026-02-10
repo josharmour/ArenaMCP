@@ -177,7 +177,7 @@ def _background_coaching_loop(
 
 
 def start_background_coaching(
-    backend: str = "claude",
+    backend: str = "claude-code",
     model: Optional[str] = None,
     auto_speak: bool = False
 ) -> None:
@@ -187,7 +187,7 @@ def start_background_coaching(
     when triggers fire.
 
     Args:
-        backend: LLM backend to use ("claude", "gemini", "ollama")
+        backend: LLM backend to use ("claude-code", "gemini-cli", "ollama")
         model: Optional model override (uses backend default if not specified)
         auto_speak: If True, automatically speak advice via TTS
     """
@@ -905,6 +905,61 @@ def get_draft_pack() -> dict[str, Any]:
     }
 
 
+def evaluate_draft_pack_for_standalone() -> dict[str, Any]:
+    """Evaluate current draft pack using composite scoring (colors, synergy, win rate).
+
+    Uses evaluate_pack() which factors in:
+    - 17lands GIH win rate
+    - On-color bonus based on already-picked cards
+    - Synergy with picked cards (tribal, mechanic, name references)
+    - Card type/mechanic value (removal, card draw, evasion, etc.)
+
+    Returns:
+        Dict with pack_number, pick_number, spoken_advice, and evaluations list,
+        or {"is_active": False} if no draft in progress.
+    """
+    if not draft_state.is_active or draft_state.is_sealed:
+        return {"is_active": False}
+
+    if not draft_state.cards_in_pack:
+        return {"is_active": True, "cards": []}
+
+    evaluations = evaluate_pack(
+        cards_in_pack=draft_state.cards_in_pack,
+        picked_cards=draft_state.picked_cards,
+        set_code=draft_state.set_code,
+        scryfall=scryfall,
+        draft_stats=draft_stats_cache,
+        mtgadb=mtgadb,
+    )
+
+    advice = format_pick_recommendation(
+        evaluations,
+        draft_state.pack_number,
+        draft_state.pick_number,
+        num_recommendations=draft_state.picks_per_pack,
+    )
+
+    return {
+        "is_active": True,
+        "pack_number": draft_state.pack_number,
+        "pick_number": draft_state.pick_number,
+        "picks_per_pack": draft_state.picks_per_pack,
+        "spoken_advice": advice,
+        "evaluations": [
+            {
+                "name": e.name,
+                "score": e.score,
+                "gih_wr": e.gih_wr,
+                "reason": e.reason,
+                "all_reasons": e.all_reasons,
+            }
+            for e in evaluations[:5]  # Top 5 for display
+        ],
+        "picked_count": len(draft_state.picked_cards),
+    }
+
+
 def get_sealed_pool() -> dict[str, Any]:
     """Get sealed pool analysis with deck building recommendations.
 
@@ -1211,7 +1266,7 @@ def clear_pending_advice() -> dict[str, Any]:
 
 @mcp.tool()
 def start_coaching(
-    backend: str = "claude",
+    backend: str = "claude-code",
     model: Optional[str] = None,
     auto_speak: bool = False
 ) -> dict[str, Any]:
@@ -1223,10 +1278,10 @@ def start_coaching(
 
     Args:
         backend: LLM backend to use for advice generation.
-            Options: "claude" (default), "gemini", "ollama"
+            Options: "claude-code" (default), "gemini-cli", "ollama"
         model: Optional model name to use. Defaults vary by backend:
-            - claude: claude-sonnet-4-20250514
-            - gemini: gemini-2.0-flash
+            - claude-code: sonnet
+            - gemini-cli: gemini-2.0-flash
             - ollama: llama3.2
         auto_speak: If True, automatically speak advice via TTS when generated.
             Default False - retrieve advice manually with get_pending_advice().

@@ -19,7 +19,7 @@ DEFAULTS = {
     "voice": "am_adam",  # American Male - Adam
     "voice_speed": 1.0,
     "muted": False,
-    "backend": "gemini",
+    "backend": "proxy",
     "auto_speak": True,
     "voice_mode": "ptt",
     "device_index": None,

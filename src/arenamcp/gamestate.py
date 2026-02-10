@@ -261,6 +261,20 @@ class GameState:
             if obj.owner_seat_id == seat_id
         ]
 
+    def _clear_stale_stack(self) -> None:
+        """Clear the stack zone on turn boundaries.
+
+        In Magic, the stack is always empty when a new turn begins.
+        MTGA often doesn't send zone updates for resolved triggered/activated
+        abilities, leaving ghost entries that cause the formatter to show
+        Legal: NONE (can't cast at sorcery speed with non-empty stack).
+        """
+        for zone in self.zones.values():
+            if zone.zone_type == ZoneType.STACK and zone.object_instance_ids:
+                count = len(zone.object_instance_ids)
+                zone.object_instance_ids = []
+                logger.info(f"Cleared {count} stale stack entries on turn change")
+
     def _cleanup_stale_objects(self) -> None:
         """Remove game objects that are no longer in any zone.
         
@@ -501,6 +515,9 @@ class GameState:
         for player_data in players:
             self._update_player(player_data)
         
+        # Ensure lands_played is correct even when Arena omits player data
+        self._infer_lands_played()
+
         # Clear untap step flag after processing all objects in this message
         self._in_untap_step = False
 
@@ -805,12 +822,9 @@ class GameState:
             current_turn = self.turn_info.turn_number
             inferred_lands = 0
             for obj in self.battlefield:
-                # Check card_types for "Land" (stored as "CardType_Land" from Arena)
-                is_land = any("Land" in ct for ct in obj.card_types) if obj.card_types else False
-
                 if (obj.owner_seat_id == seat_id and
                     obj.controller_seat_id == seat_id and
-                    is_land and
+                    self._is_land_object(obj) and
                     obj.turn_entered_battlefield == current_turn):
                     inferred_lands += 1
                     logger.debug(f"Inferred land: grp_id={obj.grp_id} entered turn {current_turn} for seat {seat_id}")
@@ -840,6 +854,48 @@ class GameState:
 
         self.players[seat_id] = player
         logger.debug(f"Updated player {seat_id} (life={life_total}, lands={lands_played})")
+
+    def _is_land_object(self, obj: GameObject) -> bool:
+        """Check if a game object is a land, with fallback for missing card_types.
+
+        Arena diff messages may create new instances without cardTypes.
+        Falls back to checking other objects with the same grp_id.
+        """
+        if obj.card_types:
+            return any("Land" in ct for ct in obj.card_types)
+        # Fallback: check if another instance with the same grp_id has land card_types
+        if obj.grp_id:
+            for other in self.game_objects.values():
+                if other.grp_id == obj.grp_id and other.card_types:
+                    return any("Land" in ct for ct in other.card_types)
+        return False
+
+    def _infer_lands_played(self) -> None:
+        """Infer lands_played for all players by counting lands that entered this turn.
+
+        Arena doesn't always include player data in diff messages, so
+        lands_played can stay at 0 even after a land enters the battlefield.
+        This runs after every game state message to correct that.
+        """
+        if self.turn_info.turn_number <= 0:
+            return
+
+        current_turn = self.turn_info.turn_number
+        for seat_id, player in self.players.items():
+            if player.lands_played > 0:
+                continue  # Already tracked (from Arena data or previous inference)
+
+            inferred_lands = 0
+            for obj in self.battlefield:
+                if (obj.owner_seat_id == seat_id and
+                    obj.controller_seat_id == seat_id and
+                    self._is_land_object(obj) and
+                    obj.turn_entered_battlefield == current_turn):
+                    inferred_lands += 1
+
+            if inferred_lands > 0:
+                player.lands_played = inferred_lands
+                logger.info(f"Inferred lands_played={inferred_lands} for seat {seat_id} (post-message)")
 
     def _update_turn_info(self, turn_data: dict) -> None:
         """Update turn info from message data.
@@ -924,6 +980,12 @@ class GameState:
         self.turn_info.active_player = new_active
         self.turn_info.priority_player = turn_data.get("priorityPlayer", self.turn_info.priority_player)
         if turn_changed:
+            # Clear stale stack entries on turn change.
+            # In Magic, the stack is always empty when a new turn begins.
+            # MTGA often doesn't send zone updates to remove resolved abilities
+            # (triggered/activated), leaving ghost entries that cause
+            # Legal: NONE and "pass priority" advice on the player's turn.
+            self._clear_stale_stack()
             # Turn changed, reset phase/step if not provided (prevent stale phase leakage)
             if "phase" in turn_data:
                 new_phase = turn_data["phase"]
@@ -953,6 +1015,11 @@ class GameState:
         # Detect phase change within same turn (or handled by reset above)
         if new_phase != self.turn_info.phase:
             logger.debug(f"Phase change: {self.turn_info.phase} -> {new_phase}")
+            # Clear stale stack on phase transitions to Main phases.
+            # The stack must be empty before any phase change in Magic.
+            # Main phases are when advice matters most (cast spells, play lands).
+            if "Main" in new_phase:
+                self._clear_stale_stack()
             # If step is not explicitly in the update AND we didn't just reset it above,
             # we should clear it to avoid stale steps (e.g. Step_Draw in Phase_Main1)
             # But if we just set it to Untap above, keep it.
@@ -1007,6 +1074,40 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                 game_state_msg = msg.get("gameStateMessage")
                 if game_state_msg:
                     game_state.update_from_message(game_state_msg)
+                    # Auto-clear stale decisions whose source is no longer on the stack.
+                    # Client→server responses (SelectTargetsResp etc.) never reach this
+                    # handler, so we detect resolution by checking if the source left the stack.
+                    if (game_state.pending_decision
+                            and game_state.pending_decision != "Mulligan"
+                            and game_state.decision_context):
+                        source_id = game_state.decision_context.get("source_id")
+                        should_clear = False
+                        if source_id is not None:
+                            still_on_stack = any(
+                                obj.instance_id == source_id for obj in game_state.stack
+                            )
+                            if not still_on_stack:
+                                should_clear = True
+                                logger.info(
+                                    f"Auto-clearing stale decision '{game_state.pending_decision}' "
+                                    f"(source {source_id} no longer on stack)"
+                                )
+                        elif game_state.decision_timestamp:
+                            # Decisions without source_id (prompt, scry, etc.):
+                            # clear after 15s — player has certainly responded by then
+                            import time
+                            age = time.time() - game_state.decision_timestamp
+                            if age > 15:
+                                should_clear = True
+                                logger.info(
+                                    f"Auto-clearing stale decision '{game_state.pending_decision}' "
+                                    f"(no source_id, age={age:.0f}s)"
+                                )
+                        if should_clear:
+                            game_state.pending_decision = None
+                            game_state.decision_seat_id = None
+                            game_state.decision_context = None
+                            game_state.decision_timestamp = 0
             
             # Handle Mulligan (MulliganReq or legacy SubmitDeckReq)
             elif msg_type in ("GREMessageType_MulliganReq", "GREMessageType_SubmitDeckReq"):

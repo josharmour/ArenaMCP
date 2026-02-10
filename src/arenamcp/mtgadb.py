@@ -197,7 +197,11 @@ class MTGADatabase:
             if row:
                 oracle_text = self._resolve_oracle_text(row["AbilityIds"])
                 name = row["Name"] or row["Order_Title"] or f"Unknown_({grp_id})"
-                
+                # Strip HTML tags that MTGA injects into hyphenated names
+                if "<" in name:
+                    import re
+                    name = re.sub(r"<[^>]+>", "", name)
+
                 return MTGACard(
                     grp_id=row["GrpId"],
                     name=name,
@@ -249,7 +253,11 @@ class MTGADatabase:
             for row in cursor.fetchall():
                 oracle_text = self._resolve_oracle_text(row["AbilityIds"])
                 name = row["Name"] or row["Order_Title"] or f"Unknown_({row['GrpId']})"
-                
+                # Strip HTML tags that MTGA injects into hyphenated names
+                if "<" in name:
+                    import re
+                    name = re.sub(r"<[^>]+>", "", name)
+
                 card = MTGACard(
                     grp_id=row["GrpId"],
                     name=name,
