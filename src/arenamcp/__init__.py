@@ -17,8 +17,8 @@ from arenamcp.coach import (
     CoachEngine,
     GameStateTrigger,
     create_backend,
-    ClaudeBackend,
-    GeminiBackend,
+    ClaudeCodeBackend,
+    GeminiCliBackend,
     OllamaBackend,
 )
 
@@ -87,7 +87,7 @@ __all__ = [
     "CoachEngine",
     "GameStateTrigger",
     "create_backend",
-    "ClaudeBackend",
-    "GeminiBackend",
+    "ClaudeCodeBackend",
+    "GeminiCliBackend",
     "OllamaBackend",
 ]

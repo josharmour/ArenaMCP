@@ -95,13 +95,13 @@ def check_synergy(
 ) -> tuple[float, str]:
     """Check for synergies with picked cards.
 
-    Args:
-        card: Card to evaluate
-        picked_cards: List of grp_ids already picked
-        scryfall: Scryfall cache for card lookups
+    Scans ALL picked cards (not just recent) to detect:
+    - Direct card name references
+    - Tribal density (creature type overlap)
+    - Mechanic density (shared keyword/mechanic themes)
+    - Archetype themes (enchantments-matter, spells-matter, etc.)
 
-    Returns:
-        Tuple of (bonus_score, reason) for synergy bonus
+    Returns the highest-scoring synergy found.
     """
     if not picked_cards or not card:
         return (0.0, "")
@@ -109,38 +109,107 @@ def check_synergy(
     card_oracle = (card.oracle_text or "").lower()
     card_types = (card.type_line or "").lower()
 
-    # Check last 5 picks for speed
-    for grp_id in picked_cards[-5:]:
+    best_score = 0.0
+    best_reason = ""
+
+    # Build picked card profiles (cache oracle text and types)
+    picked_profiles: list[tuple[str, str, str]] = []  # (name, oracle, types)
+    for grp_id in picked_cards:
         picked = scryfall.get_card_by_arena_id(grp_id)
-        if not picked:
-            continue
+        if picked:
+            picked_profiles.append((
+                picked.name,
+                (picked.oracle_text or "").lower(),
+                (picked.type_line or "").lower(),
+            ))
 
-        picked_oracle = (picked.oracle_text or "").lower()
-        picked_name = picked.name.lower()
+    if not picked_profiles:
+        return (0.0, "")
 
-        # Direct name reference
-        if picked_name in card_oracle:
-            return (12.0, f"synergy with {picked.name}")
+    # 1. Direct name reference (strongest synergy)
+    for name, _, _ in picked_profiles:
+        if name.lower() in card_oracle:
+            return (12.0, f"synergy with {name}")
 
-        # Tribal synergy
-        creature_types = [
-            "goblin", "elf", "merfolk", "zombie", "vampire",
-            "human", "wizard", "warrior", "eldrazi"
-        ]
-        for tribe in creature_types:
-            if tribe in card_types and tribe in picked_oracle:
-                return (8.0, f"{tribe} synergy")
+    # 2. Tribal density — count how many picked creatures share a type
+    creature_types = [
+        "goblin", "elf", "merfolk", "zombie", "vampire", "human",
+        "wizard", "warrior", "eldrazi", "faerie", "rat", "spider",
+        "knight", "soldier", "beast", "elemental", "angel", "demon",
+        "dragon", "dinosaur", "cat", "dog", "bird", "squirrel",
+        "skeleton", "spirit", "rogue", "cleric", "shaman", "druid",
+        "pirate", "scout", "mole", "badger", "sphinx",
+    ]
+    for tribe in creature_types:
+        if tribe in card_types or tribe in card_oracle:
+            tribe_count = sum(
+                1 for _, oracle, types in picked_profiles
+                if tribe in types or tribe in oracle
+            )
+            if tribe_count >= 3:
+                score = 10.0
+                reason = f"{tribe} tribal ({tribe_count} in deck)"
+            elif tribe_count >= 1:
+                score = 5.0
+                reason = f"{tribe} synergy"
+            else:
+                continue
+            if score > best_score:
+                best_score = score
+                best_reason = reason
 
-        # Mechanic synergy keywords
-        mechanics = [
-            "energy", "adapt", "proliferate", "counter",
-            "token", "graveyard", "sacrifice"
-        ]
-        for mech in mechanics:
-            if mech in card_oracle and mech in picked_oracle:
-                return (6.0, f"{mech} synergy")
+    # 3. Mechanic/keyword density — shared draft archetypes
+    mechanics = [
+        "energy", "adapt", "proliferate", "counter", "token",
+        "graveyard", "sacrifice", "mill", "discard", "deathtouch",
+        "lifegain", "life", "enchant", "aura", "equipment", "equip",
+        "modified", "role", "food", "treasure", "clue", "blood",
+        "flashback", "warp", "harmonize", "earthbend", "eerie",
+        "room", "threshold", "delirium", "constellation",
+        "+1/+1 counter", "flying", "defender",
+    ]
+    for mech in mechanics:
+        if mech in card_oracle or mech in card_types:
+            mech_count = sum(
+                1 for _, oracle, types in picked_profiles
+                if mech in oracle or mech in types
+            )
+            if mech_count >= 4:
+                score = 10.0
+                reason = f"{mech} theme ({mech_count} in deck)"
+            elif mech_count >= 2:
+                score = 6.0
+                reason = f"{mech} synergy"
+            elif mech_count >= 1:
+                score = 3.0
+                reason = f"{mech} synergy"
+            else:
+                continue
+            if score > best_score:
+                best_score = score
+                best_reason = reason
 
-    return (0.0, "")
+    # 4. Archetype themes — enchantments-matter, spells-matter, go-wide
+    enchantment_count = sum(1 for _, _, types in picked_profiles if "enchantment" in types)
+    if ("enchantment" in card_types or "enchant" in card_oracle) and enchantment_count >= 2:
+        score = 8.0 if enchantment_count >= 4 else 5.0
+        reason = f"enchantments theme ({enchantment_count} in deck)"
+        if score > best_score:
+            best_score = score
+            best_reason = reason
+
+    instant_sorcery_count = sum(
+        1 for _, _, types in picked_profiles
+        if "instant" in types or "sorcery" in types
+    )
+    if ("instant" in card_types or "sorcery" in card_types) and instant_sorcery_count >= 3:
+        score = 6.0
+        reason = f"spells theme ({instant_sorcery_count} in deck)"
+        if score > best_score:
+            best_score = score
+            best_reason = reason
+
+    return (best_score, best_reason)
 
 
 def evaluate_pack(
@@ -207,15 +276,36 @@ def evaluate_pack(
             if type_reason and type_reason != "creature":
                 reasons.append(type_reason)
 
-            # On-color bonus
+            # On-color bonus — scales with draft depth
+            # Early picks (0-5): explore colors freely
+            # Mid picks (6-14): favor committed colors
+            # Late picks (15+): strongly prefer on-color
+            pick_depth = len(picked_cards)
+            if pick_depth <= 5:
+                on_color_bonus = 8.0
+                splash_bonus = 5.0
+                off_color_penalty = 0.0
+            elif pick_depth <= 14:
+                on_color_bonus = 14.0
+                splash_bonus = 6.0
+                off_color_penalty = -4.0
+            else:
+                on_color_bonus = 18.0
+                splash_bonus = 4.0
+                off_color_penalty = -8.0
+
             card_colors = set(card.colors) if card.colors else set()
             if deck_colors and card_colors:
                 if card_colors.issubset(deck_colors):
-                    score += 12.0
+                    score += on_color_bonus
                     reasons.append("on color")
                 elif card_colors & deck_colors:
-                    score += 6.0
+                    score += splash_bonus
                     reasons.append("splashable")
+                else:
+                    score += off_color_penalty
+                    if off_color_penalty < 0:
+                        reasons.append("off color")
             elif not card_colors:  # Colorless fits any deck
                 score += 4.0
 

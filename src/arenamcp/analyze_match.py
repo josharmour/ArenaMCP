@@ -177,7 +177,7 @@ def generate_analysis_report(recording_path: Path, bug_report_path: Optional[Pat
     coach = None
     if regenerate:
         from arenamcp.coach import create_coach
-        coach = create_coach(backend="gemini", model="gemini-2.5-flash")
+        coach = create_coach(backend="claude-code", model="sonnet")
     
     # Build report
     lines = [

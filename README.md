@@ -10,7 +10,7 @@ A Model Context Protocol (MCP) server that connects to live Magic: The Gathering
 - **Voice coaching** - Push-to-talk (F4) and voice-activated input
 - **Text-to-speech** - Spoken advice via Kokoro TTS
 - **Background coaching** - Proactive advice on game events (new turn, combat, low life)
-- **Multiple LLM backends** - Claude, Gemini, or local Ollama
+- **Multiple LLM backends** - Claude Code CLI, Gemini CLI, or local Ollama
 
 ## Prerequisites
 
@@ -68,10 +68,7 @@ Add to your Claude Code MCP settings (`~/.claude.json` or via `/mcp add`):
     "mtga": {
       "command": "python",
       "args": ["-m", "arenamcp.server"],
-      "cwd": "/path/to/ArenaMCP",
-      "env": {
-        "ANTHROPIC_API_KEY": "your-key-here"
-      }
+      "cwd": "/path/to/ArenaMCP"
     }
   }
 }
@@ -107,8 +104,8 @@ Example for OpenCode (`~/.opencode/config.json`):
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `ANTHROPIC_API_KEY` | For Claude coaching backend | If using Claude |
-| `GOOGLE_API_KEY` | For Gemini coaching backend | If using Gemini |
+| `CLAUDE_CODE_CMD` | Path to Claude Code CLI (e.g., `claude`) | No |
+| `GEMINI_CLI_CMD` | Path to Gemini CLI (e.g., `gemini`) | No |
 | `MTGA_LOG_PATH` | Custom log path | No (auto-detected) |
 
 ## Standalone Mode (No MCP Client Required)
@@ -116,19 +113,17 @@ Example for OpenCode (`~/.opencode/config.json`):
 Run the coach directly without Claude Code or any MCP client:
 
 ```bash
-# With Gemini (recommended - fast and cheap)
-export GOOGLE_API_KEY="your-key"
-python -m arenamcp.standalone --backend gemini
+# With Claude Code CLI (uses your subscription session, no API key)
+python -m arenamcp.standalone --backend claude-code
 
-# With Claude API
-export ANTHROPIC_API_KEY="your-key"
-python -m arenamcp.standalone --backend claude
+# With Gemini CLI (uses your subscription session, no API key)
+python -m arenamcp.standalone --backend gemini-cli
 
 # With local Ollama (free, runs offline)
 python -m arenamcp.standalone --backend ollama --model gemma3:12b
 
 # Disable auto-speak (text only)
-python -m arenamcp.standalone --backend gemini --no-auto-speak
+python -m arenamcp.standalone --backend claude-code --no-auto-speak
 ```
 
 ### Standalone Features
@@ -269,13 +264,6 @@ ollama serve
 
 Download the Kokoro models (see Installation above).
 
-### "ANTHROPIC_API_KEY not set"
-
-Either:
-1. Set the environment variable
-2. Use Ollama instead: `start_coaching(backend="ollama")`
-3. Use Gemini with `GOOGLE_API_KEY`
-
 ### MCP not connecting
 
 1. Check the server runs standalone: `python -m arenamcp.server`
@@ -302,8 +290,9 @@ Either:
 │         │                │                     │             │
 │  ┌──────▼──────┐  ┌──────▼──────┐  ┌──────────▼──────────┐  │
 │  │ GameState   │  │ VoiceInput  │  │ CoachEngine         │  │
-│  │ Manager     │  │ VoiceOutput │  │ (Claude/Gemini/     │  │
-│  │             │  │ (Kokoro)    │  │  Ollama backends)   │  │
+│  │ Manager     │  │ VoiceOutput │  │ (Claude Code/       │  │
+│  │             │  │ (Kokoro)    │  │  Gemini CLI/        │  │
+│  │             │  │            │  │  Ollama backends)   │  │
 │  └──────┬──────┘  └─────────────┘  └─────────────────────┘  │
 │         │                                                    │
 │  ┌──────▼──────┐  ┌─────────────┐  ┌─────────────────────┐  │

@@ -50,7 +50,7 @@ class AdviceComparison:
 class AdvisorTuner:
     """Analyzes advisor performance and suggests improvements."""
     
-    def __init__(self, backend_type: str = "claude", model: Optional[str] = None):
+    def __init__(self, backend_type: str = "claude-code", model: Optional[str] = None):
         """Initialize tuner with LLM backend.
         
         Args:
@@ -329,7 +329,7 @@ if __name__ == "__main__":
     parser.add_argument("replay", type=Path, help="Arena .rply file or converted .json recording")
     parser.add_argument("--advice-log", type=Path, help="Optional advice log file (JSONL)")
     parser.add_argument("--output", type=Path, help="Output directory for reports")
-    parser.add_argument("--backend", default="claude", help="LLM backend (claude/gemini/ollama)")
+    parser.add_argument("--backend", default="claude-code", help="LLM backend (claude-code/gemini-cli/ollama)")
     parser.add_argument("--model", help="Model override")
     
     args = parser.parse_args()
