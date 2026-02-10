@@ -1,9 +1,9 @@
 
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
-from textual.widgets import Header, Footer, Log, RichLog, Input, Button, Select, Static
+from textual.widgets import Header, Footer, Log, RichLog, Input, Button, Static
 from textual.selection import Selection
-from textual.binding import Binding
+
 from textual.message import Message
 from textual import events
 
@@ -18,6 +18,8 @@ from arenamcp.standalone import StandaloneCoach, UIAdapter, LOG_FILE, LOG_DIR, c
 from arenamcp.tts import VoiceOutput
 from arenamcp.match_validator import MatchRecording, MatchValidator, start_recording, stop_recording, get_current_recording
 from arenamcp.mtgadb import MTGADatabase
+
+logger = logging.getLogger(__name__)
 
 
 class SelectableRichLog(RichLog):
@@ -197,6 +199,10 @@ class TUIAdapter(UIAdapter):
             except Exception as e:
                 self.error(f"TTS Error: {e}")
 
+    def subtask(self, status: str) -> None:
+        """Update the subtask/progress display in the TUI."""
+        self._safe_call(self.app.update_subtask, status)
+
 
 class GameStateDisplay(Static):
     """Live game state visualization widget."""
@@ -318,32 +324,25 @@ class GameStateDisplay(Static):
 class Sidebar(Vertical):
     """Sidebar for settings and actions."""
 
-    # Model options
-    # NOTE: Azure requires you to CREATE deployments in Azure Portal first!
-    # The deployment NAME you create is what you use here, not the base model name.
-    MODEL_OPTIONS = [
-        ("Gemini 2.0 Flash", "gemini/gemini-2.0-flash"),
-        ("Gemini 2.5 Flash", "gemini/gemini-2.5-flash"),
-        ("Gemini 3 Pro", "gemini/gemini-3-pro-preview"),
-        ("Azure GPT-5.2", "azure/gpt-5.2"),
-        ("Llama 3.2", "ollama/llama3.2:latest"),
-        ("Gemma 3N", "ollama/gemma3n:latest"),
-        ("DeepSeek R1", "ollama/deepseek-r1:14b"),
-        ("GLM-4 Flash", "ollama/glm-4.7-flash:latest"),
-    ]
+    # Populated at startup from proxy API
+    MODEL_OPTIONS = []
+
+    @classmethod
+    def load_model_options(cls) -> None:
+        """Fetch all available models from the proxy (includes Ollama)."""
+        from arenamcp.coach import fetch_proxy_models
+        cls.MODEL_OPTIONS = fetch_proxy_models()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="status-panel"):
             yield Static("Seat: Searching...", id="status-seat", classes="status-line")
             yield Static("Model: Default", id="status-model", classes="status-line")
-            yield Static("Style: CONCISE", id="status-style", classes="status-line")
+            yield Static("Style: VERBOSE", id="status-style", classes="status-line")
             yield Static("Voice: Initializing...", id="status-voice", classes="status-line")
 
-        with Vertical(id="controls-panel"):
-            yield Select(self.MODEL_OPTIONS, id="select-provider", allow_blank=False)
-            yield Select([(desc, vid) for vid, desc in VoiceOutput.VOICES], id="select-voice", prompt="Voice")
-
         with Vertical(id="actions-panel"):
+            yield Button("Proxy: loading...", id="btn-provider", variant="default")
+            yield Button("Voice: loading...", id="btn-voice-select", variant="default")
             yield Button("Mute (F5)", id="btn-mute", variant="default")
             yield Button("Speed 1.0x (F8)", id="btn-speed", variant="default")
             yield Button("Debug (F7)", id="btn-debug", variant="default")
@@ -361,17 +360,17 @@ class ArenaApp(App):
     }
 
     Sidebar {
-        width: 32;
+        width: 30;
         dock: left;
         height: 100%;
         background: $surface-darken-1;
         border-right: solid $primary;
         padding: 0 1;
+        overflow-y: auto;
     }
 
     #status-panel {
         height: auto;
-        border-bottom: solid $primary;
         padding: 0;
     }
 
@@ -380,27 +379,16 @@ class ArenaApp(App):
         color: $text-muted;
     }
 
-    #controls-panel {
-        height: auto;
-        background: $surface-darken-2;
-        border: solid $primary;
-        padding: 0 1;
-        margin-top: 1;
-    }
-
-    Select {
-        height: 3;
-        margin: 0;
-    }
-
     #actions-panel {
         height: auto;
-        margin-top: 1;
     }
 
     Button {
         width: 100%;
         margin: 0;
+        padding: 0 1;
+        min-height: 1;
+        border: none;
     }
 
     #main-area {
@@ -410,11 +398,18 @@ class ArenaApp(App):
     }
 
     #game-state-display {
-        height: 10;
+        height: 6;
         border: solid $success;
         background: $surface-darken-1;
-        padding: 1;
+        padding: 0 1;
         overflow-y: auto;
+    }
+
+    #subtask-display {
+        height: auto;
+        max-height: 2;
+        padding: 0 1;
+        display: none;
     }
 
     #log-view {
@@ -450,6 +445,9 @@ class ArenaApp(App):
         self.game_state_widget = None
         self._restart_requested = False
 
+        # Fetch proxy models before UI renders
+        Sidebar.load_model_options()
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield Sidebar()
@@ -459,6 +457,7 @@ class ArenaApp(App):
             # Advice Log (Bottom Right) - SelectableRichLog enables proper
             # text selection/copy and scroll-on-drag within the pane
             yield SelectableRichLog(id="log-view", markup=True, wrap=True)
+            yield Static("", id="subtask-display")
             yield Input(placeholder="Ask the coach...", id="chat-input")
         yield Footer()
 
@@ -524,22 +523,17 @@ class ArenaApp(App):
         current_backend = self.coach.backend_name
         current_model = self.coach.model_name
 
-        # Try to match current state to provider dropdown
+        # Update provider button label
         combo = f"{current_backend}/{current_model}" if current_model else current_backend
-
+        display_name = current_model or current_backend
+        # Try to find a friendly display name from MODEL_OPTIONS
+        for name, val in Sidebar.MODEL_OPTIONS:
+            if str(val) == combo:
+                display_name = name.split("(")[0].strip() if "(" in name else name
+                break
         try:
-            select_widget = self.query_one("#select-provider", Select)
-            found = False
-            for opt in select_widget._options:
-                if str(opt[1]) == combo:
-                    select_widget.value = combo
-                    found = True
-                    break
-            if not found:
-                for opt in select_widget._options:
-                    if str(opt[1]).startswith(current_backend):
-                        select_widget.value = opt[1]
-                        break
+            btn = self.query_one("#btn-provider", Button)
+            btn.label = f"Proxy: {display_name}"
         except Exception:
             pass
 
@@ -553,11 +547,10 @@ class ArenaApp(App):
             curr_id, desc = self.coach._voice_output.current_voice
             self.update_status("VOICE_ID", desc)
             try:
-                v_select = self.query_one("#select-voice", Select)
-                if v_select.value != curr_id:
-                    v_select.value = curr_id
-            except Exception as e:
-                self.write_log(f"[yellow]Voice Sync Warning: {e}[/]")
+                btn = self.query_one("#btn-voice-select", Button)
+                btn.label = f"Voice: {desc}"
+            except Exception:
+                pass
             # Sync speed button label
             self._update_speed_button(self.coach._voice_output._speed)
             self.sub_title = desc
@@ -616,6 +609,19 @@ class ArenaApp(App):
             self.log_widget.write(f"[bold white]{text}[/]")
             self.log_widget.write("[magenta]-----------------------[/]\n")
 
+    def update_subtask(self, status: str) -> None:
+        """Update the subtask progress display."""
+        try:
+            widget = self.query_one("#subtask-display", Static)
+            if status:
+                widget.update(f"[dim cyan]\u27f3 {status}[/]")
+                widget.display = True
+            else:
+                widget.update("")
+                widget.display = False
+        except Exception:
+            pass
+
     def _auto_start_recording_if_needed(self) -> None:
         """Auto-start recording if advisor is running and no recording active."""
         from datetime import datetime
@@ -673,9 +679,13 @@ class ArenaApp(App):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if not self.coach:
             return
-            
+
         btn_id = event.button.id
-        if btn_id == "btn-mute":
+        if btn_id == "btn-provider":
+            self._cycle_provider()
+        elif btn_id == "btn-voice-select":
+            self._cycle_voice_select()
+        elif btn_id == "btn-mute":
             self.action_toggle_mute()
         elif btn_id == "btn-speed":
             self.action_cycle_speed()
@@ -687,6 +697,65 @@ class ArenaApp(App):
             self.action_stop_recording()
         elif btn_id == "btn-restart":
             self.action_restart()
+
+    def _cycle_provider(self) -> None:
+        """Cycle to next provider/model on click."""
+        options = Sidebar.MODEL_OPTIONS
+        if not options:
+            return
+
+        current_backend = self.coach.backend_name
+        current_model = self.coach.model_name
+        current_combo = f"{current_backend}/{current_model}" if current_model else current_backend
+
+        # Find current index
+        idx = -1
+        for i, (_, val) in enumerate(options):
+            if str(val) == current_combo:
+                idx = i
+                break
+        if idx == -1:
+            for i, (_, val) in enumerate(options):
+                if str(val).startswith(current_backend):
+                    idx = i
+                    break
+
+        next_idx = ((idx if idx >= 0 else 0) + 1) % len(options)
+        display_name, next_val = options[next_idx]
+
+        # Parse provider/model
+        selection = str(next_val)
+        if "/" in selection:
+            new_provider, new_model = selection.split("/", 1)
+        else:
+            new_provider = selection
+            new_model = None
+
+        # Update button label immediately
+        short_name = display_name.split("(")[0].strip() if "(" in display_name else display_name
+        btn = self.query_one("#btn-provider", Button)
+        btn.label = f"Proxy: {short_name}"
+
+        # Switch backend in thread
+        threading.Thread(
+            target=self._verify_and_switch,
+            args=(new_provider, new_model),
+            daemon=True
+        ).start()
+
+    def _cycle_voice_select(self) -> None:
+        """Cycle to next TTS voice on click."""
+        if not self.coach or not self.coach._voice_output:
+            return
+
+        voice_id, desc = self.coach._voice_output.next_voice()
+        btn = self.query_one("#btn-voice-select", Button)
+        btn.label = f"Voice: {desc}"
+        self.update_status("VOICE_ID", desc)
+        threading.Thread(
+            target=lambda: self.coach._voice_output.speak("Voice changed.", blocking=False),
+            daemon=True
+        ).start()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle chat input."""
@@ -712,50 +781,6 @@ class ArenaApp(App):
             self.write_advice(advice, "Chat Response")
         except Exception as e:
             self.write_log(f"[red]Chat error: {e}[/]")
-
-    # --- Settings Changes ---
-    
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id == "select-provider" and self.coach:
-            if event.value == Select.BLANK or not event.value:
-                return
-
-            selection = str(event.value)
-            
-            # Parse provider/model
-            if "/" in selection:
-                new_provider, new_model = selection.split("/", 1)
-            else:
-                new_provider = selection
-                new_model = None
-
-            # Check if actually changed
-            if new_provider != self.coach.backend_name or new_model != self.coach.model_name:
-                self.write_log(f"[yellow]Switching to {new_provider} ({new_model})...[/]")
-                
-                # Verify availability (threaded to not block UI)
-                threading.Thread(
-                    target=self._verify_and_switch,
-                    args=(new_provider, new_model),
-                    daemon=True
-                ).start()
-                
-        elif event.select.id == "select-voice" and self.coach:
-            if event.value == Select.BLANK or not event.value:
-                return
-                
-            voice_id = str(event.value)
-            if self.coach._voice_output:
-                # Check if actually changed to avoid cycles
-                curr, _ = self.coach._voice_output.current_voice
-                if curr != voice_id:
-                    self.coach._voice_output.set_voice(voice_id)
-                    _, desc = self.coach._voice_output.current_voice
-                    self.write_log(f"[yellow]Voice changed to: {desc}[/]")
-                    # Update status line
-                    self.update_status("VOICE_ID", desc)
-                    # Test speak
-                    threading.Thread(target=lambda: self.coach._voice_output.speak("Voice checked.", blocking=False), daemon=True).start()
 
     def _verify_and_switch(self, provider, model):
         """Verify model exists (if ollama) then switch."""
@@ -791,34 +816,17 @@ class ArenaApp(App):
         threading.Thread(target=self._do_copy_debug, daemon=True).start()
 
     def _do_copy_debug(self):
-        """Save debug report and spawn Claude Code debug session."""
-        from arenamcp.standalone import StandaloneCoach
-
+        """Save debug report and copy path to clipboard."""
         if self.coach and hasattr(self.coach, 'save_bug_report'):
             bug_path = self.coach.save_bug_report("Copy Debug (F7)")
             if bug_path:
-                # Spawn Claude Code in a new terminal for debugging
-                spawned = StandaloneCoach.spawn_debug_session(bug_path)
-                if spawned:
-                    self.call_from_thread(
-                        self.write_log,
-                        f"[green]Debug session opened in new terminal.[/]"
-                    )
-                else:
-                    self.call_from_thread(
-                        self.write_log,
-                        f"[yellow]Bug report saved (path copied). Could not launch 'cc' — is it in PATH?[/]"
-                    )
+                file_url = f"file:///{str(bug_path).replace(chr(92), '/')}"
+                self.call_from_thread(self.write_log, "[green]Bug report saved.[/]")
+                self.call_from_thread(self.write_log, f"[dim]{file_url}[/] (copied to clipboard)")
             else:
-                self.call_from_thread(
-                    self.write_log,
-                    "[red]Failed to save debug report[/]"
-                )
+                self.call_from_thread(self.write_log, "[red]Failed to save debug report[/]")
         else:
-            self.call_from_thread(
-                self.write_log,
-                "[yellow]Coach not available for debug report[/]"
-            )
+            self.call_from_thread(self.write_log, "[yellow]Coach not available for debug report[/]")
 
     def action_restart(self) -> None:
         """Handle restart request - cleanly stops coach and exits app for restart."""
@@ -910,6 +918,8 @@ class ArenaApp(App):
             self.call_from_thread(self.write_log, "")
             self.call_from_thread(self.write_log, "[bold cyan]═══ VALIDATION REPORT ═══[/]")
             self.call_from_thread(self.write_log, f"Frames analyzed: {len(recording.frames)}")
+            self.call_from_thread(self.write_log, f"[dim]Recording: {recording_path}[/]")
+            self.call_from_thread(self.write_log, f"[dim]Report: {report_path}[/]")
             
             if not discrepancies:
                 self.call_from_thread(self.write_log, "[bold green]✅ No discrepancies found![/]")
@@ -944,12 +954,12 @@ class ArenaApp(App):
             
             # Output file paths
             self.call_from_thread(self.write_log, "")
-            self.call_from_thread(self.write_log, f"[bold]Recording saved:[/] {recording_path.name}")
-            self.call_from_thread(self.write_log, f"[bold]Report saved:[/] {report_path.name}")
+            self.call_from_thread(self.write_log, f"[bold]Recording saved:[/] {recording_path}")
+            self.call_from_thread(self.write_log, f"[bold]Report saved:[/] {report_path}")
             
-            # Copy recording path to clipboard
-            copy_to_clipboard(str(recording_path))
-            self.call_from_thread(self.write_log, "[green]Path copied to clipboard[/]")
+            # Copy report path to clipboard (more useful for sharing)
+            copy_to_clipboard(str(report_path))
+            self.call_from_thread(self.write_log, "[green]Report path copied to clipboard[/]")
             self.call_from_thread(self.write_log, "[bold cyan]═══════════════════════════[/]")
 
             # Run advisor comparison analysis
@@ -1106,8 +1116,10 @@ class ArenaApp(App):
             self.call_from_thread(self.write_log, "")
             self.call_from_thread(
                 self.write_log,
-                f"[bold]Comparison saved:[/] {comparison_path.name}"
+                f"[bold]Comparison saved:[/] {comparison_path}"
             )
+            copy_to_clipboard(str(comparison_path))
+            self.call_from_thread(self.write_log, "[green]Comparison path copied to clipboard[/]")
             self.call_from_thread(self.write_log, "[bold magenta]════════════════════════════════[/]")
 
         except Exception as e:
@@ -1147,6 +1159,11 @@ class ArenaApp(App):
             prev_bf = prev_snap.get('zones', {}).get('battlefield', [])
             curr_bf = snap.get('zones', {}).get('battlefield', [])
 
+            # Skip post-game frames (turn 0 after reset)
+            if turn == 0:
+                prev_snap = snap
+                continue
+
             # Detect cards played from hand (left hand, appeared on battlefield)
             for inst_id, card in prev_hand.items():
                 if inst_id and inst_id not in curr_hand:
@@ -1155,14 +1172,29 @@ class ArenaApp(App):
                     # Check if it appeared on battlefield
                     bf_match = [c for c in curr_bf if c.get('instance_id') == inst_id]
                     if bf_match:
-                        actions.append({
-                            'turn': turn,
-                            'phase': phase,
-                            'type': 'play_permanent',
-                            'card_name': name,
-                            'grp_id': card.get('grp_id'),
-                            'description': f"Played {name}"
-                        })
+                        # Distinguish land plays from other permanents
+                        is_land = any(
+                            'Land' in (c.get('type_line') or '')
+                            for c in bf_match
+                        )
+                        if is_land:
+                            actions.append({
+                                'turn': turn,
+                                'phase': phase,
+                                'type': 'play_land',
+                                'card_name': name,
+                                'grp_id': card.get('grp_id'),
+                                'description': f"Play Land: {name}"
+                            })
+                        else:
+                            actions.append({
+                                'turn': turn,
+                                'phase': phase,
+                                'type': 'play_permanent',
+                                'card_name': name,
+                                'grp_id': card.get('grp_id'),
+                                'description': f"Played {name}"
+                            })
                     else:
                         # Might be a spell that resolved
                         actions.append({
@@ -1208,21 +1240,40 @@ class ArenaApp(App):
         if not advice_list or not actions_list:
             return None
 
-        advice_text = advice_list[0].get('advice', '').lower()
-        action = actions_list[0]
+        # Collect all advice text for this turn (multiple advice events possible)
+        all_advice_text = " ".join(
+            a.get('advice', '') for a in advice_list
+        ).lower()
+
+        # Collect all card names the player used this turn
+        all_action_cards = set()
+        for act in actions_list:
+            name = (act.get('card_name') or '').lower()
+            if name:
+                all_action_cards.add(name)
+
+        # Land plays are never deviations — playing a land before casting the
+        # advised spell is the expected sequence (land drop is free).
+        non_land_actions = [a for a in actions_list if a.get('type') != 'play_land']
+        if not non_land_actions:
+            # Player only played lands this turn — not a deviation
+            return None
+
+        # Check if ANY non-land action was mentioned in the advice
+        for act in non_land_actions:
+            card_name = (act.get('card_name') or '').lower()
+            if card_name and card_name in all_advice_text:
+                return None  # Player followed advice
+
+        # First non-land action
+        action = non_land_actions[0]
         action_type = action.get('type', '')
-        card_name = action.get('card_name', '').lower()
+        card_name = (action.get('card_name') or '').lower()
 
         # Check if the action was a spell/permanent
         if action_type in ('play_permanent', 'cast_spell') and card_name:
-            # If the card was mentioned in the advice, it's NOT a deviation
-            # This handles "Play Mountain. Cast Gene Pollinator. Pass." correctly
-            if card_name in advice_text:
-                return None  # Card was suggested, no deviation
-
-            # Check if advice was ONLY to pass/wait (not "play X then pass")
-            # Look for pass/wait at the START of advice, or advice that's very short
-            advice_stripped = advice_text.strip()
+            # Check if advice was ONLY to pass/wait
+            advice_stripped = all_advice_text.strip()
             is_pass_only = (
                 advice_stripped.startswith('pass') or
                 advice_stripped.startswith('wait') or
@@ -1239,10 +1290,9 @@ class ArenaApp(App):
             return f"Played {action.get('card_name')} but advisor didn't suggest this card"
 
         # Check if advice said to attack but player didn't
-        if 'attack' in advice_text and action_type != 'attack':
-            # Look through all actions for an attack
+        if 'attack' in all_advice_text and action_type != 'attack':
             has_attack = any(a.get('type') == 'attack' for a in actions_list)
-            if not has_attack and 'don\'t attack' not in advice_text and 'no attack' not in advice_text:
+            if not has_attack and 'don\'t attack' not in all_advice_text and 'no attack' not in all_advice_text:
                 return "Advisor suggested attacking, but no attack detected"
 
         return None
@@ -1288,46 +1338,7 @@ class ArenaApp(App):
         """Cycle through available models (F12)."""
         if not self.coach:
             return
-
-        current_backend = self.coach.backend_name
-        current_model = self.coach.model_name
-
-        options = Sidebar.MODEL_OPTIONS
-        if not options:
-            return
-
-        # Find current index
-        current_combo = f"{current_backend}/{current_model}" if current_model else current_backend
-
-        try:
-            # 1. Try exact match
-            idx = -1
-            for i, (_, val) in enumerate(options):
-                if str(val) == current_combo:
-                    idx = i
-                    break
-
-            # 2. If no exact match, try prefix match
-            if idx == -1:
-                for i, (_, val) in enumerate(options):
-                    if str(val).startswith(current_backend):
-                        idx = i
-                        break
-
-            # 3. Default to 0 if not found
-            if idx == -1:
-                idx = 0
-
-            # Next index
-            next_idx = (idx + 1) % len(options)
-            _, next_val = options[next_idx]
-
-            # Switch via the UI
-            select = self.query_one("#select-provider", Select)
-            select.value = next_val
-
-        except Exception as e:
-            self.write_log(f"[red]Model cycle error: {e}[/]")
+        self._cycle_provider()
 
     def action_quit(self) -> None:
         if self.coach:
@@ -1342,24 +1353,28 @@ def run_tui(args):
 
     The TUI will restart if the user presses F9 (Restart).
     When running under the launcher, it exits with code 42 to signal restart.
+    Otherwise, it loops and re-creates the app in-process.
     """
     import os
 
     # Check if running under the launcher
     under_launcher = os.environ.get("ARENAMCP_LAUNCHER") == "1"
 
-    app = ArenaApp(args)
-    result = app.run()
+    while True:
+        app = ArenaApp(args)
+        result = app.run()
 
-    # Check if restart was requested
-    if result == "restart" or app._restart_requested:
-        if under_launcher:
-            # Signal the launcher to restart us
-            sys.exit(42)
+        # Check if restart was requested
+        if result == "restart" or app._restart_requested:
+            if under_launcher:
+                # Signal the launcher to restart us
+                sys.exit(42)
+            else:
+                # Restart by re-execing the process for a clean slate
+                import subprocess
+                python = sys.executable
+                os.execv(python, [python, "-m", "arenamcp.standalone"] + sys.argv[1:])
+                # execv replaces the process, so this line is never reached
         else:
-            # Not under launcher - just exit normally
-            print("\nRestart requested. Run coach.bat to restart.")
+            # Normal exit
             sys.exit(0)
-    else:
-        # Normal exit
-        sys.exit(0)
