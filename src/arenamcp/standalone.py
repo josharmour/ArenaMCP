@@ -4,7 +4,7 @@ This app runs the ArenaMCP server and connects to it as an MCP client,
 using a local LLM (Gemini/Ollama) for coaching advice with voice support.
 
 Usage:
-    python -m arenamcp.standalone --backend gemini
+    python -m arenamcp.standalone --backend gemini-cli
     python -m arenamcp.standalone --backend ollama --model llama3.2
     python -m arenamcp.standalone --draft --set MH3
 
@@ -125,6 +125,7 @@ class UIAdapter:
     def status(self, key: str, value: str) -> None: pass
     def error(self, message: str) -> None: pass
     def speak(self, text: str) -> None: pass
+    def subtask(self, status: str) -> None: pass
 
 class CLIAdapter(UIAdapter):
     """Default adapter for CLI output."""
@@ -137,6 +138,8 @@ class CLIAdapter(UIAdapter):
     def error(self, message: str) -> None:
         print(f"ERROR: {message}")
     def speak(self, text: str) -> None: pass
+    def subtask(self, status: str) -> None:
+        print(f"  ⟳ {status}", end="\r")
 
 class MCPClient:
     """Simple in-process MCP client that calls server tools directly.
@@ -187,6 +190,10 @@ class MCPClient:
         """Get draft helper status."""
         return self._server.get_draft_helper_status()
 
+    def evaluate_draft_pack(self) -> dict[str, Any]:
+        """Evaluate draft pack with composite scoring (colors, synergy, WR)."""
+        return self._server.evaluate_draft_pack_for_standalone()
+
     def get_sealed_pool(self) -> dict[str, Any]:
         """Get sealed pool analysis."""
         return self._server.get_sealed_pool()
@@ -203,6 +210,7 @@ class ConsoleAdapter(UIAdapter):
     def status(self, key: str, value: str) -> None: pass
     def error(self, message: str) -> None: print(f"ERROR: {message}")
     def speak(self, text: str) -> None: pass
+    def subtask(self, status: str) -> None: pass
 
 
 class StandaloneCoach:
@@ -210,7 +218,7 @@ class StandaloneCoach:
 
     def __init__(
         self,
-        backend: str = "gemini",
+        backend: str = "proxy",
         model: Optional[str] = None,
         voice_mode: str = "ptt",
         draft_mode: bool = False,
@@ -224,7 +232,7 @@ class StandaloneCoach:
         self.settings = get_settings()
 
         # Resolve configuration (Args > Settings > Defaults)
-        self._backend_name = backend or self.settings.get("backend", "gemini")
+        self._backend_name = backend or self.settings.get("backend", "proxy")
         self._model_name = model or self.settings.get("model")
         self._voice_mode = voice_mode or self.settings.get("voice_mode", "ptt")
 
@@ -232,7 +240,7 @@ class StandaloneCoach:
         self.set_code = set_code.upper() if set_code else None
 
         # State
-        self.advice_style = "concise"
+        self.advice_style = "verbose"
         self._advice_frequency = self.settings.get("advice_frequency", "start_of_turn")
 
         # TTS always enabled
@@ -263,6 +271,10 @@ class StandaloneCoach:
         # Threads
         self._coaching_thread: Optional[threading.Thread] = None
         self._voice_thread: Optional[threading.Thread] = None
+
+        # Background win plan
+        self._win_plan_turn = 0       # Last turn a win plan was launched
+        self._thinking_model = None   # Cached thinking model ID (lazy-init)
 
     def speak_advice(self, text: str, blocking: bool = True) -> None:
         """Speak advice using local Kokoro TTS."""
@@ -361,7 +373,9 @@ class StandaloneCoach:
 
         from arenamcp.coach import CoachEngine, GameStateTrigger, create_backend
 
-        llm_backend = create_backend(self.backend_name, model=self.model_name)
+        # Pass UI subtask callback for real-time progress display
+        progress_cb = self.ui.subtask if self.ui else None
+        llm_backend = create_backend(self.backend_name, model=self.model_name, progress_callback=progress_cb)
         actual_model = getattr(llm_backend, 'model', 'unknown')
         logger.info(f"Created {self.backend_name} backend with model: {actual_model}")
         self._coach = CoachEngine(backend=llm_backend)
@@ -456,7 +470,7 @@ class StandaloneCoach:
                         pack_num = draft_pack.get("pack_number", 0)
                         pick_num = draft_pack.get("pick_number", 0)
                         cards = draft_pack.get("cards", [])
-                        
+
                         # New pack detected
                         if cards and (pack_num != last_draft_pack or pick_num != last_draft_pick):
                             if not in_draft_mode:
@@ -469,39 +483,27 @@ class StandaloneCoach:
 
                             last_draft_pack = pack_num
                             last_draft_pick = pick_num
-                            picks_per_pack = draft_pack.get("picks_per_pack", 1)
 
-                            # Sort cards by GIH win rate descending
-                            ranked = sorted(
-                                cards,
-                                key=lambda c: c.get("gih_wr", 0) or 0,
-                                reverse=True,
-                            )
-                            top_picks = [
-                                c for c in ranked[:picks_per_pack]
-                                if (c.get("gih_wr", 0) or 0) > 0
-                            ]
+                            # Use composite evaluation (WR + on-color + synergy + card type)
+                            eval_result = self._mcp.evaluate_draft_pack()
+                            if eval_result.get("is_active") and eval_result.get("evaluations"):
+                                advice = eval_result["spoken_advice"]
+                                picked = eval_result.get("picked_count", 0)
 
-                            if top_picks:
-                                if len(top_picks) == 1:
-                                    c = top_picks[0]
-                                    wr_pct = f"{(c.get('gih_wr', 0) or 0) * 100:.1f}%"
-                                    advice = f"Pick {c.get('name', 'Unknown')}, {wr_pct} win rate"
-                                else:
-                                    parts = []
-                                    for c in top_picks:
-                                        wr_pct = f"{(c.get('gih_wr', 0) or 0) * 100:.1f}%"
-                                        parts.append(f"{c.get('name', 'Unknown')} at {wr_pct}")
-                                    advice = f"Pick {' and '.join(parts)}"
-
-                                self.ui.log(f"\n[DRAFT P{pack_num}P{pick_num}] {advice}\n")
+                                # Log detailed scores for the top picks
+                                top_evals = eval_result["evaluations"]
+                                detail_parts = []
+                                for e in top_evals[:3]:
+                                    wr = f"{e['gih_wr']*100:.0f}%" if e.get("gih_wr") else "N/A"
+                                    reasons = ", ".join(e.get("all_reasons", []))
+                                    detail_parts.append(f"  {e['name']}: score={e['score']:.0f} WR={wr} [{reasons}]")
+                                detail_log = "\n".join(detail_parts)
+                                self.ui.log(f"\n[DRAFT P{pack_num}P{pick_num}] ({picked} picked)\n{detail_log}\n")
                                 logger.info(f"DRAFT: P{pack_num}P{pick_num} - {advice}")
                                 self.speak_advice(advice)
-                            else:
-                                best_wr = (ranked[0].get("gih_wr", 0) or 0) if ranked else 0.0
-                                msg = f"No recommended pick found (Cards: {len(cards)}, Best WR: {best_wr})"
-                                self.ui.log(f"\n[DRAFT] {msg}\n")
-                                logger.warning(msg)
+                            elif eval_result.get("is_active"):
+                                self.ui.log(f"\n[DRAFT P{pack_num}P{pick_num}] No evaluated picks\n")
+                                logger.warning(f"Draft eval returned no evaluations for P{pack_num}P{pick_num}")
 
                         time.sleep(1.0)  # Faster polling during draft
                         continue
@@ -586,7 +588,7 @@ class StandaloneCoach:
                         self._deck_analyzed = True
                         logger.info(f"Starting deck analysis for {len(deck_cards)} cards")
 
-                        def _analyze_deck_bg(coach, mcp, card_ids, ui, speak_fn):
+                        def _analyze_deck_bg(coach, mcp, card_ids, ui, backend_name, model_name):
                             try:
                                 # Enrich grpIds to (name, type) tuples
                                 enriched = []
@@ -599,7 +601,13 @@ class StandaloneCoach:
                                     except Exception:
                                         enriched.append((f"Unknown({grp_id})", ""))
 
-                                strategy = coach.analyze_deck(enriched)
+                                # Use a SEPARATE backend instance so deck analysis
+                                # doesn't hold the advice backend's lock
+                                from arenamcp.coach import create_backend
+                                deck_backend = create_backend(backend_name, model=model_name)
+                                strategy = coach.analyze_deck(enriched, backend=deck_backend)
+                                if hasattr(deck_backend, 'close'):
+                                    deck_backend.close()
                                 if strategy:
                                     # Extract first line as archetype for status bar
                                     first_line = strategy.split("\n")[0].strip()
@@ -612,7 +620,8 @@ class StandaloneCoach:
 
                         t = threading.Thread(
                             target=_analyze_deck_bg,
-                            args=(self._coach, self._mcp, deck_cards, self.ui, self.speak_advice),
+                            args=(self._coach, self._mcp, deck_cards, self.ui,
+                                  self._backend_name, self.model_name),
                             daemon=True,
                         )
                         t.start()
@@ -699,7 +708,15 @@ class StandaloneCoach:
                             logger.debug(f"Suppressing combat_blockers trigger (my turn, not blocking)")
                             continue
                         # Critical triggers always fire (stack spells, low life)
+                        # BUT: "Action Required" is just generic main-phase priority,
+                        # not a real decision (Mulligan/Scry/Discard/Target). Suppress
+                        # it if we already advised this turn+phase to avoid duplicates.
                         is_critical = trigger in CRITICAL_PRIORITY
+                        if trigger == "decision_required":
+                            pending = curr_state.get("pending_decision")
+                            if pending == "Action Required" and turn_num == last_advice_turn and phase == last_advice_phase:
+                                logger.info(f"Suppressing decision_required: 'Action Required' already advised this turn+phase")
+                                continue
 
                         # New turn triggers once per turn
                         is_new_turn = trigger == "new_turn" and turn_num > last_advice_turn
@@ -725,6 +742,15 @@ class StandaloneCoach:
                                 curr_state = self._mcp.get_game_state()
                             except Exception as e:
                                 logger.debug(f"Failed to re-fetch state after new_turn delay: {e}")
+
+                            # Spawn background win plan worker (non-blocking)
+                            if is_my_turn and turn_num > self._win_plan_turn:
+                                self._win_plan_turn = turn_num
+                                threading.Thread(
+                                    target=self._win_plan_worker,
+                                    args=(curr_state,),
+                                    daemon=True,
+                                ).start()
 
                         # DELAY BUFFER: For mulligan decisions, wait for hand zone to populate.
                         # SubmitDeckReq arrives before the GameStateMessage with hand cards.
@@ -968,7 +994,6 @@ class StandaloneCoach:
                     # Check if we can use direct audio with Gemini
                     audio_data = self._voice_input.get_last_audio()
                     use_direct_audio = (
-                        self.backend_name == "gemini" and
                         audio_data is not None and
                         len(audio_data) > 0 and
                         hasattr(self._coach._backend, 'complete_with_audio')
@@ -1068,18 +1093,18 @@ class StandaloneCoach:
             with open(bug_file, "w") as f:
                 json.dump(report, f, indent=2, default=str)
 
-            # Copy path to clipboard
-            clipboard_success = copy_to_clipboard(str(bug_file))
-
-            # Make path clickable
+            # Make path clickable and copy a shareable link to clipboard
             file_url = f"file:///{str(bug_file).replace(chr(92), '/')}"
             clickable = f"\x1b]8;;{file_url}\x1b\\{bug_file}\x1b]8;;\x1b\\"
 
+            clipboard_success = copy_to_clipboard(file_url)
+
             if clipboard_success:
                 self.ui.log(f"\n[BUG] Saved: {clickable}")
-                self.ui.log("[BUG] Path copied to clipboard!\n")
+                self.ui.log(f"[BUG] Link copied to clipboard: {file_url}\n")
             else:
-                self.ui.log(f"\n[BUG] Saved: {clickable}\n")
+                self.ui.log(f"\n[BUG] Saved: {clickable}")
+                self.ui.log(f"[BUG] Link: {file_url}\n")
 
             return bug_file
         except Exception as e:
@@ -1087,68 +1112,28 @@ class StandaloneCoach:
             logger.exception("Bug report failed")
             return None
 
-    @staticmethod
-    def spawn_debug_session(bug_file: Path) -> bool:
-        """Spawn a new terminal with Claude Code for debugging a bug report.
-
-        Writes a temp .cmd file and opens it via os.startfile, which reliably
-        opens a new console window on Windows (even from within a Textual TUI).
-        """
-        import tempfile
-
-        try:
-            # Project root is three levels up from this file
-            project_root = Path(__file__).parent.parent.parent
-
-            prompt = (
-                f"{bug_file} "
-                "Read this ArenaMCP bug report and help me debug the issue. "
-                "Check the advice_history, llm_context, and game_state fields "
-                "for what the advisor saw and said."
-            )
-
-            # Write a temp batch file — most reliable way to open a new
-            # console window on Windows, especially from within a TUI.
-            bat_file = Path(tempfile.gettempdir()) / "arenamcp_debug.cmd"
-            # Use pushd instead of cd — it auto-maps UNC paths to a temp drive letter
-            # Unset ANTHROPIC_API_KEY so Claude Code uses its own auth (not the coach's key)
-            bat_file.write_text(
-                f'@set ANTHROPIC_API_KEY=\n'
-                f'@pushd "{project_root}"\n'
-                f'@claude --dangerously-skip-permissions "{prompt}"\n'
-                f'@popd\n',
-                encoding="utf-8",
-            )
-            os.startfile(str(bat_file))
-            logger.info(f"Spawned Claude Code debug session for {bug_file}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to spawn debug session: {e}")
-            return False
-
     def _on_bug_report_hotkey(self) -> None:
-        """F7 - Save comprehensive bug report and open Claude Code debug session."""
+        """F7 - Save comprehensive bug report and copy path to clipboard."""
         bug_path = self.save_bug_report("Hotkey F7")
         if bug_path:
-            self.spawn_debug_session(bug_path)
+            self.ui.log("[BUG] Path copied to clipboard. Paste it anywhere.")
 
     def take_screenshot_analysis(self) -> None:
         """Capture screen and request visual analysis (e.g. Mulligan)."""
         # Check if backend supports vision
-        # Gemini always supports vision
-        # Ollama supports vision for specific models (gemma3n, llava, etc.)
         vision_capable = False
-        if "gemini" in self.backend_name.lower():
+        backend_lower = self.backend_name.lower()
+        if backend_lower in ("claude-code", "gemini-cli", "proxy"):
             vision_capable = True
-        elif "ollama" in self.backend_name.lower():
+        elif "ollama" in backend_lower:
             # Vision-capable Ollama models
             vision_models = ["gemma3n", "llava", "bakllava", "moondream", "llama3.2-vision"]
             model_lower = (self.model_name or "").lower()
             if any(vm in model_lower for vm in vision_models):
                 vision_capable = True
-        
+
         if not vision_capable:
-            self.ui.log("[red]Visual analysis requires a vision-capable backend (Gemini or Ollama with gemma3n/llava).[/]")
+            self.ui.log("[red]Current backend does not support image analysis.[/]")
             return
              
         try:
@@ -1165,6 +1150,17 @@ class StandaloneCoach:
             img.save(buf, format='PNG')
             png_bytes = buf.getvalue()
 
+            # Save to temp file for CLI backends
+            import tempfile
+            tmp_file = None
+            file_url = None
+            if backend_lower in ("claude-code", "gemini-cli"):
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+                tmp.write(png_bytes)
+                tmp.close()
+                tmp_file = tmp.name
+                file_url = f"file:///{tmp_file.replace(chr(92), '/')}"
+
             self.ui.log("[yellow]Analyzing screenshot...[/]")
             
             # Context
@@ -1172,7 +1168,7 @@ class StandaloneCoach:
                 game_state = self.get_game_state()
             except:
                 game_state = {}
-                
+
             system_prompt = """You are an expert Magic: The Gathering Arena coach. Look at this screenshot and give immediate, actionable advice based on what you see.
 
 DETECT THE SITUATION AND RESPOND:
@@ -1202,12 +1198,62 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
                 ctx = f" Turn {turn_num}. Life: You {life_you}, Opp {life_opp}."
 
             user_msg = f"What should I do here?{ctx}"
-            
-            if hasattr(self._coach, 'complete_with_image'):
-                advice = self._coach.complete_with_image(system_prompt, user_msg, png_bytes)
-                self.ui.advice(advice, "Visual Analysis")
-                if self._auto_speak:
-                    self.speak_advice(advice, blocking=False)
+
+            if backend_lower == "proxy":
+                # Proxy backend: send image as base64 via OpenAI multimodal API
+                from arenamcp.coach import ProxyBackend
+                vision_backend = ProxyBackend(model=self.model_name)
+                self.ui.log("[yellow]Analyzing screenshot via proxy...[/]")
+                advice = vision_backend.complete_with_image(system_prompt, user_msg, png_bytes)
+
+                if advice and not advice.startswith("Error"):
+                    self.ui.advice(advice, "Visual Analysis")
+                    if self._auto_speak:
+                        self.speak_advice(advice, blocking=False)
+                else:
+                    self.ui.log(f"[red]Vision analysis failed: {advice or 'empty response'}[/]")
+
+            elif file_url:
+                # CLI backends that take file paths
+                from arenamcp.coach import create_backend, ClaudeCodeBackend
+                raw_path = tmp_file or ""
+
+                if backend_lower == "gemini-cli":
+                    vision_backend = create_backend("gemini-cli", model=self.model_name)
+                    vision_backend.timeout_s = float(os.environ.get("VISION_TIMEOUT_S", "20"))
+                    vision_msg = (
+                        f"{system_prompt}\n\n"
+                        f"Image to analyze: {raw_path}\n"
+                        f"{user_msg}"
+                    )
+                    advice = vision_backend.complete(system_prompt, vision_msg)
+                else:
+                    temp_dir = os.path.dirname(tmp_file) if tmp_file else None
+                    add_dirs = [temp_dir] if temp_dir else []
+                    vision_backend = ClaudeCodeBackend(
+                        model=os.environ.get("VISION_BACKEND_MODEL", "sonnet"),
+                        add_dirs=add_dirs,
+                        tools=["Read"],
+                        permission_mode="dontAsk",
+                    )
+                    vision_backend.timeout_s = float(os.environ.get("VISION_TIMEOUT_S", "15"))
+                    vision_msg = (
+                        f"Image path: {raw_path}\n"
+                        f"Image URL: {file_url}\n"
+                        f"{user_msg}\n"
+                        "Use the Read tool to open the image file."
+                    )
+                    advice = vision_backend.complete(system_prompt, vision_msg)
+
+                if hasattr(vision_backend, 'close'):
+                    vision_backend.close()
+
+                if advice and not advice.startswith("Error"):
+                    self.ui.advice(advice, "Visual Analysis")
+                    if self._auto_speak:
+                        self.speak_advice(advice, blocking=False)
+                else:
+                    self.ui.log(f"[red]Vision analysis failed: {advice or 'empty response'}[/]")
             else:
                 self.ui.log("[red]Current backend does not support image analysis.[/]")
 
@@ -1414,6 +1460,219 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             self.ui.error(f"Seat swap failed: {e}")
             logger.error(f"Seat swap error: {e}")
 
+    def _compute_library_summary(self, game_state: dict) -> str:
+        """Compute remaining library by subtracting visible cards from deck_cards.
+
+        Returns a compact summary like "~28 cards: 2x Mountain, 1x Lightning Bolt, ..."
+        """
+        deck_cards = game_state.get("deck_cards", [])
+        if not deck_cards:
+            return ""
+
+        # Get local player seat
+        players = game_state.get("players", [])
+        local_player = next((p for p in players if p.get("is_local")), None)
+        local_seat = local_player.get("seat_id") if local_player else 1
+
+        # Collect grp_ids of visible cards owned by local player
+        visible_grp_ids = []
+        for zone in ["hand", "battlefield", "graveyard", "exile", "stack", "command"]:
+            for card in game_state.get(zone, []):
+                if card.get("owner_seat_id") == local_seat:
+                    grp_id = card.get("grp_id", 0)
+                    if grp_id:
+                        visible_grp_ids.append(grp_id)
+
+        # Remove visible cards from deck list (handles duplicates correctly)
+        remaining = list(deck_cards)
+        for grp_id in visible_grp_ids:
+            try:
+                remaining.remove(grp_id)
+            except ValueError:
+                pass  # Card not in deck list (token, sideboard, etc.)
+
+        if not remaining:
+            return "~0 cards remaining"
+
+        # Enrich grp_ids with card info (deduplicate lookups)
+        basic_land_types = {"basic land"}
+        card_info_cache: dict[int, dict] = {}
+        name_counts: dict[str, int] = {}
+        for grp_id in remaining:
+            if grp_id not in card_info_cache:
+                try:
+                    card_info_cache[grp_id] = self._mcp.get_card_info(grp_id)
+                except Exception:
+                    card_info_cache[grp_id] = {"name": f"Unknown({grp_id})"}
+            name = card_info_cache[grp_id].get("name", f"Unknown({grp_id})")
+            name_counts[name] = name_counts.get(name, 0) + 1
+
+        # Sort by count descending, cap at top 15 unique cards
+        sorted_cards = sorted(name_counts.items(), key=lambda x: -x[1])[:15]
+        total = len(remaining)
+        shown = sum(count for _, count in sorted_cards)
+
+        # Build detailed summary with oracle text for non-basic lands
+        # so the LLM doesn't hallucinate card abilities
+        lines = [f"~{total} cards remaining in library:"]
+        # Reverse map: name -> grp_id (for info lookup)
+        name_to_grp: dict[str, int] = {}
+        for grp_id, info in card_info_cache.items():
+            name = info.get("name", "")
+            if name not in name_to_grp:
+                name_to_grp[name] = grp_id
+
+        for name, count in sorted_cards:
+            grp_id = name_to_grp.get(name)
+            info = card_info_cache.get(grp_id, {}) if grp_id else {}
+            type_line = info.get("type_line", "").lower()
+            is_basic = any(bt in type_line for bt in basic_land_types)
+
+            if is_basic:
+                lines.append(f"  {count}x {name}")
+            else:
+                mana = info.get("mana_cost", "")
+                oracle = info.get("oracle_text", "")
+                # Truncate long oracle text
+                if len(oracle) > 120:
+                    oracle = oracle[:117] + "..."
+                detail = f"  {count}x {name}"
+                if mana:
+                    detail += f" {mana}"
+                if oracle:
+                    detail += f" — {oracle}"
+                lines.append(detail)
+
+        if shown < total:
+            lines.append(f"  ... and {total - shown} more")
+
+        return "\n".join(lines)
+
+    def _on_win_plan_hotkey(self, turns: int) -> None:
+        """Handle win-in-N-turns hotkey press (keys 2-8)."""
+        if not self._coach or not self._mcp:
+            return
+
+        # 5-second cooldown to prevent spam
+        now = time.time()
+        last = getattr(self, '_last_win_plan_time', 0.0)
+        if now - last < 5.0:
+            self.ui.status("WIN-PLAN", "Cooldown — wait a few seconds")
+            return
+        self._last_win_plan_time = now
+
+        def _do():
+            try:
+                # Ensure latest log data is processed
+                self._mcp.poll_log()
+                game_state = self._mcp.get_game_state()
+
+                turn_num = game_state.get("turn", {}).get("turn_number", 0)
+                if turn_num <= 0:
+                    self.ui.status("WIN-PLAN", "No active game")
+                    logger.info("Win plan: no active game (turn=0)")
+                    return
+
+                self.ui.status("WIN-PLAN", f"Planning win in {turns} turns...")
+                self.ui.log(f"\n[bold cyan]--- WIN-IN-{turns} PLAN (generating...) ---[/]")
+                logger.info(f"Win plan: requesting {turns}-turn plan")
+
+                library_summary = self._compute_library_summary(game_state)
+                plan = self._coach.get_win_plan(game_state, turns, library_summary)
+
+                logger.info(f"Win plan: got response, {len(plan)} chars")
+                if plan:
+                    self.ui.advice(plan, f"WIN-IN-{turns}")
+                    self._record_advice(plan, f"win_in_{turns}", game_state=game_state)
+                    self.speak_advice(plan, blocking=False)
+                else:
+                    self.ui.status("WIN-PLAN", "No plan generated (timeout or error)")
+                    self.ui.log("[yellow]Win plan returned empty — API may have timed out[/]")
+            except Exception as e:
+                logger.error(f"Win plan error: {e}", exc_info=True)
+                self.ui.error(f"Win plan failed: {e}")
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _win_plan_worker(self, game_state: dict) -> None:
+        """Background worker: concurrently compute win-in-2/3/4 plans using a thinking model.
+
+        Spawned automatically at the start of each of your turns. Uses a separate
+        thinking-enabled backend so it doesn't interfere with real-time coaching.
+        """
+        import concurrent.futures
+
+        try:
+            # Lazy-init thinking model
+            if self._thinking_model is None:
+                from arenamcp.coach import pick_thinking_model
+                self._thinking_model = pick_thinking_model()
+                if self._thinking_model is None:
+                    logger.info("No thinking model available — win plan worker disabled")
+                    # Sentinel to avoid retrying every turn
+                    self._thinking_model = ""
+                    return
+            if self._thinking_model == "":
+                return  # Previously determined unavailable
+
+            logger.info(f"Win plan worker started (thinking model: {self._thinking_model})")
+
+            from arenamcp.coach import ProxyBackend
+            thinking_backend = ProxyBackend(
+                model=self._thinking_model, enable_thinking=True
+            )
+
+            library_summary = self._compute_library_summary(game_state)
+            turn_num = game_state.get("turn", {}).get("turn_number", 0)
+
+            # Submit win-in-2, win-in-3, win-in-4 concurrently
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+            future_to_turns = {}
+            for n in (2, 3, 4):
+                f = executor.submit(
+                    self._coach.get_win_plan,
+                    game_state, n, library_summary,
+                    backend=thinking_backend,
+                )
+                future_to_turns[f] = n
+
+            # Take the first non-empty result
+            for future in concurrent.futures.as_completed(future_to_turns):
+                turns = future_to_turns[future]
+                try:
+                    plan = future.result()
+                except Exception as e:
+                    logger.warning(f"Win-in-{turns} future failed: {e}")
+                    continue
+
+                if not plan or plan.startswith("Error"):
+                    continue
+
+                # Staleness check: don't display if game has advanced >2 turns
+                current_turn = 0
+                try:
+                    current_state = self._mcp.get_game_state()
+                    current_turn = current_state.get("turn", {}).get("turn_number", 0)
+                except Exception:
+                    pass
+                if current_turn and current_turn - turn_num > 2:
+                    logger.info(f"Win plan stale (started turn {turn_num}, now {current_turn})")
+                    break
+
+                logger.info(f"Win-in-{turns} plan ready ({len(plan)} chars)")
+                self.ui.advice(plan, f"WIN-IN-{turns}")
+                self._record_advice(plan, f"win_in_{turns}", game_state=game_state)
+                self.speak_advice(plan, blocking=False)
+                break  # First viable result wins
+
+            executor.shutdown(wait=False)
+
+            if hasattr(thinking_backend, 'close'):
+                thinking_backend.close()
+
+        except Exception as e:
+            logger.error(f"Win plan worker error: {e}", exc_info=True)
+
     def _on_restart_hotkey(self) -> None:
         """F9 - Restart the coach."""
         self.ui.status("RESTART", "Restarting coach...")
@@ -1433,14 +1692,15 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             # Update backend
             self.backend_name = provider
             self.model_name = model
-            llm_backend = create_backend(provider, model=model)
+            progress_cb = self.ui.subtask if self.ui else None
+            llm_backend = create_backend(provider, model=model, progress_callback=progress_cb)
             self._coach = CoachEngine(backend=llm_backend)
 
             actual_model = getattr(llm_backend, 'model', 'default')
 
             # Reconfigure voice input if needed
             if self._voice_input:
-                enable_transcription = (provider != "gemini")
+                enable_transcription = True
                 self._voice_input.transcription_enabled = enable_transcription
                 logger.info(f"Voice transcription enabled: {enable_transcription}")
 
@@ -1460,16 +1720,18 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
 
         # Unified logic: Cycle through the same list as the TUI dropdown
         # Format: (provider, model_name)
-        combo_list = [
-            ("gemini", "gemini-2.0-flash"),
-            ("gemini", "gemini-2.5-flash"),
-            ("gemini", "gemini-3-pro-preview"),
-            ("ollama", "llama3.2:latest"),
-            ("ollama", "gemma3n:latest"),
-            ("ollama", "deepseek-r1:14b"),
-            ("claude", "claude-sonnet-4-20250514"),
-            ("claude", "claude-haiku-4-5-20251001"),
-        ]
+        # Build combo list dynamically from proxy
+        if not hasattr(self, '_combo_list'):
+            from arenamcp.coach import fetch_proxy_models
+            combos = []
+            for _, val in fetch_proxy_models():
+                # val is "proxy/model-id"
+                parts = val.split("/", 1)
+                if len(parts) == 2:
+                    combos.append((parts[0], parts[1]))
+            self._combo_list = combos
+
+        combo_list = self._combo_list
 
         # Find current index
         current_idx = -1
@@ -1523,7 +1785,7 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             
             # Configure voice input based on backend
             if self._voice_input:
-                enable_transcription = (self.backend_name != "gemini")
+                enable_transcription = True
                 self._voice_input.transcription_enabled = enable_transcription
                 logger.info(f"Voice transcription enabled: {enable_transcription} (Backend: {self.backend_name})")
             
@@ -1550,6 +1812,7 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             keyboard.on_press_key("f9", lambda _: self._on_restart_hotkey(), suppress=False)
             keyboard.on_press_key("f10", lambda _: self.run_speed_test(), suppress=False)
             keyboard.on_press_key("f12", lambda _: self._on_model_cycle_hotkey(), suppress=False)
+            # Win plan hotkeys removed — now auto-spawned on each of your turns
             logger.info("Hotkeys registered")
         except Exception as e:
             logger.warning(f"Hotkey registration failed: {e}")
@@ -1568,19 +1831,6 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
         if self._running:
             logger.info("Already running, returning early")
             return
-
-        # Check API key early for non-draft mode
-        if not self.draft_mode:
-            if self.backend_name == "gemini":
-                if not os.environ.get("GOOGLE_API_KEY"):
-                    self.ui.error("GOOGLE_API_KEY not set")
-                    self.ui.log("Set it in .env file or: set GOOGLE_API_KEY=your_key")
-                    sys.exit(1)
-            elif self.backend_name == "claude":
-                if not os.environ.get("ANTHROPIC_API_KEY"):
-                    self.ui.error("ANTHROPIC_API_KEY not set")
-                    self.ui.log("Set it in .env file or: set ANTHROPIC_API_KEY=your_key")
-                    sys.exit(1)
 
         self._running = True
 
@@ -1708,6 +1958,16 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
         self._voice_thread = None
 
         # 8. Clear references to allow garbage collection
+        if self._coach and hasattr(self._coach, "_backend"):
+            backend = self._coach._backend
+            close_fn = getattr(backend, "close", None)
+            if callable(close_fn):
+                try:
+                    logger.debug("Closing LLM backend...")
+                    close_fn()
+                except Exception as e:
+                    logger.debug(f"Backend close error (non-fatal): {e}")
+
         self._mcp = None
         self._coach = None
         self._trigger = None
@@ -1723,13 +1983,12 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
         self.ui.log("\n[bold yellow]Running API Speed Test (3 passes)...[/]")
         
         # Define test cases: (Provider, Model Class, Model Name)
-        from arenamcp.coach import GeminiBackend, ClaudeBackend, OllamaBackend
+        from arenamcp.coach import GeminiCliBackend, ClaudeCodeBackend, OllamaBackend
         
         tests = [
-            ("Gemini 2.0 Flash", GeminiBackend, "gemini-2.0-flash"),
-            ("Gemini 2.5 Flash", GeminiBackend, "gemini-2.5-flash"),
-            ("Gemini 3 Pro", GeminiBackend, "gemini-3-pro-preview"),
-            ("Claude Haiku", ClaudeBackend, "claude-haiku-4-5-20251001"),
+            ("Claude Code Haiku", ClaudeCodeBackend, "haiku"),
+            ("Claude Code Sonnet", ClaudeCodeBackend, "sonnet"),
+            ("Gemini CLI Flash", GeminiCliBackend, "gemini-2.0-flash"),
             ("Ollama Local", OllamaBackend, "llama3.2:latest"),
         ]
         
@@ -1790,18 +2049,19 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m arenamcp.standalone --backend gemini
+  python -m arenamcp.standalone --backend gemini-cli
+  python -m arenamcp.standalone --backend claude-code
   python -m arenamcp.standalone --backend ollama --model llama3.2
   python -m arenamcp.standalone --draft --set MH3
 
 Environment variables:
-  GOOGLE_API_KEY     Required for Gemini
-  ANTHROPIC_API_KEY  Required for Claude
+  CLAUDE_CODE_CMD    Optional: path to claude.exe for claude-code backend
+  GEMINI_CLI_CMD     Optional: path to gemini CLI (default: gemini)
         """
     )
 
-    parser.add_argument("--backend", "-b", choices=["claude", "gemini", "ollama"],
-                        default=None, help="LLM backend (default: gemini)")
+    parser.add_argument("--backend", "-b", choices=["claude-code", "gemini-cli", "ollama", "proxy"],
+                        default=None, help="LLM backend (default: proxy)")
     parser.add_argument("--model", "-m", help="Model name override")
     parser.add_argument("--voice", "-v", choices=["ptt", "vox"], default=None,
                         help="Voice input: ptt (F4) or vox (auto)")
@@ -1834,15 +2094,6 @@ Environment variables:
                 for line in f.readlines()[-30:]:
                     print(line, end='')
         return
-
-    # Check API keys
-    if not args.draft:
-        if args.backend == "gemini" and not os.environ.get("GOOGLE_API_KEY"):
-            print("Error: GOOGLE_API_KEY not set")
-            sys.exit(1)
-        if args.backend == "claude" and not os.environ.get("ANTHROPIC_API_KEY"):
-            print("Error: ANTHROPIC_API_KEY not set")
-            sys.exit(1)
 
     logger.info(f"Starting: backend={args.backend}, draft={args.draft}")
 
