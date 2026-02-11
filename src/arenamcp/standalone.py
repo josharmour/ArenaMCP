@@ -1,11 +1,12 @@
 """Standalone MTGA Coach - Lightweight MCP client with voice I/O.
 
 This app runs the ArenaMCP server and connects to it as an MCP client,
-using a local LLM (Gemini/Ollama) for coaching advice with voice support.
+using an LLM (via cli-api-proxy, Claude CLI, or Gemini CLI) for coaching
+advice with voice support.
 
 Usage:
-    python -m arenamcp.standalone --backend gemini-cli
-    python -m arenamcp.standalone --backend ollama --model llama3.2
+    python -m arenamcp.standalone --backend proxy
+    python -m arenamcp.standalone --provider gemini-2.5-pro
     python -m arenamcp.standalone --draft --set MH3
 
 The MCP server handles all game state tracking; this client just:
@@ -225,6 +226,9 @@ class StandaloneCoach:
         set_code: Optional[str] = None,
         ui_adapter: Optional[UIAdapter] = None,
         register_hotkeys: bool = True,
+        autopilot: bool = False,
+        dry_run: bool = False,
+        afk: bool = False,
     ):
         self._register_keyboard = register_hotkeys
 
@@ -275,6 +279,15 @@ class StandaloneCoach:
         # Background win plan
         self._win_plan_turn = 0       # Last turn a win plan was launched
         self._thinking_model = None   # Cached thinking model ID (lazy-init)
+        self._pending_win_plan: Optional[str] = None    # Stored viable plan text
+        self._pending_win_plan_turns: int = 0            # N in "win-in-N"
+        self._pending_win_plan_turn: int = 0             # Game turn when plan was generated
+
+        # Autopilot mode
+        self._autopilot_enabled = autopilot
+        self._autopilot: Optional[Any] = None  # AutopilotEngine, lazy-init
+        self._dry_run = dry_run
+        self._afk_enabled = afk
 
     def speak_advice(self, text: str, blocking: bool = True) -> None:
         """Speak advice using local Kokoro TTS."""
@@ -380,6 +393,118 @@ class StandaloneCoach:
         logger.info(f"Created {self.backend_name} backend with model: {actual_model}")
         self._coach = CoachEngine(backend=llm_backend)
         self._trigger = GameStateTrigger()
+
+    def _init_autopilot(self) -> None:
+        """Initialize autopilot components if enabled."""
+        if not self._autopilot_enabled:
+            return
+
+        from arenamcp.action_planner import ActionPlanner
+        from arenamcp.screen_mapper import ScreenMapper
+        from arenamcp.input_controller import InputController
+        from arenamcp.autopilot import AutopilotEngine, AutopilotConfig
+
+        logger.info(f"Initializing autopilot (dry_run={self._dry_run})...")
+
+        # Reuse the coach's LLM backend — it's already configured with the
+        # correct model and has fallback logic for deprecated models.
+        # The autopilot branch in the coaching loop means they won't run
+        # concurrently (autopilot replaces coach, not runs alongside it).
+        if self._coach and hasattr(self._coach, '_backend'):
+            planner_backend = self._coach._backend
+            logger.info(f"Autopilot reusing coach backend: {type(planner_backend).__name__}")
+        else:
+            # Fallback: create a new backend
+            progress_cb = self.ui.subtask if self.ui else None
+            from arenamcp.coach import create_backend
+            planner_backend = create_backend(
+                self.backend_name, model=self.model_name, progress_callback=progress_cb
+            )
+            logger.info(f"Autopilot created new backend: {type(planner_backend).__name__}")
+        planner = ActionPlanner(backend=planner_backend)
+
+        # Create screen mapper and input controller
+        mapper = ScreenMapper()
+        controller = InputController(dry_run=self._dry_run)
+
+        # Create config
+        config = AutopilotConfig(dry_run=self._dry_run, afk_mode=self._afk_enabled)
+
+        # Create engine
+        self._autopilot = AutopilotEngine(
+            planner=planner,
+            mapper=mapper,
+            controller=controller,
+            get_game_state=lambda: self._mcp.get_game_state() if self._mcp else {},
+            config=config,
+            speak_fn=self.speak_advice if hasattr(self, 'speak_advice') else None,
+            ui_advice_fn=self.ui.advice if self.ui else None,
+        )
+
+        self.ui.status("AUTOPILOT", "ON" if self._autopilot_enabled else "OFF")
+        self.ui.status("AFK", "ON" if self._afk_enabled else "OFF")
+        logger.info("Autopilot initialized")
+
+    def _toggle_autopilot(self) -> None:
+        """Toggle autopilot mode on/off."""
+        self._autopilot_enabled = not self._autopilot_enabled
+
+        if self._autopilot_enabled and self._autopilot is None:
+            self._init_autopilot()
+
+        if self._autopilot and not self._autopilot_enabled:
+            self._autopilot.on_abort()
+
+        status = "ON" if self._autopilot_enabled else "OFF"
+        self.ui.status("AUTOPILOT", status)
+        self.ui.log(f"\n[AUTOPILOT] {status}\n")
+        logger.info(f"Autopilot toggled: {status}")
+
+        # When toggling ON mid-turn, immediately trigger a planning cycle
+        # for the current game state. Without this, no triggers fire because
+        # the coaching loop already processed the current turn/phase.
+        if self._autopilot_enabled and self._autopilot and self._mcp:
+            def _immediate_trigger():
+                try:
+                    game_state = self._mcp.get_game_state()
+                    turn = game_state.get("turn", {})
+                    phase = turn.get("phase", "")
+                    # Determine appropriate trigger name from current phase
+                    if "Combat" in phase:
+                        step = turn.get("step", "")
+                        if "DeclareAttack" in step:
+                            trigger = "combat_attackers"
+                        elif "DeclareBlock" in step:
+                            trigger = "combat_blockers"
+                        else:
+                            trigger = "priority_gained"
+                    elif "Main" in phase:
+                        trigger = "new_turn"
+                    else:
+                        trigger = "priority_gained"
+                    logger.info(f"Autopilot immediate trigger: {trigger}")
+                    self._autopilot.process_trigger(game_state, trigger)
+                except Exception as e:
+                    logger.error(f"Autopilot immediate trigger failed: {e}")
+            threading.Thread(target=_immediate_trigger, daemon=True).start()
+
+    def _toggle_afk(self) -> None:
+        """Toggle AFK mode on/off (F9)."""
+        # AFK mode requires autopilot engine to be initialized
+        if self._autopilot is None:
+            # Auto-enable autopilot when toggling AFK
+            self._autopilot_enabled = True
+            self._init_autopilot()
+
+        if self._autopilot:
+            new_state = self._autopilot.toggle_afk()
+            self._afk_enabled = new_state
+            status = "ON" if new_state else "OFF"
+            self.ui.status("AFK", status)
+            self.ui.log(f"\n[AFK] {status}\n")
+            logger.info(f"AFK mode toggled: {status}")
+        else:
+            self.ui.log("\n[AFK] Failed: autopilot not available\n")
 
     def _init_voice(self) -> None:
         """Initialize voice I/O components."""
@@ -743,8 +868,15 @@ class StandaloneCoach:
                             except Exception as e:
                                 logger.debug(f"Failed to re-fetch state after new_turn delay: {e}")
 
+                            # Clear stale pending win plan if game has advanced
+                            if self._pending_win_plan and turn_num > self._pending_win_plan_turn + 1:
+                                logger.info(f"Clearing stale win plan (plan turn {self._pending_win_plan_turn}, now {turn_num})")
+                                self._pending_win_plan = None
+                                self.ui.status("WIN-PLAN", "")
+
                             # Spawn background win plan worker (non-blocking)
-                            if is_my_turn and turn_num > self._win_plan_turn:
+                            # Skip when autopilot is active — it handles its own strategy
+                            if is_my_turn and turn_num > self._win_plan_turn and not self._autopilot_enabled:
                                 self._win_plan_turn = turn_num
                                 threading.Thread(
                                     target=self._win_plan_worker,
@@ -791,6 +923,23 @@ class StandaloneCoach:
                         # Additional check: Don't spam priority triggers if we just advised on new_turn
                         # unless distinct phase
                         if trigger == "priority_gained" and is_new_turn:
+                            continue
+
+                        # AUTOPILOT BRANCH: If autopilot is enabled, route ALL
+                        # triggers directly to the autopilot engine. The autopilot
+                        # handles its own noise suppression (auto-pass, auto-resolve)
+                        # and needs to see triggers that the coaching noise filters
+                        # would normally drop (priority_gained, spell_resolved, etc.).
+                        if self._autopilot_enabled and self._autopilot:
+                            try:
+                                logger.info(f"Autopilot processing: {trigger}")
+                                self._autopilot.process_trigger(curr_state, trigger)
+                                last_advice_turn = turn_num
+                                last_advice_phase = phase
+                            except Exception as e:
+                                logger.error(f"Autopilot error: {e}")
+                                logger.debug(traceback.format_exc())
+                                self.ui.error(f"Autopilot error: {e}")
                             continue
 
                         should_advise = is_critical or is_new_turn or is_opponent_turn or is_step_by_step or is_frequent
@@ -1121,16 +1270,8 @@ class StandaloneCoach:
     def take_screenshot_analysis(self) -> None:
         """Capture screen and request visual analysis (e.g. Mulligan)."""
         # Check if backend supports vision
-        vision_capable = False
         backend_lower = self.backend_name.lower()
-        if backend_lower in ("claude-code", "gemini-cli", "proxy"):
-            vision_capable = True
-        elif "ollama" in backend_lower:
-            # Vision-capable Ollama models
-            vision_models = ["gemma3n", "llava", "bakllava", "moondream", "llama3.2-vision"]
-            model_lower = (self.model_name or "").lower()
-            if any(vm in model_lower for vm in vision_models):
-                vision_capable = True
+        vision_capable = backend_lower in ("claude-code", "gemini-cli", "proxy")
 
         if not vision_capable:
             self.ui.log("[red]Current backend does not support image analysis.[/]")
@@ -1595,11 +1736,19 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
         threading.Thread(target=_do, daemon=True).start()
 
     def _win_plan_worker(self, game_state: dict) -> None:
-        """Background worker: concurrently compute win-in-2/3/4 plans using a thinking model.
+        """Background worker: compute win-in-2 and win-in-3 plans using a thinking model.
 
         Spawned automatically at the start of each of your turns. Uses a separate
         thinking-enabled backend so it doesn't interfere with real-time coaching.
+
+        Parses VIABLE: YES/NO from the LLM response. Only stores viable plans
+        and plays a sound alert. The plan is read aloud only on numpad-0 press.
         """
+        # Bail immediately if autopilot was enabled after this thread was spawned
+        if self._autopilot_enabled:
+            logger.info("Win plan worker: skipping (autopilot active)")
+            return
+
         import concurrent.futures
 
         try:
@@ -1625,30 +1774,41 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             library_summary = self._compute_library_summary(game_state)
             turn_num = game_state.get("turn", {}).get("turn_number", 0)
 
-            # Submit win-in-2, win-in-3, win-in-4 concurrently
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-            future_to_turns = {}
-            for n in (2, 3, 4):
+            # Submit win-in-2 and win-in-3 concurrently (no win-in-4)
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+            futures_ordered = []
+            for n in (2, 3):
                 f = executor.submit(
                     self._coach.get_win_plan,
                     game_state, n, library_summary,
                     backend=thinking_backend,
                 )
-                future_to_turns[f] = n
+                futures_ordered.append((n, f))
 
-            # Take the first non-empty result
-            for future in concurrent.futures.as_completed(future_to_turns):
-                turns = future_to_turns[future]
+            # Process in order (prefer shortest viable plan: 2-turn over 3-turn)
+            for n, future in futures_ordered:
                 try:
                     plan = future.result()
                 except Exception as e:
-                    logger.warning(f"Win-in-{turns} future failed: {e}")
+                    logger.warning(f"Win-in-{n} future failed: {e}")
                     continue
 
                 if not plan or plan.startswith("Error"):
                     continue
 
-                # Staleness check: don't display if game has advanced >2 turns
+                # Parse viability from first line
+                first_line = plan.split("\n", 1)[0].strip()
+                is_viable = first_line.upper().startswith("VIABLE: YES") or first_line.upper().startswith("VIABLE:YES")
+
+                # Strip the VIABLE: line from the plan text
+                if first_line.upper().startswith("VIABLE:"):
+                    plan = plan.split("\n", 1)[1].strip() if "\n" in plan else ""
+
+                if not is_viable:
+                    logger.info(f"Win-in-{n} plan not viable, skipping")
+                    continue
+
+                # Staleness check: don't store if game has advanced >2 turns
                 current_turn = 0
                 try:
                     current_state = self._mcp.get_game_state()
@@ -1659,10 +1819,29 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
                     logger.info(f"Win plan stale (started turn {turn_num}, now {current_turn})")
                     break
 
-                logger.info(f"Win-in-{turns} plan ready ({len(plan)} chars)")
-                self.ui.advice(plan, f"WIN-IN-{turns}")
-                self._record_advice(plan, f"win_in_{turns}", game_state=game_state)
-                self.speak_advice(plan, blocking=False)
+                # Suppress if autopilot was enabled while this was running
+                if self._autopilot_enabled:
+                    logger.info("Win plan ready but autopilot active — suppressing")
+                    break
+
+                logger.info(f"VIABLE win-in-{n} plan found ({len(plan)} chars)")
+
+                # Store pending plan (no text output, no TTS — wait for numpad-0)
+                self._pending_win_plan = plan
+                self._pending_win_plan_turns = n
+                self._pending_win_plan_turn = turn_num
+                self._record_advice(plan, f"win_in_{n}", game_state=game_state)
+
+                # Play ascending two-tone alert
+                try:
+                    from arenamcp.voice import play_beep
+                    play_beep(frequency=1047, duration=0.12, volume=0.4)  # C6
+                    time.sleep(0.08)
+                    play_beep(frequency=1319, duration=0.12, volume=0.4)  # E6
+                except Exception as e:
+                    logger.debug(f"Win plan beep failed: {e}")
+
+                self.ui.status("WIN-PLAN", f"WIN IN {n} FOUND — Numpad 0 to hear")
                 break  # First viable result wins
 
             executor.shutdown(wait=False)
@@ -1672,6 +1851,19 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
 
         except Exception as e:
             logger.error(f"Win plan worker error: {e}", exc_info=True)
+
+    def _on_read_win_plan(self) -> None:
+        """Numpad 0 — Read the pending win plan aloud via TTS."""
+        plan = self._pending_win_plan
+        if not plan:
+            self.ui.status("WIN-PLAN", "No win plan available")
+            return
+        turns = self._pending_win_plan_turns
+        self.ui.advice(plan, f"WIN-IN-{turns}")
+        self.speak_advice(plan, blocking=False)
+        # Clear pending state after reading
+        self._pending_win_plan = None
+        self.ui.status("WIN-PLAN", "")
 
     def _on_restart_hotkey(self) -> None:
         """F9 - Restart the coach."""
@@ -1809,10 +2001,13 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             keyboard.on_press_key("f6", lambda _: self._on_voice_cycle_hotkey(), suppress=False)
             keyboard.on_press_key("f7", lambda _: self._on_bug_report_hotkey(), suppress=False)
             keyboard.on_press_key("f8", lambda _: self._on_swap_seat_hotkey(), suppress=False)
-            keyboard.on_press_key("f9", lambda _: self._on_restart_hotkey(), suppress=False)
+            keyboard.on_press_key("f9", lambda _: self._toggle_afk(), suppress=False)
+            keyboard.on_press_key("f1", lambda _: self._autopilot and self._autopilot.on_spacebar(), suppress=False)
+            keyboard.on_press_key("f4", lambda _: self._autopilot and self._autopilot.on_escape(), suppress=False)
             keyboard.on_press_key("f10", lambda _: self.run_speed_test(), suppress=False)
+            keyboard.on_press_key("f11", lambda _: self._toggle_autopilot(), suppress=False)
             keyboard.on_press_key("f12", lambda _: self._on_model_cycle_hotkey(), suppress=False)
-            # Win plan hotkeys removed — now auto-spawned on each of your turns
+            keyboard.on_press_key("num 0", lambda _: self._on_read_win_plan(), suppress=False)
             logger.info("Hotkeys registered")
         except Exception as e:
             logger.warning(f"Hotkey registration failed: {e}")
@@ -1849,6 +2044,8 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
         else:
             # Initialize LLM for coaching
             self._init_llm()
+            # Initialize autopilot if enabled
+            self._init_autopilot()
             # Get actual model name from backend
             if self._coach and hasattr(self._coach, '_backend'):
                 actual_model = getattr(self._coach._backend, 'model', self.model_name)
@@ -1983,13 +2180,13 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
         self.ui.log("\n[bold yellow]Running API Speed Test (3 passes)...[/]")
         
         # Define test cases: (Provider, Model Class, Model Name)
-        from arenamcp.coach import GeminiCliBackend, ClaudeCodeBackend, OllamaBackend
-        
+        from arenamcp.coach import GeminiCliBackend, ClaudeCodeBackend, ProxyBackend
+
         tests = [
             ("Claude Code Haiku", ClaudeCodeBackend, "haiku"),
             ("Claude Code Sonnet", ClaudeCodeBackend, "sonnet"),
             ("Gemini CLI Flash", GeminiCliBackend, "gemini-2.0-flash"),
-            ("Ollama Local", OllamaBackend, "llama3.2:latest"),
+            ("Proxy Default", ProxyBackend, None),
         ]
         
         import time
@@ -2049,9 +2246,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m arenamcp.standalone --backend gemini-cli
+  python -m arenamcp.standalone --backend proxy
+  python -m arenamcp.standalone --provider gemini-2.5-pro
   python -m arenamcp.standalone --backend claude-code
-  python -m arenamcp.standalone --backend ollama --model llama3.2
   python -m arenamcp.standalone --draft --set MH3
 
 Environment variables:
@@ -2060,21 +2257,36 @@ Environment variables:
         """
     )
 
-    parser.add_argument("--backend", "-b", choices=["claude-code", "gemini-cli", "ollama", "proxy"],
+    parser.add_argument("--backend", "-b", choices=["claude-code", "gemini-cli", "proxy"],
                         default=None, help="LLM backend (default: proxy)")
     parser.add_argument("--model", "-m", help="Model name override")
+    parser.add_argument("--provider", help="Default proxy model (e.g., gemini-2.5-pro, claude-sonnet-4-5-20250929)")
     parser.add_argument("--voice", "-v", choices=["ptt", "vox"], default=None,
                         help="Voice input: ptt (F4) or vox (auto)")
     parser.add_argument("--draft", action="store_true",
                         help="Draft helper mode (no LLM needed)")
     parser.add_argument("--set", "-s", dest="set_code",
                         help="Set code for draft (e.g., MH3, BLB)")
+    parser.add_argument("--autopilot", action="store_true",
+                        help="Enable autopilot mode (AI plays via mouse clicks)")
+    parser.add_argument("--afk", action="store_true",
+                        help="Start in AFK mode (auto-pass all priority without LLM)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Autopilot dry run: plan actions but log instead of clicking")
     parser.add_argument("--show-log", action="store_true",
                         help="Show log file and exit")
     parser.add_argument("--cli", action="store_true",
                         help="Run in legacy CLI mode (default is TUI)")
 
     args = parser.parse_args()
+
+    # --provider shortcut: set proxy model and backend
+    if args.provider:
+        settings = get_settings()
+        settings.set("model", args.provider)
+        settings.set("backend", "proxy")
+        args.model = args.provider
+        args.backend = "proxy"
 
     # Launch TUI unless CLI mode requested or show-log
     if not args.cli and not args.show_log:
@@ -2104,6 +2316,9 @@ Environment variables:
             voice_mode=args.voice,
             draft_mode=args.draft,
             set_code=args.set_code,
+            autopilot=args.autopilot,
+            dry_run=args.dry_run,
+            afk=getattr(args, 'afk', False),
         )
 
         try:

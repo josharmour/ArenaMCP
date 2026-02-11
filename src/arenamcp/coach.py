@@ -1,7 +1,7 @@
 """Coach engine with pluggable LLM backends for MTG game coaching.
 
 This module provides the CoachEngine for getting strategic advice from LLMs,
-with support for Claude Code CLI, Gemini CLI, and local models via Ollama.
+with support for Claude Code CLI, Gemini CLI, and cli-api-proxy.
 """
 
 import json
@@ -30,61 +30,6 @@ class LLMBackend(Protocol):
     def list_models(self) -> list[str]:
         """List available models (optional)."""
         return []
-
-
-class ClaudeBackend:
-    """LLM backend using Anthropic's Claude API."""
-
-    def __init__(self, model: str = "claude-sonnet-4-20250514"):
-        """Initialize Claude backend with lazy client creation.
-
-        Args:
-            model: The Claude model to use (default: claude-sonnet-4-20250514)
-        """
-        self.model = model
-        self._client = None
-
-    def _get_client(self):
-        """Lazy initialization of Anthropic client."""
-        if self._client is None:
-            try:
-                import anthropic
-
-                self._client = anthropic.Anthropic()
-            except ImportError:
-                raise ImportError("anthropic package required: pip install anthropic")
-        return self._client
-
-    def complete(self, system_prompt: str, user_message: str) -> str:
-        """Get completion from Claude API."""
-        import time
-
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            return "Error: ANTHROPIC_API_KEY environment variable not set"
-
-        try:
-            client_start = time.perf_counter()
-            client = self._get_client()
-            client_time = (time.perf_counter() - client_start) * 1000
-
-            request_start = time.perf_counter()
-            # OPTIMIZATION: Increased from 500 to 1000 for complex game states
-            response = client.messages.create(
-                model=self.model,
-                max_tokens=1000,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}],
-            )
-            request_time = (time.perf_counter() - request_start) * 1000
-
-            logger.debug(
-                f"[CLAUDE] client init: {client_time:.1f}ms, API request: {request_time:.0f}ms, model: {self.model}"
-            )
-            return response.content[0].text
-        except Exception as e:
-            logger.error(f"Claude API error: {e}")
-            return f"Error getting advice from Claude: {e}"
 
 
 class ClaudeCodeBackend:
@@ -642,421 +587,6 @@ class GeminiCliBackend:
         self._proc = None
 
 
-class GeminiBackend:
-    """LLM backend using Google's Gemini API (new google.genai SDK)."""
-
-    def __init__(self, model: str = "gemini-2.5-flash"):
-        """Initialize Gemini backend with lazy client creation.
-
-        Args:
-            model: The Gemini model to use (default: gemini-2.5-flash)
-        """
-        self.model = model
-        self._client = None
-
-    def _get_client(self):
-        """Lazy initialization of Gemini client."""
-        if self._client is None:
-            try:
-                from google import genai
-
-                api_key = os.environ.get("GOOGLE_API_KEY")
-                self._client = genai.Client(api_key=api_key)
-            except ImportError:
-                raise ImportError(
-                    "google-genai package required: pip install google-genai"
-                )
-        return self._client
-
-    def complete(
-        self,
-        system_prompt: str,
-        user_message: str,
-        max_tokens: int = 4096,
-        use_thinking: bool = False,
-    ) -> str:
-        """Get completion from Gemini API.
-
-        Args:
-            use_thinking: Enable thinking mode for complex tasks (deck analysis).
-                          Disabled by default for real-time game advice since the
-                          system prompt + Legal line already constrain the answer,
-                          and thinking adds 5-15s latency.
-        """
-        import time
-
-        api_key = os.environ.get("GOOGLE_API_KEY")
-        if not api_key:
-            return "Error: GOOGLE_API_KEY environment variable not set"
-
-        try:
-            from google import genai
-            from google.genai import types
-
-            client_start = time.perf_counter()
-            client = self._get_client()
-            client_time = (time.perf_counter() - client_start) * 1000
-
-            # Thinking disabled by default for speed (real-time advice).
-            # Only enable for deeper analysis like deck strategy.
-            thinking_config = None
-            if use_thinking:
-                if "gemini-3" in self.model:
-                    thinking_config = types.ThinkingConfig(thinking_level="low")
-                elif "gemini-2.5" in self.model:
-                    thinking_config = types.ThinkingConfig(thinking_budget=1024)
-            else:
-                # Explicitly disable thinking for fastest response
-                if "gemini-2.5" in self.model:
-                    thinking_config = types.ThinkingConfig(thinking_budget=0)
-                elif "gemini-3" in self.model:
-                    thinking_config = types.ThinkingConfig(thinking_level="none")
-
-            request_start = time.perf_counter()
-            response = client.models.generate_content(
-                model=self.model,
-                contents=user_message,
-                config=genai.types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    max_output_tokens=max_tokens,
-                    temperature=0.0,
-                    thinking_config=thinking_config,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                        disable=True
-                    ),
-                    safety_settings=[
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_HARASSMENT",
-                            threshold="BLOCK_NONE",
-                        ),
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_HATE_SPEECH",
-                            threshold="BLOCK_NONE",
-                        ),
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                            threshold="BLOCK_NONE",
-                        ),
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                            threshold="BLOCK_NONE",
-                        ),
-                    ],
-                ),
-            )
-            request_time = (time.perf_counter() - request_start) * 1000
-
-            # Log finish reason and safety ratings for debugging truncation
-            finish_reason = "UNKNOWN"
-            safety_ratings = "UNKNOWN"
-            if hasattr(response, "candidates") and response.candidates:
-                candidate = response.candidates[0]
-                finish_reason = getattr(candidate, "finish_reason", "UNKNOWN")
-                safety_ratings = getattr(candidate, "safety_ratings", "UNKNOWN")
-
-            # CHANGED TO INFO so it appears in standard logs
-            logger.info(
-                f"[GEMINI] client: {client_time:.1f}ms, API: {request_time:.0f}ms, model: {self.model}, reason: {finish_reason}, safety: {safety_ratings}"
-            )
-
-            # Extract visible text only, skipping thinking/thought parts
-            text = ""
-            if hasattr(response, "candidates") and response.candidates:
-                candidate = response.candidates[0]
-                parts = (
-                    getattr(candidate.content, "parts", None)
-                    if candidate.content
-                    else None
-                )
-                if parts:
-                    for part in parts:
-                        if getattr(part, "thought", False):
-                            continue  # Skip thinking parts
-                        if hasattr(part, "text") and part.text:
-                            text += part.text
-
-            if not text:
-                try:
-                    text = response.text  # Fallback
-                except (AttributeError, ValueError):
-                    text = ""
-
-            if not text or text.strip() == "...":
-                logger.warning(
-                    f"Empty/Ellipsis response from Gemini. Reason: {finish_reason}"
-                )
-                return "I didn't catch that. Please try again."
-
-            return text
-        except ImportError as e:
-            return f"Error: {e}"
-        except Exception as e:
-            logger.error(f"Gemini API error: {e}")
-            return f"Error getting advice from Gemini: {e}"
-
-    def complete_with_audio(
-        self,
-        system_prompt: str,
-        user_message: str,
-        audio_data: "np.ndarray",
-        sample_rate: int = 16000,
-    ) -> str:
-        """Get completion from Gemini API with audio input.
-
-        Args:
-            system_prompt: The system prompt setting up the assistant role
-            user_message: The text context/question
-            audio_data: Raw audio as numpy float32 array
-            sample_rate: Audio sample rate (default: 16000)
-
-        Returns:
-            The LLM's response text, or error message string on failure
-        """
-        import io
-        import time
-        import wave
-        import numpy as np
-
-        api_key = os.environ.get("GOOGLE_API_KEY")
-        if not api_key:
-            return "Error: GOOGLE_API_KEY environment variable not set"
-
-        try:
-            from google import genai
-            from google.genai import types
-
-            # Convert numpy audio to WAV bytes
-            wav_start = time.perf_counter()
-            audio_int16 = (audio_data * 32767).astype(np.int16)
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, "wb") as wav_file:
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(2)  # 16-bit
-                wav_file.setframerate(sample_rate)
-                wav_file.writeframes(audio_int16.tobytes())
-            wav_bytes = wav_buffer.getvalue()
-            wav_time = (time.perf_counter() - wav_start) * 1000
-
-            client_start = time.perf_counter()
-            client = self._get_client()
-            client_time = (time.perf_counter() - client_start) * 1000
-
-            # Create audio part
-            audio_part = types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")
-
-            # Disable thinking for real-time audio advice (speed priority)
-            thinking_config = None
-            if "gemini-2.5" in self.model:
-                thinking_config = types.ThinkingConfig(thinking_budget=0)
-            elif "gemini-3" in self.model:
-                thinking_config = types.ThinkingConfig(thinking_level="none")
-
-            request_start = time.perf_counter()
-            response = client.models.generate_content(
-                model=self.model,
-                contents=[user_message, audio_part],
-                config=genai.types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    max_output_tokens=4096,
-                    temperature=0.0,
-                    thinking_config=thinking_config,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                        disable=True
-                    ),
-                    safety_settings=[
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_HARASSMENT",
-                            threshold="BLOCK_NONE",
-                        ),
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_HATE_SPEECH",
-                            threshold="BLOCK_NONE",
-                        ),
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                            threshold="BLOCK_NONE",
-                        ),
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                            threshold="BLOCK_NONE",
-                        ),
-                    ],
-                ),
-            )
-            request_time = (time.perf_counter() - request_start) * 1000
-
-            # Log finish reason
-            finish_reason = "UNKNOWN"
-            safety_ratings = "UNKNOWN"
-            if hasattr(response, "candidates") and response.candidates:
-                candidate = response.candidates[0]
-                finish_reason = getattr(candidate, "finish_reason", "UNKNOWN")
-                safety_ratings = getattr(candidate, "safety_ratings", "UNKNOWN")
-
-            logger.info(
-                f"[GEMINI+AUDIO] wav: {wav_time:.1f}ms, client: {client_time:.1f}ms, API: {request_time:.0f}ms, reason: {finish_reason}, safety: {safety_ratings}"
-            )
-
-            text = response.text
-            if not text or text.strip() == "...":
-                logger.warning(
-                    f"Empty/Ellipsis response from Gemini. Reason: {finish_reason}"
-                )
-                return "I didn't catch that."
-
-            return text
-        except ImportError as e:
-            return f"Error: {e}"
-        except Exception as e:
-            logger.error(f"Gemini audio API error: {e}")
-            return f"Error getting advice from Gemini with audio: {e}"
-
-    def complete_with_image(
-        self,
-        system_prompt: str,
-        user_message: str,
-        image_data: bytes,
-        mime_type: str = "image/png",
-    ) -> str:
-        """Get completion from Gemini API with image input."""
-        import time
-        from google import genai
-        from google.genai import types
-
-        api_key = os.environ.get("GOOGLE_API_KEY")
-        if not api_key:
-            return "Error: GOOGLE_API_KEY environment variable not set"
-
-        try:
-            client = self._get_client()
-
-            # Create image part
-            image_part = types.Part.from_bytes(data=image_data, mime_type=mime_type)
-
-            # Disable thinking for real-time image advice (speed priority)
-            thinking_config = None
-            if "gemini-2.5" in self.model:
-                thinking_config = types.ThinkingConfig(thinking_budget=0)
-            elif "gemini-3" in self.model:
-                thinking_config = types.ThinkingConfig(thinking_level="none")
-
-            response = client.models.generate_content(
-                model=self.model,
-                contents=[user_message, image_part],
-                config=genai.types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    max_output_tokens=4096,
-                    temperature=0.0,
-                    thinking_config=thinking_config,
-                    safety_settings=[
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"
-                        ),
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"
-                        ),
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                            threshold="BLOCK_NONE",
-                        ),
-                        types.SafetySetting(
-                            category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                            threshold="BLOCK_NONE",
-                        ),
-                    ],
-                ),
-            )
-
-            text = response.text or ""
-            return text
-        except Exception as e:
-            logger.error(f"Gemini Image API error: {e}")
-            return f"Error analyzing image: {e}"
-
-
-class OllamaBackend:
-    """LLM backend using local Ollama server."""
-
-    def __init__(
-        self, model: str = "llama3.2", base_url: str = "http://localhost:11434"
-    ):
-        """Initialize Ollama backend.
-
-        Args:
-            model: The Ollama model to use (default: llama3.2)
-            base_url: Ollama server URL (default: localhost:11434)
-        """
-        self.model = model
-        self.base_url = base_url
-
-    def complete(self, system_prompt: str, user_message: str) -> str:
-        """Get completion from local Ollama server."""
-        import requests
-
-        try:
-            response = requests.post(
-                f"{self.base_url}/api/generate",
-                json={
-                    "model": self.model,
-                    "prompt": user_message,
-                    "system": system_prompt,
-                    "stream": False,
-                },
-                timeout=60,
-            )
-
-            if response.status_code == 404:
-                return f"Error: Model '{self.model}' not found. Run: ollama pull {self.model}"
-
-            response.raise_for_status()
-            return response.json().get("response", "No response from Ollama")
-
-        except requests.exceptions.ConnectionError:
-            return "Error: Cannot connect to Ollama. Is it running? Start with: ollama serve"
-        except requests.exceptions.Timeout:
-            return "Error: Ollama request timed out"
-        except Exception as e:
-            logger.error(f"Ollama error: {e}")
-            return f"Error getting advice from Ollama: {e}"
-
-    def complete_with_image(
-        self, system_prompt: str, user_message: str, image_data: bytes
-    ) -> str:
-        """Get completion from Ollama with image input (vision models like gemma3n, llava, etc.)."""
-        import requests
-        import base64
-
-        try:
-            # Encode image as base64
-            img_b64 = base64.b64encode(image_data).decode("utf-8")
-
-            response = requests.post(
-                f"{self.base_url}/api/generate",
-                json={
-                    "model": self.model,
-                    "prompt": user_message,
-                    "system": system_prompt,
-                    "images": [img_b64],  # Ollama expects list of base64 images
-                    "stream": False,
-                },
-                timeout=120,  # Vision requests may take longer
-            )
-
-            if response.status_code == 404:
-                return f"Error: Model '{self.model}' not found. Run: ollama pull {self.model}"
-
-            response.raise_for_status()
-            return response.json().get("response", "No response from Ollama")
-
-        except requests.exceptions.ConnectionError:
-            return "Error: Cannot connect to Ollama. Is it running? Start with: ollama serve"
-        except requests.exceptions.Timeout:
-            return "Error: Ollama vision request timed out"
-        except Exception as e:
-            logger.error(f"Ollama vision error: {e}")
-            return f"Error getting vision advice from Ollama: {e}"
-
-
 class ProxyBackend:
     """LLM backend using CLI Proxy API (OpenAI-compatible endpoint).
 
@@ -1297,188 +827,6 @@ def pick_thinking_model() -> Optional[str]:
         return None
 
 
-class AzureBackend:
-    """LLM backend using Azure OpenAI."""
-
-    def __init__(self, model: str = "gpt-4o"):
-        """Initialize Azure backend.
-
-        Args:
-           model: Deployment name (default: gpt-4o)
-        """
-        self.model = model
-        self._client = None
-
-    def _get_client(self):
-        """Lazy init of Azure client."""
-        if self._client is None:
-            try:
-                from openai import AzureOpenAI
-
-                self._client = AzureOpenAI(
-                    api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
-                    api_version=os.environ.get(
-                        "AZURE_OPENAI_API_VERSION", "2024-12-01-preview"
-                    ),
-                    azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
-                )
-            except ImportError:
-                raise ImportError("openai package required: pip install openai")
-        return self._client
-
-    def complete(self, system_prompt: str, user_message: str) -> str:
-        """Get completion from Azure OpenAI."""
-        import time
-
-        if not os.environ.get("AZURE_OPENAI_API_KEY"):
-            return "Error: AZURE_OPENAI_API_KEY not set"
-
-        try:
-            client = self._get_client()
-
-            client_start = time.perf_counter()
-            response = client.chat.completions.create(
-                model=self.model,  # This is the deployment name
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                max_completion_tokens=800,  # GPT-5 requires this instead of max_tokens
-            )
-            request_time = (time.perf_counter() - client_start) * 1000
-
-            content = response.choices[0].message.content
-            logger.info(f"[AZURE] API: {request_time:.0f}ms, model: {self.model}")
-
-            return content
-        except Exception as e:
-            # Try to handle "DeploymentNotFound" gracefully
-            err_str = str(e)
-            is_404 = "404" in err_str or "DeploymentNotFound" in err_str
-
-            if is_404:
-                # Try to list available models to help the user
-                try:
-                    available = self.list_models()
-                    # Prioritize GPT-5 models for visibility
-                    gpt5_models = [
-                        m
-                        for m in available
-                        if "gpt-5" in m.lower() or "5.1" in m or "5.2" in m
-                    ]
-                    other_gpt = [
-                        m
-                        for m in available
-                        if "gpt" in m.lower() and m not in gpt5_models
-                    ][:15]
-
-                    if gpt5_models:
-                        help_msg = f"\n\nGPT-5 models found:\n" + "\n".join(
-                            [f"- {m}" for m in gpt5_models[:10]]
-                        )
-                        if other_gpt:
-                            help_msg += f"\n\nOther GPT models:\n" + "\n".join(
-                                [f"- {m}" for m in other_gpt]
-                            )
-                    else:
-                        help_msg = (
-                            f"\n\nNo GPT-5 deployments found. Available GPT models:\n"
-                            + "\n".join([f"- {m}" for m in other_gpt])
-                        )
-                        help_msg += f"\n\n(Total {len(available)} models available)"
-                except Exception:
-                    help_msg = ""
-
-                return f"Error: Deployment '{self.model}' not found.{help_msg}"
-
-            logger.error(f"Azure API error: {e}")
-            return f"Error getting advice from Azure: {e}"
-
-    def list_models(self) -> list[str]:
-        """List available models (deployments) from Azure endpoint."""
-        try:
-            client = self._get_client()
-            # client.models.list() gives base models.
-            # We want deployments. The SDK doesn't support listing deployments directly easily.
-            # We will try to filter models that look like deployments or return base models
-            # and let the user try them.
-            models = client.models.list()
-            return [m.id for m in models.data]
-        except Exception as e:
-            logger.error(f"Failed to list Azure models: {e}")
-            # Fallback to standard known models
-            return ["gpt-4o", "gpt-4-turbo", "gpt-35-turbo"]
-
-
-class GPTRealtimeBackendWrapper:
-    """LLM backend wrapper for GPT-Realtime (voice-to-voice).
-
-    This provides the standard LLMBackend interface for GPT-Realtime,
-    enabling it to be used as a drop-in replacement for other backends.
-    """
-
-    def __init__(self, model: str = "gpt-realtime", voice: str = "alloy"):
-        """Initialize GPT-Realtime backend.
-
-        Args:
-            model: Deployment name (default: gpt-realtime)
-            voice: Voice for TTS output (default: alloy)
-        """
-        self.model = model
-        self._voice = voice
-        self._backend = None
-
-    def _get_backend(self):
-        """Lazy init of realtime backend."""
-        if self._backend is None:
-            try:
-                from arenamcp.realtime import GPTRealtimeBackend
-
-                self._backend = GPTRealtimeBackend(model=self.model, voice=self._voice)
-            except ImportError as e:
-                raise ImportError(f"GPT-Realtime dependencies required: {e}")
-        return self._backend
-
-    def complete(self, system_prompt: str, user_message: str) -> str:
-        """Get completion from GPT-Realtime (text mode)."""
-        backend = self._get_backend()
-        return backend.complete(system_prompt, user_message)
-
-    def complete_with_audio(
-        self,
-        system_prompt: str,
-        user_message: str,
-        audio_data: "np.ndarray",
-        sample_rate: int = 16000,
-    ) -> str:
-        """Get completion from GPT-Realtime with audio input.
-
-        Args:
-            system_prompt: System instructions
-            user_message: Text context
-            audio_data: Audio as numpy float32 array
-            sample_rate: Audio sample rate
-
-        Returns:
-            Response text
-        """
-        backend = self._get_backend()
-        return backend.complete_with_audio(
-            system_prompt, user_message, audio_data, sample_rate
-        )
-
-    def get_last_audio_response(self) -> Optional[bytes]:
-        """Get audio from last response (PCM16 at 24kHz)."""
-        if self._backend:
-            return self._backend.get_last_audio_response()
-        return None
-
-    def disconnect(self) -> None:
-        """Close the realtime connection."""
-        if self._backend:
-            self._backend.disconnect()
-
-
 def create_backend(
     backend_type: str,
     model: Optional[str] = None,
@@ -1487,7 +835,7 @@ def create_backend(
     """Factory function to create LLM backends by name.
 
     Args:
-        backend_type: One of "claude-code", "gemini-cli", "ollama"
+        backend_type: One of "proxy", "claude-code", "gemini-cli"
         model: Optional model override (uses backend default if not specified)
         progress_callback: Optional callback(status: str) for real-time subtask updates
 
@@ -1508,18 +856,12 @@ def create_backend(
     ):
         return ClaudeCodeBackend(model=model, progress_callback=progress_callback)
     elif backend_type in ("gemini", "gemini-cli", "gemini_cli"):
-        # Map "gemini" to CLI backend as requested by user ("subscription" / "cli subtask")
         return GeminiCliBackend(model=model, progress_callback=progress_callback)
-    elif backend_type in ("gemini-api", "gemini_api"):
-        # Use explicit "gemini-api" for the SDK backend
-        return GeminiBackend(model=model or "gemini-2.5-flash")
-    elif backend_type == "ollama":
-        return OllamaBackend(model=model) if model else OllamaBackend()
     elif backend_type == "proxy":
         return ProxyBackend(model=model or "claude-sonnet-4-5-20250929")
     else:
         raise ValueError(
-            f"Unknown backend type: {backend_type}. Use 'claude-code', 'gemini' (CLI), 'gemini-api', 'ollama', or 'proxy'"
+            f"Unknown backend type: {backend_type}. Use 'proxy', 'claude-code', or 'gemini-cli'"
         )
 
 
@@ -1690,7 +1032,13 @@ CRITICAL: Only reference card abilities that are explicitly shown in the provide
 Do NOT invent or guess what a card does — if no oracle text is provided for a card, refer to it only by name and mana cost.
 
 Be specific with card names and mana costs. If the plan requires drawing specific cards, note the probability.
-Keep the plan speakable in about 60 seconds — be concise but precise."""
+Keep the plan speakable in about 60 seconds — be concise but precise.
+
+Start your response with exactly one of:
+  VIABLE: YES — if this plan can realistically win in {n} turns using mostly cards already in hand/on board
+  VIABLE: NO — if it requires specific draws, opponent misplays, or is highly speculative
+
+Then provide the plan."""
 
 DECK_ANALYSIS_PROMPT = """Analyze this Magic: The Gathering deck list. Provide a brief strategic summary:
 1. ARCHETYPE: One-line description (e.g. "Mono-Red Aggro", "Dimir Control")
@@ -1798,10 +1146,10 @@ class CoachEngine:
         """Initialize the coach engine.
 
         Args:
-            backend: LLM backend to use (default: ClaudeCodeBackend)
+            backend: LLM backend to use (default: ProxyBackend)
             system_prompt: Custom system prompt (default: MTG coach persona)
         """
-        self._backend = backend if backend is not None else ClaudeCodeBackend()
+        self._backend = backend if backend is not None else ProxyBackend()
         self._system_prompt = (
             system_prompt if system_prompt is not None else DEFAULT_SYSTEM_PROMPT
         )

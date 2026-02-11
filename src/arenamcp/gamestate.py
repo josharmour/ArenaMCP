@@ -4,10 +4,13 @@ This module provides the GameState class that maintains a complete
 snapshot of the current game state from parsed MTGA log events.
 """
 
+import json
 import logging
+import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Optional
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -1302,4 +1305,100 @@ def create_recording_handler(
             logger.warning(f"Failed to record frame: {e}")
     
     return recording_handler
+
+
+# --- Match State Persistence ---
+
+MATCH_STATE_PATH = Path.home() / ".arenamcp" / "last_match.json"
+MATCH_STATE_MAX_AGE = 1800  # 30 minutes
+
+
+def save_match_state(
+    game_state: GameState,
+    log_offset: int = 0,
+) -> None:
+    """Save current match state for recovery after restart.
+
+    Writes match_id, local_seat_id, log_offset, turn info, and timestamp
+    to ~/.arenamcp/last_match.json.
+
+    Args:
+        game_state: Current GameState instance.
+        log_offset: Current file position in the log file.
+    """
+    if not game_state.match_id:
+        return
+
+    state = {
+        "match_id": game_state.match_id,
+        "local_seat_id": game_state.local_seat_id,
+        "log_offset": log_offset,
+        "turn_number": game_state.turn_info.turn_number,
+        "phase": game_state.turn_info.phase,
+        "timestamp": time.time(),
+        "status": "active",
+    }
+
+    try:
+        MATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(MATCH_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        logger.debug(f"Saved match state: turn {state['turn_number']}, offset {log_offset}")
+    except Exception as e:
+        logger.warning(f"Failed to save match state: {e}")
+
+
+def load_match_state() -> Optional[dict[str, Any]]:
+    """Load saved match state if valid (< 30 min old, status active).
+
+    Returns:
+        Dict with match_id, local_seat_id, log_offset, turn_number, phase,
+        timestamp, status. Or None if no valid state exists.
+    """
+    if not MATCH_STATE_PATH.exists():
+        return None
+
+    try:
+        with open(MATCH_STATE_PATH, "r", encoding="utf-8") as f:
+            state = json.load(f)
+
+        # Validate age
+        age = time.time() - state.get("timestamp", 0)
+        if age > MATCH_STATE_MAX_AGE:
+            logger.info(f"Match state too old ({age:.0f}s > {MATCH_STATE_MAX_AGE}s)")
+            return None
+
+        # Validate status
+        if state.get("status") != "active":
+            logger.info(f"Match state status is '{state.get('status')}', not active")
+            return None
+
+        logger.info(
+            f"Loaded match state: match={state.get('match_id')}, "
+            f"turn={state.get('turn_number')}, offset={state.get('log_offset')}"
+        )
+        return state
+
+    except Exception as e:
+        logger.warning(f"Failed to load match state: {e}")
+        return None
+
+
+def mark_match_ended() -> None:
+    """Mark the saved match state as ended."""
+    if not MATCH_STATE_PATH.exists():
+        return
+
+    try:
+        with open(MATCH_STATE_PATH, "r", encoding="utf-8") as f:
+            state = json.load(f)
+
+        state["status"] = "ended"
+        state["ended_at"] = time.time()
+
+        with open(MATCH_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        logger.info("Marked match state as ended")
+    except Exception as e:
+        logger.warning(f"Failed to mark match ended: {e}")
 

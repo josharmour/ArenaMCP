@@ -26,6 +26,14 @@ faster-whisper>=0.10.0
 kokoro>=0.3.0
 soundfile>=0.12.0
 
+# Synergy graph
+networkx>=3.0
+
+# Web scraping (EDHREC + MTGGoldfish)
+beautifulsoup4>=4.12.0
+pyedhrec>=0.0.2
+lxml>=5.0.0
+
 # Utilities
 numpy>=1.24.0
 
@@ -42,5 +50,9 @@ websocket-client>=1.6.0
 scipy>=1.10.0
 
 # Screenshots (for debug reports)
-pygetwindow>=0.0.9
+# pygetwindow replaced by ctypes user32 calls in input_controller.py
 Pillow>=10.0.0
+
+# Autopilot mode (input simulation)
+pyautogui>=0.9.54
+pydirectinput-rgx>=1.0.0  # Optional: DirectInput backend for games (fallback #2)

@@ -19,8 +19,16 @@ from arenamcp.coach import (
     create_backend,
     ClaudeCodeBackend,
     GeminiCliBackend,
-    OllamaBackend,
 )
+from arenamcp.action_planner import ActionPlanner, ActionPlan, GameAction, ActionType
+from arenamcp.screen_mapper import ScreenMapper, ScreenCoord, FixedCoordinates
+from arenamcp.input_controller import InputController, ClickResult
+from arenamcp.autopilot import AutopilotEngine, AutopilotConfig, AutopilotState
+from arenamcp.synergy import SynergyGraph, get_synergy_graph
+from arenamcp.deck_builder import DeckBuilderV2, DeckSuggestion, CardRating
+from arenamcp.edhrec import EDHRECClient
+from arenamcp.mtggoldfish import MTGGoldfishClient
+from arenamcp.gamestate import save_match_state, load_match_state, mark_match_ended
 
 __version__ = "0.1.0"
 
@@ -89,5 +97,26 @@ __all__ = [
     "create_backend",
     "ClaudeCodeBackend",
     "GeminiCliBackend",
-    "OllamaBackend",
+    "ActionPlanner",
+    "ActionPlan",
+    "GameAction",
+    "ActionType",
+    "ScreenMapper",
+    "ScreenCoord",
+    "FixedCoordinates",
+    "InputController",
+    "ClickResult",
+    "AutopilotEngine",
+    "AutopilotConfig",
+    "AutopilotState",
+    "SynergyGraph",
+    "get_synergy_graph",
+    "DeckBuilderV2",
+    "DeckSuggestion",
+    "CardRating",
+    "EDHRECClient",
+    "MTGGoldfishClient",
+    "save_match_state",
+    "load_match_state",
+    "mark_match_ended",
 ]
