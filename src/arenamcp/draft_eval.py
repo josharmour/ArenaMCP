@@ -7,12 +7,15 @@ This module contains the composite scoring logic for draft picks, combining:
 - Synergy detection with picked cards
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
 from arenamcp.scryfall import ScryfallCache, ScryfallCard
 from arenamcp.draftstats import DraftStatsCache
 from arenamcp.mtgadb import MTGADatabase
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -309,11 +312,36 @@ def evaluate_pack(
             elif not card_colors:  # Colorless fits any deck
                 score += 4.0
 
-            # Synergy bonus
+            # Synergy bonus (keyword/tribal matching)
             syn_score, syn_reason = check_synergy(card, picked_cards, scryfall)
             if syn_score:
                 score += syn_score
                 reasons.append(syn_reason)
+
+            # Graph-based synergy bonus (SynergyGraph if available)
+            try:
+                from arenamcp.synergy import get_synergy_graph
+                sg = get_synergy_graph()
+                if sg is not None and picked_cards:
+                    # Resolve picked card names for graph lookup
+                    picked_names = []
+                    for pid in picked_cards:
+                        pc = scryfall.get_card_by_arena_id(pid)
+                        if pc:
+                            picked_names.append(pc.name)
+                    if picked_names:
+                        recs = sg.get_cluster_recommendations(picked_names, top_n=30)
+                        rec_dict = dict(recs)
+                        graph_score = rec_dict.get(card_name, 0.0)
+                        if graph_score > 0:
+                            # Cap at +15 points
+                            bonus = min(graph_score * 15, 15.0)
+                            score += bonus
+                            reasons.append(f"graph synergy +{bonus:.0f}")
+            except ImportError:
+                pass  # networkx not installed
+            except Exception as e:
+                logger.debug(f"Graph synergy error for {card_name}: {e}")
 
         # Pick best reason (most specific)
         best_reason = reasons[-1] if reasons else ""

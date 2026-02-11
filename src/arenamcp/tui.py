@@ -339,16 +339,20 @@ class Sidebar(Vertical):
             yield Static("Model: Default", id="status-model", classes="status-line")
             yield Static("Style: VERBOSE", id="status-style", classes="status-line")
             yield Static("Voice: Initializing...", id="status-voice", classes="status-line")
+            yield Static("Autopilot: OFF", id="status-autopilot", classes="status-line")
+            yield Static("AFK: OFF", id="status-afk", classes="status-line")
 
         with Vertical(id="actions-panel"):
             yield Button("Proxy: loading...", id="btn-provider", variant="default")
             yield Button("Voice: loading...", id="btn-voice-select", variant="default")
             yield Button("Mute (F5)", id="btn-mute", variant="default")
             yield Button("Speed 1.0x (F8)", id="btn-speed", variant="default")
+            yield Button("Autopilot (F11)", id="btn-autopilot", variant="default")
+            yield Button("AFK (F9)", id="btn-afk", variant="default")
             yield Button("Debug (F7)", id="btn-debug", variant="default")
             yield Button("Analyze Screen (F3)", id="btn-screenshot", variant="primary")
             yield Button("Analyze Match", id="btn-analyze", variant="warning")
-            yield Button("Restart (F9)", id="btn-restart", variant="error")
+            yield Button("Restart", id="btn-restart", variant="error")
 
 
 class ArenaApp(App):
@@ -433,8 +437,12 @@ class ArenaApp(App):
         ("f6", "cycle_voice", "Voice"),
         ("f7", "copy_debug", "Debug"),
         ("f8", "cycle_speed", "Speed"),
-        ("f9", "restart", "Restart"),
+        ("f9", "toggle_afk", "AFK"),
+        ("f1", "autopilot_confirm", "AP Confirm"),
+        ("f4", "autopilot_skip", "AP Skip"),
+        ("f11", "toggle_autopilot", "Autopilot"),
         ("f12", "cycle_model", "Model"),
+        ("keypad_0", "read_win_plan", "Win Plan"),
     ]
 
     def __init__(self, args):
@@ -501,7 +509,10 @@ class ArenaApp(App):
                 draft_mode=self.args.draft,
                 set_code=self.args.set_code,
                 ui_adapter=self.adapter,
-                register_hotkeys=False  # Textual handles keys
+                register_hotkeys=False,  # Textual handles keys
+                autopilot=getattr(self.args, 'autopilot', False),
+                dry_run=getattr(self.args, 'dry_run', False),
+                afk=getattr(self.args, 'afk', False),
             )
             
             # Sync initial state to UI
@@ -673,6 +684,30 @@ class ArenaApp(App):
             self.sub_title = value
         elif key == "SEAT_INFO":
             self.query_one("#status-seat", Static).update(f"Seat: {value}")
+        elif key == "AUTOPILOT":
+            self.query_one("#status-autopilot", Static).update(f"Autopilot: {value}")
+            try:
+                btn = self.query_one("#btn-autopilot", Button)
+                if value == "ON":
+                    btn.variant = "success"
+                    btn.label = "Autopilot ON (F11)"
+                else:
+                    btn.variant = "default"
+                    btn.label = "Autopilot (F11)"
+            except Exception:
+                pass
+        elif key == "AFK":
+            try:
+                self.query_one("#status-afk", Static).update(f"AFK: {value}")
+                btn = self.query_one("#btn-afk", Button)
+                if value == "ON":
+                    btn.variant = "warning"
+                    btn.label = "AFK ON (F9)"
+                else:
+                    btn.variant = "default"
+                    btn.label = "AFK (F9)"
+            except Exception:
+                pass
 
     # --- Actions ---
 
@@ -695,6 +730,10 @@ class ArenaApp(App):
             self.action_analyze_screen()
         elif btn_id == "btn-analyze":
             self.action_stop_recording()
+        elif btn_id == "btn-autopilot":
+            self.action_toggle_autopilot()
+        elif btn_id == "btn-afk":
+            self.action_toggle_afk()
         elif btn_id == "btn-restart":
             self.action_restart()
 
@@ -1340,6 +1379,35 @@ class ArenaApp(App):
             return
         self._cycle_provider()
 
+    def action_toggle_afk(self) -> None:
+        """Toggle AFK mode (F9)."""
+        if self.coach:
+            threading.Thread(target=self.coach._toggle_afk, daemon=True).start()
+
+    def action_toggle_autopilot(self) -> None:
+        """Toggle autopilot mode (F11)."""
+        if self.coach:
+            threading.Thread(target=self.coach._toggle_autopilot, daemon=True).start()
+
+    def action_autopilot_confirm(self) -> None:
+        """Confirm current autopilot action (F1)."""
+        if not self.coach or not self.coach._autopilot_enabled:
+            return
+        if self.coach._autopilot:
+            self.coach._autopilot.on_spacebar()
+
+    def action_autopilot_skip(self) -> None:
+        """Skip current autopilot action (F4)."""
+        if not self.coach or not self.coach._autopilot_enabled:
+            return
+        if self.coach._autopilot:
+            self.coach._autopilot.on_escape()
+
+    def action_read_win_plan(self) -> None:
+        """Read pending win plan aloud (Numpad 0)."""
+        if self.coach:
+            threading.Thread(target=self.coach._on_read_win_plan, daemon=True).start()
+
     def action_quit(self) -> None:
         if self.coach:
             self.coach.stop()
@@ -1351,7 +1419,7 @@ def run_tui(args):
     Args:
         args: Command line arguments from argparse.
 
-    The TUI will restart if the user presses F9 (Restart).
+    The TUI will restart if the user clicks the Restart button.
     When running under the launcher, it exits with code 42 to signal restart.
     Otherwise, it loops and re-creates the app in-process.
     """

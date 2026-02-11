@@ -15,7 +15,10 @@ from mcp.server.fastmcp import FastMCP
 
 from arenamcp.coach import CoachEngine, GameStateTrigger, create_backend
 
-from arenamcp.gamestate import GameState, ZoneType, create_game_state_handler
+from arenamcp.gamestate import (
+    GameState, ZoneType, create_game_state_handler,
+    save_match_state, load_match_state, mark_match_ended,
+)
 from arenamcp.parser import LogParser
 from arenamcp.scryfall import ScryfallCache
 from arenamcp.draftstats import DraftStatsCache
@@ -47,6 +50,12 @@ _mtgadb: Optional[MTGADatabase] = None
 # Lazy-loaded voice components
 _voice_input: Optional[VoiceInput] = None
 _voice_output: Optional[VoiceOutput] = None
+
+# Lazy-loaded new modules
+_edhrec = None
+_mtggoldfish = None
+_deck_builder = None
+_synergy_graph = None
 
 # Advice queue for proactive coaching (Phase 9 integration)
 _pending_advice: deque[dict[str, Any]] = deque(maxlen=10)
@@ -116,6 +125,62 @@ def _get_voice_output() -> VoiceOutput:
         logger.info("Initializing voice output (TTS)...")
         _voice_output = VoiceOutput()
     return _voice_output
+
+
+# Match state tracking
+_last_saved_turn: int = -1
+
+
+def _get_edhrec():
+    """Get or initialize EDHREC client (lazy loading)."""
+    global _edhrec
+    if _edhrec is None:
+        from arenamcp.edhrec import EDHRECClient
+        logger.info("Initializing EDHREC client...")
+        _edhrec = EDHRECClient()
+    return _edhrec
+
+
+def _get_mtggoldfish():
+    """Get or initialize MTGGoldfish client (lazy loading)."""
+    global _mtggoldfish
+    if _mtggoldfish is None:
+        from arenamcp.mtggoldfish import MTGGoldfishClient
+        logger.info("Initializing MTGGoldfish client...")
+        _mtggoldfish = MTGGoldfishClient()
+    return _mtggoldfish
+
+
+def _get_deck_builder():
+    """Get or initialize DeckBuilderV2 (lazy loading)."""
+    global _deck_builder
+    if _deck_builder is None:
+        from arenamcp.deck_builder import DeckBuilderV2
+        logger.info("Initializing DeckBuilderV2...")
+        _deck_builder = DeckBuilderV2(
+            draft_stats=_get_draft_stats(),
+            enrich_fn=enrich_with_oracle_text,
+        )
+    return _deck_builder
+
+
+def _get_synergy_graph():
+    """Get or initialize SynergyGraph (lazy loading)."""
+    global _synergy_graph
+    if _synergy_graph is None:
+        from arenamcp.synergy import get_synergy_graph
+        _synergy_graph = get_synergy_graph()
+    return _synergy_graph
+
+
+def _save_match_state_if_needed() -> None:
+    """Save match state on turn changes."""
+    global _last_saved_turn
+    current_turn = game_state.turn_info.turn_number
+    if current_turn != _last_saved_turn and game_state.match_id:
+        _last_saved_turn = current_turn
+        offset = watcher.file_position if watcher else 0
+        save_match_state(game_state, log_offset=offset)
 
 
 def _background_coaching_loop(
@@ -424,6 +489,7 @@ def start_watching() -> None:
 
     Creates and starts the watcher if not already running.
     Watcher feeds log chunks to the parser, which updates game_state and draft_state.
+    Checks for saved match state to resume from if available.
     """
     global watcher
     if watcher is not None:
@@ -443,8 +509,25 @@ def start_watching() -> None:
     draft_handler = create_draft_handler(draft_state)
     parser.set_default_handler(draft_handler)
 
+    # Check for saved match state to resume from
+    resume_offset = None
+    saved_state = load_match_state()
+    if saved_state:
+        resume_offset = saved_state.get("log_offset")
+        if saved_state.get("local_seat_id") is not None:
+            game_state.set_local_seat_id(saved_state["local_seat_id"], source=2)
+        if saved_state.get("match_id"):
+            game_state.match_id = saved_state["match_id"]
+        logger.info(
+            f"Resuming match {saved_state.get('match_id')} "
+            f"from offset {resume_offset}"
+        )
+
     # Create and start the watcher
-    watcher = MTGALogWatcher(callback=parser.process_chunk)
+    watcher = MTGALogWatcher(
+        callback=parser.process_chunk,
+        resume_offset=resume_offset,
+    )
     watcher.start()
     logger.info("Started MTGA log watcher")
 
@@ -683,6 +766,9 @@ def get_game_state() -> dict[str, Any]:
     stack = [_serialize_game_object(obj) for obj in game_state.stack]
     exile = [_serialize_game_object(obj) for obj in game_state.get_objects_in_zone(ZoneType.EXILE)]
     command = [_serialize_game_object(obj) for obj in game_state.command]
+
+    # Save match state on turn changes for recovery
+    _save_match_state_if_needed()
 
     return {
         "turn": turn,
@@ -1410,6 +1496,125 @@ def get_draft_helper_status() -> dict[str, Any]:
         "current_pack": _draft_helper_last_pack,
         "current_pick": _draft_helper_last_pick,
     }
+
+
+@mcp.tool()
+def build_deck(top_n: int = 3) -> dict[str, Any]:
+    """Build deck suggestions from the current draft pool.
+
+    Analyzes picked cards using 17lands GIHWR data and archetype constraints
+    (Aggro/Midrange/Control) to suggest optimal deck configurations with
+    maindeck, sideboard, and land base.
+
+    Args:
+        top_n: Number of deck suggestions to return (default 3).
+
+    Returns:
+        Dict with:
+        - suggestions: List of deck suggestions, each with:
+          - archetype: "Aggro", "Midrange", or "Control"
+          - color_pair_name: e.g., "Dimir", "Boros"
+          - maindeck: {card_name: count}
+          - sideboard: {card_name: count}
+          - lands: {land_name: count}
+          - score: Overall deck quality score
+          - avg_gihwr: Average Games In Hand Win Rate
+        - pool_size: Number of cards in draft pool
+
+        or {"error": message} if no draft pool available.
+    """
+    if not draft_state.picked_cards:
+        return {"error": "No draft pool available. Pick cards first."}
+
+    builder = _get_deck_builder()
+    set_code = draft_state.set_code or ""
+
+    suggestions = builder.suggest_deck(
+        drafted_grp_ids=draft_state.picked_cards,
+        set_code=set_code,
+        top_n=top_n,
+    )
+
+    if not suggestions:
+        return {"error": f"Could not build decks from pool. Check set_code ({set_code})."}
+
+    return {
+        "suggestions": [
+            {
+                "archetype": s.archetype,
+                "main_colors": s.main_colors,
+                "color_pair_name": s.color_pair_name,
+                "maindeck": s.maindeck,
+                "sideboard": s.sideboard,
+                "lands": s.lands,
+                "avg_gihwr": round(s.avg_gihwr, 4),
+                "penalty": round(s.penalty, 4),
+                "score": round(s.score, 4),
+            }
+            for s in suggestions
+        ],
+        "pool_size": len(draft_state.picked_cards),
+        "set_code": set_code,
+    }
+
+
+@mcp.tool()
+def get_metagame(format_name: str) -> dict[str, Any]:
+    """Get metagame breakdown for a constructed format from MTGGoldfish.
+
+    Scrapes current metagame data showing top deck archetypes, their
+    meta share, and color identity.
+
+    Args:
+        format_name: Format to query (standard, modern, pioneer, legacy, pauper).
+
+    Returns:
+        Dict with:
+        - format: The format queried
+        - decks: List of deck dicts with name, meta_share, url, colors
+        - count: Number of decks returned
+
+        or {"error": message} on failure.
+    """
+    try:
+        client = _get_mtggoldfish()
+        decks = client.get_metagame(format_name)
+        return {
+            "format": format_name.lower(),
+            "decks": decks,
+            "count": len(decks),
+        }
+    except Exception as e:
+        logger.error(f"Metagame lookup error: {e}")
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def get_commander_info(commander_name: str) -> dict[str, Any]:
+    """Get EDHREC data for a commander (top cards, themes, salt score).
+
+    Fetches detailed commander page data from EDHREC including most-played
+    cards, deck themes, and community salt score.
+
+    Args:
+        commander_name: Name of the commander card.
+
+    Returns:
+        Dict with:
+        - commander: Commander name
+        - url: EDHREC page URL
+        - cards: List of top cards with synergy/inclusion rates
+        - themes: List of deck themes
+        - meta: Rank, total decks, salt score
+
+        or {"error": message} on failure.
+    """
+    try:
+        client = _get_edhrec()
+        return client.get_commander_page(commander_name)
+    except Exception as e:
+        logger.error(f"EDHREC lookup error: {e}")
+        return {"commander": commander_name, "error": str(e)}
 
 
 # Entry point for running as module

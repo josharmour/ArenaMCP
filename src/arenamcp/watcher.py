@@ -148,7 +148,8 @@ class MTGALogWatcher:
         self,
         callback: Callable[[str], None],
         log_path: Optional[str] = None,
-        backfill: bool = True
+        backfill: bool = True,
+        resume_offset: Optional[int] = None,
     ) -> None:
         """Initialize the log watcher.
 
@@ -159,6 +160,9 @@ class MTGALogWatcher:
             backfill: If True, parse existing log content from the last match
                      start on first call to start(). Enables catching up on
                      in-progress games. Defaults to True.
+            resume_offset: If provided, start reading from this byte offset
+                          instead of the default position. Used for match
+                          state recovery after restart.
         """
         # Resolve log path
         if log_path is None:
@@ -167,6 +171,7 @@ class MTGALogWatcher:
         self.log_path = Path(log_path).resolve()
         self.callback = callback
         self._backfill_enabled = backfill
+        self._resume_offset = resume_offset
         self._observer: Optional[Observer] = None
         self._handler: Optional[MTGALogHandler] = None
 
@@ -249,8 +254,21 @@ class MTGALogWatcher:
 
         self._handler = MTGALogHandler(str(self.log_path), self.callback)
 
-        # Backfill existing content if enabled
-        if self._backfill_enabled and self.log_path.exists():
+        # Use resume_offset if provided (match state recovery)
+        if self._resume_offset is not None and self.log_path.exists():
+            file_size = self.log_path.stat().st_size
+            if self._resume_offset <= file_size:
+                logger.info(f"Resuming from saved offset {self._resume_offset}")
+                self._handler.read_from_position(self._resume_offset)
+            else:
+                logger.warning(
+                    f"Resume offset {self._resume_offset} > file size {file_size}, "
+                    "falling back to backfill"
+                )
+                if self._backfill_enabled:
+                    start_pos = self.find_last_match_start()
+                    self._handler.read_from_position(start_pos)
+        elif self._backfill_enabled and self.log_path.exists():
             start_pos = self.find_last_match_start()
             self._handler.read_from_position(start_pos)
 
@@ -274,6 +292,16 @@ class MTGALogWatcher:
         self._handler = None
 
         logger.info("Watcher stopped")
+
+    @property
+    def file_position(self) -> int:
+        """Current byte position in the log file.
+
+        Useful for saving match state for recovery after restart.
+        """
+        if self._handler:
+            return self._handler.file_position
+        return 0
 
     def poll(self) -> None:
         """Manually poll for new log content.
