@@ -771,8 +771,20 @@ def fetch_proxy_models() -> list[tuple[str, str]]:
     """
     import urllib.request
 
-    base_url = os.environ.get("PROXY_BASE_URL", "http://127.0.0.1:8080/v1")
-    api_key = os.environ.get("PROXY_API_KEY", "your-api-key-1")
+    # Resolve URL/key: env var > settings > default
+    base_url = os.environ.get("PROXY_BASE_URL", "")
+    api_key = os.environ.get("PROXY_API_KEY", "")
+    if not base_url:
+        try:
+            from arenamcp.settings import get_settings
+            s = get_settings()
+            base_url = s.get("proxy_url") or "http://127.0.0.1:8080/v1"
+            if not api_key:
+                api_key = s.get("proxy_api_key") or "your-api-key-1"
+        except Exception:
+            base_url = "http://127.0.0.1:8080/v1"
+    if not api_key:
+        api_key = "your-api-key-1"
 
     # Display name mapping for known model prefixes
     OWNER_LABELS = {
@@ -811,10 +823,30 @@ def fetch_proxy_models() -> list[tuple[str, str]]:
         return results
     except Exception as e:
         logger.warning(f"Could not fetch proxy models: {e}")
-        return [
-            ("Proxy: claude-sonnet-4-5-20250929 (Claude)", "proxy/claude-sonnet-4-5-20250929"),
-            ("Proxy: gemini-2.5-pro (Gemini)", "proxy/gemini-2.5-pro"),
-        ]
+
+    # Fallback: try Ollama if available
+    try:
+        from arenamcp.settings import get_settings
+        ollama_url = get_settings().get("ollama_url") or "http://localhost:11434/v1"
+        req = urllib.request.Request(f"{ollama_url}/models")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read())
+        results = []
+        for m in data.get("data", []):
+            model_id = m["id"]
+            display = f"Ollama: {model_id}"
+            results.append((display, f"ollama/{model_id}"))
+        if results:
+            logger.info(f"Fetched {len(results)} models from Ollama")
+            return results
+    except Exception:
+        pass
+
+    # Static fallback
+    return [
+        ("Proxy: claude-sonnet-4-5-20250929 (Claude)", "proxy/claude-sonnet-4-5-20250929"),
+        ("Proxy: gemini-2.5-pro (Gemini)", "proxy/gemini-2.5-pro"),
+    ]
 
 
 THINKING_MODEL_PREFERENCE = [
