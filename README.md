@@ -49,18 +49,23 @@ venv\Scripts\activate
 # With cli-api-proxy (recommended)
 python -m arenamcp.standalone --backend proxy
 
+# With local Ollama (free, offline)
+python -m arenamcp.standalone --backend ollama --model llama3.2
+
 # With Claude Code CLI (uses subscription, no API key)
 python -m arenamcp.standalone --backend claude-code
 
 # With Gemini CLI
 python -m arenamcp.standalone --backend gemini-cli
 
-# With local Ollama (free, offline)
-python -m arenamcp.standalone --backend ollama --model gemma3:12b
+# With a specific language (Dutch STT + English TTS)
+python -m arenamcp.standalone --backend ollama --model llama3.2 --language nl
 
 # Draft mode
 python -m arenamcp.standalone --draft --set MH3
 ```
+
+The setup wizard (`install.bat`) auto-detects available backends and saves your choice to `~/.arenamcp/settings.json`, so after initial setup you can just run `coach.bat` without any flags.
 
 ## MCP Server Mode
 
@@ -92,7 +97,28 @@ Can also run as an MCP server for Claude Code, OpenCode, or any MCP client:
 
 ## Configuration
 
-Copy `.env.example` to `.env` and edit, or let `install.bat` generate it for you.
+Run `install.bat` (setup wizard) for guided configuration, or edit `~/.arenamcp/settings.json` directly.
+
+### Settings (`~/.arenamcp/settings.json`)
+
+The primary configuration file. Created by the setup wizard or on first launch.
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `backend` | LLM backend: `proxy`, `ollama`, `claude-code`, `gemini-cli` | `proxy` |
+| `model` | Model name override (null = backend default) | `null` |
+| `language` | Language for TTS + STT (`en`, `nl`, `es`, `fr`, `de`, `ja`, etc.) | `en` |
+| `ollama_url` | Ollama API endpoint | `http://localhost:11434/v1` |
+| `proxy_url` | Proxy API endpoint | (uses env var or default) |
+| `proxy_api_key` | Proxy API key | (uses env var or default) |
+| `voice` | Kokoro voice ID (e.g., `af_sarah`, `bm_george`) | `am_adam` |
+| `voice_speed` | TTS speed multiplier | `1.0` |
+| `voice_mode` | Voice input: `ptt`, `vox`, `none` | `ptt` |
+| `muted` | Mute TTS output | `false` |
+
+### Environment Variables (`.env`)
+
+Legacy configuration, still supported. Settings.json takes priority where both exist.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -102,6 +128,26 @@ Copy `.env.example` to `.env` and edit, or let `install.bat` generate it for you
 | `GEMINI_CLI_CMD` | Path to Gemini CLI | `gemini` |
 | `VOICE_MODE` | Voice input mode (`ptt`/`vox`/`none`) | `ptt` |
 | `MTGA_LOG_PATH` | Custom MTGA log path | auto-detected |
+
+### Language Support
+
+Set via `--language` flag or in settings.json. Affects both voice output (TTS) and voice input (STT).
+
+| Code | Language | TTS | STT |
+|------|----------|-----|-----|
+| `en` | English | Yes | Yes |
+| `de` | German | Yes | Yes |
+| `es` | Spanish | Yes | Yes |
+| `fr` | French | Yes | Yes |
+| `it` | Italian | Yes | Yes |
+| `ja` | Japanese | Yes | Yes |
+| `ko` | Korean | Yes | Yes |
+| `pt` | Portuguese | Yes | Yes |
+| `zh` | Chinese | Yes | Yes |
+| `hi` | Hindi | Yes | Yes |
+| `nl` | Dutch | No (falls back to English) | Yes |
+
+Note: TTS uses Kokoro which supports the languages above. STT uses Whisper which supports 99+ languages.
 
 ## Architecture
 
