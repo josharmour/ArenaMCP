@@ -680,6 +680,59 @@ class InputController:
             logger.error(f"Hand card click failed: {e}")
             return ClickResult(False, x, y, card_name, str(e))
 
+    def drag_card_from_hand(
+        self,
+        from_x: int,
+        from_y: int,
+        to_x: int,
+        to_y: int,
+        card_name: str,
+        window_rect: Optional[tuple[int, int, int, int]] = None,
+    ) -> ClickResult:
+        """Drag a card from hand to the battlefield.
+
+        Hovers over the card first to trigger the expansion animation,
+        then drags it to the target position (e.g., land row on battlefield).
+        """
+        if not self._backend:
+            return ClickResult(False, from_x, from_y, card_name, "no input backend")
+
+        if window_rect:
+            if not self._is_in_bounds(from_x, from_y, window_rect):
+                return ClickResult(False, from_x, from_y, card_name, f"({from_x}, {from_y}) outside MTGA window")
+            if not self._is_in_bounds(to_x, to_y, window_rect):
+                return ClickResult(False, to_x, to_y, card_name, f"({to_x}, {to_y}) outside MTGA window")
+
+        self._enforce_delay()
+
+        if self._dry_run:
+            logger.info(
+                f"[DRY RUN] Drag hand card ({from_x},{from_y})->({to_x},{to_y}): {card_name}"
+            )
+            self._last_click_time = time.time()
+            return ClickResult(True, from_x, from_y, f"[DRY] Drag hand: {card_name}")
+
+        try:
+            # Hover first to trigger card expansion animation
+            self._backend.move_to(from_x, from_y, duration=self._move_duration)
+            time.sleep(0.3)  # Wait for card expansion
+
+            # Drag from hand to battlefield
+            ok = self._backend.drag(
+                from_x, from_y, to_x, to_y,
+                duration=self._move_duration * 3,  # Slower drag for reliability
+            )
+            self._last_click_time = time.time()
+            if ok:
+                logger.info(
+                    f"Dragged hand card ({from_x},{from_y})->({to_x},{to_y}): {card_name}"
+                )
+                return ClickResult(True, from_x, from_y, f"Drag hand: {card_name}")
+            return ClickResult(False, from_x, from_y, card_name, "backend drag returned False")
+        except Exception as e:
+            logger.error(f"Hand card drag failed: {e}")
+            return ClickResult(False, from_x, from_y, card_name, str(e))
+
     def double_click(
         self,
         x: int,

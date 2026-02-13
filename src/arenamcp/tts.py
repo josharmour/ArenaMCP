@@ -30,6 +30,25 @@ VOICES_FILE = "voices-v1.0.bin"
 MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
 VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
 
+# Language code → Kokoro lang ID mapping
+# Kokoro v1.0 supports: en-us, en-gb, ja, zh, ko, fr, de, es, pt-br, hi, it
+LANG_MAP = {
+    "en": "en-us",
+    "en-us": "en-us",
+    "en-gb": "en-gb",
+    "ja": "ja",
+    "zh": "zh",
+    "ko": "ko",
+    "fr": "fr",
+    "de": "de",
+    "es": "es",
+    "pt": "pt-br",
+    "pt-br": "pt-br",
+    "hi": "hi",
+    "it": "it",
+    # Unsupported languages fall back to en-us via .get() default
+}
+
 
 class KokoroTTS:
     """Text-to-speech synthesizer using Kokoro ONNX.
@@ -236,6 +255,10 @@ class VoiceOutput:
         self._muted = settings.get("muted", False)
         self._settings = settings
 
+        # Language: map short codes to Kokoro lang IDs
+        lang_code = settings.get("language", "en")
+        self._lang = LANG_MAP.get(lang_code, "en-us")
+
         # Find initial voice index
         for i, (vid, _) in enumerate(self.VOICES):
             if vid == self._voice:
@@ -256,7 +279,7 @@ class VoiceOutput:
     def _ensure_tts(self) -> None:
         """Initialize TTS on first use."""
         if self._tts_engine is None:
-            self._tts_engine = KokoroTTS(voice=self._voice, speed=self._speed)
+            self._tts_engine = KokoroTTS(voice=self._voice, speed=self._speed, lang=self._lang)
 
     @property
     def muted(self) -> bool:

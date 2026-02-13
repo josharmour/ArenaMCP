@@ -50,6 +50,7 @@ class AutopilotConfig:
     enable_tts_preview: bool = True
     dry_run: bool = False
     afk_mode: bool = False  # When True, auto-pass everything without LLM
+    land_drop_mode: bool = False  # When True, auto-play one land per turn (no LLM)
 
 
 class AutopilotEngine:
@@ -103,6 +104,10 @@ class AutopilotEngine:
         self._actions_skipped = 0
         self._plans_completed = 0
 
+        # Land-drop dedup: track last turn we played a land to prevent
+        # double-triggers when game state hasn't updated yet
+        self._land_drop_last_turn: int = -1
+
     @property
     def afk_mode(self) -> bool:
         """Whether AFK mode is active."""
@@ -115,6 +120,19 @@ class AutopilotEngine:
         logger.info(f"AFK mode toggled: {status}")
         self._notify("AFK", status)
         return self._config.afk_mode
+
+    @property
+    def land_drop_mode(self) -> bool:
+        """Whether land-drop-only mode is active."""
+        return self._config.land_drop_mode
+
+    def toggle_land_drop(self) -> bool:
+        """Toggle land-drop-only mode on/off. Returns new state."""
+        self._config.land_drop_mode = not self._config.land_drop_mode
+        status = "ON" if self._config.land_drop_mode else "OFF"
+        logger.info(f"Land-drop mode toggled: {status}")
+        self._notify("LAND_DROP", status)
+        return self._config.land_drop_mode
 
     @property
     def state(self) -> AutopilotState:
@@ -245,6 +263,10 @@ class AutopilotEngine:
         # --- AFK MODE: auto-pass everything without LLM ---
         if self._config.afk_mode:
             return self._handle_afk(game_state, trigger)
+
+        # --- LAND DROP MODE: auto-play one land per turn without LLM ---
+        if self._config.land_drop_mode:
+            return self._handle_land_drop(game_state, trigger)
 
         # --- Quick shortcuts: auto-pass/resolve without LLM ---
         # These save 5-15s by not calling the LLM for obvious actions.
@@ -515,6 +537,101 @@ class AutopilotEngine:
             time.sleep(0.15)
         return self._exec_pass_priority().success
 
+    def _handle_land_drop(self, game_state: dict[str, Any], trigger: str) -> bool:
+        """Handle a trigger in land-drop-only mode.
+
+        Automatically plays one land per turn by dragging it from hand to
+        the battlefield. No LLM is used. All other priority passes are
+        auto-resolved so the game keeps moving.
+        """
+        turn = game_state.get("turn", {})
+        phase = turn.get("phase", "")
+        local_seat = None
+        local_player = None
+        for p in game_state.get("players", []):
+            if p.get("is_local"):
+                local_seat = p.get("seat_id")
+                local_player = p
+
+        is_my_turn = turn.get("active_player") == local_seat if local_seat else False
+        is_main_phase = "Main" in phase
+        stack = game_state.get("stack", [])
+        is_stack_empty = len(stack) == 0
+        lands_played = local_player.get("lands_played", 0) if local_player else 1
+        turn_number = turn.get("turn_number", 0)
+
+        # Check if we can play a land right now
+        # Also guard against double-triggers: if we already dragged a land
+        # this turn, skip (the server may not have confirmed lands_played yet)
+        already_played_this_turn = self._land_drop_last_turn == turn_number
+        if is_my_turn and is_main_phase and is_stack_empty and lands_played < 1 and not already_played_this_turn:
+            hand = game_state.get("hand", [])
+            land_card = None
+            for card in hand:
+                card_types = card.get("card_types", [])
+                type_line = card.get("type_line", "")
+                if any("Land" in ct for ct in card_types) or "Land" in type_line:
+                    land_card = card
+                    break
+
+            if land_card:
+                land_name = land_card.get("name", "Land")
+                logger.info(f"LAND DROP: playing {land_name}")
+                self._notify("LAND_DROP", f"Playing {land_name}")
+
+                coord = self._mapper.get_card_in_hand_coord(
+                    land_name, hand, game_state
+                )
+                if coord:
+                    window_rect = self._mapper.window_rect
+                    if not window_rect:
+                        window_rect = self._mapper.refresh_window()
+                    if window_rect:
+                        if not self._config.dry_run:
+                            self._controller.focus_mtga_window()
+                            time.sleep(0.15)
+
+                        from_x, from_y = coord.to_absolute(window_rect)
+                        # Drag to your land row (y ≈ 0.75, center of screen)
+                        target = ScreenCoord(0.50, 0.75, f"Battlefield: {land_name}")
+                        to_x, to_y = target.to_absolute(window_rect)
+
+                        result = self._controller.drag_card_from_hand(
+                            from_x, from_y, to_x, to_y, land_name, window_rect
+                        )
+                        if result.success:
+                            self._actions_executed += 1
+                            self._land_drop_last_turn = turn_number
+                            logger.info(f"LAND DROP: {land_name} played successfully")
+                            return True
+                        else:
+                            logger.warning(f"LAND DROP: drag failed: {result.error}")
+                else:
+                    logger.warning(f"LAND DROP: could not map {land_name} in hand")
+
+        # For everything else, auto-pass to keep the game moving
+        pending = game_state.get("pending_decision")
+        if pending:
+            pending_lower = pending.lower() if isinstance(pending, str) else ""
+            if "mulligan" in pending_lower:
+                logger.info("LAND DROP: keeping hand (mulligan)")
+                if not self._config.dry_run:
+                    self._controller.focus_mtga_window()
+                    time.sleep(0.15)
+                return self._click_fixed("keep").success
+            if "scry" in pending_lower:
+                logger.info("LAND DROP: scry to bottom")
+                if not self._config.dry_run:
+                    self._controller.focus_mtga_window()
+                    time.sleep(0.15)
+                return self._click_fixed("scry_bottom").success
+
+        logger.info(f"LAND DROP: passing ({trigger})")
+        if not self._config.dry_run:
+            self._controller.focus_mtga_window()
+            time.sleep(0.15)
+        return self._exec_pass_priority().success
+
     def _get_legal_actions(self, game_state: dict[str, Any]) -> list[str]:
         """Get legal actions from the rules engine."""
         try:
@@ -616,7 +733,12 @@ class AutopilotEngine:
     def _exec_play_card(
         self, action: GameAction, game_state: dict[str, Any]
     ) -> ClickResult:
-        """Play a card from hand (land or spell)."""
+        """Play a card from hand (land or spell).
+
+        Lands are dragged from hand to the battlefield land row (y ≈ 0.75)
+        because MTGA requires a drag gesture to play them. Spells are
+        clicked normally (MTGA auto-casts on click).
+        """
         hand = game_state.get("hand", [])
         hand_names = [c.get("name", "???") for c in hand]
         logger.info(
@@ -639,6 +761,16 @@ class AutopilotEngine:
             return ClickResult(False, 0, 0, action.card_name, "MTGA window not found")
 
         abs_x, abs_y = coord.to_absolute(window_rect)
+
+        # Lands: drag from hand to battlefield land row
+        if action.action_type == ActionType.PLAY_LAND:
+            target = ScreenCoord(0.50, 0.75, f"Battlefield: {action.card_name}")
+            to_x, to_y = target.to_absolute(window_rect)
+            return self._controller.drag_card_from_hand(
+                abs_x, abs_y, to_x, to_y, action.card_name, window_rect
+            )
+
+        # Spells/abilities: click to cast
         return self._controller.click_card_in_hand(
             abs_x, abs_y, action.card_name, window_rect
         )
