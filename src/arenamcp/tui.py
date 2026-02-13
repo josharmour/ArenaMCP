@@ -442,7 +442,7 @@ class ArenaApp(App):
         ("f1", "autopilot_confirm", "AP Confirm"),
         ("f4", "autopilot_skip", "AP Skip"),
         ("f11", "toggle_autopilot", "Autopilot"),
-        ("f12", "cycle_model", "Model"),
+        ("keypad_2", "cycle_model", "Model"),
         ("keypad_0", "read_win_plan", "Win Plan"),
         ("keypad_1", "toggle_land_drop", "Land Drop"),
     ]
