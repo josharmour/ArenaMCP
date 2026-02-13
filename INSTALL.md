@@ -75,9 +75,11 @@ The setup wizard will:
 1. Check your Python version
 2. Create a virtual environment (`venv/`)
 3. Install all Python packages
-4. Ask which LLM backend you want
-5. Test the backend connection
-6. Write a `.env` config file
+4. **Auto-detect available backends** (Ollama, Proxy, Claude CLI, Gemini CLI) and show which are found
+5. Let you **pick a model** from the detected list
+6. **Language selection** for voice input/output (English, Dutch, Spanish, French, etc.)
+7. Voice input mode (push-to-talk, voice activation, or disabled)
+8. Save everything to `~/.arenamcp/settings.json`
 
 This takes 2-5 minutes depending on your internet speed.
 
@@ -92,16 +94,17 @@ cli-api-proxy --port 8080
 
 Leave this running in a separate terminal. The setup wizard will auto-detect it.
 
-#### Option B: Ollama
+#### Option B: Ollama (free, local)
 
+1. Install from [ollama.com](https://ollama.com) (runs as a system service automatically)
+2. Pull a model:
 ```bash
-# Install from https://ollama.com
-# Then pull a model:
 ollama pull llama3.2      # Fast, 2GB VRAM
 ollama pull gemma3:12b    # Better quality, 8GB VRAM
 ```
+3. The setup wizard will detect Ollama automatically and list your available models
 
-Ollama runs as a system service automatically after install.
+Ollama serves an OpenAI-compatible API at `http://localhost:11434`. The coach connects to it natively - no proxy needed.
 
 ### 5. Launch the coach
 
@@ -152,13 +155,42 @@ pip install textual openai websocket-client scipy Pillow
 pip install networkx beautifulsoup4 pyedhrec lxml
 pip install pyautogui pydirectinput-rgx
 
-# Copy and edit config
-copy .env.example .env
-notepad .env
+# Run with Ollama (if installed)
+python -m arenamcp.standalone --backend ollama --model llama3.2
 
-# Run
+# Run with proxy
 python -m arenamcp.standalone --backend proxy
+
+# Run with specific language
+python -m arenamcp.standalone --backend ollama --model llama3.2 --language nl
 ```
+
+---
+
+## Language Configuration
+
+The coach supports multiple languages for voice input (STT) and output (TTS).
+
+Set during initial setup, or change anytime:
+
+```bash
+# Via command line flag (saved to settings)
+python -m arenamcp.standalone --language nl    # Dutch
+python -m arenamcp.standalone --language es    # Spanish
+python -m arenamcp.standalone --language de    # German
+
+# Or edit ~/.arenamcp/settings.json directly
+{
+  "language": "nl"
+}
+
+# Or re-run the setup wizard
+python setup_wizard.py
+```
+
+Supported: English, German, Spanish, French, Italian, Japanese, Korean, Portuguese, Chinese, Hindi, Dutch.
+
+Note: Dutch (`nl`) is supported for voice input (Whisper STT) but TTS output will fall back to English since Kokoro doesn't have Dutch voices yet.
 
 ---
 
@@ -180,12 +212,43 @@ Invoke-WebRequest -Uri "https://github.com/thewh1teagle/kokoro-onnx/releases/dow
 
 Requires a microphone. The `faster-whisper` model downloads automatically on first use (~150MB).
 
-Set voice mode in `.env`:
+Set voice mode in `.env` or `settings.json`:
 ```
 VOICE_MODE=ptt    # Push-to-talk (hold F4)
 VOICE_MODE=vox    # Voice-activated
 VOICE_MODE=none   # Disabled
 ```
+
+---
+
+## Configuration Files
+
+The coach uses two config files:
+
+### `~/.arenamcp/settings.json` (primary)
+
+Created by the setup wizard. This is the main config file:
+```json
+{
+  "backend": "ollama",
+  "model": "llama3.2",
+  "language": "en",
+  "ollama_url": "http://localhost:11434/v1",
+  "voice": "af_sarah",
+  "voice_speed": 1.2,
+  "voice_mode": "ptt",
+  "muted": false
+}
+```
+
+To reconfigure, either:
+- Edit this file directly
+- Re-run `python setup_wizard.py` (skips venv/deps if already installed)
+- Use CLI flags like `--backend ollama --model llama3.2 --language nl`
+
+### `.env` (legacy, still read)
+
+Environment variables in the project root. Used for `PROXY_BASE_URL`, `PROXY_API_KEY`, `VOICE_MODE`. Settings.json takes priority where both exist.
 
 ---
 
