@@ -343,12 +343,12 @@ class Sidebar(Vertical):
             yield Static("AFK: OFF", id="status-afk", classes="status-line")
 
         with Vertical(id="actions-panel"):
-            yield Button("Proxy: loading...", id="btn-provider", variant="default")
-            yield Button("Voice: loading...", id="btn-voice-select", variant="default")
-            yield Button("Mute (F5)", id="btn-mute", variant="default")
-            yield Button("Speed 1.0x (F8)", id="btn-speed", variant="default")
-            yield Button("Autopilot (F11)", id="btn-autopilot", variant="default")
-            yield Button("AFK (F9)", id="btn-afk", variant="default")
+            yield Button("Proxy: loading...", id="btn-provider", variant="primary")
+            yield Button("Voice: loading...", id="btn-voice-select", variant="success")
+            yield Button("Mute (F5)", id="btn-mute", variant="success")
+            yield Button("Speed 1.0x (F8)", id="btn-speed", variant="success")
+            yield Button("Autopilot (F11)", id="btn-autopilot", variant="warning")
+            yield Button("AFK (F9)", id="btn-afk", variant="warning")
             yield Button("Land Drop (Num1)", id="btn-land-drop", variant="default")
             yield Button("Debug (F7)", id="btn-debug", variant="default")
             yield Button("Analyze Screen (F3)", id="btn-screenshot", variant="primary")
