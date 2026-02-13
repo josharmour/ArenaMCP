@@ -991,6 +991,7 @@ CRITICAL BLOCKING RULES:
 - Creatures tagged [FLYING] can ONLY be blocked by creatures with [FLYING] or [REACH].
 - Do NOT suggest blocking a [FLYING] creature with a ground creature (no [FLYING]/[REACH]).
 - If enemy attackers have [FLYING] and you have no flyers/reach, you CANNOT block them.
+- HOWEVER: A creature WITH [FLYING] CAN block ground creatures! Flying only restricts what blocks THEM, not what they block. A flyer is a valid blocker for any attacker.
 
 CRITICAL STRATEGY RULES:
 - LETHAL CHECK: Before anything else, count your total attack power vs opponent life and blockers.
@@ -1049,6 +1050,7 @@ RULES:
 - Only suggest lands shown in HAND. If no land in hand, don't suggest playing one.
 - Say "pass priority" not just "pass" to avoid sounding like a card name.
 - Creatures have power/toughness (e.g. 5/5). Don't call creatures "planeswalkers."
+- [FLYING] attackers can only be blocked by [FLYING] or [REACH]. But flyers CAN block ground creatures — flying restricts what blocks them, not what they block.
 - This is spoken aloud — keep it natural and under 30 words.
 """
 
