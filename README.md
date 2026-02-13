@@ -34,7 +34,7 @@ See [INSTALL.md](INSTALL.md) for detailed instructions, including sending to som
 | F8 | Cycle TTS speed |
 | F9 | Toggle AFK mode |
 | F11 | Toggle autopilot |
-| F12 | Cycle LLM model |
+| Numpad 2 | Cycle LLM model |
 | Numpad 0 | Read win plan aloud |
 | Ctrl+Q | Quit |
 
