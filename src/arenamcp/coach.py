@@ -2807,13 +2807,20 @@ class CoachEngine:
         advice = re.sub(r"\s+", " ", advice).strip()
 
         # 5. Enforce Legal actions only (hard filter)
-        try:
-            from arenamcp.rules_engine import RulesEngine
+        # MULLIGAN OVERRIDE: During mulligan, RulesEngine returns "Wait (Opponent
+        # has priority)" because priority_player != local_seat. Override here just
+        # like _format_game_context does (line ~1384).
+        pending = game_state.get("pending_decision")
+        if pending == "Mulligan":
+            legal_actions = ["KEEP", "MULLIGAN"]
+        else:
+            try:
+                from arenamcp.rules_engine import RulesEngine
 
-            legal_actions = RulesEngine.get_legal_actions(game_state) or []
-        except Exception as e:
-            logger.warning(f"RulesEngine error in postprocess: {e}")
-            legal_actions = []
+                legal_actions = RulesEngine.get_legal_actions(game_state) or []
+            except Exception as e:
+                logger.warning(f"RulesEngine error in postprocess: {e}")
+                legal_actions = []
 
         if legal_actions:
 
@@ -2875,11 +2882,10 @@ class CoachEngine:
             if not matches and any(p in advice_lower for p in PASSTHROUGH_PHRASES):
                 matches = True
 
-            # Special-case "Play <land>" suggestions to map to "Play Land: <land>"
+            # Special-case "Play <land>" suggestions to match "Play Land: <land>"
             if not matches and advice_lower.startswith("play "):
                 for act in legal_actions:
                     if act.lower().startswith("play land:"):
-                        advice = act
                         matches = True
                         break
 
@@ -2913,6 +2919,11 @@ class CoachEngine:
         else:
             # If no legal actions, instruct pass priority explicitly
             advice = "pass priority"
+
+        # Clean up internal action format for spoken output:
+        # "Play Land: Plains" → "Play Plains"
+        advice = re.sub(r"(?i)^Play Land:\s*", "Play ", advice)
+        advice = re.sub(r"(?i)Play Land:\s*", "Play ", advice)
 
         return advice
 

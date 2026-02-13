@@ -931,6 +931,20 @@ class StandaloneCoach:
                             except Exception as e:
                                 logger.debug(f"Failed to re-fetch state after mulligan delay: {e}")
 
+                        # DELAY BUFFER: For spell_resolved, wait briefly for ETB triggers to resolve.
+                        # When spells like Sheltered by Ghosts resolve, the exile/removal happens
+                        # via a subsequent ETB trigger that needs another game state diff.
+                        if trigger == "spell_resolved":
+                            time.sleep(0.4)  # 400ms to allow ETB triggers to resolve
+                            try:
+                                self._mcp.poll_log()
+                            except Exception:
+                                pass
+                            try:
+                                curr_state = self._mcp.get_game_state()
+                            except Exception as e:
+                                logger.debug(f"Failed to re-fetch state after spell_resolved delay: {e}")
+
                         # Check if there's a pending decision (scry, discard, target, etc.)
                         # If so, suppress step-by-step "what's next" triggers until decision resolves
                         pending_decision = curr_state.get("pending_decision")
