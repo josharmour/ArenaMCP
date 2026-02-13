@@ -1148,9 +1148,16 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                 import time
                 prompt_text = msg.get("promptReq", {}).get("prompt", {}).get("text", "Action Required")
                 logger.info(f"Captured Decision: Prompt ({prompt_text})")
-                game_state.pending_decision = prompt_text
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {"type": "prompt", "text": prompt_text}
+                # Don't overwrite Mulligan with a generic PromptReq — the
+                # mulligan prompt often arrives as a PromptReq right after the
+                # MulliganReq and would clobber the specific "Mulligan" state
+                # that the coach relies on for keep/mull advice.
+                if game_state.pending_decision == "Mulligan":
+                    logger.info("Skipping PromptReq — Mulligan decision already active")
+                else:
+                    game_state.pending_decision = prompt_text
+                    game_state.decision_timestamp = time.time()
+                    game_state.decision_context = {"type": "prompt", "text": prompt_text}
                 
             elif msg_type == "GREMessageType_SelectTargetsReq":
                 # PHASE 1: Capture rich context for target selection

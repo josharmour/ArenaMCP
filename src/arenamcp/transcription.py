@@ -35,6 +35,7 @@ class WhisperTranscriber:
         model_size: str = "base",
         device: str = "cpu",
         compute_type: str = "int8",
+        language: Optional[str] = None,
     ) -> None:
         """Initialize the transcriber.
 
@@ -45,11 +46,22 @@ class WhisperTranscriber:
             device: Device to run inference on. Default 'cpu'.
             compute_type: Quantization type. Use 'int8' for CPU, 'float16'
                          for GPU. Default 'int8'.
+            language: Language code for transcription (e.g., 'en', 'nl', 'es').
+                     If None, reads from settings (default: 'en').
         """
         self._model_size = model_size
         self._device = device
         self._compute_type = compute_type
         self._model: Optional[WhisperModel] = None
+
+        if language is not None:
+            self._language = language
+        else:
+            try:
+                from arenamcp.settings import get_settings
+                self._language = get_settings().get("language", "en")
+            except Exception:
+                self._language = "en"
 
     def _ensure_model_loaded(self) -> None:
         """Lazy-load the Whisper model on first use.
@@ -85,11 +97,11 @@ class WhisperTranscriber:
         if audio.dtype != np.float32:
             audio = audio.astype(np.float32)
 
-        # Transcribe with optimized settings for English
+        # Transcribe with optimized settings
         segments, _ = self._model.transcribe(
             audio,
             beam_size=5,
-            language="en",
+            language=self._language,
             vad_filter=True,  # Filter out non-speech
         )
 

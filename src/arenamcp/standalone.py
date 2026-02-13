@@ -506,6 +506,40 @@ class StandaloneCoach:
         else:
             self.ui.log("\n[AFK] Failed: autopilot not available\n")
 
+    def _toggle_land_drop(self) -> None:
+        """Toggle land-drop-only mode on/off (Numpad 1)."""
+        # Land drop mode requires autopilot engine to be initialized
+        if self._autopilot is None:
+            self._autopilot_enabled = True
+            self._init_autopilot()
+
+        if self._autopilot:
+            new_state = self._autopilot.toggle_land_drop()
+            status = "ON" if new_state else "OFF"
+            self.ui.status("LAND_DROP", status)
+            self.ui.log(f"\n[LAND DROP] {status}\n")
+            logger.info(f"Land-drop mode toggled: {status}")
+
+            # Fire an immediate trigger so it plays a land right now
+            # (coaching loop may have already processed this turn's triggers)
+            if new_state and self._mcp:
+                def _immediate_land_drop():
+                    try:
+                        game_state = self._mcp.get_game_state()
+                        turn = game_state.get("turn", {})
+                        phase = turn.get("phase", "")
+                        if "Main" in phase:
+                            trigger = "priority_gained"
+                        else:
+                            trigger = "priority_gained"
+                        logger.info(f"Land drop immediate trigger: {trigger}")
+                        self._autopilot.process_trigger(game_state, trigger)
+                    except Exception as e:
+                        logger.error(f"Land drop immediate trigger failed: {e}")
+                threading.Thread(target=_immediate_land_drop, daemon=True).start()
+        else:
+            self.ui.log("\n[LAND DROP] Failed: autopilot not available\n")
+
     def _init_voice(self) -> None:
         """Initialize voice I/O components."""
         logger.info(f"_init_voice called, backend_name={self.backend_name}")
@@ -2008,6 +2042,7 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             keyboard.on_press_key("f11", lambda _: self._toggle_autopilot(), suppress=False)
             keyboard.on_press_key("f12", lambda _: self._on_model_cycle_hotkey(), suppress=False)
             keyboard.on_press_key("num 0", lambda _: self._on_read_win_plan(), suppress=False)
+            keyboard.on_press_key("num 1", lambda _: self._toggle_land_drop(), suppress=False)
             logger.info("Hotkeys registered")
         except Exception as e:
             logger.warning(f"Hotkey registration failed: {e}")
@@ -2080,7 +2115,7 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             self.ui.status("BACKEND", f"{self.backend_name} ({actual_model or 'default'})")
             self.ui.status("VOICE", f"PTT (F4) + Kokoro")
         self.ui.log("-"*50)
-        self.ui.log("F5=mute F6=voice F7=bug F8=seat F9=restart F10=speed F12=model")
+        self.ui.log("F5=mute F6=voice F7=bug F8=seat F9=restart F10=speed F12=model Num1=land")
         self.ui.log("="*50)
         self.ui.log("\nWaiting for MTGA...")
         self.ui.log("F8=swap seat if wrong | F9=restart coach\n")
@@ -2257,7 +2292,7 @@ Environment variables:
         """
     )
 
-    parser.add_argument("--backend", "-b", choices=["claude-code", "gemini-cli", "proxy"],
+    parser.add_argument("--backend", "-b", choices=["claude-code", "gemini-cli", "proxy", "ollama"],
                         default=None, help="LLM backend (default: proxy)")
     parser.add_argument("--model", "-m", help="Model name override")
     parser.add_argument("--provider", help="Default proxy model (e.g., gemini-2.5-pro, claude-sonnet-4-5-20250929)")
@@ -2275,6 +2310,8 @@ Environment variables:
                         help="Autopilot dry run: plan actions but log instead of clicking")
     parser.add_argument("--show-log", action="store_true",
                         help="Show log file and exit")
+    parser.add_argument("--language", "-l", default=None,
+                        help="Language code for voice (e.g., en, nl, es, fr, de, ja)")
     parser.add_argument("--cli", action="store_true",
                         help="Run in legacy CLI mode (default is TUI)")
 
@@ -2287,6 +2324,11 @@ Environment variables:
         settings.set("backend", "proxy")
         args.model = args.provider
         args.backend = "proxy"
+
+    # --language: persist to settings
+    if args.language:
+        settings = get_settings()
+        settings.set("language", args.language)
 
     # Launch TUI unless CLI mode requested or show-log
     if not args.cli and not args.show_log:

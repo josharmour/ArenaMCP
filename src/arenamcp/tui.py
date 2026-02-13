@@ -349,6 +349,7 @@ class Sidebar(Vertical):
             yield Button("Speed 1.0x (F8)", id="btn-speed", variant="default")
             yield Button("Autopilot (F11)", id="btn-autopilot", variant="default")
             yield Button("AFK (F9)", id="btn-afk", variant="default")
+            yield Button("Land Drop (Num1)", id="btn-land-drop", variant="default")
             yield Button("Debug (F7)", id="btn-debug", variant="default")
             yield Button("Analyze Screen (F3)", id="btn-screenshot", variant="primary")
             yield Button("Analyze Match", id="btn-analyze", variant="warning")
@@ -443,6 +444,7 @@ class ArenaApp(App):
         ("f11", "toggle_autopilot", "Autopilot"),
         ("f12", "cycle_model", "Model"),
         ("keypad_0", "read_win_plan", "Win Plan"),
+        ("keypad_1", "toggle_land_drop", "Land Drop"),
     ]
 
     def __init__(self, args):
@@ -708,6 +710,17 @@ class ArenaApp(App):
                     btn.label = "AFK (F9)"
             except Exception:
                 pass
+        elif key == "LAND_DROP":
+            try:
+                btn = self.query_one("#btn-land-drop", Button)
+                if value == "ON":
+                    btn.variant = "success"
+                    btn.label = "Land Drop ON (Num1)"
+                else:
+                    btn.variant = "default"
+                    btn.label = "Land Drop (Num1)"
+            except Exception:
+                pass
 
     # --- Actions ---
 
@@ -734,6 +747,8 @@ class ArenaApp(App):
             self.action_toggle_autopilot()
         elif btn_id == "btn-afk":
             self.action_toggle_afk()
+        elif btn_id == "btn-land-drop":
+            self.action_toggle_land_drop()
         elif btn_id == "btn-restart":
             self.action_restart()
 
@@ -1383,6 +1398,11 @@ class ArenaApp(App):
         """Toggle AFK mode (F9)."""
         if self.coach:
             threading.Thread(target=self.coach._toggle_afk, daemon=True).start()
+
+    def action_toggle_land_drop(self) -> None:
+        """Toggle land-drop-only mode (Numpad 1)."""
+        if self.coach:
+            threading.Thread(target=self.coach._toggle_land_drop, daemon=True).start()
 
     def action_toggle_autopilot(self) -> None:
         """Toggle autopilot mode (F11)."""

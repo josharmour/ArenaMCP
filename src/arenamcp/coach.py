@@ -594,16 +594,28 @@ class ProxyBackend:
     across multiple OAuth providers (Antigravity, Claude, Codex, etc.).
     """
 
-    def __init__(self, model: str = "claude-sonnet-4-5-20250929", enable_thinking: bool = False):
+    def __init__(
+        self,
+        model: str = "claude-sonnet-4-5-20250929",
+        enable_thinking: bool = False,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ):
         """Initialize Proxy backend.
 
         Args:
             model: Model name as exposed by the proxy (default: claude-sonnet-4-5-20250929)
             enable_thinking: If True, enable extended thinking for models that support it.
                              Used by background win-plan workers for deeper analysis.
+            base_url: Override the proxy endpoint URL. Falls back to PROXY_BASE_URL
+                     env var, then settings, then http://127.0.0.1:8080/v1.
+            api_key: Override the API key. Falls back to PROXY_API_KEY env var,
+                    then settings, then default placeholder.
         """
         self.model = model
         self.enable_thinking = enable_thinking
+        self._base_url = base_url
+        self._api_key = api_key
         self._client = None
 
     def _get_client(self):
@@ -612,12 +624,31 @@ class ProxyBackend:
             try:
                 from openai import OpenAI
 
-                self._client = OpenAI(
-                    base_url=os.environ.get(
-                        "PROXY_BASE_URL", "http://127.0.0.1:8080/v1"
-                    ),
-                    api_key=os.environ.get("PROXY_API_KEY", "your-api-key-1"),
-                )
+                # Resolve URL: explicit param > env var > settings > default
+                if self._base_url:
+                    url = self._base_url
+                elif os.environ.get("PROXY_BASE_URL"):
+                    url = os.environ["PROXY_BASE_URL"]
+                else:
+                    try:
+                        from arenamcp.settings import get_settings
+                        url = get_settings().get("proxy_url") or "http://127.0.0.1:8080/v1"
+                    except Exception:
+                        url = "http://127.0.0.1:8080/v1"
+
+                # Resolve key: explicit param > env var > settings > default
+                if self._api_key:
+                    key = self._api_key
+                elif os.environ.get("PROXY_API_KEY"):
+                    key = os.environ["PROXY_API_KEY"]
+                else:
+                    try:
+                        from arenamcp.settings import get_settings
+                        key = get_settings().get("proxy_api_key") or "your-api-key-1"
+                    except Exception:
+                        key = "your-api-key-1"
+
+                self._client = OpenAI(base_url=url, api_key=key)
             except ImportError:
                 raise ImportError("openai package required: pip install openai")
         return self._client
@@ -859,9 +890,21 @@ def create_backend(
         return GeminiCliBackend(model=model, progress_callback=progress_callback)
     elif backend_type == "proxy":
         return ProxyBackend(model=model or "claude-sonnet-4-5-20250929")
+    elif backend_type == "ollama":
+        # Ollama exposes an OpenAI-compatible API at localhost:11434/v1
+        try:
+            from arenamcp.settings import get_settings
+            ollama_url = get_settings().get("ollama_url") or "http://localhost:11434/v1"
+        except Exception:
+            ollama_url = "http://localhost:11434/v1"
+        return ProxyBackend(
+            model=model or "llama3.2",
+            base_url=ollama_url,
+            api_key="ollama",  # Ollama ignores the key but OpenAI client requires one
+        )
     else:
         raise ValueError(
-            f"Unknown backend type: {backend_type}. Use 'proxy', 'claude-code', or 'gemini-cli'"
+            f"Unknown backend type: {backend_type}. Use 'proxy', 'claude-code', 'gemini-cli', or 'ollama'"
         )
 
 
@@ -905,6 +948,7 @@ CRITICAL MATH RULES:
 - When suggesting removal, check the creature's TOUGHNESS (second number, e.g., 4/5 has 5 toughness).
 - -2/-2 or 2 damage ONLY kills toughness 2 or less (unless damaged).
 - Do NOT suggest removal that won't kill the target unless it enables a profitable attack.
+- Cards tagged [NO TARGETS] have NO VALID TARGETS on the opponent's board right now. Do NOT cast them — it wastes the card for no effect. Even if the card appears in the Legal: line, casting it without targets is a mistake.
 
 CRITICAL BLOCKING RULES:
 - Creatures tagged [FLYING] can ONLY be blocked by creatures with [FLYING] or [REACH].
@@ -1252,6 +1296,21 @@ class CoachEngine:
         # Handle nested parens if possible, but simple greedy match usually works for MTG
         # Use simple non-greedy match for multiple parens
         return re.sub(r"\(.*?\)", "", text)
+
+    @staticmethod
+    def _get_cmc(mana_cost: str) -> int:
+        """Calculate converted mana cost from a mana cost string like '{1}{W}{W}'."""
+        import re
+        if not mana_cost:
+            return 0
+        cmc = 0
+        generic = re.findall(r"\{(\d+)\}", mana_cost)
+        cmc += sum(int(g) for g in generic)
+        for color in "WUBRGC":
+            cmc += len(re.findall(rf"\{{{color}\}}", mana_cost))
+        hybrid = re.findall(r"\{[^}]+/[^}]+\}", mana_cost)
+        cmc += len(hybrid)
+        return cmc
 
     def _format_game_context(
         self, game_state: dict[str, Any], question: str = ""
@@ -1930,12 +1989,16 @@ class CoachEngine:
         lines.append("")
         lines.append(f"HAND:")
 
-        # Pre-compute opponent creatures for terse removal analysis
+        # Pre-compute opponent battlefield subsets for removal target analysis
         opp_creatures = [
             c
             for c in opp_cards
             if c.get("power") is not None
             and "land" not in c.get("type_line", "").lower()
+        ]
+        opp_nonland = [
+            c for c in opp_cards
+            if "land" not in c.get("type_line", "").lower()
         ]
 
         if hand:
@@ -2054,6 +2117,38 @@ class CoachEngine:
                     elif minus_match:
                         tough_reduction = abs(int(minus_match.group(2)))
                         removal_info = f" [RM:<={tough_reduction}T]"
+
+                    # Target availability check: warn if no valid targets exist
+                    targets_nonland = "nonland" in oracle_lower
+                    targets_creature = is_destroy_creature or is_exile_creature
+                    targets_art_ench = is_destroy_art_ench
+                    # Check MV restriction (e.g., "mana value 2 or less")
+                    mv_match = re.search(r"mana value (\d+) or less", oracle_lower)
+                    mv_limit = int(mv_match.group(1)) if mv_match else None
+
+                    # Determine the valid target pool
+                    if targets_creature:
+                        target_pool = opp_creatures
+                    elif targets_nonland or is_destroy_permanent or is_exile_permanent:
+                        target_pool = opp_nonland
+                    elif targets_art_ench:
+                        target_pool = [
+                            c for c in opp_nonland
+                            if any(t in c.get("type_line", "").lower()
+                                   for t in ["artifact", "enchantment"])
+                        ]
+                    else:
+                        target_pool = opp_creatures  # damage/minus targets creatures
+
+                    # Apply MV filter if present
+                    if mv_limit is not None and target_pool:
+                        target_pool = [
+                            c for c in target_pool
+                            if self._get_cmc(c.get("mana_cost", "")) <= mv_limit
+                        ]
+
+                    if not target_pool:
+                        removal_info += " [NO TARGETS]"
 
                 # OPTIMIZATION: Only show oracle text for non-basic, non-land cards with relevant text
                 is_basic_land = "land" in type_line and (

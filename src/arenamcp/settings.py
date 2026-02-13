@@ -20,9 +20,16 @@ DEFAULTS = {
     "voice_speed": 1.0,
     "muted": False,
     "backend": "proxy",
+    "model": None,  # None = use backend default
     "auto_speak": True,
     "voice_mode": "ptt",
     "device_index": None,
+    # Backend endpoint config (override env vars)
+    "ollama_url": "http://localhost:11434/v1",
+    "proxy_url": "",  # Empty = use PROXY_BASE_URL env or default
+    "proxy_api_key": "",  # Empty = use PROXY_API_KEY env or default
+    # Language for TTS and STT (e.g., "en", "nl", "es", "fr", "de", "ja")
+    "language": "en",
 }
 
 
