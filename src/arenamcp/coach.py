@@ -794,6 +794,9 @@ def fetch_proxy_models() -> list[tuple[str, str]]:
         "antigravity": "AG",
     }
 
+    results = []
+
+    # Try proxy
     try:
         req = urllib.request.Request(
             f"{base_url}/models",
@@ -802,47 +805,49 @@ def fetch_proxy_models() -> list[tuple[str, str]]:
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read())
 
-        results = []
+        proxy_results = []
         for m in data.get("data", []):
             model_id = m["id"]
             owner = m.get("owned_by", "unknown")
             label = OWNER_LABELS.get(owner, owner.title())
-            # Build a human-friendly display name
             display = f"Proxy: {model_id} ({label})"
-            results.append((display, f"proxy/{model_id}"))
+            proxy_results.append((display, f"proxy/{model_id}"))
 
         # Sort: Claude first, then Google, then others
         owner_order = {"anthropic": 0, "google": 1, "openai": 2, "antigravity": 3}
         model_owners = {m["id"]: m.get("owned_by", "zzz") for m in data.get("data", [])}
-        results.sort(key=lambda x: (
+        proxy_results.sort(key=lambda x: (
             owner_order.get(model_owners.get(x[1].split("/", 1)[1], "zzz"), 9),
             x[1],
         ))
 
-        logger.info(f"Fetched {len(results)} models from proxy")
-        return results
+        logger.info(f"Fetched {len(proxy_results)} models from proxy")
+        results.extend(proxy_results)
     except Exception as e:
         logger.warning(f"Could not fetch proxy models: {e}")
 
-    # Fallback: try Ollama if available
+    # Try Ollama (always, not just as fallback — user may have both)
     try:
         from arenamcp.settings import get_settings
         ollama_url = get_settings().get("ollama_url") or "http://localhost:11434/v1"
-        req = urllib.request.Request(f"{ollama_url}/models")
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read())
-        results = []
-        for m in data.get("data", []):
-            model_id = m["id"]
-            display = f"Ollama: {model_id}"
-            results.append((display, f"ollama/{model_id}"))
-        if results:
-            logger.info(f"Fetched {len(results)} models from Ollama")
-            return results
+        # Skip if Ollama URL is the same as proxy URL (avoid duplicates)
+        if ollama_url.rstrip("/") != base_url.rstrip("/"):
+            req = urllib.request.Request(f"{ollama_url}/models")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read())
+            for m in data.get("data", []):
+                model_id = m["id"]
+                display = f"Ollama: {model_id}"
+                results.append((display, f"ollama/{model_id}"))
+            if results:
+                logger.info(f"Fetched Ollama models, total now: {len(results)}")
     except Exception:
         pass
 
-    # Static fallback
+    if results:
+        return results
+
+    # Static fallback only if nothing was reachable
     return [
         ("Proxy: claude-sonnet-4-5-20250929 (Claude)", "proxy/claude-sonnet-4-5-20250929"),
         ("Proxy: gemini-2.5-pro (Gemini)", "proxy/gemini-2.5-pro"),
