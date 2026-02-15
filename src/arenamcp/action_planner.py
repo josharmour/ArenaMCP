@@ -101,14 +101,12 @@ output a JSON action plan that the autopilot will execute by clicking in the MTG
 
 CRITICAL RULES:
 - ONLY suggest actions that appear in the "Legal:" line. Never hallucinate actions.
-- Creatures tagged [SS] have SUMMONING SICKNESS — they CANNOT attack or use tap abilities.
+- ONE ACTION PER PLAN: You must suggest only ONE card to play or ONE button to click per JSON response. 
+- EXCEPTION: For "declare_attackers" or "declare_blockers", you MUST list all creatures to attack/block with, AND THEN add a final action to click "1 attacker", "2 attackers", or "done" to confirm.
+  - Example: [{"action_type": "declare_attackers", "attacker_names": ["Elf", "Bear"]}, {"action_type": "click_button", "card_name": "done"}]
+- DO NOT sequence plays (e.g. do not suggest "play land" AND "cast spell"). Suggest the land, wait for the next trigger, then suggest the spell.
+- Creatures tagged [SS] have SUMMONING SICKNESS — they CANNOT attack.
 - Output ONLY valid JSON matching the schema below. No markdown, no commentary outside JSON.
-- Each action in the array will be executed sequentially.
-- For "pass_priority" or "resolve", card_name can be empty.
-- For "declare_attackers", list creature names in attacker_names.
-- For "declare_blockers", map each blocker to the attacker it should block.
-- For "select_n" (scry, discard, etc.), list cards in select_card_names.
-- For "modal_choice", set modal_index (0-based).
 - Be decisive. Pick the best line of play.
 
 JSON SCHEMA:

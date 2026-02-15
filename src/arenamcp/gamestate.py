@@ -163,6 +163,7 @@ class GameState:
         # PHASE 1: Enhanced decision context
         self.decision_context: Optional[dict] = None  # Rich context: source_card, options, etc.
         self.decision_timestamp: float = 0  # Track when decision was set
+        self.legal_actions: list[str] = [] # List of exact legal actions from GRE
         
         # Match tracking (to avoid stale state across matches)
         self.match_id: Optional[str] = None
@@ -201,6 +202,7 @@ class GameState:
         self.decision_seat_id = None
         self.decision_context = None
         self.decision_timestamp = 0
+        self.legal_actions = []
         self.deck_cards = []
 
     # Backward compatibility for _seat_manually_set
@@ -398,6 +400,7 @@ class GameState:
             "pending_decision": self.pending_decision,
             "decision_seat_id": self.decision_seat_id,
             "decision_context": self.decision_context,
+            "legal_actions": self.legal_actions,
         }
         return snapshot
 
@@ -1232,6 +1235,48 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                     "num_options": len(options),
                     "options": options,
                 }
+
+            elif msg_type == "GREMessageType_ActionsAvailableReq":
+                # PHASE 1: Capture the exact list of actions Arena says are legal right now.
+                # This is the "Ground Truth" for the autopilot.
+                req = msg.get("actionsAvailableReq", {})
+                raw_actions = req.get("actions", [])
+                
+                legal_list = []
+                for action in raw_actions:
+                    atype = action.get("actionType", "")
+                    # Human-friendly mapping
+                    if atype == "ActionType_Pass":
+                        legal_list.append("Pass")
+                    elif atype == "ActionType_Play":
+                        # Try to resolve card name if grpId is present
+                        name = "Land"
+                        if action.get("grpId"):
+                            try:
+                                from arenamcp import server
+                                info = server.get_card_info(action["grpId"])
+                                name = info.get("name", "Land")
+                            except: pass
+                        legal_list.append(f"Play Land: {name}")
+                    elif atype == "ActionType_Cast":
+                        name = "Spell"
+                        if action.get("grpId"):
+                            try:
+                                from arenamcp import server
+                                info = server.get_card_info(action["grpId"])
+                                name = info.get("name", "Spell")
+                            except: pass
+                        legal_list.append(f"Cast {name}")
+                    elif atype == "ActionType_Activate":
+                        legal_list.append(f"Activate Ability")
+                    else:
+                        # Fallback for other types
+                        clean_type = atype.replace("ActionType_", "")
+                        legal_list.append(f"Action: {clean_type}")
+                
+                if legal_list:
+                    game_state.legal_actions = legal_list
+                    logger.info(f"Captured {len(legal_list)} legal actions from GRE: {legal_list}")
 
             elif msg_type == "GREMessageType_ConnectResp":
                 connect_resp = msg.get("connectResp", {})

@@ -29,6 +29,11 @@ _IS_WINDOWS = sys.platform == "win32"
 if _IS_WINDOWS:
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
+    # Make the process DPI aware so coordinates match physical pixels
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1) # PROCESS_SYSTEM_DPI_AWARE
+    except Exception:
+        user32.SetProcessDPIAware()
 else:
     user32 = None
     kernel32 = None
