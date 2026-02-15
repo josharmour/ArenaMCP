@@ -194,8 +194,8 @@ class MTGALogWatcher:
         try:
             file_size = self.log_path.stat().st_size
 
-            # Scan last 5MB for match start — enough to find the most recent game
-            MAX_SCAN_BYTES = 5 * 1024 * 1024
+            # Scan last 15MB for match start — long games can generate 8-10MB of log data
+            MAX_SCAN_BYTES = 15 * 1024 * 1024
             read_size = min(file_size, MAX_SCAN_BYTES)
             start_offset = max(0, file_size - read_size)
 
