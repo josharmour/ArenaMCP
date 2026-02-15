@@ -1931,8 +1931,6 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
         else:
             # Initialize LLM for coaching
             self._init_llm()
-            # Initialize autopilot if enabled
-            self._init_autopilot()
             # Get actual model name from backend
             if self._coach and hasattr(self._coach, '_backend'):
                 actual_model = getattr(self._coach._backend, 'model', self.model_name)
