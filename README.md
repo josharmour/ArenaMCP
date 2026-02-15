@@ -12,7 +12,6 @@ An AI-powered coach for Magic: The Gathering Arena that watches your live games 
 - **Draft helper** - 17lands stats + composite scoring for draft picks
 - **Multiple LLM backends** - Claude Code CLI, Gemini CLI, cli-api-proxy, or local Ollama
 - **Card lookup** - Scryfall integration with oracle text and rulings
-- **Autopilot mode** - Experimental auto-play using screen coordinates
 
 ## Quick Start (Windows)
 
@@ -33,7 +32,6 @@ See [INSTALL.md](INSTALL.md) for detailed instructions, including sending to som
 | F6 | Cycle TTS voice |
 | F8 | Cycle TTS speed |
 | F9 | Toggle AFK mode |
-| F11 | Toggle autopilot |
 | Numpad 2 | Cycle LLM model |
 | Numpad 0 | Read win plan aloud |
 | Ctrl+Q | Quit |
@@ -177,11 +175,6 @@ arenamcp.standalone  (main app)
     |       +-- VoiceOutput (Kokoro TTS)
     |
     +-- TUI (Textual terminal UI)
-    |
-    +-- Autopilot (experimental)
-            +-- ActionPlanner (LLM -> game actions)
-            +-- ScreenMapper (coordinate mapping)
-            +-- InputController (mouse/keyboard simulation)
 ```
 
 ## Troubleshooting

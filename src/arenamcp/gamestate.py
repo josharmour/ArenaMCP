@@ -1285,6 +1285,22 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                     game_state.deck_cards = deck_cards
                     logger.info(f"Captured deck list from ConnectResp: {len(deck_cards)} cards")
 
+            elif msg_type.endswith("Req") and msg_type not in (
+                "GREMessageType_MulliganReq", "GREMessageType_SubmitDeckReq",
+                "GREMessageType_IntermissionReq", "GREMessageType_PromptReq",
+                "GREMessageType_SelectTargetsReq", "GREMessageType_SelectNReq",
+                "GREMessageType_GroupOptionReq", "GREMessageType_ActionsAvailableReq",
+            ):
+                import time
+                logger.warning(f"Unknown GRE Req type: {msg_type} - treating as pending decision")
+                game_state.pending_decision = f"Unknown Decision ({msg_type})"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "unknown_req",
+                    "gre_type": msg_type,
+                    "raw_message": {k: v for k, v in msg.items() if k != "type"},
+                }
+
             elif "Resp" in msg_type:
                 # PHASE 3: Only clear decisions on actual decision responses, not generic responses
                 # Only clear on explicit decision submission responses

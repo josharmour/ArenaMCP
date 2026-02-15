@@ -556,6 +556,19 @@ class AutopilotEngine:
                     time.sleep(0.15)
                 return self._click_fixed("scry_bottom").success
 
+            # Unknown decision: try Done button, then spacebar
+            if pending_lower and "mulligan" not in pending_lower and "scry" not in pending_lower:
+                logger.warning(f"AFK: unknown decision '{pending}' - trying Done button")
+                if not self._config.dry_run:
+                    self._controller.focus_mtga_window()
+                    time.sleep(0.15)
+                result = self._click_fixed("done")
+                if result.success:
+                    return True
+                # Done didn't work, try spacebar
+                self._controller.press_key("space", "AFK: unknown decision spacebar")
+                return True
+
         # Everything else: click pass/resolve/done
         logger.info(f"AFK: passing ({trigger})")
         if not self._config.dry_run:
@@ -652,6 +665,18 @@ class AutopilotEngine:
                     time.sleep(0.15)
                 return self._click_fixed("scry_bottom").success
 
+            # Unknown decision: try Done button, then spacebar
+            if pending_lower and "mulligan" not in pending_lower and "scry" not in pending_lower:
+                logger.warning(f"LAND DROP: unknown decision '{pending}' - trying Done button")
+                if not self._config.dry_run:
+                    self._controller.focus_mtga_window()
+                    time.sleep(0.15)
+                result = self._click_fixed("done")
+                if result.success:
+                    return True
+                self._controller.press_key("space", "LAND DROP: unknown decision spacebar")
+                return True
+
         logger.info(f"LAND DROP: passing ({trigger})")
         if not self._config.dry_run:
             self._controller.focus_mtga_window()
@@ -720,23 +745,41 @@ class AutopilotEngine:
     def _recover_stuck(self) -> None:
         """Attempt to recover from a stuck state (UI prompts, dialogs, etc)."""
         self._notify("AUTOPILOT", "STUCK DETECTED: Attempting recovery...")
+
+        # 1. Re-poll state to see if there's a pending decision we can re-plan for
+        try:
+            fresh_state = self._get_game_state()
+            pending = fresh_state.get("pending_decision")
+            if pending and pending != "Action Required":
+                logger.info(f"Stuck recovery: found pending decision '{pending}', re-planning")
+                self._notify("AUTOPILOT", f"Re-planning for: {pending}")
+                legal = self._get_legal_actions(fresh_state)
+                plan = self._planner.plan_actions(fresh_state, "decision_required", legal)
+                if plan.actions:
+                    for action in plan.actions:
+                        self._execute_action(action, fresh_state)
+                        time.sleep(self._config.action_delay)
+                    self._consecutive_failed_verifications = 0
+                    return
+        except Exception as e:
+            logger.error(f"Stuck recovery re-plan failed: {e}")
+
+        # 2. Try common dismissal keys
         logger.warning("Stuck recovery: sending Escape and Spacebar")
-        
-        # 1. Try common dismissal keys
         self._controller.focus_mtga_window()
         time.sleep(0.2)
         self._controller.press_key("escape", "Dismissing dialog")
         time.sleep(0.5)
         self._controller.press_key("space", "Confirming priority")
-        
-        # 2. Vision analysis of the stuck state
+
+        # 3. Vision analysis of the stuck state
         logger.info("Stuck recovery: Analyzing screen via vision")
         coord = self._get_vision_coord("Blocking UI Prompt")
         if coord:
             logger.info(f"Vision suggests stuck UI element at {coord}")
             abs_x, abs_y = coord.to_absolute(self._mapper.window_rect)
             self._controller.click(abs_x, abs_y, "Dismissing via vision")
-        
+
         self._consecutive_failed_verifications = 0
 
     # --- Action Execution Handlers ---
