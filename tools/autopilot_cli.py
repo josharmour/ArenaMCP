@@ -91,7 +91,15 @@ class HeadlessAutopilot:
         print(f" Backend: {self.args.backend} | Model: {self.args.model}")
         print(f" Mode: {'DRY RUN' if self.args.dry_run else 'LIVE'}")
         print("="*50 + "\n")
-        
+
+        # Show watcher status
+        from arenamcp import server as _srv
+        if _srv.watcher:
+            print(f"  Log: {_srv.watcher.log_path}")
+            print(f"  Turn: {_srv.game_state.turn_info.turn_number} | Players: {list(_srv.game_state.players.keys())}")
+        else:
+            print("  WARNING: No watcher created!")
+
         while self.running:
             try:
                 # 1. Poll Game State
