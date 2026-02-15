@@ -83,6 +83,7 @@ class HeadlessAutopilot:
         self.running = True
         self.last_state = {}
         self.last_action_time = time.time()
+        self.idle_threshold = getattr(args, 'idle_threshold', 8)
 
     def run(self):
         print("\n" + "="*50)
@@ -110,9 +111,15 @@ class HeadlessAutopilot:
                     time.sleep(2)
                     continue
 
+                # Determine priority before trigger processing
+                local_seat = 1
+                for p in gs.get("players", []):
+                    if p.get("is_local"): local_seat = p.get("seat_id")
+                is_my_priority = turn.get("priority_player") == local_seat
+
                 # 2. Check for Triggers
                 triggers = self.trigger_detector.check_triggers(self.last_state, gs)
-                
+
                 if triggers:
                     logger.info(f"Triggers detected: {triggers}")
                     # Prioritize critical triggers
@@ -124,24 +131,44 @@ class HeadlessAutopilot:
                             logger.info("Action taken, refreshing game state...")
                             self.mcp.poll_log()
                             gs = self.mcp.get_game_state()
-                        
+
                         self.last_action_time = time.time()
-                
-                # 3. Vision Watchdog
-                # If it's our turn and we've been idle for > 15 seconds, check if we missed a prompt
-                local_seat = 1
-                for p in gs.get("players", []):
-                    if p.get("is_local"): local_seat = p.get("seat_id")
-                
-                is_my_priority = turn.get("priority_player") == local_seat
-                
-                if is_my_priority and (time.time() - self.last_action_time > 15):
+
+                # 3. Proactive check: if we have priority and a pending decision,
+                # ensure autopilot acts even if triggers missed the transition
+                if not triggers and is_my_priority:
+                    pending = gs.get("pending_decision")
+                    if pending and pending != "Action Required":
+                        logger.info(f"Proactive: pending decision '{pending}' with our priority, no trigger fired")
+                        if self.engine.process_trigger(gs, "decision_required"):
+                            self.mcp.poll_log()
+                            gs = self.mcp.get_game_state()
+                        self.last_action_time = time.time()
+                    elif pending == "Action Required" or not pending:
+                        # We have priority but no specific decision - check if idle too long
+                        idle_time = time.time() - self.last_action_time
+                        if idle_time > self.idle_threshold:
+                            logger.info(f"Proactive: priority held for {idle_time:.1f}s, forcing trigger")
+                            if self.engine.process_trigger(gs, "priority_gained"):
+                                self.mcp.poll_log()
+                                gs = self.mcp.get_game_state()
+                            self.last_action_time = time.time()
+
+                # 4. Vision Watchdog
+                if is_my_priority and (time.time() - self.last_action_time > self.idle_threshold):
                     logger.info("Watchdog: Idle detected on player turn. Checking vision...")
                     self._vision_check(gs)
-                    self.last_action_time = time.time() # Reset timer
+                    self.last_action_time = time.time()
 
                 self.last_state = gs
-                time.sleep(1.5)
+
+                # Adaptive polling: faster when we have priority (game waiting for us)
+                if is_my_priority:
+                    time.sleep(0.5)
+                elif turn_num > 0:
+                    time.sleep(1.0)
+                else:
+                    time.sleep(2.0)
                 
             except KeyboardInterrupt:
                 logger.info("Stopping autopilot...")
@@ -169,9 +196,25 @@ class HeadlessAutopilot:
                 response = self.backend.complete_with_image(system_prompt, user_msg, buf.getvalue())
                 logger.info(f"Watchdog response: {response}")
                 if "CLEAR" not in response.upper():
-                    # If LLM suggests an action, we could potentially parse it and execute
-                    # For now, just log it.
-                    pass
+                    logger.warning(f"Vision watchdog: stuck detected - {response}")
+                    self.controller.focus_mtga_window()
+                    time.sleep(0.2)
+
+                    # Check for known button keywords in the LLM response
+                    response_lower = response.lower()
+                    if any(kw in response_lower for kw in ("done", "ok", "confirm", "submit", "accept")):
+                        self.engine._click_fixed("done")
+                    elif any(kw in response_lower for kw in ("cancel", "decline", "no")):
+                        self.controller.press_key("escape", "Vision: dismiss")
+                    elif "keep" in response_lower:
+                        self.engine._click_fixed("keep")
+                    elif "mulligan" in response_lower:
+                        self.engine._click_fixed("mulligan")
+                    else:
+                        # Fallback: try spacebar (pass/resolve) then escape
+                        self.controller.press_key("space", "Vision: spacebar fallback")
+                        time.sleep(0.5)
+                        self.controller.press_key("escape", "Vision: escape fallback")
         except Exception as e:
             logger.error(f"Vision watchdog failed: {e}")
 
@@ -180,6 +223,8 @@ if __name__ == "__main__":
     parser.add_argument("--backend", default="proxy")
     parser.add_argument("--model", default="claude-opus-4-6")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--idle-threshold", type=float, default=8,
+                        help="Seconds of idle priority before vision watchdog fires (default: 8)")
     args = parser.parse_args()
     
     app = HeadlessAutopilot(args)
