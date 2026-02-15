@@ -283,12 +283,6 @@ class StandaloneCoach:
         self._pending_win_plan_turns: int = 0            # N in "win-in-N"
         self._pending_win_plan_turn: int = 0             # Game turn when plan was generated
 
-        # Autopilot mode
-        self._autopilot_enabled = autopilot
-        self._autopilot: Optional[Any] = None  # AutopilotEngine, lazy-init
-        self._dry_run = dry_run
-        self._afk_enabled = afk
-
     def speak_advice(self, text: str, blocking: bool = True) -> None:
         """Speak advice using local Kokoro TTS."""
         if not text:
@@ -393,152 +387,6 @@ class StandaloneCoach:
         logger.info(f"Created {self.backend_name} backend with model: {actual_model}")
         self._coach = CoachEngine(backend=llm_backend)
         self._trigger = GameStateTrigger()
-
-    def _init_autopilot(self) -> None:
-        """Initialize autopilot components if enabled."""
-        if not self._autopilot_enabled:
-            return
-
-        from arenamcp.action_planner import ActionPlanner
-        from arenamcp.screen_mapper import ScreenMapper
-        from arenamcp.input_controller import InputController
-        from arenamcp.autopilot import AutopilotEngine, AutopilotConfig
-
-        logger.info(f"Initializing autopilot (dry_run={self._dry_run})...")
-
-        # Reuse the coach's LLM backend — it's already configured with the
-        # correct model and has fallback logic for deprecated models.
-        # The autopilot branch in the coaching loop means they won't run
-        # concurrently (autopilot replaces coach, not runs alongside it).
-        if self._coach and hasattr(self._coach, '_backend'):
-            planner_backend = self._coach._backend
-            logger.info(f"Autopilot reusing coach backend: {type(planner_backend).__name__}")
-        else:
-            # Fallback: create a new backend
-            progress_cb = self.ui.subtask if self.ui else None
-            from arenamcp.coach import create_backend
-            planner_backend = create_backend(
-                self.backend_name, model=self.model_name, progress_callback=progress_cb
-            )
-            logger.info(f"Autopilot created new backend: {type(planner_backend).__name__}")
-        planner = ActionPlanner(backend=planner_backend)
-
-        # Create screen mapper and input controller
-        mapper = ScreenMapper()
-        controller = InputController(dry_run=self._dry_run)
-
-        # Create config
-        config = AutopilotConfig(dry_run=self._dry_run, afk_mode=self._afk_enabled)
-
-        # Create engine
-        self._autopilot = AutopilotEngine(
-            planner=planner,
-            mapper=mapper,
-            controller=controller,
-            get_game_state=lambda: self._mcp.get_game_state() if self._mcp else {},
-            config=config,
-            speak_fn=self.speak_advice if hasattr(self, 'speak_advice') else None,
-            ui_advice_fn=self.ui.advice if self.ui else None,
-        )
-
-        self.ui.status("AUTOPILOT", "ON" if self._autopilot_enabled else "OFF")
-        self.ui.status("AFK", "ON" if self._afk_enabled else "OFF")
-        logger.info("Autopilot initialized")
-
-    def _toggle_autopilot(self) -> None:
-        """Toggle autopilot mode on/off."""
-        self._autopilot_enabled = not self._autopilot_enabled
-
-        if self._autopilot_enabled and self._autopilot is None:
-            self._init_autopilot()
-
-        if self._autopilot and not self._autopilot_enabled:
-            self._autopilot.on_abort()
-
-        status = "ON" if self._autopilot_enabled else "OFF"
-        self.ui.status("AUTOPILOT", status)
-        self.ui.log(f"\n[AUTOPILOT] {status}\n")
-        logger.info(f"Autopilot toggled: {status}")
-
-        # When toggling ON mid-turn, immediately trigger a planning cycle
-        # for the current game state. Without this, no triggers fire because
-        # the coaching loop already processed the current turn/phase.
-        if self._autopilot_enabled and self._autopilot and self._mcp:
-            def _immediate_trigger():
-                try:
-                    game_state = self._mcp.get_game_state()
-                    turn = game_state.get("turn", {})
-                    phase = turn.get("phase", "")
-                    # Determine appropriate trigger name from current phase
-                    if "Combat" in phase:
-                        step = turn.get("step", "")
-                        if "DeclareAttack" in step:
-                            trigger = "combat_attackers"
-                        elif "DeclareBlock" in step:
-                            trigger = "combat_blockers"
-                        else:
-                            trigger = "priority_gained"
-                    elif "Main" in phase:
-                        trigger = "new_turn"
-                    else:
-                        trigger = "priority_gained"
-                    logger.info(f"Autopilot immediate trigger: {trigger}")
-                    self._autopilot.process_trigger(game_state, trigger)
-                except Exception as e:
-                    logger.error(f"Autopilot immediate trigger failed: {e}")
-            threading.Thread(target=_immediate_trigger, daemon=True).start()
-
-    def _toggle_afk(self) -> None:
-        """Toggle AFK mode on/off (F9)."""
-        # AFK mode requires autopilot engine to be initialized
-        if self._autopilot is None:
-            # Auto-enable autopilot when toggling AFK
-            self._autopilot_enabled = True
-            self._init_autopilot()
-
-        if self._autopilot:
-            new_state = self._autopilot.toggle_afk()
-            self._afk_enabled = new_state
-            status = "ON" if new_state else "OFF"
-            self.ui.status("AFK", status)
-            self.ui.log(f"\n[AFK] {status}\n")
-            logger.info(f"AFK mode toggled: {status}")
-        else:
-            self.ui.log("\n[AFK] Failed: autopilot not available\n")
-
-    def _toggle_land_drop(self) -> None:
-        """Toggle land-drop-only mode on/off (Numpad 1)."""
-        # Land drop mode requires autopilot engine to be initialized
-        if self._autopilot is None:
-            self._autopilot_enabled = True
-            self._init_autopilot()
-
-        if self._autopilot:
-            new_state = self._autopilot.toggle_land_drop()
-            status = "ON" if new_state else "OFF"
-            self.ui.status("LAND_DROP", status)
-            self.ui.log(f"\n[LAND DROP] {status}\n")
-            logger.info(f"Land-drop mode toggled: {status}")
-
-            # Fire an immediate trigger so it plays a land right now
-            # (coaching loop may have already processed this turn's triggers)
-            if new_state and self._mcp:
-                def _immediate_land_drop():
-                    try:
-                        game_state = self._mcp.get_game_state()
-                        turn = game_state.get("turn", {})
-                        phase = turn.get("phase", "")
-                        if "Main" in phase:
-                            trigger = "priority_gained"
-                        else:
-                            trigger = "priority_gained"
-                        logger.info(f"Land drop immediate trigger: {trigger}")
-                        self._autopilot.process_trigger(game_state, trigger)
-                    except Exception as e:
-                        logger.error(f"Land drop immediate trigger failed: {e}")
-                threading.Thread(target=_immediate_land_drop, daemon=True).start()
-        else:
-            self.ui.log("\n[LAND DROP] Failed: autopilot not available\n")
 
     def _init_voice(self) -> None:
         """Initialize voice I/O components."""
@@ -978,35 +826,6 @@ class StandaloneCoach:
                         # DECISION PRIORITY: If there's a decision required, skip non-critical triggers
                         # in the same batch to ensure the decision is the primary focus.
                         if "decision_required" in triggers and trigger != "decision_required" and not is_critical:
-                            continue
-
-                        # AUTOPILOT BRANCH: If autopilot is enabled, route ALL
-                        # triggers directly to the autopilot engine. The autopilot
-                        # handles its own noise suppression (auto-pass, auto-resolve)
-                        # and needs to see triggers that the coaching noise filters
-                        # would normally drop (priority_gained, spell_resolved, etc.).
-                        if self._autopilot_enabled and self._autopilot:
-                            try:
-                                # Prioritize decision_required if it's in the list
-                                if trigger == "decision_required" or "decision_required" in triggers:
-                                    actual_trigger = "decision_required" if "decision_required" in triggers else trigger
-                                    logger.info(f"Autopilot prioritizing decision: {actual_trigger}")
-                                    self._autopilot.process_trigger(curr_state, actual_trigger)
-                                    last_advice_turn = turn_num
-                                    last_advice_phase = phase
-                                    # If we handled a decision, we might want to skip other
-                                    # triggers in this batch to avoid racing
-                                    if actual_trigger == "decision_required":
-                                        break 
-                                else:
-                                    logger.info(f"Autopilot processing: {trigger}")
-                                    self._autopilot.process_trigger(curr_state, trigger)
-                                    last_advice_turn = turn_num
-                                    last_advice_phase = phase
-                            except Exception as e:
-                                logger.error(f"Autopilot error: {e}")
-                                logger.debug(traceback.format_exc())
-                                self.ui.error(f"Autopilot error: {e}")
                             continue
 
                         should_advise = is_critical or is_new_turn or is_opponent_turn or is_step_by_step or is_frequent
