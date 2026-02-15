@@ -536,12 +536,18 @@ class AutopilotEngine:
         For mandatory choices (mulligan, scry), picks the "safe default":
         - Mulligan: keep hand
         - Scry: scry to bottom
+        - Declare Attackers/Blockers: skip (don't attack/block)
+        - Choose Play/Draw: choose play
+        - All other decisions: click Done/spacebar
         """
         pending = game_state.get("pending_decision")
+        decision_context = game_state.get("decision_context") or {}
+        dec_type = decision_context.get("type", "")
 
         # Mandatory decisions that need a specific click
         if pending:
             pending_lower = pending.lower() if isinstance(pending, str) else ""
+
             if "mulligan" in pending_lower:
                 logger.info("AFK: keeping hand (mulligan)")
                 if not self._config.dry_run:
@@ -555,6 +561,48 @@ class AutopilotEngine:
                     self._controller.focus_mtga_window()
                     time.sleep(0.15)
                 return self._click_fixed("scry_bottom").success
+
+            # New decision types from expanded GRE handling
+            if dec_type == "declare_attackers":
+                logger.info("AFK: skipping attackers (click Done)")
+                if not self._config.dry_run:
+                    self._controller.focus_mtga_window()
+                    time.sleep(0.15)
+                return self._click_fixed("done").success
+
+            if dec_type == "declare_blockers":
+                logger.info("AFK: skipping blockers (click Done)")
+                if not self._config.dry_run:
+                    self._controller.focus_mtga_window()
+                    time.sleep(0.15)
+                return self._click_fixed("done").success
+
+            if dec_type == "choose_starting_player":
+                logger.info("AFK: choosing to play")
+                if not self._config.dry_run:
+                    self._controller.focus_mtga_window()
+                    time.sleep(0.15)
+                # "Play" is typically the first option
+                return self._click_fixed("pass").success
+
+            if dec_type in (
+                "assign_damage", "order_combat_damage", "pay_costs",
+                "search", "distribution", "numeric_input",
+                "select_replacement", "casting_time_options",
+                "select_counters", "order_triggers",
+                "select_n_group", "select_from_groups",
+                "search_from_groups", "gather",
+            ):
+                logger.info(f"AFK: auto-accepting decision '{dec_type}' (click Done)")
+                if not self._config.dry_run:
+                    self._controller.focus_mtga_window()
+                    time.sleep(0.15)
+                result = self._click_fixed("done")
+                if result.success:
+                    return True
+                # Done didn't work, try spacebar
+                self._controller.press_key("space", f"AFK: {dec_type} spacebar")
+                return True
 
             # Unknown decision: try Done button, then spacebar
             if pending_lower and "mulligan" not in pending_lower and "scry" not in pending_lower:
@@ -650,6 +698,9 @@ class AutopilotEngine:
 
         # For everything else, auto-pass to keep the game moving
         pending = game_state.get("pending_decision")
+        decision_context = game_state.get("decision_context") or {}
+        dec_type = decision_context.get("type", "")
+
         if pending:
             pending_lower = pending.lower() if isinstance(pending, str) else ""
             if "mulligan" in pending_lower:
@@ -664,6 +715,39 @@ class AutopilotEngine:
                     self._controller.focus_mtga_window()
                     time.sleep(0.15)
                 return self._click_fixed("scry_bottom").success
+
+            # New decision types: auto-pass combat, auto-accept others
+            if dec_type in ("declare_attackers", "declare_blockers"):
+                logger.info(f"LAND DROP: skipping {dec_type} (click Done)")
+                if not self._config.dry_run:
+                    self._controller.focus_mtga_window()
+                    time.sleep(0.15)
+                return self._click_fixed("done").success
+
+            if dec_type == "choose_starting_player":
+                logger.info("LAND DROP: choosing to play")
+                if not self._config.dry_run:
+                    self._controller.focus_mtga_window()
+                    time.sleep(0.15)
+                return self._click_fixed("pass").success
+
+            if dec_type in (
+                "assign_damage", "order_combat_damage", "pay_costs",
+                "search", "distribution", "numeric_input",
+                "select_replacement", "casting_time_options",
+                "select_counters", "order_triggers",
+                "select_n_group", "select_from_groups",
+                "search_from_groups", "gather",
+            ):
+                logger.info(f"LAND DROP: auto-accepting decision '{dec_type}' (click Done)")
+                if not self._config.dry_run:
+                    self._controller.focus_mtga_window()
+                    time.sleep(0.15)
+                result = self._click_fixed("done")
+                if result.success:
+                    return True
+                self._controller.press_key("space", f"LAND DROP: {dec_type} spacebar")
+                return True
 
             # Unknown decision: try Done button, then spacebar
             if pending_lower and "mulligan" not in pending_lower and "scry" not in pending_lower:
@@ -812,6 +896,18 @@ class AutopilotEngine:
             ActionType.MULLIGAN_MULL: lambda: self._exec_mulligan(keep=False),
             ActionType.DRAFT_PICK: lambda: self._exec_draft_pick(action, game_state),
             ActionType.ORDER_BLOCKERS: lambda: self._exec_order_blockers(action, game_state),
+            # New decision types — most resolve via Done/pass after LLM selection
+            ActionType.ASSIGN_DAMAGE: lambda: self._exec_done_action("assign_damage"),
+            ActionType.ORDER_COMBAT_DAMAGE: lambda: self._exec_done_action("order_combat_damage"),
+            ActionType.PAY_COSTS: lambda: self._exec_done_action("pay_costs"),
+            ActionType.SEARCH_LIBRARY: lambda: self._exec_select_n(action, game_state),
+            ActionType.DISTRIBUTE: lambda: self._exec_done_action("distribute"),
+            ActionType.NUMERIC_INPUT: lambda: self._exec_done_action("numeric_input"),
+            ActionType.CHOOSE_STARTING_PLAYER: lambda: self._exec_choose_play_draw(action),
+            ActionType.SELECT_REPLACEMENT: lambda: self._exec_done_action("select_replacement"),
+            ActionType.SELECT_COUNTERS: lambda: self._exec_select_n(action, game_state),
+            ActionType.CASTING_OPTIONS: lambda: self._exec_modal_choice(action, game_state),
+            ActionType.ORDER_TRIGGERS: lambda: self._exec_done_action("order_triggers"),
         }
 
         handler = handlers.get(action.action_type)
@@ -1171,6 +1267,44 @@ class AutopilotEngine:
         # since MTGA defaults to a reasonable order.
         logger.info("Blocker ordering: using default order (click Done)")
         return self._click_fixed("done")
+
+    def _exec_done_action(self, decision_name: str) -> ClickResult:
+        """Generic handler for decisions that just need a Done click after MTGA auto-selects."""
+        logger.info(f"{decision_name}: accepting default / clicking Done")
+        result = self._click_fixed("done")
+        if not result.success:
+            # Fallback: try spacebar
+            self._controller.press_key("space", f"{decision_name}: spacebar fallback")
+            return ClickResult(True, 0, 0, decision_name, "spacebar fallback")
+        return result
+
+    def _exec_choose_play_draw(self, action: GameAction) -> ClickResult:
+        """Handle choose starting player (play or draw)."""
+        choice = action.play_or_draw.lower() if action.play_or_draw else "play"
+        logger.info(f"Choosing to {choice}")
+        # In MTGA, "Play" is the first option button, "Draw" is second
+        # Both typically resolve via the pass/done area or modal options
+        if choice == "draw":
+            # Try clicking the second option
+            coord = self._mapper.get_option_coord(1, 2, "modal")
+            if coord:
+                window_rect = self._mapper.window_rect
+                if not window_rect:
+                    window_rect = self._mapper.refresh_window()
+                if window_rect:
+                    abs_x, abs_y = coord.to_absolute(window_rect)
+                    return self._controller.click(abs_x, abs_y, "Choose: Draw", window_rect)
+        # Default: "Play" = first option
+        coord = self._mapper.get_option_coord(0, 2, "modal")
+        if coord:
+            window_rect = self._mapper.window_rect
+            if not window_rect:
+                window_rect = self._mapper.refresh_window()
+            if window_rect:
+                abs_x, abs_y = coord.to_absolute(window_rect)
+                return self._controller.click(abs_x, abs_y, "Choose: Play", window_rect)
+        # Last fallback
+        return self._click_fixed("pass")
 
     # --- State Verification ---
 

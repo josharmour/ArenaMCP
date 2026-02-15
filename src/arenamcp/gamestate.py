@@ -30,6 +30,29 @@ class ZoneType(Enum):
     UNKNOWN = "Unknown"
 
 
+class GameObjectKind(Enum):
+    """Game object types from GRE protobuf (GameObjectType enum)."""
+    NONE = "GameObjectType_None"
+    CARD = "GameObjectType_Card"
+    TOKEN = "GameObjectType_Token"
+    ABILITY = "GameObjectType_Ability"
+    EMBLEM = "GameObjectType_Emblem"
+    SPLIT_CARD = "GameObjectType_SplitCard"
+    SPLIT_LEFT = "GameObjectType_SplitLeft"
+    SPLIT_RIGHT = "GameObjectType_SplitRight"
+    REVEALED_CARD = "GameObjectType_RevealedCard"
+    TRIGGER_HOLDER = "GameObjectType_TriggerHolder"
+    ADVENTURE = "GameObjectType_Adventure"
+    MDFC_BACK = "GameObjectType_MDFCBack"
+    DISTURB_BACK = "GameObjectType_DisturbBack"
+    BOON = "GameObjectType_Boon"
+    PROTOTYPE_FACET = "GameObjectType_PrototypeFacet"
+    ROOM_LEFT = "GameObjectType_RoomLeft"
+    ROOM_RIGHT = "GameObjectType_RoomRight"
+    OMEN = "GameObjectType_Omen"
+    UNKNOWN = "Unknown"
+
+
 @dataclass
 class GameObject:
     """A game object (card, token, ability, etc.) in the game."""
@@ -45,16 +68,19 @@ class GameObject:
     toughness: Optional[int] = None
     is_tapped: bool = False
     # For abilities: instance_id of the source permanent
-    # For abilities: instance_id of the source permanent
     parent_instance_id: Optional[int] = None
     # For summoning sickness tracking
     turn_entered_battlefield: int = -1
     # Combat status
     is_attacking: bool = False
     is_blocking: bool = False
+    # GRE object kind (Card, Token, Ability, Emblem, MDFC, etc.)
+    object_kind: GameObjectKind = GameObjectKind.UNKNOWN
+    # Counters on this object: {"counter_type": count}
+    counters: dict[str, int] = field(default_factory=dict)
     def to_dict(self) -> dict:
         """Convert to simple dict for snapshot serialization."""
-        return {
+        result = {
             "instance_id": self.instance_id,
             "grp_id": self.grp_id,
             "zone_id": self.zone_id,
@@ -69,7 +95,11 @@ class GameObject:
             "turn_entered_battlefield": self.turn_entered_battlefield,
             "is_attacking": self.is_attacking,
             "is_blocking": self.is_blocking,
+            "object_kind": self.object_kind.name,
         }
+        if self.counters:
+            result["counters"] = self.counters
+        return result
 
 
 @dataclass
@@ -164,12 +194,21 @@ class GameState:
         self.decision_context: Optional[dict] = None  # Rich context: source_card, options, etc.
         self.decision_timestamp: float = 0  # Track when decision was set
         self.legal_actions: list[str] = [] # List of exact legal actions from GRE
-        
+
         # Match tracking (to avoid stale state across matches)
         self.match_id: Optional[str] = None
 
         # Deck list captured from ConnectResp
         self.deck_cards: list[int] = []
+
+        # --- Annotation-derived event tracking ---
+        # Recent game events from GRE annotations (ring buffer, max 50)
+        self.recent_events: list[dict] = []
+        self._max_recent_events: int = 50
+        # Cumulative damage tracking per player this game: {seat_id: total_damage_taken}
+        self.damage_taken: dict[int, int] = {}
+        # Cards revealed to us by opponent (from CardRevealed/InstanceRevealedToOpponent)
+        self.revealed_cards: dict[int, set[int]] = {}  # seat_id -> set of grp_ids
 
     def reset(self) -> None:
         """Reset the game state to essentially empty (for new match)."""
@@ -204,6 +243,9 @@ class GameState:
         self.decision_timestamp = 0
         self.legal_actions = []
         self.deck_cards = []
+        self.recent_events = []
+        self.damage_taken = {}
+        self.revealed_cards = {}
 
     # Backward compatibility for _seat_manually_set
     @property
@@ -382,6 +424,11 @@ class GameState:
             p_dict["is_local"] = (p.seat_id == self.local_seat_id)
             players_list.append(p_dict)
             
+        # Serialize revealed cards (sets -> lists for JSON)
+        revealed = {}
+        for seat_id, grp_ids in self.revealed_cards.items():
+            revealed[seat_id] = list(grp_ids)
+
         snapshot = {
             "match_id": self.match_id,
             "local_seat_id": self.local_seat_id,
@@ -401,6 +448,10 @@ class GameState:
             "decision_seat_id": self.decision_seat_id,
             "decision_context": self.decision_context,
             "legal_actions": self.legal_actions,
+            # Annotation-derived data
+            "recent_events": self.recent_events[-10:],  # Last 10 events for display
+            "damage_taken": self.damage_taken,
+            "revealed_cards": revealed,
         }
         return snapshot
 
@@ -524,6 +575,11 @@ class GameState:
         # Ensure lands_played is correct even when Arena omits player data
         self._infer_lands_played()
 
+        # Process annotations (damage, counters, zone transfers, reveals, etc.)
+        annotations = message.get("annotations", [])
+        if annotations:
+            self._process_annotations(annotations)
+
         # Clear untap step flag after processing all objects in this message
         self._in_untap_step = False
 
@@ -570,6 +626,8 @@ class GameState:
             turn_entered_battlefield = existing_obj.turn_entered_battlefield
             is_attacking = existing_obj.is_attacking
             is_blocking = existing_obj.is_blocking
+            object_kind = existing_obj.object_kind
+            counters = existing_obj.counters.copy()
         else:
             grp_id = 0
             zone_id = 0
@@ -585,6 +643,8 @@ class GameState:
             turn_entered_battlefield = -1
             is_attacking = False
             is_blocking = False
+            object_kind = GameObjectKind.UNKNOWN
+            counters = {}
 
         # 2. Overwrite with present data
         if "grpId" in obj_data: grp_id = obj_data["grpId"]
@@ -618,12 +678,29 @@ class GameState:
 
         if "cardTypes" in obj_data:
             card_types = list(obj_data["cardTypes"])
-            
+
         if "subtypes" in obj_data:
             subtypes = []
             for st in obj_data["subtypes"]:
                 clean_subtype = st.replace("SubType_", "") if isinstance(st, str) else str(st)
                 subtypes.append(clean_subtype)
+
+        # Parse GRE object kind (Card, Token, Ability, Emblem, MDFC, etc.)
+        if "type" in obj_data:
+            kind_str = obj_data["type"]
+            try:
+                object_kind = GameObjectKind(kind_str)
+            except ValueError:
+                object_kind = GameObjectKind.UNKNOWN
+                logger.debug(f"Unknown GameObjectType: {kind_str}")
+
+        # Parse counters on this object
+        if "counters" in obj_data:
+            counters = {}
+            for counter_data in obj_data["counters"]:
+                ctype = counter_data.get("type", counter_data.get("counterType", "unknown"))
+                ccount = counter_data.get("count", 1)
+                counters[ctype] = ccount
 
         game_object = GameObject(
             instance_id=instance_id,
@@ -641,6 +718,8 @@ class GameState:
             turn_entered_battlefield=turn_entered_battlefield,
             is_attacking=is_attacking,
             is_blocking=is_blocking,
+            object_kind=object_kind,
+            counters=counters,
         )
 
 
@@ -902,6 +981,244 @@ class GameState:
             if inferred_lands > 0:
                 player.lands_played = inferred_lands
                 logger.info(f"Inferred lands_played={inferred_lands} for seat {seat_id} (post-message)")
+
+    def _add_event(self, event: dict) -> None:
+        """Add a game event to the recent_events ring buffer.
+
+        Args:
+            event: Event dict with at minimum a 'type' key.
+        """
+        event["turn"] = self.turn_info.turn_number
+        event["phase"] = self.turn_info.phase
+        self.recent_events.append(event)
+        if len(self.recent_events) > self._max_recent_events:
+            self.recent_events.pop(0)
+
+    def _resolve_card_name(self, grp_id: int) -> str:
+        """Resolve a grp_id to a card name, with fallback."""
+        if not grp_id:
+            return "Unknown"
+        try:
+            from arenamcp import server
+            info = server.get_card_info(grp_id)
+            return info.get("name", f"Card#{grp_id}")
+        except Exception:
+            return f"Card#{grp_id}"
+
+    def _process_annotations(self, annotations: list[dict]) -> None:
+        """Process GRE annotations from a GameStateMessage.
+
+        Annotations carry the 'why' behind state changes: damage, counters,
+        zone transfers, reveals, resolution lifecycle, etc.
+
+        Args:
+            annotations: List of annotation dicts from GameStateMessage.
+        """
+        for ann in annotations:
+            ann_types = ann.get("type", [])
+            if isinstance(ann_types, str):
+                ann_types = [ann_types]
+            details = ann.get("details", [])
+            affected_ids = ann.get("affectedIds", [])
+            # Build a quick detail lookup
+            detail_map = {}
+            for d in details:
+                key = d.get("key", "")
+                if key:
+                    detail_map[key] = d.get("valueInt32", d.get("valueString", d.get("valueInt64", "")))
+
+            for ann_type in ann_types:
+                if ann_type == "AnnotationType_DamageDealt":
+                    # Track damage: who dealt how much to whom
+                    damage_amount = detail_map.get("damage", 0)
+                    source_id = detail_map.get("sourceId", 0)
+                    target_id = detail_map.get("targetId", affected_ids[0] if affected_ids else 0)
+                    # If target is a player seat, track cumulative damage
+                    for seat_id in self.players:
+                        if target_id == seat_id:
+                            self.damage_taken[seat_id] = self.damage_taken.get(seat_id, 0) + damage_amount
+                    # Resolve source card name for event log
+                    source_obj = self.game_objects.get(source_id)
+                    source_name = self._resolve_card_name(source_obj.grp_id) if source_obj else f"#{source_id}"
+                    self._add_event({
+                        "type": "damage_dealt",
+                        "source": source_name,
+                        "source_id": source_id,
+                        "amount": damage_amount,
+                        "target_id": target_id,
+                    })
+
+                elif ann_type == "AnnotationType_ZoneTransfer":
+                    # Card moved zones (died, bounced, exiled, etc.)
+                    zone_src = detail_map.get("zone_src", "")
+                    zone_dest = detail_map.get("zone_dest", "")
+                    category = detail_map.get("category", "")
+                    for obj_id in affected_ids:
+                        obj = self.game_objects.get(obj_id)
+                        if obj:
+                            self._add_event({
+                                "type": "zone_transfer",
+                                "card": self._resolve_card_name(obj.grp_id),
+                                "instance_id": obj_id,
+                                "from_zone": zone_src,
+                                "to_zone": zone_dest,
+                                "category": category,
+                            })
+
+                elif ann_type in ("AnnotationType_CounterAdded", "AnnotationType_CounterRemoved"):
+                    counter_type = detail_map.get("counterType", "unknown")
+                    counter_count = detail_map.get("counterCount", detail_map.get("count", 1))
+                    is_added = "Added" in ann_type
+                    for obj_id in affected_ids:
+                        obj = self.game_objects.get(obj_id)
+                        if obj:
+                            # Update counter state on the object
+                            current = obj.counters.get(counter_type, 0)
+                            if is_added:
+                                obj.counters[counter_type] = current + counter_count
+                            else:
+                                obj.counters[counter_type] = max(0, current - counter_count)
+                                if obj.counters[counter_type] == 0:
+                                    del obj.counters[counter_type]
+                            self._add_event({
+                                "type": "counter_added" if is_added else "counter_removed",
+                                "card": self._resolve_card_name(obj.grp_id),
+                                "instance_id": obj_id,
+                                "counter_type": counter_type,
+                                "amount": counter_count,
+                            })
+
+                elif ann_type == "AnnotationType_ControllerChanged":
+                    for obj_id in affected_ids:
+                        obj = self.game_objects.get(obj_id)
+                        new_controller = detail_map.get("controllerId", 0)
+                        if obj:
+                            self._add_event({
+                                "type": "controller_changed",
+                                "card": self._resolve_card_name(obj.grp_id),
+                                "instance_id": obj_id,
+                                "new_controller": new_controller,
+                            })
+
+                elif ann_type in ("AnnotationType_CardRevealed",
+                                  "AnnotationType_InstanceRevealedToOpponent",
+                                  "AnnotationType_RevealedCardCreated"):
+                    for obj_id in affected_ids:
+                        obj = self.game_objects.get(obj_id)
+                        if obj and obj.grp_id:
+                            owner = obj.owner_seat_id
+                            if owner not in self.revealed_cards:
+                                self.revealed_cards[owner] = set()
+                            self.revealed_cards[owner].add(obj.grp_id)
+                            self._add_event({
+                                "type": "card_revealed",
+                                "card": self._resolve_card_name(obj.grp_id),
+                                "instance_id": obj_id,
+                                "owner_seat": owner,
+                            })
+
+                elif ann_type == "AnnotationType_ResolutionStart":
+                    for obj_id in affected_ids:
+                        obj = self.game_objects.get(obj_id)
+                        if obj:
+                            self._add_event({
+                                "type": "resolution_start",
+                                "card": self._resolve_card_name(obj.grp_id),
+                                "instance_id": obj_id,
+                            })
+
+                elif ann_type == "AnnotationType_ResolutionComplete":
+                    for obj_id in affected_ids:
+                        obj = self.game_objects.get(obj_id)
+                        if obj:
+                            self._add_event({
+                                "type": "resolution_complete",
+                                "card": self._resolve_card_name(obj.grp_id),
+                                "instance_id": obj_id,
+                            })
+
+                elif ann_type in ("AnnotationType_TokenCreated", "AnnotationType_TokenDeleted"):
+                    is_created = "Created" in ann_type
+                    for obj_id in affected_ids:
+                        obj = self.game_objects.get(obj_id)
+                        if obj:
+                            self._add_event({
+                                "type": "token_created" if is_created else "token_deleted",
+                                "card": self._resolve_card_name(obj.grp_id),
+                                "instance_id": obj_id,
+                            })
+
+                elif ann_type == "AnnotationType_TriggeringObject":
+                    # Links a triggered ability to its source
+                    source_id = detail_map.get("sourceId", affected_ids[0] if affected_ids else 0)
+                    trigger_id = detail_map.get("triggerId", 0)
+                    source_obj = self.game_objects.get(source_id)
+                    if source_obj:
+                        self._add_event({
+                            "type": "trigger",
+                            "source": self._resolve_card_name(source_obj.grp_id),
+                            "source_id": source_id,
+                            "trigger_id": trigger_id,
+                        })
+
+                elif ann_type == "AnnotationType_ManaPaid":
+                    # Mana payment details
+                    self._add_event({
+                        "type": "mana_paid",
+                        "details": detail_map,
+                        "affected_ids": affected_ids,
+                    })
+
+                elif ann_type == "AnnotationType_UserActionTaken":
+                    # Player took an action (fixes "can't see what player chose" gap)
+                    self._add_event({
+                        "type": "user_action",
+                        "details": detail_map,
+                        "affected_ids": affected_ids,
+                    })
+
+                elif ann_type == "AnnotationType_Scry":
+                    self._add_event({
+                        "type": "scry",
+                        "affected_ids": affected_ids,
+                        "details": detail_map,
+                    })
+
+                elif ann_type in ("AnnotationType_LossOfGame", "AnnotationType_WinTheGame"):
+                    self._add_event({
+                        "type": "game_end",
+                        "result": "loss" if "Loss" in ann_type else "win",
+                        "affected_ids": affected_ids,
+                    })
+
+                elif ann_type == "AnnotationType_ModifiedLife":
+                    self._add_event({
+                        "type": "life_changed",
+                        "details": detail_map,
+                        "affected_ids": affected_ids,
+                    })
+
+                elif ann_type in ("AnnotationType_CoinFlip", "AnnotationType_ChoiceResult"):
+                    self._add_event({
+                        "type": "random_result",
+                        "sub_type": ann_type.replace("AnnotationType_", ""),
+                        "details": detail_map,
+                    })
+
+                elif ann_type == "AnnotationType_FaceDown":
+                    for obj_id in affected_ids:
+                        self._add_event({
+                            "type": "face_down",
+                            "instance_id": obj_id,
+                        })
+
+                elif ann_type in ("AnnotationType_CreateAttachment",
+                                  "AnnotationType_AttachmentCreated"):
+                    self._add_event({
+                        "type": "attachment",
+                        "affected_ids": affected_ids,
+                        "details": detail_map,
+                    })
 
     def _update_turn_info(self, turn_data: dict) -> None:
         """Update turn info from message data.
@@ -1285,11 +1602,256 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                     game_state.deck_cards = deck_cards
                     logger.info(f"Captured deck list from ConnectResp: {len(deck_cards)} cards")
 
+            # --- Combat Decision Messages ---
+
+            elif msg_type == "GREMessageType_DeclareAttackersReq":
+                import time
+                req = msg.get("declareAttackersReq", {})
+                legal_attackers = req.get("attackers", req.get("qualifiedAttackers", []))
+                attacker_names = []
+                for atk in legal_attackers:
+                    obj_id = atk if isinstance(atk, int) else atk.get("instanceId", atk.get("attackerInstanceId", 0))
+                    obj = game_state.game_objects.get(obj_id)
+                    if obj:
+                        attacker_names.append(game_state._resolve_card_name(obj.grp_id))
+                logger.info(f"Captured Decision: Declare Attackers ({len(attacker_names)} legal)")
+                game_state.pending_decision = "Declare Attackers"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "declare_attackers",
+                    "legal_attackers": attacker_names,
+                    "raw_attackers": legal_attackers,
+                }
+
+            elif msg_type == "GREMessageType_DeclareBlockersReq":
+                import time
+                req = msg.get("declareBlockersReq", {})
+                legal_blockers = req.get("blockers", req.get("qualifiedBlockers", []))
+                blocker_names = []
+                for blk in legal_blockers:
+                    obj_id = blk if isinstance(blk, int) else blk.get("instanceId", blk.get("blockerInstanceId", 0))
+                    obj = game_state.game_objects.get(obj_id)
+                    if obj:
+                        blocker_names.append(game_state._resolve_card_name(obj.grp_id))
+                logger.info(f"Captured Decision: Declare Blockers ({len(blocker_names)} legal)")
+                game_state.pending_decision = "Declare Blockers"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "declare_blockers",
+                    "legal_blockers": blocker_names,
+                    "raw_blockers": legal_blockers,
+                }
+
+            elif msg_type == "GREMessageType_AssignDamageReq":
+                import time
+                req = msg.get("assignDamageReq", {})
+                logger.info("Captured Decision: Assign Damage")
+                game_state.pending_decision = "Assign Damage"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "assign_damage",
+                    "raw": {k: v for k, v in req.items()},
+                }
+
+            elif msg_type == "GREMessageType_OrderCombatDamageReq":
+                import time
+                req = msg.get("orderCombatDamageReq", msg.get("orderDamageReq", {}))
+                logger.info("Captured Decision: Order Combat Damage")
+                game_state.pending_decision = "Order Combat Damage"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "order_combat_damage",
+                    "raw": {k: v for k, v in req.items()},
+                }
+
+            # --- Additional Decision Messages ---
+
+            elif msg_type == "GREMessageType_PayCostsReq":
+                import time
+                req = msg.get("payCostsReq", {})
+                source_id = req.get("sourceId", 0)
+                source_obj = game_state.game_objects.get(source_id)
+                source_name = game_state._resolve_card_name(source_obj.grp_id) if source_obj else "Unknown"
+                logger.info(f"Captured Decision: Pay Costs (source: {source_name})")
+                game_state.pending_decision = "Pay Costs"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "pay_costs",
+                    "source_card": source_name,
+                    "source_id": source_id,
+                    "raw": {k: v for k, v in req.items()},
+                }
+
+            elif msg_type == "GREMessageType_SearchReq":
+                import time
+                req = msg.get("searchReq", {})
+                zone_id = req.get("zoneId", 0)
+                logger.info(f"Captured Decision: Search (zone {zone_id})")
+                game_state.pending_decision = "Search Library"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "search",
+                    "zone_id": zone_id,
+                    "raw": {k: v for k, v in req.items()},
+                }
+
+            elif msg_type == "GREMessageType_DistributionReq":
+                import time
+                req = msg.get("distributionReq", {})
+                total = req.get("amount", req.get("total", 0))
+                source_id = req.get("sourceId", 0)
+                source_obj = game_state.game_objects.get(source_id)
+                source_name = game_state._resolve_card_name(source_obj.grp_id) if source_obj else "Unknown"
+                logger.info(f"Captured Decision: Distribute {total} (source: {source_name})")
+                game_state.pending_decision = "Distribute"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "distribution",
+                    "source_card": source_name,
+                    "source_id": source_id,
+                    "total": total,
+                    "raw": {k: v for k, v in req.items()},
+                }
+
+            elif msg_type == "GREMessageType_NumericInputReq":
+                import time
+                req = msg.get("numericInputReq", {})
+                source_id = req.get("sourceId", 0)
+                source_obj = game_state.game_objects.get(source_id)
+                source_name = game_state._resolve_card_name(source_obj.grp_id) if source_obj else "Unknown"
+                min_val = req.get("min", 0)
+                max_val = req.get("max", 0)
+                logger.info(f"Captured Decision: Numeric Input for {source_name} ({min_val}-{max_val})")
+                game_state.pending_decision = "Choose Number"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "numeric_input",
+                    "source_card": source_name,
+                    "source_id": source_id,
+                    "min": min_val,
+                    "max": max_val,
+                }
+
+            elif msg_type == "GREMessageType_ChooseStartingPlayerReq":
+                import time
+                logger.info("Captured Decision: Choose Starting Player (Play or Draw)")
+                game_state.pending_decision = "Choose Play/Draw"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "choose_starting_player",
+                }
+
+            elif msg_type == "GREMessageType_SelectReplacementReq":
+                import time
+                req = msg.get("selectReplacementReq", {})
+                logger.info("Captured Decision: Select Replacement Effect")
+                game_state.pending_decision = "Select Replacement"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "select_replacement",
+                    "raw": {k: v for k, v in req.items()},
+                }
+
+            elif msg_type == "GREMessageType_SelectNGroupReq":
+                import time
+                req = msg.get("selectNGroupReq", {})
+                logger.info("Captured Decision: Select N from Group")
+                game_state.pending_decision = "Select from Group"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "select_n_group",
+                    "raw": {k: v for k, v in req.items()},
+                }
+
+            elif msg_type == "GREMessageType_SelectFromGroupsReq":
+                import time
+                req = msg.get("selectFromGroupsReq", {})
+                logger.info("Captured Decision: Select from Groups")
+                game_state.pending_decision = "Select from Groups"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "select_from_groups",
+                    "raw": {k: v for k, v in req.items()},
+                }
+
+            elif msg_type == "GREMessageType_SearchFromGroupsReq":
+                import time
+                req = msg.get("searchFromGroupsReq", {})
+                logger.info("Captured Decision: Search from Groups")
+                game_state.pending_decision = "Search from Groups"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "search_from_groups",
+                    "raw": {k: v for k, v in req.items()},
+                }
+
+            elif msg_type == "GREMessageType_CastingTimeOptionsReq":
+                import time
+                req = msg.get("castingTimeOptionsReq", {})
+                logger.info("Captured Decision: Casting Time Options (alternative cost)")
+                game_state.pending_decision = "Choose Casting Option"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "casting_time_options",
+                    "raw": {k: v for k, v in req.items()},
+                }
+
+            elif msg_type == "GREMessageType_SelectCountersReq":
+                import time
+                req = msg.get("selectCountersReq", {})
+                logger.info("Captured Decision: Select Counters")
+                game_state.pending_decision = "Select Counters"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "select_counters",
+                    "raw": {k: v for k, v in req.items()},
+                }
+
+            elif msg_type == "GREMessageType_RevealHandReq":
+                # Opponent's hand is being revealed - track for strategy
+                req = msg.get("revealHandReq", {})
+                seat_ids = req.get("systemSeatIds", [])
+                logger.info(f"Hand reveal for seats: {seat_ids}")
+                # The actual revealed cards arrive via GameStateMessage + CardRevealed annotations
+
+            elif msg_type == "GREMessageType_OrderReq":
+                import time
+                req = msg.get("orderReq", {})
+                logger.info("Captured Decision: Order (triggered ability ordering)")
+                game_state.pending_decision = "Order Triggers"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "order_triggers",
+                    "raw": {k: v for k, v in req.items()},
+                }
+
+            elif msg_type == "GREMessageType_GatherReq":
+                import time
+                req = msg.get("gatherReq", {})
+                logger.info("Captured Decision: Gather")
+                game_state.pending_decision = "Gather"
+                game_state.decision_timestamp = time.time()
+                game_state.decision_context = {
+                    "type": "gather",
+                    "raw": {k: v for k, v in req.items()},
+                }
+
+            # --- Fallback for truly unknown Req types ---
+
             elif msg_type.endswith("Req") and msg_type not in (
                 "GREMessageType_MulliganReq", "GREMessageType_SubmitDeckReq",
                 "GREMessageType_IntermissionReq", "GREMessageType_PromptReq",
                 "GREMessageType_SelectTargetsReq", "GREMessageType_SelectNReq",
                 "GREMessageType_GroupOptionReq", "GREMessageType_ActionsAvailableReq",
+                "GREMessageType_DeclareAttackersReq", "GREMessageType_DeclareBlockersReq",
+                "GREMessageType_AssignDamageReq", "GREMessageType_OrderCombatDamageReq",
+                "GREMessageType_PayCostsReq", "GREMessageType_SearchReq",
+                "GREMessageType_DistributionReq", "GREMessageType_NumericInputReq",
+                "GREMessageType_ChooseStartingPlayerReq", "GREMessageType_SelectReplacementReq",
+                "GREMessageType_SelectNGroupReq", "GREMessageType_SelectFromGroupsReq",
+                "GREMessageType_SearchFromGroupsReq", "GREMessageType_CastingTimeOptionsReq",
+                "GREMessageType_SelectCountersReq", "GREMessageType_RevealHandReq",
+                "GREMessageType_OrderReq", "GREMessageType_GatherReq",
             ):
                 import time
                 logger.warning(f"Unknown GRE Req type: {msg_type} - treating as pending decision")
@@ -1306,10 +1868,15 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                 # Only clear on explicit decision submission responses
                 decision_response_types = [
                     "GREMessageType_SelectTargetsResp",
+                    "GREMessageType_SubmitTargetsResp",
                     "GREMessageType_SelectNResp",
                     "GREMessageType_GroupOptionResp",
                     "GREMessageType_SubmitDeckResp",  # Mulligan
                     "GREMessageType_PromptResp",
+                    "GREMessageType_SubmitAttackersResp",
+                    "GREMessageType_SubmitBlockersResp",
+                    "GREMessageType_AssignDamageConfirmation",
+                    "GREMessageType_OrderDamageConfirmation",
                 ]
                 
                 if game_state.pending_decision and msg_type in decision_response_types:

@@ -216,12 +216,32 @@ class GameStateDisplay(Static):
         self._last_state = game_state_snapshot
         self.refresh_display()
     
+    @staticmethod
+    def _format_permanent_name(card: dict) -> str:
+        """Format a permanent name with token/counter annotations."""
+        name = card.get("name", "?")
+        kind = card.get("object_kind", "")
+        prefix = ""
+        if kind == "TOKEN":
+            prefix = "*"  # Asterisk prefix for tokens
+        elif kind == "EMBLEM":
+            prefix = "E:"
+        suffix = ""
+        counters = card.get("counters", {})
+        if counters:
+            counter_parts = []
+            for ctype, count in counters.items():
+                clean = ctype.replace("CounterType_", "").replace("Counter_", "")
+                counter_parts.append(f"{count}{clean[:3]}")
+            suffix = f" [{','.join(counter_parts)}]"
+        return f"{prefix}{name}{suffix}"
+
     def refresh_display(self):
         """Render the current game state to markup."""
         if not self._last_state:
             self.update("[dim]Waiting for game state...[/]")
             return
-        
+
         try:
             lines = []
             turn_info = self._last_state.get("turn_info", {})
@@ -230,29 +250,31 @@ class GameStateDisplay(Static):
             battlefield = zones.get("battlefield", [])
             hand = zones.get("my_hand", [])
             pending_decision = self._last_state.get("pending_decision")
-            
+            decision_context = self._last_state.get("decision_context")
+            recent_events = self._last_state.get("recent_events", [])
+            damage_taken = self._last_state.get("damage_taken", {})
+
             # Turn and Phase
             turn_num = turn_info.get("turn_number", "?")
             phase = turn_info.get("phase", "").replace("Phase_", "")
             step = turn_info.get("step", "").replace("Step_", "")
             active_player = turn_info.get("active_player", 0)
             priority_player = turn_info.get("priority_player", 0)
-            
+
             # Identify local player
             local_player = next((p for p in players if p.get("is_local")), None)
             local_seat = local_player.get("seat_id") if local_player else None
-            
+
             # FIX: During DeclareBlock, defending player (non-active) has priority
-            # Arena logs may report active player has priority, but that's incorrect
             if step == "DeclareBlock" and active_player != local_seat:
-                priority_player = local_seat  # Defending player chooses blockers
-            
+                priority_player = local_seat
+
             # Header line
             active_label = f"[green]YOUR[/]" if active_player == local_seat else f"[yellow]OPP[/]"
             priority_label = f"[green]YOU[/]" if priority_player == local_seat else f"[yellow]OPP[/]"
             lines.append(f"[bold]T{turn_num}[/] {phase}{f':{step}' if step else ''} | Active:{active_label} Priority:{priority_label}")
-            
-            # Life totals
+
+            # Life totals with cumulative damage
             if players:
                 life_parts = []
                 for p in players:
@@ -260,32 +282,80 @@ class GameStateDisplay(Static):
                     life = p.get("life_total", 20)
                     is_you = p.get("is_local", False)
                     label = f"[bold green]YOU[/]" if is_you else f"[yellow]OPP[/]"
-                    life_parts.append(f"{label}:{life}")
+                    dmg = damage_taken.get(str(seat), damage_taken.get(seat, 0))
+                    dmg_str = f" (-{dmg})" if dmg else ""
+                    life_parts.append(f"{label}:{life}{dmg_str}")
                 lines.append(" | ".join(life_parts))
-            
-            # Pending decision
+
+            # Pending decision with context
             if pending_decision:
-                lines.append(f"[bold red]⚠ {pending_decision}[/]")
-            
-            # Battlefield (compact view) - count all permanents, not just creatures
+                decision_line = f"[bold red]⚠ {pending_decision}[/]"
+                if decision_context:
+                    dtype = decision_context.get("type", "")
+                    if dtype == "declare_attackers":
+                        attackers = decision_context.get("legal_attackers", [])
+                        if attackers:
+                            decision_line += f" [dim]({len(attackers)} legal: {', '.join(attackers[:4])}{'...' if len(attackers) > 4 else ''})[/]"
+                    elif dtype == "declare_blockers":
+                        blockers = decision_context.get("legal_blockers", [])
+                        if blockers:
+                            decision_line += f" [dim]({len(blockers)} legal: {', '.join(blockers[:4])}{'...' if len(blockers) > 4 else ''})[/]"
+                    elif dtype == "target_selection":
+                        src = decision_context.get("source_card")
+                        if src:
+                            decision_line += f" [dim](for {src})[/]"
+                    elif dtype == "distribution":
+                        src = decision_context.get("source_card")
+                        total = decision_context.get("total")
+                        if src:
+                            decision_line += f" [dim]({total} from {src})[/]"
+                    elif dtype == "numeric_input":
+                        src = decision_context.get("source_card")
+                        min_v = decision_context.get("min", 0)
+                        max_v = decision_context.get("max", 0)
+                        if src:
+                            decision_line += f" [dim]({src}: {min_v}-{max_v})[/]"
+                    elif dtype == "search":
+                        decision_line += " [dim](searching library)[/]"
+                    elif dtype == "pay_costs":
+                        src = decision_context.get("source_card")
+                        if src:
+                            decision_line += f" [dim](for {src})[/]"
+                    elif dtype == "choose_starting_player":
+                        decision_line += " [dim](play or draw?)[/]"
+                    elif dtype == "casting_time_options":
+                        decision_line += " [dim](alternative cost?)[/]"
+                lines.append(decision_line)
+
+            # Battlefield (compact view) with token distinction
             your_permanents = [c for c in battlefield if c.get("controller_seat_id") == local_seat]
             opp_permanents = [c for c in battlefield if c.get("controller_seat_id") != local_seat]
             your_creatures = [c for c in your_permanents if c.get("power") is not None]
             opp_creatures = [c for c in opp_permanents if c.get("power") is not None]
-            
+            your_tokens = [c for c in your_permanents if c.get("object_kind") == "TOKEN"]
+            opp_tokens = [c for c in opp_permanents if c.get("object_kind") == "TOKEN"]
+
             if your_permanents or opp_permanents:
-                lines.append(f"[bold]Board:[/] You:{len(your_permanents)} ({len(your_creatures)}⚔) Opp:{len(opp_permanents)} ({len(opp_creatures)}⚔)")
-                
-                # List your permanents
+                you_summary = f"{len(your_permanents)} ({len(your_creatures)}⚔"
+                if your_tokens:
+                    you_summary += f" {len(your_tokens)}T"
+                you_summary += ")"
+                opp_summary = f"{len(opp_permanents)} ({len(opp_creatures)}⚔"
+                if opp_tokens:
+                    opp_summary += f" {len(opp_tokens)}T"
+                opp_summary += ")"
+                lines.append(f"[bold]Board:[/] You:{you_summary} Opp:{opp_summary}")
+
+                # List your permanents with counter annotations
                 if your_permanents:
-                    your_names = [c.get("name", "?") for c in your_permanents]
+                    your_names = [self._format_permanent_name(c) for c in your_permanents]
                     lines.append(f"  [green]You:[/] {', '.join(your_names[:6])}" + ("..." if len(your_names) > 6 else ""))
-                
+
                 # List opponent permanents
                 if opp_permanents:
-                    opp_names = [c.get("name", "?") for c in opp_permanents]
+                    opp_names = [self._format_permanent_name(c) for c in opp_permanents]
                     lines.append(f"  [yellow]Opp:[/] {', '.join(opp_names[:6])}" + ("..." if len(opp_names) > 6 else ""))
-                
+
                 # Show attacking creatures prominently
                 attackers = [c for c in battlefield if c.get("is_attacking")]
                 blockers = [c for c in battlefield if c.get("is_blocking")]
@@ -297,14 +367,14 @@ class GameStateDisplay(Static):
                     lines.append(f"[bold blue]🛡 Blocking:[/] {', '.join(blk_names[:3])}" + ("..." if len(blk_names) > 3 else ""))
             else:
                 lines.append("[dim]Board: Empty[/]")
-            
+
             # Hand - show more cards (up to 7 visible)
             if hand:
                 hand_names = [c.get("name", "?") for c in hand]
                 lines.append(f"[bold]Hand ({len(hand)}):[/] {', '.join(hand_names[:7])}" + ("..." if len(hand) > 7 else ""))
             else:
                 lines.append("[dim]Hand: Empty[/]")
-            
+
             # Graveyard, Exile, Library counts
             graveyard = zones.get("graveyard", [])
             exile = zones.get("exile", [])
@@ -313,9 +383,36 @@ class GameStateDisplay(Static):
             your_exile = len([c for c in exile if c.get("owner_seat_id") == local_seat])
             opp_exile = len([c for c in exile if c.get("owner_seat_id") != local_seat])
             library_count = zones.get("library_count", "?")
-            
+
             lines.append(f"[dim]GY: You={your_gy} Opp={opp_gy} | Exile: You={your_exile} Opp={opp_exile} | Lib: {library_count}[/]")
-            
+
+            # Recent events ticker (last 3 notable events)
+            notable_events = [e for e in recent_events if e.get("type") in
+                              ("damage_dealt", "zone_transfer", "counter_added", "counter_removed",
+                               "token_created", "controller_changed", "card_revealed", "game_end")]
+            if notable_events:
+                event_strs = []
+                for evt in notable_events[-3:]:
+                    etype = evt.get("type")
+                    if etype == "damage_dealt":
+                        event_strs.append(f"{evt.get('source','?')} deals {evt.get('amount',0)} dmg")
+                    elif etype == "zone_transfer":
+                        event_strs.append(f"{evt.get('card','?')} moved")
+                    elif etype == "counter_added":
+                        event_strs.append(f"+{evt.get('amount',1)} {evt.get('counter_type','').replace('CounterType_','')[:6]} on {evt.get('card','?')}")
+                    elif etype == "counter_removed":
+                        event_strs.append(f"-{evt.get('amount',1)} {evt.get('counter_type','').replace('CounterType_','')[:6]} on {evt.get('card','?')}")
+                    elif etype == "token_created":
+                        event_strs.append(f"Token: {evt.get('card','?')}")
+                    elif etype == "controller_changed":
+                        event_strs.append(f"{evt.get('card','?')} stolen")
+                    elif etype == "card_revealed":
+                        event_strs.append(f"Revealed: {evt.get('card','?')}")
+                    elif etype == "game_end":
+                        event_strs.append(f"Game {evt.get('result','over')}")
+                if event_strs:
+                    lines.append(f"[dim italic]{'  |  '.join(event_strs)}[/]")
+
             self.update("\n".join(lines))
         except Exception as e:
             self.update(f"[red]State Error: {e}[/]")
