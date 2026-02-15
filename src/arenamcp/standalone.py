@@ -760,7 +760,7 @@ class StandaloneCoach:
 
                             # Spawn background win plan worker (non-blocking)
                             # Skip when autopilot is active — it handles its own strategy
-                            if is_my_turn and turn_num > self._win_plan_turn and not self._autopilot_enabled:
+                            if is_my_turn and turn_num > self._win_plan_turn:
                                 self._win_plan_turn = turn_num
                                 threading.Thread(
                                     target=self._win_plan_worker,
@@ -1630,11 +1630,6 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
         Parses VIABLE: YES/NO from the LLM response. Only stores viable plans
         and plays a sound alert. The plan is read aloud only on numpad-0 press.
         """
-        # Bail immediately if autopilot was enabled after this thread was spawned
-        if self._autopilot_enabled:
-            logger.info("Win plan worker: skipping (autopilot active)")
-            return
-
         import concurrent.futures
 
         try:
@@ -1703,11 +1698,6 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
                     pass
                 if current_turn and current_turn - turn_num > 2:
                     logger.info(f"Win plan stale (started turn {turn_num}, now {current_turn})")
-                    break
-
-                # Suppress if autopilot was enabled while this was running
-                if self._autopilot_enabled:
-                    logger.info("Win plan ready but autopilot active — suppressing")
                     break
 
                 logger.info(f"VIABLE win-in-{n} plan found ({len(plan)} chars)")
@@ -1887,14 +1877,9 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             keyboard.on_press_key("f6", lambda _: self._on_voice_cycle_hotkey(), suppress=False)
             keyboard.on_press_key("f7", lambda _: self._on_bug_report_hotkey(), suppress=False)
             keyboard.on_press_key("f8", lambda _: self._on_swap_seat_hotkey(), suppress=False)
-            keyboard.on_press_key("f9", lambda _: self._toggle_afk(), suppress=False)
-            keyboard.on_press_key("f1", lambda _: self._autopilot and self._autopilot.on_spacebar(), suppress=False)
-            keyboard.on_press_key("f4", lambda _: self._autopilot and self._autopilot.on_escape(), suppress=False)
             keyboard.on_press_key("f10", lambda _: self.run_speed_test(), suppress=False)
-            keyboard.on_press_key("f11", lambda _: self._toggle_autopilot(), suppress=False)
             keyboard.on_press_key("f12", lambda _: self._on_model_cycle_hotkey(), suppress=False)
             keyboard.on_press_key("num 0", lambda _: self._on_read_win_plan(), suppress=False)
-            keyboard.on_press_key("num 1", lambda _: self._toggle_land_drop(), suppress=False)
             logger.info("Hotkeys registered")
         except Exception as e:
             logger.warning(f"Hotkey registration failed: {e}")
