@@ -406,6 +406,81 @@ class RulesEngine:
         return actions
 
     @staticmethod
+    def _get_decision_actions(game_state: Dict[str, Any]) -> List[str]:
+        """Compute legal actions for pending GRE decision types."""
+        decision_context = game_state.get("decision_context") or {}
+        dec_type = decision_context.get("type", "")
+        if not dec_type:
+            return []
+
+        players = game_state.get("players", [])
+        local_player = next((p for p in players if p.get("is_local")), None)
+        local_seat = local_player.get("seat_id") if local_player else None
+        battlefield = game_state.get("battlefield", [])
+
+        if dec_type == "declare_attackers":
+            legal = decision_context.get("legal_attackers", [])
+            actions = []
+            if legal:
+                for name in RulesEngine._disambiguate_names(legal):
+                    actions.append(f"Attack with: {name}")
+            actions.append("Done (confirm attackers)")
+            return actions
+
+        if dec_type == "declare_blockers":
+            legal = decision_context.get("legal_blockers", [])
+            actions = []
+            if legal:
+                for name in RulesEngine._disambiguate_names(legal):
+                    actions.append(f"Block with: {name}")
+            actions.append("Done (confirm blockers)")
+            return actions
+
+        if dec_type == "assign_damage":
+            return ["Assign damage (order targets by priority)", "Done"]
+
+        if dec_type == "order_combat_damage":
+            return ["Order damage targets by priority", "Done"]
+
+        if dec_type == "pay_costs":
+            source = decision_context.get("source_card", "spell")
+            return [f"Pay costs for {source}", "Auto-pay"]
+
+        if dec_type == "search":
+            return ["Search library (pick best card)", "Cancel search"]
+
+        if dec_type == "distribution":
+            source = decision_context.get("source_card", "effect")
+            total = decision_context.get("total", "?")
+            return [f"Distribute {total} from {source}", "Done"]
+
+        if dec_type == "numeric_input":
+            source = decision_context.get("source_card", "effect")
+            min_v = decision_context.get("min", 0)
+            max_v = decision_context.get("max", "?")
+            return [f"Choose number ({min_v}-{max_v}) for {source}"]
+
+        if dec_type == "choose_starting_player":
+            return ["Choose: Play", "Choose: Draw"]
+
+        if dec_type == "select_replacement":
+            return ["Select replacement effect order", "Done"]
+
+        if dec_type == "casting_time_options":
+            return ["Cast normally", "Use alternative cost (Foretell/Flashback/Escape)"]
+
+        if dec_type == "select_counters":
+            return ["Select counters", "Done"]
+
+        if dec_type == "order_triggers":
+            return ["Order triggered abilities", "Done"]
+
+        if dec_type in ("select_n_group", "select_from_groups", "search_from_groups", "gather"):
+            return ["Select from options", "Done"]
+
+        return []
+
+    @staticmethod
     def get_legal_actions(game_state: Dict[str, Any]) -> List[str]:
         # PREFERENCE: Use ground-truth legal actions from GRE if available
         if game_state.get("legal_actions"):
@@ -414,6 +489,11 @@ class RulesEngine:
         target_actions = RulesEngine._get_target_selection_actions(game_state)
         if target_actions:
             return target_actions
+
+        # Check for new decision types from expanded GRE handling
+        decision_actions = RulesEngine._get_decision_actions(game_state)
+        if decision_actions:
+            return decision_actions
 
         actions = []
 

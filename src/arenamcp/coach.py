@@ -1420,6 +1420,7 @@ class CoachEngine:
                         valid_moves_str += f"... (+{len(valid_moves) - 8})"
             except Exception as e:
                 logger.error(f"RulesEngine error: {e}")
+                valid_moves = []
                 valid_moves_str = "Error"
 
         lines = []
@@ -1573,6 +1574,82 @@ class CoachEngine:
                     lines.append(f"!!! DECISION: CHOOSE MODE ({num_opts} options) !!!")
                     lines.append("Evaluate: which mode solves current problem best")
 
+                elif dec_type == "declare_attackers":
+                    legal = decision_context.get("legal_attackers", [])
+                    lines.append(f"!!! DECISION: DECLARE ATTACKERS ({len(legal)} legal) !!!")
+                    if legal:
+                        lines.append(f"Can attack: {', '.join(legal[:8])}")
+                    lines.append("Choose: maximize damage while keeping safe blockers back")
+
+                elif dec_type == "declare_blockers":
+                    legal = decision_context.get("legal_blockers", [])
+                    lines.append(f"!!! DECISION: DECLARE BLOCKERS ({len(legal)} legal) !!!")
+                    if legal:
+                        lines.append(f"Can block: {', '.join(legal[:8])}")
+                    lines.append("Choose: trade up, double-block threats, protect life total")
+
+                elif dec_type == "assign_damage":
+                    lines.append("!!! DECISION: ASSIGN COMBAT DAMAGE !!!")
+                    lines.append("Order: kill most important blocker/attacker first")
+
+                elif dec_type == "order_combat_damage":
+                    lines.append("!!! DECISION: ORDER COMBAT DAMAGE !!!")
+                    lines.append("Order: prioritize killing the biggest threat")
+
+                elif dec_type == "pay_costs":
+                    source = decision_context.get("source_card", "spell")
+                    lines.append(f"!!! DECISION: PAY COSTS for {source} !!!")
+                    lines.append("Choose: tap lands that leave best mana open for responses")
+
+                elif dec_type == "search":
+                    lines.append("!!! DECISION: SEARCH LIBRARY !!!")
+                    lines.append("Choose: what you need most — land, removal, threat, or answer")
+
+                elif dec_type == "distribution":
+                    source = decision_context.get("source_card", "effect")
+                    total = decision_context.get("total", "?")
+                    lines.append(f"!!! DECISION: DISTRIBUTE {total} from {source} !!!")
+                    lines.append("Distribute: maximize kills, finish off wounded targets first")
+
+                elif dec_type == "numeric_input":
+                    source = decision_context.get("source_card", "effect")
+                    min_v = decision_context.get("min", 0)
+                    max_v = decision_context.get("max", "?")
+                    lines.append(f"!!! DECISION: CHOOSE NUMBER for {source} ({min_v}-{max_v}) !!!")
+                    lines.append("Choose: balance value vs. cost (life, mana, etc.)")
+
+                elif dec_type == "choose_starting_player":
+                    lines.append("!!! DECISION: PLAY OR DRAW !!!")
+                    lines.append("Aggro decks: PLAY (tempo). Control/limited: DRAW (card advantage)")
+
+                elif dec_type == "select_replacement":
+                    lines.append("!!! DECISION: ORDER REPLACEMENT EFFECTS !!!")
+                    lines.append("Choose: apply the replacement that gives most advantage first")
+
+                elif dec_type == "casting_time_options":
+                    lines.append("!!! DECISION: CHOOSE CASTING OPTION !!!")
+                    lines.append("Evaluate: alternative cost vs normal cost (Foretell, Flashback, Escape)")
+
+                elif dec_type == "select_counters":
+                    lines.append("!!! DECISION: SELECT COUNTERS !!!")
+                    lines.append("Choose: remove least valuable counters, keep most impactful")
+
+                elif dec_type == "order_triggers":
+                    lines.append("!!! DECISION: ORDER TRIGGERED ABILITIES !!!")
+                    lines.append("Order: resolve most impactful trigger last (it resolves first)")
+
+                elif dec_type == "select_n_group":
+                    lines.append("!!! DECISION: SELECT FROM GROUP !!!")
+
+                elif dec_type == "select_from_groups":
+                    lines.append("!!! DECISION: SELECT FROM GROUPS !!!")
+
+                elif dec_type == "search_from_groups":
+                    lines.append("!!! DECISION: SEARCH FROM GROUPS !!!")
+
+                elif dec_type == "gather":
+                    lines.append("!!! DECISION: GATHER !!!")
+
                 else:
                     # Fallback for other decision types
                     lines.append(f"!!! DECISION: {pending_decision} !!!")
@@ -1650,10 +1727,15 @@ class CoachEngine:
             else:
                 lines.append("Timing: INSTANTS ONLY")
 
-        # OPTIMIZATION: Compact life totals - single line
+        # OPTIMIZATION: Compact life totals - single line with damage tracking
         your_life = local_player.get("life_total", "?") if local_player else "?"
         opp_life = opponent_player.get("life_total", "?") if opponent_player else "?"
-        lines.append(f"Life: You={your_life} Opp={opp_life}")
+        damage_taken = game_state.get("damage_taken", {})
+        your_dmg = damage_taken.get(str(local_seat), damage_taken.get(local_seat, 0))
+        opp_dmg = damage_taken.get(str(opp_seat), damage_taken.get(opp_seat, 0)) if opp_seat else 0
+        your_dmg_str = f" (taken {your_dmg})" if your_dmg else ""
+        opp_dmg_str = f" (taken {opp_dmg})" if opp_dmg else ""
+        lines.append(f"Life: You={your_life}{your_dmg_str} Opp={opp_life}{opp_dmg_str}")
 
         # Battlefield - grouped by owner
         battlefield = game_state.get("battlefield", [])
@@ -1826,8 +1908,21 @@ class CoachEngine:
                     if card.get("is_blocking"):
                         flags.append("BLK")
 
+                    # Token and counter annotations
+                    obj_kind = card.get("object_kind", "")
+                    if obj_kind == "TOKEN":
+                        display_name = f"*{display_name}"
+                    counters = card.get("counters", {})
+                    counter_str = ""
+                    if counters:
+                        cparts = []
+                        for ctype, ccount in counters.items():
+                            clean = ctype.replace("CounterType_", "")[:4]
+                            cparts.append(f"{ccount}{clean}")
+                        counter_str = f" ({','.join(cparts)})"
+
                     flag_str = f" [{','.join(flags)}]" if flags else ""
-                    lines.append(f"  {display_name}{pt}{flag_str}")
+                    lines.append(f"  {display_name}{pt}{counter_str}{flag_str}")
 
             else:
                 lines.append("  (empty)")
@@ -1927,8 +2022,21 @@ class CoachEngine:
                     if card.get("is_blocking"):
                         flags.append("BLK")
 
+                    # Token and counter annotations (opponent)
+                    obj_kind = card.get("object_kind", "")
+                    if obj_kind == "TOKEN":
+                        display_name = f"*{display_name}"
+                    counters = card.get("counters", {})
+                    counter_str = ""
+                    if counters:
+                        cparts = []
+                        for ctype, ccount in counters.items():
+                            clean = ctype.replace("CounterType_", "")[:4]
+                            cparts.append(f"{ccount}{clean}")
+                        counter_str = f" ({','.join(cparts)})"
+
                     flag_str = f" [{','.join(flags)}]" if flags else ""
-                    lines.append(f"  {display_name}{pt}{flag_str}")
+                    lines.append(f"  {display_name}{pt}{counter_str}{flag_str}")
             else:
                 lines.append("  (empty)")
 
@@ -2058,6 +2166,37 @@ class CoachEngine:
         else:
             lines.append("")
             lines.append("BOARD: Empty")
+
+        # Recent events (damage, zone transfers, reveals, etc.)
+        recent_events = game_state.get("recent_events", [])
+        if recent_events:
+            event_strs = []
+            for evt in recent_events[-5:]:
+                etype = evt.get("type", "")
+                if etype == "damage_dealt":
+                    event_strs.append(f"{evt.get('source','?')} dealt {evt.get('amount',0)} to {evt.get('target','?')}")
+                elif etype == "zone_transfer":
+                    event_strs.append(f"{evt.get('card','?')} moved zones")
+                elif etype == "counter_added":
+                    event_strs.append(f"+{evt.get('amount',1)} counter on {evt.get('card','?')}")
+                elif etype == "counter_removed":
+                    event_strs.append(f"-{evt.get('amount',1)} counter from {evt.get('card','?')}")
+                elif etype == "token_created":
+                    event_strs.append(f"Token: {evt.get('card','?')}")
+                elif etype == "card_revealed":
+                    event_strs.append(f"Revealed: {evt.get('card','?')}")
+                elif etype == "controller_changed":
+                    event_strs.append(f"{evt.get('card','?')} changed controller")
+            if event_strs:
+                lines.append(f"Recent: {'; '.join(event_strs)}")
+
+        # Revealed cards from opponent
+        revealed = game_state.get("revealed_cards", {})
+        if revealed and opp_seat is not None:
+            opp_revealed = revealed.get(str(opp_seat), revealed.get(opp_seat, []))
+            if opp_revealed:
+                # opp_revealed is a list of grp_ids; try to resolve names from battlefield/graveyard
+                lines.append(f"Opp revealed {len(opp_revealed)} card(s) this game")
 
         # OPTIMIZATION: Compact hand display
         hand = game_state.get("hand", [])

@@ -32,6 +32,18 @@ class ActionType(Enum):
     CLICK_BUTTON = "click_button"
     ACTIVATE_ABILITY = "activate_ability"
     ORDER_BLOCKERS = "order_blockers"
+    # New decision types from GRE protocol
+    ASSIGN_DAMAGE = "assign_damage"
+    ORDER_COMBAT_DAMAGE = "order_combat_damage"
+    PAY_COSTS = "pay_costs"
+    SEARCH_LIBRARY = "search_library"
+    DISTRIBUTE = "distribute"
+    NUMERIC_INPUT = "numeric_input"
+    CHOOSE_STARTING_PLAYER = "choose_starting_player"
+    SELECT_REPLACEMENT = "select_replacement"
+    SELECT_COUNTERS = "select_counters"
+    CASTING_OPTIONS = "casting_options"
+    ORDER_TRIGGERS = "order_triggers"
 
 
 @dataclass
@@ -45,6 +57,9 @@ class GameAction:
     modal_index: int = 0
     select_card_names: list[str] = field(default_factory=list)
     scry_position: str = ""  # "top" or "bottom"
+    numeric_value: int = 0  # For numeric_input (X spells, pay life)
+    distribution: dict[str, int] = field(default_factory=dict)  # target_name -> amount
+    play_or_draw: str = ""  # "play" or "draw"
     reasoning: str = ""
     confidence: float = 1.0
 
@@ -82,7 +97,7 @@ class ActionPlan:
 # JSON schema embedded in the system prompt for constrained output
 ACTION_SCHEMA = """{
   "actions": [{
-    "action_type": "play_land|cast_spell|declare_attackers|declare_blockers|select_target|select_n|modal_choice|mulligan_keep|mulligan_mull|pass_priority|resolve|draft_pick|click_button|activate_ability|order_blockers",
+    "action_type": "play_land|cast_spell|declare_attackers|declare_blockers|select_target|select_n|modal_choice|mulligan_keep|mulligan_mull|pass_priority|resolve|draft_pick|click_button|activate_ability|order_blockers|assign_damage|order_combat_damage|pay_costs|search_library|distribute|numeric_input|choose_starting_player|select_replacement|select_counters|casting_options|order_triggers",
     "card_name": "string (card name, empty if not applicable)",
     "target_names": ["string (target card/player names)"],
     "attacker_names": ["string (creature names to attack with)"],
@@ -90,6 +105,9 @@ ACTION_SCHEMA = """{
     "modal_index": 0,
     "select_card_names": ["string (cards to select for scry/discard/etc)"],
     "scry_position": "top|bottom (only for scry decisions)",
+    "numeric_value": 0,
+    "distribution": {"target_name": 0},
+    "play_or_draw": "play|draw",
     "reasoning": "string (brief explanation)"
   }],
   "overall_strategy": "string (1-sentence strategy summary)"
@@ -101,13 +119,22 @@ output a JSON action plan that the autopilot will execute by clicking in the MTG
 
 CRITICAL RULES:
 - ONLY suggest actions that appear in the "Legal:" line. Never hallucinate actions.
-- ONE ACTION PER PLAN: You must suggest only ONE card to play or ONE button to click per JSON response. 
+- ONE ACTION PER PLAN: You must suggest only ONE card to play or ONE button to click per JSON response.
 - EXCEPTION: For "declare_attackers" or "declare_blockers", you MUST list all creatures to attack/block with, AND THEN add a final action to click "1 attacker", "2 attackers", or "done" to confirm.
   - Example: [{"action_type": "declare_attackers", "attacker_names": ["Elf", "Bear"]}, {"action_type": "click_button", "card_name": "done"}]
 - DO NOT sequence plays (e.g. do not suggest "play land" AND "cast spell"). Suggest the land, wait for the next trigger, then suggest the spell.
 - Creatures tagged [SS] have SUMMONING SICKNESS — they CANNOT attack.
+- Tokens are prefixed with * (e.g. "*Soldier"). Counters shown as [3P1P] = 3 +1/+1 counters.
 - Output ONLY valid JSON matching the schema below. No markdown, no commentary outside JSON.
 - Be decisive. Pick the best line of play.
+
+DECISION-SPECIFIC RULES:
+- choose_starting_player: Set play_or_draw to "play" (aggro) or "draw" (control).
+- numeric_input: Set numeric_value (e.g. X for X spells). Check min/max in context.
+- distribute: Set distribution dict mapping target names to amounts. Total must match.
+- assign_damage: Order targets by priority (kill most important first).
+- search_library: Use select_card_names for what to find. Consider mana curve and game plan.
+- select_counters: Use select_card_names for which counters to select.
 
 JSON SCHEMA:
 """ + ACTION_SCHEMA
@@ -201,6 +228,18 @@ class ActionPlanner:
             "decision_required": "A game decision is pending. Make your choice.",
             "mulligan": "Mulligan decision. Keep or mulligan?",
             "land_played": "Land played. What's the next play?",
+            # New triggers for expanded decision types
+            "assign_damage": "Assign combat damage to blockers/attackers. Order by priority.",
+            "order_combat_damage": "Order combat damage assignment. Prioritize lethal.",
+            "pay_costs": "Pay costs for a spell or ability. Choose mana sources wisely.",
+            "search_library": "Search your library. Pick the best card for the situation.",
+            "distribute": "Distribute damage/counters among targets.",
+            "numeric_input": "Choose a number (X spell, pay life, etc.).",
+            "choose_starting_player": "Won the die roll. Choose to play or draw.",
+            "select_replacement": "Multiple replacement effects. Choose which applies first.",
+            "select_counters": "Select counters to add or remove.",
+            "casting_options": "Choose alternative casting cost (Foretell, Flashback, etc.).",
+            "order_triggers": "Order triggered abilities on the stack.",
         }
         trigger_desc = trigger_descriptions.get(trigger, f"Trigger: {trigger}")
 
@@ -233,13 +272,15 @@ class ActionPlanner:
             f"Active: Seat {turn.get('active_player', '?')}"
         )
 
-        # Players
+        # Players with damage tracking
+        damage_taken = game_state.get("damage_taken", {})
         for p in game_state.get("players", []):
             marker = "(YOU)" if p.get("is_local") else "(OPP)"
-            parts.append(
-                f"Seat {p.get('seat_id', '?')} {marker}: "
-                f"Life={p.get('life', '?')}"
-            )
+            seat = p.get("seat_id", "?")
+            life = p.get("life", p.get("life_total", "?"))
+            dmg = damage_taken.get(str(seat), damage_taken.get(seat, 0))
+            dmg_str = f" (taken {dmg} dmg)" if dmg else ""
+            parts.append(f"Seat {seat} {marker}: Life={life}{dmg_str}")
 
         # Hand
         hand = game_state.get("hand", [])
@@ -247,11 +288,42 @@ class ActionPlanner:
             card_names = [c.get("name", "?") for c in hand]
             parts.append(f"Hand: {', '.join(card_names)}")
 
-        # Battlefield
+        # Battlefield with token/counter annotations
         battlefield = game_state.get("battlefield", [])
         if battlefield:
-            bf_names = [c.get("name", "?") for c in battlefield]
+            bf_names = []
+            for c in battlefield:
+                name = c.get("name", "?")
+                kind = c.get("object_kind", "")
+                if kind == "TOKEN":
+                    name = f"*{name}"
+                counters = c.get("counters", {})
+                if counters:
+                    cparts = [f"{v}{k.replace('CounterType_','')[:4]}" for k, v in counters.items()]
+                    name += f" [{','.join(cparts)}]"
+                bf_names.append(name)
             parts.append(f"Battlefield: {', '.join(bf_names)}")
+
+        # Recent events
+        recent = game_state.get("recent_events", [])
+        if recent:
+            event_strs = []
+            for evt in recent[-5:]:
+                etype = evt.get("type", "")
+                if etype == "damage_dealt":
+                    event_strs.append(f"{evt.get('source','?')} dealt {evt.get('amount',0)} damage")
+                elif etype == "zone_transfer":
+                    event_strs.append(f"{evt.get('card','?')} moved zones")
+                elif etype == "counter_added":
+                    event_strs.append(f"+{evt.get('amount',1)} counter on {evt.get('card','?')}")
+                elif etype == "token_created":
+                    event_strs.append(f"Token created: {evt.get('card','?')}")
+                elif etype == "card_revealed":
+                    event_strs.append(f"Revealed: {evt.get('card','?')}")
+                elif etype == "controller_changed":
+                    event_strs.append(f"{evt.get('card','?')} changed controller")
+            if event_strs:
+                parts.append(f"Recent: {'; '.join(event_strs)}")
 
         return "\n".join(parts)
 
@@ -310,6 +382,9 @@ class ActionPlanner:
                 modal_index=data.get("modal_index", 0),
                 select_card_names=data.get("select_card_names", []),
                 scry_position=data.get("scry_position", ""),
+                numeric_value=data.get("numeric_value", 0),
+                distribution=data.get("distribution", {}),
+                play_or_draw=data.get("play_or_draw", ""),
                 reasoning=data.get("reasoning", ""),
                 confidence=data.get("confidence", 1.0),
             )
