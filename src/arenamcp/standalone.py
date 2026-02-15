@@ -749,16 +749,17 @@ class StandaloneCoach:
 
                         def _analyze_deck_bg(coach, mcp, card_ids, ui, backend_name, model_name):
                             try:
-                                # Enrich grpIds to (name, type) tuples
+                                # Enrich grpIds to (name, type, oracle_text) tuples
                                 enriched = []
                                 for grp_id in card_ids:
                                     try:
                                         info = mcp.get_card_info(grp_id)
                                         name = info.get("name", f"Unknown({grp_id})")
                                         card_type = info.get("type_line", "")
-                                        enriched.append((name, card_type))
+                                        oracle = info.get("oracle_text", "")
+                                        enriched.append((name, card_type, oracle))
                                     except Exception:
-                                        enriched.append((f"Unknown({grp_id})", ""))
+                                        enriched.append((f"Unknown({grp_id})", "", ""))
 
                                 # Use a SEPARATE backend instance so deck analysis
                                 # doesn't hold the advice backend's lock
@@ -834,8 +835,9 @@ class StandaloneCoach:
                     is_my_turn = (active_seat == local_seat) if local_seat else False
 
                     # Sort triggers by priority to ensure we handle the most critical one only
-                    # Priority order: Critical > Action > Combat > Turn > Priority
+                    # Priority order: Decision > Stack > Action > Combat > Turn > Priority
                     trigger_priorities = {
+                        "decision_required": 11,
                         "stack_spell": 10,
                         "stack_spell_yours": 10,
                         "stack_spell_opponent": 10,
@@ -973,6 +975,11 @@ class StandaloneCoach:
                         if trigger == "priority_gained" and is_new_turn:
                             continue
 
+                        # DECISION PRIORITY: If there's a decision required, skip non-critical triggers
+                        # in the same batch to ensure the decision is the primary focus.
+                        if "decision_required" in triggers and trigger != "decision_required" and not is_critical:
+                            continue
+
                         # AUTOPILOT BRANCH: If autopilot is enabled, route ALL
                         # triggers directly to the autopilot engine. The autopilot
                         # handles its own noise suppression (auto-pass, auto-resolve)
@@ -980,10 +987,22 @@ class StandaloneCoach:
                         # would normally drop (priority_gained, spell_resolved, etc.).
                         if self._autopilot_enabled and self._autopilot:
                             try:
-                                logger.info(f"Autopilot processing: {trigger}")
-                                self._autopilot.process_trigger(curr_state, trigger)
-                                last_advice_turn = turn_num
-                                last_advice_phase = phase
+                                # Prioritize decision_required if it's in the list
+                                if trigger == "decision_required" or "decision_required" in triggers:
+                                    actual_trigger = "decision_required" if "decision_required" in triggers else trigger
+                                    logger.info(f"Autopilot prioritizing decision: {actual_trigger}")
+                                    self._autopilot.process_trigger(curr_state, actual_trigger)
+                                    last_advice_turn = turn_num
+                                    last_advice_phase = phase
+                                    # If we handled a decision, we might want to skip other
+                                    # triggers in this batch to avoid racing
+                                    if actual_trigger == "decision_required":
+                                        break 
+                                else:
+                                    logger.info(f"Autopilot processing: {trigger}")
+                                    self._autopilot.process_trigger(curr_state, trigger)
+                                    last_advice_turn = turn_num
+                                    last_advice_phase = phase
                             except Exception as e:
                                 logger.error(f"Autopilot error: {e}")
                                 logger.debug(traceback.format_exc())

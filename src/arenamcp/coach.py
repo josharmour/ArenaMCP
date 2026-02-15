@@ -1247,12 +1247,12 @@ class CoachEngine:
         self._deck_strategy_pending = False
 
     def analyze_deck(
-        self, deck_cards: list[tuple[str, str]], backend=None
+        self, deck_cards: list[tuple[str, str, str]], backend=None
     ) -> Optional[str]:
         """Analyze a deck list and store the strategy summary.
 
         Args:
-            deck_cards: List of (card_name, card_type) tuples
+            deck_cards: List of (card_name, card_type, oracle_text) tuples
             backend: Optional separate backend instance (avoids lock contention
                      with advice calls when run on a background thread)
 
@@ -1271,11 +1271,30 @@ class CoachEngine:
             # Group duplicates compactly: "4x Mountain (Basic Land)"
             from collections import Counter
 
-            card_counts = Counter(deck_cards)
+            # Group by (name, type) for counting, but keep oracle text
+            oracle_by_name: dict[str, str] = {}
+            count_key = Counter()
+            for name, card_type, oracle in deck_cards:
+                count_key[(name, card_type)] += 1
+                if oracle and name not in oracle_by_name:
+                    oracle_by_name[name] = oracle
+
             deck_lines = []
-            for (name, card_type), count in card_counts.most_common():
+            for (name, card_type), count in count_key.most_common():
                 type_short = card_type.split("—")[0].strip() if card_type else "Unknown"
-                deck_lines.append(f"{count}x {name} ({type_short})")
+                line = f"{count}x {name} ({type_short})"
+                # Include oracle text for non-basic-land spells so the LLM
+                # knows what the card actually does instead of guessing
+                oracle = oracle_by_name.get(name, "")
+                is_basic = "basic" in (card_type or "").lower()
+                if oracle and not is_basic:
+                    # Strip reminder text and truncate for token budget
+                    oracle_short = self._remove_reminder_text(oracle).strip()
+                    if len(oracle_short) > 120:
+                        oracle_short = oracle_short[:117] + "..."
+                    if oracle_short:
+                        line += f" — {oracle_short}"
+                deck_lines.append(line)
 
             deck_text = "\n".join(deck_lines)
             user_message = f"DECK LIST ({len(deck_cards)} cards):\n{deck_text}"
@@ -1974,6 +1993,23 @@ class CoachEngine:
                 else:
                     lines.append(f"Atk: None (T/SS)")
 
+                # Crackback warning: opponent's potential attack power next turn
+                opp_attack_power = sum(
+                    c.get("power", 0) for c in opp_creatures
+                )
+                your_life = (
+                    local_player.get("life_total", 20) if local_player else 20
+                )
+                if opp_attack_power > 0:
+                    if opp_attack_power >= your_life:
+                        lines.append(
+                            f"Crackback: {opp_attack_power}pwr vs your {your_life} life — LETHAL if no blockers held!"
+                        )
+                    else:
+                        lines.append(
+                            f"Crackback: {opp_attack_power}pwr vs your {your_life} life — safe"
+                        )
+
             # OPTIMIZATION: Compact blocking analysis (was 50+ lines, now ~10)
             elif "Combat" in phase and not is_your_turn:
                 attacking = [c for c in opp_cards if c.get("is_attacking")]
@@ -2196,10 +2232,13 @@ class CoachEngine:
                 )
                 is_aura = "enchantment" in type_line and "aura" in type_line
                 # Auras ALWAYS show oracle text — targeting (own vs opponent) depends on effect
+                # Check length AFTER removing reminder text so cards with long keyword
+                # reminders (e.g. Harmonize) aren't wrongly hidden
+                oracle_stripped = self._remove_reminder_text(oracle_text) if oracle_text else ""
                 show_oracle = (
                     oracle_text
                     and not is_basic_land
-                    and (is_aura or len(oracle_text) < 200)
+                    and (is_aura or len(oracle_stripped) < 200)
                 )
 
                 # Type tag for non-creature, non-land cards so LLM knows what it is
@@ -2228,14 +2267,14 @@ class CoachEngine:
                     f"  {display_name}{type_tag} {cost} [{timing},{castable}]{removal_info}"
                 )
                 if show_oracle:
-                    # OPTIMIZATION: Remove reminder text to save tokens
-                    oracle_compact = self._remove_reminder_text(oracle_text)
+                    # Use pre-stripped text (reminder text already removed above)
+                    oracle_compact = oracle_stripped
                     if is_aura:
                         # Auras: show full text (targeting depends on knowing effect)
                         if len(oracle_compact) > 160:
                             oracle_compact = oracle_compact[:157] + "..."
-                    elif len(oracle_compact) > 100:
-                        oracle_compact = oracle_compact[:97] + "..."
+                    elif len(oracle_compact) > 150:
+                        oracle_compact = oracle_compact[:147] + "..."
                     lines.append(f"    {oracle_compact}")
         else:
             lines.append("  (empty)")
@@ -2577,6 +2616,9 @@ class CoachEngine:
         1. Remove 'Play [Land]' suggestions when no land is in hand
         2. Fix typos in card names using fuzzy matching
         """
+        if not advice:
+            return ""
+
         import re
 
         def _combat_attack_summary() -> Optional[tuple[int, int, int]]:
@@ -3147,14 +3189,20 @@ class GameStateTrigger:
             ):
                 triggers.append("priority_gained")
 
-        # Check explicit pending decisions (like Mulligan)
+        # Check explicit pending decisions (like Mulligan) or legal action changes
         pending_decision = curr_state.get("pending_decision")
-        if pending_decision:
-            prev_decision = prev_state.get("pending_decision")
-            if pending_decision != prev_decision:
-                logger.info(f"Triggering decision: {pending_decision}")
+        legal_actions = curr_state.get("legal_actions", [])
+        prev_legal = prev_state.get("legal_actions", [])
+        
+        # Trigger if decision label changed OR if we got a new list of legal actions from GRE
+        if pending_decision and pending_decision != prev_state.get("pending_decision"):
+            logger.info(f"Triggering decision: {pending_decision}")
+            triggers.append("decision_required")
+        elif legal_actions and legal_actions != prev_legal:
+            logger.info(f"Triggering decision due to legal_actions update: {legal_actions}")
+            if "decision_required" not in triggers:
                 triggers.append("decision_required")
-            elif pending_decision == "Mulligan":
+        elif pending_decision == "Mulligan":
                 # Mulligan re-fire: the hand zone may not be populated on
                 # the first poll (SubmitDeckReq arrives before GameState).
                 # Re-trigger once when the hand appears so the player gets
@@ -3323,6 +3371,20 @@ class GameStateTrigger:
                     logger.info(
                         f"Threat detected: {card_name} - {self.THREAT_CARDS[card_name]}"
                     )
+                    triggers.append("threat_detected")
+
+                # Generic planeswalker detection fallback
+                elif (
+                    card_name not in self.THREAT_CARDS
+                    and "planeswalker" in card.get("type_line", "").lower()
+                    and instance_id not in self._seen_threats
+                ):
+                    self._seen_threats.add(instance_id)
+                    self._last_threat = {
+                        "name": card_name,
+                        "warning": f"Opponent played planeswalker {card_name} — generates value every turn, consider attacking it.",
+                    }
+                    logger.info(f"Threat detected (planeswalker): {card_name}")
                     triggers.append("threat_detected")
 
         return triggers

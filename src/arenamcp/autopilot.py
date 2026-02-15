@@ -12,9 +12,11 @@ The autopilot layers onto the existing coaching loop without replacing it:
 import logging
 import threading
 import time
+import io
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
+from PIL import ImageGrab
 
 from arenamcp.action_planner import ActionPlan, ActionPlanner, ActionType, GameAction
 from arenamcp.input_controller import ClickResult, InputController
@@ -43,8 +45,9 @@ class AutopilotConfig:
     auto_pass_priority: bool = True
     auto_resolve: bool = True
     verify_after_action: bool = True
-    verification_timeout: float = 3.0
-    action_delay: float = 0.3
+    verification_timeout: float = 4.0
+    action_delay: float = 1.0
+    post_action_delay: float = 1.5  # Delay after action to allow GRE to update
     planning_timeout: float = 15.0
     enable_vision_fallback: bool = True
     enable_tts_preview: bool = True
@@ -91,8 +94,9 @@ class AutopilotEngine:
 
         # State
         self._state = AutopilotState.IDLE
-        self._current_plan: Optional[ActionPlan] = None
+        self._current_plan = None
         self._current_action_idx = 0
+        self._lock = threading.Lock()
 
         # Confirmation events
         self._confirm_event = threading.Event()
@@ -103,6 +107,7 @@ class AutopilotEngine:
         self._actions_executed = 0
         self._actions_skipped = 0
         self._plans_completed = 0
+        self._consecutive_failed_verifications = 0
 
         # Land-drop dedup: track last turn we played a land to prevent
         # double-triggers when game state hasn't updated yet
@@ -254,254 +259,275 @@ class AutopilotEngine:
         Returns:
             True if plan was fully executed, False otherwise.
         """
-        if self._abort_event.is_set():
-            self._state = AutopilotState.IDLE
+        if not self._lock.acquire(blocking=False):
+            logger.debug(f"Autopilot: already processing a trigger, skipping {trigger}")
             return False
 
-        self._clear_events()
-
-        # --- AFK MODE: auto-pass everything without LLM ---
-        if self._config.afk_mode:
-            return self._handle_afk(game_state, trigger)
-
-        # --- LAND DROP MODE: auto-play one land per turn without LLM ---
-        if self._config.land_drop_mode:
-            return self._handle_land_drop(game_state, trigger)
-
-        # --- Quick shortcuts: auto-pass/resolve without LLM ---
-        # These save 5-15s by not calling the LLM for obvious actions.
-        pending = game_state.get("pending_decision")
-        has_decision = pending is not None and pending != "Action Required"
-        turn = game_state.get("turn", {})
-        local_seat = None
-        for p in game_state.get("players", []):
-            if p.get("is_local"):
-                local_seat = p.get("seat_id")
-        is_my_turn = turn.get("active_player") == local_seat if local_seat else False
-
-        # Don't auto-pass when there's a pending decision (scry, discard, target, etc.)
-        if not has_decision:
-            if self._config.auto_pass_priority and trigger == "priority_gained":
-                legal = self._get_legal_actions(game_state)
-                if not legal or legal == ["Pass"]:
-                    logger.info("Autopilot: auto-passing priority (no actions)")
-                    if not self._config.dry_run:
-                        self._controller.focus_mtga_window()
-                        time.sleep(0.15)
-                    self._exec_pass_priority()
-                    return True
-
-            if self._config.auto_resolve and trigger == "spell_resolved":
-                if not is_my_turn:
-                    logger.info("Autopilot: auto-resolving (opponent's spell)")
-                    if not self._config.dry_run:
-                        self._controller.focus_mtga_window()
-                        time.sleep(0.15)
-                    self._exec_resolve()
-                    return True
-
-            # Auto-pass stack triggers with no instant-speed responses
-            if trigger in ("stack_spell_yours", "stack_spell_opponent"):
-                legal = self._get_legal_actions(game_state)
-                has_instants = any("instant" in a.lower() or "flash" in a.lower() for a in legal) if legal else False
-                if not has_instants:
-                    logger.info(f"Autopilot: auto-passing {trigger} (no instant responses)")
-                    if not self._config.dry_run:
-                        self._controller.focus_mtga_window()
-                        time.sleep(0.15)
-                    self._exec_pass_priority()
-                    return True
-
-            # Auto-pass opponent's turn with no responses
-            if trigger == "opponent_turn":
-                legal = self._get_legal_actions(game_state)
-                has_instants = any("instant" in a.lower() or "flash" in a.lower() for a in legal) if legal else False
-                if not has_instants:
-                    logger.info("Autopilot: auto-passing opponent turn (no responses)")
-                    return True  # Just skip, don't click anything
-
-        # --- 1. PLANNING ---
-        self._state = AutopilotState.PLANNING
-        self._notify("AUTOPILOT", f"Planning: {trigger}...")
-
-        # Snapshot state before planning (for staleness check)
-        pre_plan_turn = game_state.get("turn", {})
-        pre_turn_num = pre_plan_turn.get("turn_number", 0)
-        pre_phase = pre_plan_turn.get("phase", "")
-        pre_step = pre_plan_turn.get("step", "")
-        pre_active = pre_plan_turn.get("active_player", 0)
-
-        legal_actions = self._get_legal_actions(game_state)
-        decision_context = game_state.get("decision_context")
-
-        plan = self._planner.plan_actions(
-            game_state, trigger, legal_actions, decision_context
-        )
-
-        if not plan.actions:
-            logger.info("Autopilot: planner returned no actions")
-            self._state = AutopilotState.IDLE
-            return False
-
-        # --- STALENESS CHECK ---
-        # Re-poll game state after planning (LLM call may take 5-15s).
-        # If the game has moved on (different turn, phase, or active player),
-        # discard the stale plan instead of executing outdated actions.
         try:
-            fresh_state = self._get_game_state()
-            fresh_turn = fresh_state.get("turn", {})
-            stale = False
-
-            if fresh_turn.get("turn_number", 0) != pre_turn_num:
-                logger.warning(f"STALE: turn advanced {pre_turn_num} → {fresh_turn.get('turn_number')}")
-                stale = True
-            elif fresh_turn.get("phase", "") != pre_phase:
-                logger.warning(f"STALE: phase changed {pre_phase} → {fresh_turn.get('phase')}")
-                stale = True
-            elif fresh_turn.get("active_player", 0) != pre_active:
-                logger.warning(f"STALE: active player changed {pre_active} → {fresh_turn.get('active_player')}")
-                stale = True
-
-            if stale:
-                self._notify("AUTOPILOT", "Plan discarded (game moved on)")
-                self._state = AutopilotState.IDLE
-                return False
-
-            # Use the fresh state for execution (more accurate coordinates)
-            game_state = fresh_state
-        except Exception as e:
-            logger.error(f"Staleness check failed: {e}")
-            # Continue with original state if re-poll fails
-
-        self._current_plan = plan
-        self._current_action_idx = 0
-
-        # --- 2. PREVIEWING (auto-execute countdown) ---
-        self._state = AutopilotState.PREVIEWING
-        plan_text = self._format_plan_preview(plan)
-
-        self._notify("AUTOPILOT", plan_text)
-        if self._config.enable_tts_preview and self._speak_fn:
-            self._speak_fn(f"Plan: {plan.overall_strategy}", False)
-
-        # Auto-execute countdown: executes after delay unless user cancels
-        if self._config.confirm_plan:
-            # Legacy mode: wait for explicit F1 confirm
-            logger.info("Waiting for plan confirmation (F1)...")
-            result = self._wait_for_confirmation()
-            if result == "abort":
-                self._state = AutopilotState.IDLE
-                self._notify("AUTOPILOT", "Aborted")
-                return False
-            if result == "skip":
-                self._state = AutopilotState.IDLE
-                self._actions_skipped += len(plan.actions)
-                self._notify("AUTOPILOT", "Plan skipped")
-                return False
-        elif self._config.auto_execute_delay > 0:
-            # New default: auto-execute after countdown, F1/F4 cancels
-            delay = self._config.auto_execute_delay
-            self._notify("AUTOPILOT", f"Executing in {delay:.1f}s... [F1/F4 to cancel]")
-            result = self._wait_for_cancel(delay)
-            if result == "abort":
-                self._state = AutopilotState.IDLE
-                self._notify("AUTOPILOT", "Aborted")
-                return False
-            if result == "cancel":
-                self._state = AutopilotState.IDLE
-                self._actions_skipped += len(plan.actions)
-                self._notify("AUTOPILOT", "Plan cancelled by user")
-                return False
-            # result == "execute" → proceed
-
-        # --- PRE-EXECUTION STALENESS RECHECK ---
-        # The countdown may have consumed up to 1s. Re-poll game state to
-        # make sure the game hasn't moved on during that window.
-        try:
-            exec_state = self._get_game_state()
-            exec_turn = exec_state.get("turn", {})
-            if (exec_turn.get("turn_number", 0) != pre_turn_num
-                    or exec_turn.get("phase", "") != pre_phase
-                    or exec_turn.get("active_player", 0) != pre_active):
-                logger.warning("STALE at execution time — game moved on during countdown")
-                self._notify("AUTOPILOT", "Plan discarded (game moved during countdown)")
-                self._state = AutopilotState.IDLE
-                return False
-            game_state = exec_state  # Use freshest state
-        except Exception as e:
-            logger.error(f"Pre-execution recheck failed: {e}")
-
-        # --- 3. EXECUTING ---
-        self._state = AutopilotState.EXECUTING
-
-        # Focus MTGA now — no more user input expected
-        if not self._config.dry_run:
-            self._controller.focus_mtga_window()
-            time.sleep(0.15)
-
-        for i, action in enumerate(plan.actions):
             if self._abort_event.is_set():
                 self._state = AutopilotState.IDLE
                 return False
 
-            self._current_action_idx = i
+            self._clear_events()
 
-            action_text = f"[{i+1}/{len(plan.actions)}] {action}"
-            self._notify("AUTOPILOT", action_text)
+            # --- AFK MODE: auto-pass everything without LLM ---
+            if self._config.afk_mode:
+                return self._handle_afk(game_state, trigger)
 
-            # Per-action staleness check: verify game hasn't advanced
-            # between multi-step actions (e.g., declare attackers then done)
-            if i > 0:
-                try:
-                    step_state = self._get_game_state()
-                    step_turn = step_state.get("turn", {})
-                    if step_turn.get("turn_number", 0) != pre_turn_num:
-                        logger.warning(f"STALE mid-execution: turn advanced at action {i+1}")
-                        self._notify("AUTOPILOT", "Stopping: game advanced mid-plan")
-                        self._state = AutopilotState.IDLE
-                        return False
-                    game_state = step_state
-                except Exception:
-                    pass
+            # --- LAND DROP MODE: auto-play one land per turn without LLM ---
+            if self._config.land_drop_mode:
+                return self._handle_land_drop(game_state, trigger)
 
-            # Legacy per-action confirmation (only if explicitly enabled)
-            if self._config.confirm_each_action:
+            # --- Quick shortcuts: auto-pass/resolve without LLM ---
+            # These save 5-15s by not calling the LLM for obvious actions.
+            pending = game_state.get("pending_decision")
+            has_decision = pending is not None and pending != "Action Required"
+            turn = game_state.get("turn", {})
+            local_seat = None
+            for p in game_state.get("players", []):
+                if p.get("is_local"):
+                    local_seat = p.get("seat_id")
+            is_my_turn = turn.get("active_player") == local_seat if local_seat else False
+
+            # NEVER auto-pass when there's a pending decision (scry, discard, target, etc.)
+            if not has_decision:
+                # Get legal actions once to check if we can actually do anything
+                legal = self._get_legal_actions(game_state)
+                can_do_anything = legal and legal != ["Pass"] and not all("Wait" in a for a in legal)
+
+                if self._config.auto_pass_priority and trigger == "priority_gained":
+                    if not can_do_anything:
+                        logger.info("Autopilot: auto-passing priority (no actions)")
+                        if not self._config.dry_run:
+                            self._controller.focus_mtga_window()
+                            time.sleep(0.15)
+                        self._exec_pass_priority()
+                        return True
+
+                if self._config.auto_resolve and trigger == "spell_resolved":
+                    if not is_my_turn and not can_do_anything:
+                        logger.info("Autopilot: auto-resolving (opponent's spell, no responses)")
+                        if not self._config.dry_run:
+                            self._controller.focus_mtga_window()
+                            time.sleep(0.15)
+                        self._exec_resolve()
+                        return True
+
+                # Auto-pass stack triggers with no instant-speed responses
+                if trigger in ("stack_spell_yours", "stack_spell_opponent"):
+                    if not can_do_anything:
+                        logger.info(f"Autopilot: auto-passing {trigger} (no instant responses)")
+                        if not self._config.dry_run:
+                            self._controller.focus_mtga_window()
+                            time.sleep(0.15)
+                        self._exec_pass_priority()
+                        return True
+
+                # Auto-pass opponent's turn with no responses
+                if trigger == "opponent_turn":
+                    if not can_do_anything:
+                        logger.info("Autopilot: auto-passing opponent turn (no responses)")
+                        return True  # Just skip, don't click anything
+
+            # --- 1. PLANNING ---
+            self._state = AutopilotState.PLANNING
+            self._notify("AUTOPILOT", f"Planning: {trigger}...")
+
+            # Snapshot state before planning (for staleness check)
+            pre_plan_turn = game_state.get("turn", {})
+            pre_turn_num = pre_plan_turn.get("turn_number", 0)
+            pre_phase = pre_plan_turn.get("phase", "")
+            pre_active = pre_plan_turn.get("active_player", 0)
+
+            legal_actions = self._get_legal_actions(game_state)
+            decision_context = game_state.get("decision_context")
+
+            plan = self._planner.plan_actions(
+                game_state, trigger, legal_actions, decision_context
+            )
+
+            if not plan.actions:
+                logger.info("Autopilot: planner returned no actions")
+                self._state = AutopilotState.IDLE
+                return False
+
+            # --- STALENESS CHECK ---
+            # Re-poll game state after planning (LLM call may take 5-15s).
+            # If the game has moved on (different turn, phase, or active player),
+            # discard the stale plan instead of executing outdated actions.
+            try:
+                fresh_state = self._get_game_state()
+                fresh_turn = fresh_state.get("turn", {})
+                stale = False
+
+                if fresh_turn.get("turn_number", 0) != pre_turn_num:
+                    logger.warning(f"STALE: turn advanced {pre_turn_num} → {fresh_turn.get('turn_number')}")
+                    stale = True
+                elif fresh_turn.get("active_player", 0) != pre_active:
+                    logger.warning(f"STALE: active player changed {pre_active} → {fresh_turn.get('active_player')}")
+                    stale = True
+                elif fresh_turn.get("phase", "") != pre_phase:
+                    # Lenient phase check: allow Main1 -> Main2 or Combat steps as long as it's still
+                    # the same turn and player. BUT if a sorcery/land action was planned and we are
+                    # now in Combat, it's stale.
+                    is_sorcery_play = any(a.action_type in (ActionType.PLAY_LAND, ActionType.CAST_SPELL) for a in plan.actions)
+                    now_combat = "Combat" in fresh_turn.get("phase", "")
+
+                    if is_sorcery_play and now_combat:
+                        logger.warning(f"STALE: phase changed {pre_phase} → {fresh_turn.get('phase')} (sorcery plan in combat)")
+                        stale = True
+                    else:
+                        # For other changes (Main1->Main2, or combat step changes), we can try to proceed
+                        # but we should update the game_state so coordinates are fresh.
+                        logger.info(f"Phase changed {pre_phase} → {fresh_turn.get('phase')}, proceeding with caution")
+
+                if stale:
+                    self._notify("AUTOPILOT", "Plan discarded (game moved on)")
+                    self._state = AutopilotState.IDLE
+                    return False
+
+                # Use the fresh state for execution (more accurate coordinates)
+                game_state = fresh_state
+            except Exception as e:
+                logger.error(f"Staleness check failed: {e}")
+                # Continue with original state if re-poll fails
+
+            self._current_plan = plan
+            self._current_action_idx = 0
+
+            # --- 2. PREVIEWING (auto-execute countdown) ---
+            self._state = AutopilotState.PREVIEWING
+            plan_text = self._format_plan_preview(plan)
+
+            self._notify("AUTOPILOT", plan_text)
+            if self._config.enable_tts_preview and self._speak_fn:
+                self._speak_fn(f"Plan: {plan.overall_strategy}", False)
+
+            # Auto-execute countdown: executes after delay unless user cancels
+            if self._config.confirm_plan:
+                # Legacy mode: wait for explicit F1 confirm
+                logger.info("Waiting for plan confirmation (F1)...")
                 result = self._wait_for_confirmation()
                 if result == "abort":
                     self._state = AutopilotState.IDLE
+                    self._notify("AUTOPILOT", "Aborted")
                     return False
                 if result == "skip":
-                    self._actions_skipped += 1
+                    self._state = AutopilotState.IDLE
+                    self._actions_skipped += len(plan.actions)
+                    self._notify("AUTOPILOT", "Plan skipped")
+                    return False
+            elif self._config.auto_execute_delay > 0:
+                # New default: auto-execute after countdown, F1/F4 cancels
+                delay = self._config.auto_execute_delay
+                self._notify("AUTOPILOT", f"Executing in {delay:.1f}s... [F1/F4 to cancel]")
+                result = self._wait_for_cancel(delay)
+                if result == "abort":
+                    self._state = AutopilotState.IDLE
+                    self._notify("AUTOPILOT", "Aborted")
+                    return False
+                if result == "cancel":
+                    self._state = AutopilotState.IDLE
+                    self._actions_skipped += len(plan.actions)
+                    self._notify("AUTOPILOT", "Plan cancelled by user")
+                    return False
+                # result == "execute" → proceed
+
+            # --- PRE-EXECUTION STALENESS RECHECK ---
+            # The countdown may have consumed up to 1s. Re-poll game state to
+            # make sure the game hasn't moved on during that window.
+            try:
+                exec_state = self._get_game_state()
+                exec_turn = exec_state.get("turn", {})
+                if (exec_turn.get("turn_number", 0) != pre_turn_num
+                        or exec_turn.get("active_player", 0) != pre_active):
+                    logger.warning("STALE at execution time — game moved on during countdown")
+                    self._notify("AUTOPILOT", "Plan discarded (game moved during countdown)")
+                    self._state = AutopilotState.IDLE
+                    return False
+                game_state = exec_state  # Use freshest state
+            except Exception as e:
+                logger.error(f"Pre-execution recheck failed: {e}")
+
+            # --- 3. EXECUTING ---
+            self._state = AutopilotState.EXECUTING
+
+            # Focus MTGA now — no more user input expected
+            if not self._config.dry_run:
+                self._controller.focus_mtga_window()
+                time.sleep(0.15)
+
+            for i, action in enumerate(plan.actions):
+                if self._abort_event.is_set():
+                    self._state = AutopilotState.IDLE
+                    return False
+
+                self._current_action_idx = i
+
+                action_text = f"[{i+1}/{len(plan.actions)}] {action}"
+                self._notify("AUTOPILOT", action_text)
+
+                # Per-action staleness check: verify game hasn't advanced
+                # between multi-step actions (e.g., declare attackers then done)
+                if i > 0:
+                    try:
+                        step_state = self._get_game_state()
+                        step_turn = step_state.get("turn", {})
+                        if step_turn.get("turn_number", 0) != pre_turn_num:
+                            logger.warning(f"STALE mid-execution: turn advanced at action {i+1}")
+                            self._notify("AUTOPILOT", "Stopping: game advanced mid-plan")
+                            self._state = AutopilotState.IDLE
+                            return False
+                        game_state = step_state
+                    except Exception:
+                        pass
+
+                # Legacy per-action confirmation (only if explicitly enabled)
+                if self._config.confirm_each_action:
+                    result = self._wait_for_confirmation()
+                    if result == "abort":
+                        self._state = AutopilotState.IDLE
+                        return False
+                    if result == "skip":
+                        self._actions_skipped += 1
+                        continue
+
+                # Snapshot state before action (for verification)
+                pre_state = self._get_game_state() if self._config.verify_after_action else None
+
+                # Execute
+                click_result = self._execute_action(action, game_state)
+                if not click_result.success:
+                    logger.warning(f"Action failed: {click_result}")
+                    self._notify("AUTOPILOT", f"FAILED: {click_result.error}")
                     continue
 
-            # Snapshot state before action (for verification)
-            pre_state = self._get_game_state() if self._config.verify_after_action else None
+                self._actions_executed += 1
 
-            # Execute
-            click_result = self._execute_action(action, game_state)
-            if not click_result.success:
-                logger.warning(f"Action failed: {click_result}")
-                self._notify("AUTOPILOT", f"FAILED: {click_result.error}")
-                continue
+                # --- 4. VERIFYING ---
+                if self._config.verify_after_action and pre_state:
+                    self._state = AutopilotState.VERIFYING
+                    verified = self._verify_action(action, pre_state)
+                    if not verified:
+                        logger.warning(f"Action verification failed for: {action}")
+                        self._notify("AUTOPILOT", "Verification: state unchanged (may be OK)")
+                        self._consecutive_failed_verifications += 1
+                        
+                        if self._consecutive_failed_verifications >= 3:
+                            self._recover_stuck()
+                    else:
+                        self._consecutive_failed_verifications = 0
 
-            self._actions_executed += 1
+                # Delay between actions
+                if i < len(plan.actions) - 1:
+                    self._controller.wait(self._config.action_delay, "between actions")
 
-            # --- 4. VERIFYING ---
-            if self._config.verify_after_action and pre_state:
-                self._state = AutopilotState.VERIFYING
-                verified = self._verify_action(action, pre_state)
-                if not verified:
-                    logger.warning(f"Action verification failed for: {action}")
-                    self._notify("AUTOPILOT", "Verification: state unchanged (may be OK)")
-
-            # Delay between actions
-            if i < len(plan.actions) - 1:
-                self._controller.wait(self._config.action_delay, "between actions")
-
-        self._state = AutopilotState.IDLE
-        self._plans_completed += 1
-        self._notify("AUTOPILOT", f"Plan complete ({len(plan.actions)} actions)")
-        return True
+            self._state = AutopilotState.IDLE
+            self._plans_completed += 1
+            self._notify("AUTOPILOT", f"Plan complete ({len(plan.actions)} actions)")
+            return True
+        finally:
+            self._lock.release()
 
     def _handle_afk(self, game_state: dict[str, Any], trigger: str) -> bool:
         """Handle a trigger in AFK mode — auto-pass without LLM.
@@ -592,8 +618,8 @@ class AutopilotEngine:
                             time.sleep(0.15)
 
                         from_x, from_y = coord.to_absolute(window_rect)
-                        # Drag to your land row (y ≈ 0.75, center of screen)
-                        target = ScreenCoord(0.50, 0.75, f"Battlefield: {land_name}")
+                        # Drag to center of battlefield (y ≈ 0.50)
+                        target = ScreenCoord(0.50, 0.50, f"Battlefield: {land_name}")
                         to_x, to_y = target.to_absolute(window_rect)
 
                         result = self._controller.drag_card_from_hand(
@@ -664,6 +690,55 @@ class AutopilotEngine:
             except Exception:
                 pass
 
+    def _get_vision_coord(self, card_name: str) -> Optional[ScreenCoord]:
+        """Capture screenshot and use vision to find a card."""
+        try:
+            # Capture MTGA window area
+            window_rect = self._mapper.window_rect
+            if not window_rect:
+                window_rect = self._mapper.refresh_window()
+            if not window_rect:
+                return None
+
+            left, top, width, height = window_rect
+            # Grab slightly larger area or full screen if needed, 
+            # but usually client area is best
+            screenshot = ImageGrab.grab(bbox=(left, top, left+width, top+height))
+            
+            # Convert to PNG bytes
+            buf = io.BytesIO()
+            screenshot.save(buf, format='PNG')
+            png_bytes = buf.getvalue()
+            
+            # Use the planner's backend for vision
+            backend = self._planner._backend
+            return self._mapper.get_card_coord_via_vision(card_name, png_bytes, backend)
+        except Exception as e:
+            logger.error(f"Failed to get vision coord: {e}")
+            return None
+
+    def _recover_stuck(self) -> None:
+        """Attempt to recover from a stuck state (UI prompts, dialogs, etc)."""
+        self._notify("AUTOPILOT", "STUCK DETECTED: Attempting recovery...")
+        logger.warning("Stuck recovery: sending Escape and Spacebar")
+        
+        # 1. Try common dismissal keys
+        self._controller.focus_mtga_window()
+        time.sleep(0.2)
+        self._controller.press_key("escape", "Dismissing dialog")
+        time.sleep(0.5)
+        self._controller.press_key("space", "Confirming priority")
+        
+        # 2. Vision analysis of the stuck state
+        logger.info("Stuck recovery: Analyzing screen via vision")
+        coord = self._get_vision_coord("Blocking UI Prompt")
+        if coord:
+            logger.info(f"Vision suggests stuck UI element at {coord}")
+            abs_x, abs_y = coord.to_absolute(self._mapper.window_rect)
+            self._controller.click(abs_x, abs_y, "Dismissing via vision")
+        
+        self._consecutive_failed_verifications = 0
+
     # --- Action Execution Handlers ---
 
     def _execute_action(
@@ -684,7 +759,7 @@ class AutopilotEngine:
             ActionType.CLICK_BUTTON: lambda: self._exec_click_button(action),
             ActionType.PLAY_LAND: lambda: self._exec_play_card(action, game_state),
             ActionType.CAST_SPELL: lambda: self._exec_play_card(action, game_state),
-            ActionType.ACTIVATE_ABILITY: lambda: self._exec_play_card(action, game_state),
+            ActionType.ACTIVATE_ABILITY: lambda: self._exec_activate_ability(action, game_state),
             ActionType.DECLARE_ATTACKERS: lambda: self._exec_declare_attackers(action, game_state),
             ActionType.DECLARE_BLOCKERS: lambda: self._exec_declare_blockers(action, game_state),
             ActionType.SELECT_TARGET: lambda: self._exec_select_target(action, game_state),
@@ -728,6 +803,9 @@ class AutopilotEngine:
     def _exec_click_button(self, action: GameAction) -> ClickResult:
         """Click a named button."""
         button_name = action.card_name.lower().replace(" ", "_")
+        # Fallback for common MTGA action buttons that might be named differently by the LLM
+        if button_name in ("next", "attack", "all_attack", "done", "no_attacks", "no_blocks"):
+            return self._click_fixed("pass") # They all share the same spot
         return self._click_fixed(button_name)
 
     def _exec_play_card(
@@ -751,8 +829,10 @@ class AutopilotEngine:
             # Vision fallback
             if self._config.enable_vision_fallback:
                 logger.info(f"Trying vision fallback for '{action.card_name}'")
-                # TODO: Take screenshot and use vision
-            return ClickResult(False, 0, 0, action.card_name, "Card not found in hand")
+                coord = self._get_vision_coord(action.card_name)
+            
+            if not coord:
+                return ClickResult(False, 0, 0, action.card_name, "Card not found in hand (Heuristic & Vision failed)")
 
         window_rect = self._mapper.window_rect
         if not window_rect:
@@ -762,18 +842,53 @@ class AutopilotEngine:
 
         abs_x, abs_y = coord.to_absolute(window_rect)
 
-        # Lands: drag from hand to battlefield land row
-        if action.action_type == ActionType.PLAY_LAND:
-            target = ScreenCoord(0.50, 0.75, f"Battlefield: {action.card_name}")
+        # Lands and Spells: drag from hand to battlefield center
+        if action.action_type in (ActionType.PLAY_LAND, ActionType.CAST_SPELL):
+            target = ScreenCoord(0.50, 0.50, f"Battlefield: {action.card_name}")
             to_x, to_y = target.to_absolute(window_rect)
             return self._controller.drag_card_from_hand(
                 abs_x, abs_y, to_x, to_y, action.card_name, window_rect
             )
 
-        # Spells/abilities: click to cast
+        # Abilities/Other: click to cast
         return self._controller.click_card_in_hand(
             abs_x, abs_y, action.card_name, window_rect
         )
+
+    def _exec_activate_ability(
+        self, action: GameAction, game_state: dict[str, Any]
+    ) -> ClickResult:
+        """Click a permanent on the battlefield to activate its ability."""
+        battlefield = game_state.get("battlefield", [])
+        local_seat = None
+        for p in game_state.get("players", []):
+            if p.get("is_local"):
+                local_seat = p.get("seat_id")
+
+        if not local_seat:
+            return ClickResult(False, 0, 0, action.card_name, "Local seat not found")
+
+        coord = self._mapper.get_permanent_coord(
+            action.card_name, None, battlefield, local_seat, local_seat
+        )
+
+        if not coord:
+            # Vision fallback
+            if self._config.enable_vision_fallback:
+                logger.info(f"Trying vision fallback for board permanent '{action.card_name}'")
+                coord = self._get_vision_coord(action.card_name)
+            
+            if not coord:
+                return ClickResult(False, 0, 0, action.card_name, "Permanent not found on battlefield (Heuristic & Vision failed)")
+
+        window_rect = self._mapper.window_rect
+        if not window_rect:
+            window_rect = self._mapper.refresh_window()
+        if not window_rect:
+            return ClickResult(False, 0, 0, action.card_name, "MTGA window not found")
+
+        abs_x, abs_y = coord.to_absolute(window_rect)
+        return self._controller.click(abs_x, abs_y, f"Activate: {action.card_name}", window_rect)
 
     def _exec_declare_attackers(
         self, action: GameAction, game_state: dict[str, Any]
@@ -1030,35 +1145,70 @@ class AutopilotEngine:
         Returns:
             True if state changed as expected.
         """
+        # Initial delay to give MTGA time to process the click and update logs
+        time.sleep(self._config.post_action_delay)
+
         deadline = time.time() + self._config.verification_timeout
         poll_interval = 0.3
+
+        card_name = action.card_name.lower() if action.card_name else ""
 
         while time.time() < deadline:
             try:
                 post_state = self._get_game_state()
 
-                # Simple check: did something change?
+                # 1. Global state changes (Turn, Phase, Priority)
                 pre_turn = pre_state.get("turn", {})
                 post_turn = post_state.get("turn", {})
 
-                # Phase/step/priority changed = action registered
                 if (
                     post_turn.get("phase") != pre_turn.get("phase")
                     or post_turn.get("step") != pre_turn.get("step")
                     or post_turn.get("priority_player") != pre_turn.get("priority_player")
                     or post_turn.get("turn_number") != pre_turn.get("turn_number")
                 ):
-                    logger.info("Action verified: state changed")
+                    logger.info(f"Action verified: global state changed ({pre_turn.get('phase')} -> {post_turn.get('phase')})")
                     return True
 
-                # Hand size changed (played a card)
+                # 2. Specific Action Verification
+                if action.action_type in (ActionType.PLAY_LAND, ActionType.CAST_SPELL):
+                    # Card should no longer be in hand, or should be on stack/battlefield/GY
+                    pre_hand = [c.get("instance_id") for c in pre_state.get("hand", [])]
+                    post_hand = [c.get("instance_id") for c in post_state.get("hand", [])]
+                    
+                    if len(post_hand) < len(pre_hand):
+                        logger.info(f"Action verified: card '{action.card_name}' left hand")
+                        return True
+                    
+                    # Check if card appeared on battlefield
+                    post_bf = [c.get("name", "").lower() for c in post_state.get("battlefield", [])]
+                    if any(card_name in name for name in post_bf):
+                        # This is a bit weak if the card was already there, but better than nothing
+                        # Ideally we'd track instance_id movement
+                        pass
+
+                if action.action_type == ActionType.DECLARE_ATTACKERS:
+                    # Check if any creatures are now attacking that weren't before
+                    pre_atk = sum(1 for c in pre_state.get("battlefield", []) if c.get("is_attacking"))
+                    post_atk = sum(1 for c in post_state.get("battlefield", []) if c.get("is_attacking"))
+                    if post_atk > pre_atk or (post_atk == 0 and pre_atk > 0): # attacking finished
+                        logger.info("Action verified: attackers declared")
+                        return True
+
+                # 3. Generic fallback: did ANYTHING change?
+                # Hand size changed
                 if len(post_state.get("hand", [])) != len(pre_state.get("hand", [])):
                     logger.info("Action verified: hand size changed")
                     return True
 
-                # Battlefield changed
+                # Battlefield count changed
                 if len(post_state.get("battlefield", [])) != len(pre_state.get("battlefield", [])):
-                    logger.info("Action verified: battlefield changed")
+                    logger.info("Action verified: battlefield count changed")
+                    return True
+                
+                # Stack size changed
+                if len(post_state.get("stack", [])) != len(pre_state.get("stack", [])):
+                    logger.info("Action verified: stack changed")
                     return True
 
             except Exception as e:

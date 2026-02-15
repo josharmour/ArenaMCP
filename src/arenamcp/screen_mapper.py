@@ -36,10 +36,10 @@ class ScreenCoord:
             (abs_x, abs_y) in screen pixels.
         """
         left, top, width, height = window_rect
-        return (
-            int(left + self.x * width),
-            int(top + self.y * height),
-        )
+        abs_x = int(left + self.x * width)
+        abs_y = int(top + self.y * height)
+        logger.info(f"Coord: norm({self.x:.3f}, {self.y:.3f}) -> abs({abs_x}, {abs_y}) [rect: {window_rect}]")
+        return (abs_x, abs_y)
 
 
 class FixedCoordinates:
@@ -73,6 +73,11 @@ class FixedCoordinates:
         "pass_turn": PASS_TURN,
         "resolve": RESOLVE,
         "done": DONE,
+        "next": PASS_TURN,
+        "attack": PASS_TURN,
+        "block": PASS_TURN,
+        "no_attacks": PASS_TURN,
+        "no_blocks": PASS_TURN,
         "keep": KEEP,
         "mulligan": MULLIGAN,
         "scry_top": SCRY_TOP,
@@ -179,11 +184,11 @@ class ScreenMapper:
 
         hand_size = len(hand_cards)
 
-        # Hand spans roughly x=0.25 to x=0.75, y=0.92
+        # Hand spans roughly x=0.30 to x=0.70, y=0.95
         # Cards are evenly distributed
-        hand_left = 0.25
-        hand_right = 0.75
-        hand_y = 0.92
+        hand_left = 0.30
+        hand_right = 0.70
+        hand_y = 0.95
 
         if hand_size == 1:
             x = 0.50
@@ -191,6 +196,7 @@ class ScreenMapper:
             spacing = (hand_right - hand_left) / (hand_size - 1)
             x = hand_left + card_index * spacing
 
+        logger.info(f"Calc: card_idx={card_index}, size={hand_size}, x_norm={x:.3f}, y_norm={hand_y:.3f}")
         return ScreenCoord(x, hand_y, f"Hand card: {card_name}")
 
     @staticmethod
@@ -274,6 +280,12 @@ class ScreenMapper:
         type_line = card.get("type_line", "")
         return "land" in type_line.lower()
 
+    @staticmethod
+    def _is_aura(card: dict[str, Any]) -> bool:
+        """Check if a card is an Aura."""
+        type_line = card.get("type_line", "").lower()
+        return "aura" in type_line
+
     def get_permanent_coord(
         self,
         card_name: str,
@@ -282,37 +294,23 @@ class ScreenMapper:
         owner_seat: int,
         local_seat: int,
     ) -> Optional[ScreenCoord]:
-        """Calculate the screen position of a permanent on the battlefield.
-
-        MTGA uses a row-based layout with separate rows for creatures and
-        non-creatures (lands/enchantments/artifacts):
-
-            Opponent lands:      y ≈ 0.22  (top)
-            Opponent creatures:  y ≈ 0.38
-            --- center line ---
-            Your creatures:      y ≈ 0.58
-            Your lands:          y ≈ 0.75  (bottom)
-
-        Within each row, cards are centered and evenly spaced.
-
-        Args:
-            card_name: Name of the permanent.
-            instance_id: Instance ID for disambiguation.
-            battlefield: List of all battlefield card dicts.
-            owner_seat: Seat ID of the permanent's owner.
-            local_seat: Seat ID of the local player.
-
-        Returns:
-            ScreenCoord for the permanent, or None if not found.
-        """
+        """Calculate the screen position of a permanent on the battlefield."""
         is_yours = owner_seat == local_seat
 
         # Filter battlefield to the right owner
         owner_cards = [c for c in battlefield if c.get("owner_seat_id") == owner_seat]
 
         # Split into creatures vs non-creatures (lands/enchantments/artifacts)
+        # CRITICAL: Auras do not take up space in the row!
         creatures = [c for c in owner_cards if self._is_creature(c)]
-        non_creatures = [c for c in owner_cards if not self._is_creature(c)]
+        non_creatures = [c for c in owner_cards if not self._is_creature(c) and not self._is_aura(c)]
+
+        # Reverse lists to match MTGA's Left-to-Right layout (usually Oldest -> Newest)
+        creatures.reverse()
+        non_creatures.reverse()
+
+        logger.info(f"Row 'creature' contents: {[c.get('name') for c in creatures]}")
+        logger.info(f"Row 'non_creature' contents: {[c.get('name') for c in non_creatures]}")
 
         # Find the specific card and determine which row it's in
         target_card = None
@@ -375,27 +373,45 @@ class ScreenMapper:
         # MTGA layout (16:9):
         #   Opp non-creatures (lands):  y ≈ 0.22
         #   Opp creatures:              y ≈ 0.38
+        #   --- center line ---
         #   Your creatures:             y ≈ 0.58
         #   Your non-creatures (lands): y ≈ 0.75
+        
+        # ADJUSTMENT: If you have many non-creatures (artifacts/enchantments), 
+        # MTGA might shift the creature row up slightly.
         if is_yours:
-            y = 0.58 if card_row == "creature" else 0.75
+            if card_row == "creature":
+                # If there are a lot of non-creatures, the creature row is higher
+                y = 0.58 if len(non_creatures) <= 4 else 0.52
+            else:
+                y = 0.75 if len(creatures) <= 4 else 0.82
         else:
-            y = 0.38 if card_row == "creature" else 0.22
+            if card_row == "creature":
+                y = 0.38 if len(non_creatures) <= 4 else 0.42
+            else:
+                y = 0.22 if len(creatures) <= 4 else 0.15
 
         # Determine X coordinate — centered, evenly spaced in the row
         row_cards = creatures if card_row == "creature" else non_creatures
         num_in_row = len(row_cards)
 
-        bf_left = 0.20
-        bf_right = 0.80
-
+        # Spacing logic: MTGA cards overlap as the row grows.
+        # Max width is roughly 0.60 (from 0.20 to 0.80)
+        # But if there are few cards, they stay closer to the center.
         if num_in_row == 1:
             x = 0.50
+        elif num_in_row <= 4:
+            # Small group: keep them centered and comfortably spaced
+            total_width = 0.12 * num_in_row
+            left_bound = 0.50 - (total_width / 2)
+            spacing = total_width / (num_in_row)
+            x = left_bound + (spacing / 2) + card_idx_in_row * spacing
         else:
-            # Evenly space across the row, centered
+            # Large group: spread across the full available area
+            bf_left = 0.15
+            bf_right = 0.85
             total_width = bf_right - bf_left
             spacing = total_width / num_in_row
-            # Center the group: offset = (total_width - (n-1)*spacing) / 2
             x = bf_left + (spacing / 2) + card_idx_in_row * spacing
 
         logger.info(
@@ -407,23 +423,43 @@ class ScreenMapper:
         return ScreenCoord(x, y, f"Permanent: {card_name}")
 
     def get_card_coord_via_vision(
-        self, card_name: str, screenshot_bytes: bytes
+        self, card_name: str, screenshot_bytes: bytes, backend: Any
     ) -> Optional[ScreenCoord]:
         """Use vision LLM to locate a card on screen.
 
         Fallback for when positional heuristics fail.
-
-        Args:
-            card_name: Name of the card to find.
-            screenshot_bytes: Screenshot of the MTGA window as PNG bytes.
-
-        Returns:
-            ScreenCoord or None if vision detection fails.
         """
-        # TODO: Implement vision-based card detection
-        # This would send the screenshot to a vision LLM (GPT-4V, Gemini Pro Vision)
-        # with a prompt like "Find the card named X and return its center coordinates"
-        logger.warning(f"Vision fallback not yet implemented for '{card_name}'")
+        logger.info(f"Using Vision to locate '{card_name}'...")
+        
+        system_prompt = """You are an MTG Arena UI locator. 
+        Analyze the screenshot and find the EXACT center of the card or button requested.
+        Output ONLY a JSON object with 'x' and 'y' as normalized coordinates (0.0 to 1.0).
+        Example: {"x": 0.45, "y": 0.58}
+        """
+        
+        user_msg = f"Find the card named '{card_name}' on the battlefield or in hand."
+        
+        try:
+            if not hasattr(backend, 'complete_with_image'):
+                logger.warning("Current backend does not support vision.")
+                return None
+                
+            response = backend.complete_with_image(system_prompt, user_msg, screenshot_bytes)
+            
+            # Extract JSON from response
+            import json
+            import re
+            match = re.search(r'\{.*\}', response)
+            if match:
+                data = json.loads(match.group(0))
+                vx = data.get("x")
+                vy = data.get("y")
+                if vx is not None and vy is not None:
+                    logger.info(f"Vision found '{card_name}' at ({vx}, {vy})")
+                    return ScreenCoord(vx, vy, f"Vision: {card_name}")
+        except Exception as e:
+            logger.error(f"Vision detection failed: {e}")
+            
         return None
 
     def get_option_coord(

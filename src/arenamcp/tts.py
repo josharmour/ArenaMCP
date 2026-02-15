@@ -439,6 +439,12 @@ class VoiceOutput:
             if len(samples) == 0:
                 return
 
+            # Add a small amount of leading silence (200ms) to prevent cutting off the first word
+            # on some audio devices/Bluetooth that have a wake-up delay.
+            silence_len = int(sample_rate * 0.2)
+            silence = np.zeros(silence_len, dtype=np.float32)
+            samples = np.concatenate([silence, samples])
+
             with self._lock:
                 self._is_speaking = True
                 self._stop_requested = False
@@ -479,6 +485,11 @@ class VoiceOutput:
         samples, sample_rate = self._tts_engine.synthesize(text)
         if len(samples) == 0:
             return
+
+        # Add a small amount of leading silence (200ms) to prevent cutting off the first word
+        silence_len = int(sample_rate * 0.2)
+        silence = np.zeros(silence_len, dtype=np.float32)
+        samples = np.concatenate([silence, samples])
 
         def _playback_worker():
             with self._lock:
