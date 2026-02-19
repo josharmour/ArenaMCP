@@ -33,6 +33,8 @@ DEFAULTS = {
     "api_key": "",
     # Language for TTS and STT (e.g., "en", "nl", "es", "fr", "de", "ja")
     "language": "en",
+    # Backends user has been notified about (prevents repeat notifications)
+    "known_backends": [],
 }
 
 

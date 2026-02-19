@@ -586,11 +586,42 @@ class ArenaApp(App):
         # Check for updates in background (non-blocking)
         threading.Thread(target=self._check_for_update, daemon=True).start()
 
+        # Check for newly-installed backends in background
+        threading.Thread(target=self._check_new_backends, daemon=True).start()
+
         # Start initial coach logic in a thread
         threading.Thread(target=self.start_coach, daemon=True).start()
 
         # Start game state polling
         threading.Thread(target=self._poll_game_state, daemon=True).start()
+
+    def _check_new_backends(self):
+        """Background thread: detect newly-installed LLM backends."""
+        from arenamcp.backend_detect import detect_backends_quick
+        from arenamcp.settings import get_settings
+
+        try:
+            detected = detect_backends_quick()
+            available = [name for name, ok in detected.items() if ok]
+
+            settings = get_settings()
+            known = settings.get("known_backends", [])
+
+            if not known:
+                # First run — seed the list with whatever is present now
+                settings.set("known_backends", available)
+                return
+
+            new_backends = [b for b in available if b not in known]
+            if new_backends:
+                for b in new_backends:
+                    self.call_from_thread(
+                        self.write_log,
+                        f"[bold green]New backend detected: {b}[/] — switch via the sidebar or re-run the setup wizard.",
+                    )
+                settings.set("known_backends", list(set(known) | set(available)))
+        except Exception as exc:
+            logger.debug("Backend detection failed: %s", exc)
 
     def _check_for_update(self):
         """Background thread: check for a newer version on origin."""

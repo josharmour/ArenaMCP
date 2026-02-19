@@ -597,7 +597,7 @@ def step_detect_and_choose_backend(settings: dict) -> tuple[str, str]:
             cli_available.append(cmd_name)
     cli_tag = f" [{', '.join(cli_available)} detected]" if cli_available else ""
 
-    print(f"    [1] Ollama (Local){ollama_tag}")
+    print(f"    [1] Ollama (Local or Cloud){ollama_tag}")
     print(f"        Run models on your GPU, no internet needed")
     print(f"    [2] CLI Subscription{cli_tag}")
     print(f"        Claude CLI / Gemini CLI / Codex CLI")
@@ -605,7 +605,7 @@ def step_detect_and_choose_backend(settings: dict) -> tuple[str, str]:
     print(f"        Any OpenAI-compatible endpoint (URL + API key)")
 
     print()
-    choice = prompt_choice(["Ollama (Local)", "CLI Subscription", "API Endpoint"], "Select category")
+    choice = prompt_choice(["Ollama (Local or Cloud)", "CLI Subscription", "API Endpoint"], "Select category")
 
     model = ""
 
@@ -637,17 +637,24 @@ def step_detect_and_choose_backend(settings: dict) -> tuple[str, str]:
                 model = raw
         else:
             fail("No models pulled yet")
-            if prompt_yn("Pull llama3.2 (recommended)?", default=True):
-                info("Pulling llama3.2 -- this may take a while...")
-                pull = subprocess.run(["ollama", "pull", "llama3.2"])
+            info("Browse available models at: https://ollama.com/library")
+            model_name = prompt_input("Model to pull (e.g. llama3.2, mistral, phi3)", "llama3.2")
+            if prompt_yn(f"Pull {model_name} now?", default=True):
+                info(f"Pulling {model_name} -- this may take a while...")
+                pull = subprocess.run(["ollama", "pull", model_name])
                 if pull.returncode == 0:
-                    ok("llama3.2 ready")
-                    model = "llama3.2"
+                    ok(f"{model_name} ready")
+                    model = model_name
                 else:
-                    fail("Pull failed -- retry manually: ollama pull llama3.2")
+                    fail(f"Pull failed -- retry manually: ollama pull {model_name}")
             if not model:
-                model = prompt_input("Model name", "llama3.2")
+                model = model_name
 
+        print()
+        info("Ollama can connect to a local or remote server:")
+        info("  Local:  http://localhost:11434/v1  (default)")
+        info("  Cloud:  http://your-server:11434/v1")
+        info("  Tunnel: https://my-ollama.example.com/v1")
         ollama_url = prompt_input("Ollama API URL", OLLAMA_DEFAULT_URL)
         settings["ollama_url"] = ollama_url
 
