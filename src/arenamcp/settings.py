@@ -28,6 +28,9 @@ DEFAULTS = {
     "ollama_url": "http://localhost:11434/v1",
     "proxy_url": "",  # Empty = use PROXY_BASE_URL env or default
     "proxy_api_key": "",  # Empty = use PROXY_API_KEY env or default
+    # Generic OpenAI-compatible API endpoint (for "api" backend)
+    "api_url": "",
+    "api_key": "",
     # Language for TTS and STT (e.g., "en", "nl", "es", "fr", "de", "ja")
     "language": "en",
 }

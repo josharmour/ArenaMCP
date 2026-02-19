@@ -1628,7 +1628,7 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
         thinking-enabled backend so it doesn't interfere with real-time coaching.
 
         Parses VIABLE: YES/NO from the LLM response. Only stores viable plans
-        and plays a sound alert. The plan is read aloud only on numpad-0 press.
+        and plays a sound alert. The plan is read aloud only on Ctrl+0 press.
         """
         import concurrent.futures
 
@@ -1702,7 +1702,7 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
 
                 logger.info(f"VIABLE win-in-{n} plan found ({len(plan)} chars)")
 
-                # Store pending plan (no text output, no TTS — wait for numpad-0)
+                # Store pending plan (no text output, no TTS — wait for Ctrl+0)
                 self._pending_win_plan = plan
                 self._pending_win_plan_turns = n
                 self._pending_win_plan_turn = turn_num
@@ -1717,7 +1717,7 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
                 except Exception as e:
                     logger.debug(f"Win plan beep failed: {e}")
 
-                self.ui.status("WIN-PLAN", f"WIN IN {n} FOUND — Numpad 0 to hear")
+                self.ui.status("WIN-PLAN", f"WIN IN {n} FOUND — Ctrl+0 to hear")
                 break  # First viable result wins
 
             executor.shutdown(wait=False)
@@ -1879,7 +1879,7 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             keyboard.on_press_key("f8", lambda _: self._on_swap_seat_hotkey(), suppress=False)
             keyboard.on_press_key("f10", lambda _: self.run_speed_test(), suppress=False)
             keyboard.on_press_key("f12", lambda _: self._on_model_cycle_hotkey(), suppress=False)
-            keyboard.on_press_key("num 0", lambda _: self._on_read_win_plan(), suppress=False)
+            keyboard.add_hotkey("ctrl+0", lambda: self._on_read_win_plan(), suppress=False)
             logger.info("Hotkeys registered")
         except Exception as e:
             logger.warning(f"Hotkey registration failed: {e}")

@@ -587,6 +587,107 @@ class GeminiCliBackend:
         self._proc = None
 
 
+class CodexCliBackend:
+    """LLM backend using Codex CLI (one-shot subprocess, similar to Gemini one-shot)."""
+
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        command: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+        progress_callback: Optional[Any] = None,
+    ) -> None:
+        self.model = model
+        self.command = command or os.environ.get("CODEX_CLI_CMD", "codex")
+        self.timeout_s = float(
+            os.environ.get("CODEX_CLI_TIMEOUT_S", timeout_s or 30.0)
+        )
+        self.progress_callback = progress_callback
+
+    def _build_args(self) -> list[str]:
+        import shutil
+
+        cmd = self.command
+        if cmd and os.path.isabs(cmd):
+            resolved = cmd
+        else:
+            resolved = shutil.which(cmd) or ""
+
+        if not resolved and os.name == "nt":
+            resolved = (
+                shutil.which(f"{cmd}.ps1")
+                or shutil.which(f"{cmd}.cmd")
+                or ""
+            )
+
+        if resolved and resolved.lower().endswith(".ps1"):
+            return [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                resolved,
+            ]
+
+        return [resolved or cmd]
+
+    def complete(self, system_prompt: str, user_message: str) -> str:
+        """Get completion via Codex CLI (one-shot)."""
+        combined = (
+            f"SYSTEM INSTRUCTIONS:\n{system_prompt}\n\nUSER MESSAGE:\n{user_message}"
+        )
+        args = self._build_args() + ["-q", combined]
+        if self.model:
+            args += ["--model", self.model]
+
+        if self.progress_callback:
+            self.progress_callback("Thinking (codex)...")
+
+        try:
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = subprocess.CREATE_NO_WINDOW
+
+            result = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_s,
+                creationflags=creationflags,
+            )
+        except FileNotFoundError:
+            if self.progress_callback:
+                self.progress_callback("")
+            return (
+                "Error: Codex CLI not found. "
+                "Install it or set CODEX_CLI_CMD to the full path."
+            )
+        except subprocess.TimeoutExpired:
+            if self.progress_callback:
+                self.progress_callback("")
+            return "Error: Codex CLI request timed out"
+        except Exception as e:
+            if self.progress_callback:
+                self.progress_callback("")
+            return f"Error running Codex CLI: {e}"
+
+        if self.progress_callback:
+            self.progress_callback("")
+
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            return f"Error: Codex CLI failed: {err}"
+
+        return (result.stdout or "").strip()
+
+    def list_models(self) -> list[str]:
+        return []
+
+    def close(self) -> None:
+        pass
+
+
 class ProxyBackend:
     """LLM backend using CLI Proxy API (OpenAI-compatible endpoint).
 
@@ -612,7 +713,7 @@ class ProxyBackend:
             api_key: Override the API key. Falls back to PROXY_API_KEY env var,
                     then settings, then default placeholder.
         """
-        self.model = model
+        self.model = model or "claude-sonnet-4-5-20250929"
         self.enable_thinking = enable_thinking
         self._base_url = base_url
         self._api_key = api_key
@@ -844,6 +945,27 @@ def fetch_proxy_models() -> list[tuple[str, str]]:
     except Exception:
         pass
 
+    # Try generic API endpoint (api_url/api_key from settings)
+    try:
+        from arenamcp.settings import get_settings
+        s = get_settings()
+        api_url = s.get("api_url") or ""
+        api_key_val = s.get("api_key") or ""
+        if api_url and api_url.rstrip("/") != base_url.rstrip("/"):
+            headers = {}
+            if api_key_val:
+                headers["Authorization"] = f"Bearer {api_key_val}"
+            req = urllib.request.Request(f"{api_url.rstrip('/')}/models", headers=headers)
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read())
+            for m in data.get("data", []):
+                model_id = m["id"]
+                display = f"API: {model_id}"
+                results.append((display, f"api/{model_id}"))
+            logger.info(f"Fetched API endpoint models, total now: {len(results)}")
+    except Exception:
+        pass
+
     if results:
         return results
 
@@ -927,6 +1049,19 @@ def create_backend(
         return GeminiCliBackend(model=model, progress_callback=progress_callback)
     elif backend_type == "proxy":
         return ProxyBackend(model=model or "claude-sonnet-4-5-20250929")
+    elif backend_type in ("codex", "codex-cli", "codex_cli"):
+        return CodexCliBackend(model=model, progress_callback=progress_callback)
+    elif backend_type == "api":
+        # Generic OpenAI-compatible API endpoint
+        try:
+            from arenamcp.settings import get_settings
+            s = get_settings()
+            url = s.get("api_url") or "https://api.openai.com/v1"
+            key = s.get("api_key") or ""
+        except Exception:
+            url = "https://api.openai.com/v1"
+            key = ""
+        return ProxyBackend(model=model or "gpt-4o", base_url=url, api_key=key)
     elif backend_type == "ollama":
         # Ollama exposes an OpenAI-compatible API at localhost:11434/v1
         try:
@@ -941,7 +1076,8 @@ def create_backend(
         )
     else:
         raise ValueError(
-            f"Unknown backend type: {backend_type}. Use 'proxy', 'claude-code', 'gemini-cli', or 'ollama'"
+            f"Unknown backend type: {backend_type}. "
+            "Use 'proxy', 'claude-code', 'gemini-cli', 'codex-cli', 'api', or 'ollama'"
         )
 
 
@@ -992,6 +1128,7 @@ CRITICAL BLOCKING RULES:
 - Do NOT suggest blocking a [FLYING] creature with a ground creature (no [FLYING]/[REACH]).
 - If enemy attackers have [FLYING] and you have no flyers/reach, you CANNOT block them.
 - HOWEVER: A creature WITH [FLYING] CAN block ground creatures! Flying only restricts what blocks THEM, not what they block. A flyer is a valid blocker for any attacker.
+- DEATHTOUCH [DTH]: A creature with deathtouch KILLS any creature that blocks it, regardless of toughness. Do NOT block a deathtouch creature with a valuable creature just to prevent 1-2 damage — you lose the blocker! Only block deathtouch if the blocker is expendable or you MUST block to survive.
 
 CRITICAL STRATEGY RULES:
 - LETHAL CHECK: Before anything else, count your total attack power vs opponent life and blockers.
@@ -1406,6 +1543,12 @@ class CoachEngine:
         if pending == "Mulligan":
             valid_moves = ["KEEP", "MULLIGAN"]
             valid_moves_str = "KEEP, MULLIGAN"
+        elif pending == "Mulligan Bottom":
+            # London Mulligan: player kept but must put N cards on bottom
+            hand_cards = game_state.get("hand", [])
+            card_names = [c.get("name", "Unknown") for c in hand_cards]
+            valid_moves = [f"Bottom: {n}" for n in card_names]
+            valid_moves_str = ", ".join(card_names)
         else:
             try:
                 from arenamcp.rules_engine import RulesEngine
@@ -1547,7 +1690,14 @@ class CoachEngine:
             if decision_context:
                 dec_type = decision_context.get("type", "unknown")
 
-                if dec_type == "discard":
+                if dec_type == "mulligan_bottom":
+                    # London Mulligan: choose cards to put on bottom
+                    hand = game_state.get("hand", [])
+                    num_to_bottom = max(1, 7 - len(hand) + 1)  # estimate from hand size
+                    lines.append(f"!!! DECISION: MULLIGAN - PUT {num_to_bottom} CARD(S) ON BOTTOM !!!")
+                    lines.append("Keep: lands + on-curve plays | Bottom: expensive/off-color/redundant")
+
+                elif dec_type == "discard":
                     count = decision_context.get("count", 1)
                     lines.append(f"!!! DECISION: DISCARD {count} card(s) !!!")
                     lines.append(
@@ -1709,7 +1859,7 @@ class CoachEngine:
 
         # OPTIMIZATION: Single line for turn/phase/priority
         # During mulligan, override the turn line to avoid "Pri:Opp" confusing the LLM
-        if pending_decision == "Mulligan":
+        if pending_decision in ("Mulligan", "Mulligan Bottom"):
             lines.append("YOUR MULLIGAN DECISION")
         else:
             phase_str = f"{phase}/{step}" if step else phase
@@ -1717,7 +1867,7 @@ class CoachEngine:
 
         # OPTIMIZATION: Compact timing rules - single line
         # Skip timing info during mulligan - it's irrelevant and confusing
-        if pending_decision != "Mulligan":
+        if pending_decision not in ("Mulligan", "Mulligan Bottom"):
             if can_cast_sorcery:
                 lines.append("Timing: ALL SPELLS")
             elif is_blocking:
@@ -1747,11 +1897,13 @@ class CoachEngine:
         mana_pool = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0, "C": 0, "Any": 0}
         mana_sources = []  # Track individual sources for clearer display
         total_mana = 0
+        creature_mana_source_count = 0  # For bonus-mana detection
 
         for card in your_cards:
             type_line = card.get("type_line", "").lower()
             oracle = card.get("oracle_text", "")
             is_creature = "creature" in type_line
+            is_land = "land" in type_line
             # Check for casting sickness (unless it has haste)
             has_haste = "haste" in self._remove_reminder_text(oracle).lower()
             is_summoning_sick = (
@@ -1766,29 +1918,41 @@ class CoachEngine:
             has_mana_ability = (
                 "add {" in oracle.lower() or "add one mana" in oracle.lower()
             )
+            # Some lands say "this land is the chosen type" (e.g. Multiversal Passage)
+            # — they produce mana of whatever basic type they are but don't have "add {" in oracle.
+            # Detect via basic land subtypes in the type_line.
+            if is_land and not has_mana_ability:
+                for basic in ("plains", "island", "swamp", "mountain", "forest"):
+                    if basic in type_line:
+                        has_mana_ability = True
+                        break
 
             if not card.get("is_tapped"):
-                if "land" in type_line or (
+                if is_land or (
                     is_creature and has_mana_ability and not is_summoning_sick
                 ):
                     total_mana += 1
                     name = card.get("name", "")
 
+                    # Track creature mana sources for bonus-mana effects
+                    if is_creature and has_mana_ability and not is_summoning_sick:
+                        creature_mana_source_count += 1
+
                     # Detect what colors this specific source can produce
                     source_colors = []
-                    if "Plains" in name or "{W}" in oracle:
+                    if "Plains" in name or "plains" in type_line or "{W}" in oracle:
                         mana_pool["W"] += 1
                         source_colors.append("W")
-                    if "Island" in name or "{U}" in oracle:
+                    if "Island" in name or "island" in type_line or "{U}" in oracle:
                         mana_pool["U"] += 1
                         source_colors.append("U")
-                    if "Swamp" in name or "{B}" in oracle:
+                    if "Swamp" in name or "swamp" in type_line or "{B}" in oracle:
                         mana_pool["B"] += 1
                         source_colors.append("B")
-                    if "Mountain" in name or "{R}" in oracle:
+                    if "Mountain" in name or "mountain" in type_line or "{R}" in oracle:
                         mana_pool["R"] += 1
                         source_colors.append("R")
-                    if "Forest" in name or "{G}" in oracle:
+                    if "Forest" in name or "forest" in type_line or "{G}" in oracle:
                         mana_pool["G"] += 1
                         source_colors.append("G")
                     if "{C}" in oracle:
@@ -1805,6 +1969,33 @@ class CoachEngine:
                     elif len(source_colors) == 1:
                         mana_sources.append(source_colors[0])
 
+        # Detect bonus-mana effects: "whenever you tap a creature for mana, add"
+        # e.g. Badgermole Cub, Leyline of Abundance
+        mana_bonus_notes = []
+        import re
+        for card in your_cards:
+            oracle_lower = card.get("oracle_text", "").lower()
+            name = card.get("name", "")
+            # Pattern: "whenever you tap a creature for mana, add an additional {X}"
+            bonus_match = re.search(r"whenever you tap a creature for mana,?\s*add an additional \{(\w)\}", oracle_lower)
+            if bonus_match and creature_mana_source_count > 0:
+                bonus_color = bonus_match.group(1).upper()
+                bonus_total = creature_mana_source_count
+                total_mana += bonus_total
+                if bonus_color in mana_pool:
+                    mana_pool[bonus_color] += bonus_total
+                # Add bonus sources to display
+                for _ in range(bonus_total):
+                    mana_sources.append(f"+{bonus_color}")
+                logger.info(f"Mana bonus from {name}: +{bonus_total} {{{bonus_color}}} ({creature_mana_source_count} creature sources)")
+
+            # Detect untap-on-cast effects for annotation
+            if "untap" in oracle_lower and ("mana value" in oracle_lower or "converted mana cost" in oracle_lower):
+                untap_match = re.search(r"(?:mana value|converted mana cost)\s*(\d+)\s*or greater.*untap|cast.*(?:mana value|converted mana cost)\s*(\d+).*untap|untap.*(?:mana value|converted mana cost)\s*(\d+)", oracle_lower)
+                if untap_match:
+                    threshold = untap_match.group(1) or untap_match.group(2) or untap_match.group(3)
+                    mana_bonus_notes.append(f"{name} untaps on MV{threshold}+ cast → tap again for extra mana")
+
         logger.info(f"Mana: {mana_pool} (Total: {total_mana})")
 
         # IMPROVED: Show mana sources more clearly to avoid dual-land confusion
@@ -1818,6 +2009,8 @@ class CoachEngine:
             lines.append(f"Mana: {total_mana} (sources: {source_display})")
         else:
             lines.append(f"Mana: 0")
+        for note in mana_bonus_notes:
+            lines.append(f"⚠️ {note}")
 
         # OPTIMIZATION: Compact land drop status
         lands_played = local_player.get("lands_played", 0) if local_player else 0
@@ -1848,10 +2041,10 @@ class CoachEngine:
                     else:
                         display_name = name
 
-                    # P/T for creatures
+                    # P/T for creatures (use type_line, handle null power)
                     pt = (
-                        f" {card['power']}/{card['toughness']}"
-                        if card.get("power") is not None
+                        f" {card.get('power') or 0}/{card.get('toughness') or 0}"
+                        if "creature" in type_line or card.get("power") is not None
                         else ""
                     )
 
@@ -1945,8 +2138,7 @@ class CoachEngine:
                         )
                         if (
                             c.get("is_tapped")
-                            and c.get("power") is not None
-                            and "land" not in c_type
+                            and "creature" in c_type
                             and not is_ss
                         ):
                             _inferred_atk_ids.add(c.get("instance_id"))
@@ -2045,8 +2237,7 @@ class CoachEngine:
                 your_creatures = [
                     c
                     for c in your_cards
-                    if c.get("power") is not None
-                    and "land" not in c.get("type_line", "").lower()
+                    if "creature" in c.get("type_line", "").lower()
                 ]
 
                 valid_attackers = [
@@ -2062,13 +2253,12 @@ class CoachEngine:
                     )
                 ]
 
-                your_attack_power = sum(c.get("power", 0) for c in valid_attackers)
+                your_attack_power = sum(c.get("power") or 0 for c in valid_attackers)
 
                 opp_creatures = [
                     c
                     for c in opp_cards
-                    if c.get("power") is not None
-                    and "land" not in c.get("type_line", "").lower()
+                    if "creature" in c.get("type_line", "").lower()
                 ]
                 opp_blockers = [c for c in opp_creatures if not c.get("is_tapped")]
                 opp_block_count = len(opp_blockers)
@@ -2103,15 +2293,20 @@ class CoachEngine:
 
                 # Crackback warning: opponent's potential attack power next turn
                 opp_attack_power = sum(
-                    c.get("power", 0) for c in opp_creatures
+                    c.get("power") or 0 for c in opp_creatures
                 )
                 your_life = (
                     local_player.get("life_total", 20) if local_player else 20
                 )
                 if opp_attack_power > 0:
-                    if opp_attack_power >= your_life:
+                    life_margin = your_life - opp_attack_power
+                    if life_margin <= 0:
                         lines.append(
                             f"Crackback: {opp_attack_power}pwr vs your {your_life} life — LETHAL if no blockers held!"
+                        )
+                    elif life_margin <= 3:
+                        lines.append(
+                            f"Crackback: {opp_attack_power}pwr vs your {your_life} life — DANGER (only {life_margin} margin!)"
                         )
                     else:
                         lines.append(
@@ -2139,9 +2334,8 @@ class CoachEngine:
                 your_creatures = [
                     c
                     for c in your_cards
-                    if c.get("power") is not None
+                    if "creature" in c.get("type_line", "").lower()
                     and not c.get("is_tapped")
-                    and "land" not in c.get("type_line", "").lower()
                 ]
 
                 flyer_blockers = [
@@ -2156,13 +2350,69 @@ class CoachEngine:
 
                 # Single line blocking summary
                 if attacking:
-                    fly_dmg = sum(c.get("power", 0) for c in flying_atk)
-                    gnd_dmg = sum(c.get("power", 0) for c in ground_atk)
+                    fly_dmg = sum(c.get("power") or 0 for c in flying_atk)
+                    gnd_dmg = sum(c.get("power") or 0 for c in ground_atk)
                     lines.append(
                         f"Blk: {fly_dmg}fly/{gnd_dmg}gnd dmg | {len(flyer_blockers)}FLY-blk avail"
                     )
                     if flying_atk and not flyer_blockers:
                         lines.append(f"⚠️ {fly_dmg} UNBLOCKABLE!")
+                    # Deathtouch warning — critical for blocking decisions
+                    dth_atk = [
+                        c for c in attacking
+                        if "deathtouch" in self._remove_reminder_text(c.get("oracle_text", "")).lower()
+                    ]
+                    if dth_atk:
+                        dth_names = ", ".join(c.get("name", "?") for c in dth_atk)
+                        lines.append(f"⚠️ DEATHTOUCH: {dth_names} — any blocker DIES regardless of toughness!")
+
+                    # Trade analysis: show what happens for each block
+                    if your_creatures and attacking:
+                        for atk in attacking:
+                            atk_name = atk.get("name", "?")
+                            atk_pow = atk.get("power") or 0
+                            atk_tgh = atk.get("toughness") or 0
+                            atk_oracle = self._remove_reminder_text(
+                                atk.get("oracle_text", "")
+                            ).lower()
+                            atk_has_dth = "deathtouch" in atk_oracle
+                            atk_has_trample = "trample" in atk_oracle
+                            atk_has_fs = "first strike" in atk_oracle or "double strike" in atk_oracle
+                            for blk in your_creatures:
+                                blk_name = blk.get("name", "?")
+                                blk_pow = blk.get("power") or 0
+                                blk_tgh = blk.get("toughness") or 0
+                                blk_oracle = self._remove_reminder_text(
+                                    blk.get("oracle_text", "")
+                                ).lower()
+                                blk_has_dth = "deathtouch" in blk_oracle
+                                blk_has_fs = "first strike" in blk_oracle or "double strike" in blk_oracle
+                                # Determine outcomes
+                                atk_dies = (blk_pow >= atk_tgh) or blk_has_dth
+                                blk_dies = (atk_pow >= blk_tgh) or atk_has_dth
+                                # First strike advantage
+                                if atk_has_fs and not blk_has_fs:
+                                    if atk_pow >= blk_tgh or atk_has_dth:
+                                        atk_dies = False  # blocker dies before dealing damage
+                                elif blk_has_fs and not atk_has_fs:
+                                    if blk_pow >= atk_tgh or blk_has_dth:
+                                        blk_dies = False  # attacker dies before dealing damage
+                                if atk_dies and blk_dies:
+                                    result = "TRADE (both die)"
+                                elif atk_dies:
+                                    result = f"{atk_name} dies, {blk_name} lives ({blk_tgh - atk_pow} left)"
+                                elif blk_dies:
+                                    trample_dmg = ""
+                                    if atk_has_trample:
+                                        spillover = atk_pow - blk_tgh
+                                        if spillover > 0:
+                                            trample_dmg = f", {spillover} trample through"
+                                    result = f"{blk_name} dies, {atk_name} lives ({atk_tgh - blk_pow} left){trample_dmg}"
+                                else:
+                                    result = "both live"
+                                lines.append(
+                                    f"  If {blk_name} {blk_pow}/{blk_tgh} blocks {atk_name} {atk_pow}/{atk_tgh}: {result}"
+                                )
         else:
             lines.append("")
             lines.append("BOARD: Empty")
@@ -2207,8 +2457,7 @@ class CoachEngine:
         opp_creatures = [
             c
             for c in opp_cards
-            if c.get("power") is not None
-            and "land" not in c.get("type_line", "").lower()
+            if "creature" in c.get("type_line", "").lower()
         ]
         opp_nonland = [
             c for c in opp_cards
@@ -2787,8 +3036,7 @@ class CoachEngine:
                 c
                 for c in battlefield
                 if c.get("owner_seat_id") == local_seat
-                and c.get("power") is not None
-                and "land" not in c.get("type_line", "").lower()
+                and "creature" in c.get("type_line", "").lower()
             ]
 
             def _has_haste(card: dict[str, Any]) -> bool:
@@ -2805,14 +3053,13 @@ class CoachEngine:
                     c.get("turn_entered_battlefield") == turn_num and not _has_haste(c)
                 )
             ]
-            attack_power = sum(c.get("power", 0) for c in valid_attackers)
+            attack_power = sum(c.get("power") or 0 for c in valid_attackers)
 
             opp_creatures = [
                 c
                 for c in battlefield
                 if c.get("owner_seat_id") != local_seat
-                and c.get("power") is not None
-                and "land" not in c.get("type_line", "").lower()
+                and "creature" in c.get("type_line", "").lower()
             ]
             opp_blockers = len([c for c in opp_creatures if not c.get("is_tapped")])
             opp_life = opponent_player.get("life_total", 20)
@@ -2996,6 +3243,9 @@ class CoachEngine:
         pending = game_state.get("pending_decision")
         if pending == "Mulligan":
             legal_actions = ["KEEP", "MULLIGAN"]
+        elif pending == "Mulligan Bottom":
+            # During bottom-card selection, any card name advice is valid
+            legal_actions = []
         else:
             try:
                 from arenamcp.rules_engine import RulesEngine
@@ -3341,7 +3591,7 @@ class GameStateTrigger:
             logger.info(f"Triggering decision due to legal_actions update: {legal_actions}")
             if "decision_required" not in triggers:
                 triggers.append("decision_required")
-        elif pending_decision == "Mulligan":
+        elif pending_decision in ("Mulligan", "Mulligan Bottom"):
                 # Mulligan re-fire: the hand zone may not be populated on
                 # the first poll (SubmitDeckReq arrives before GameState).
                 # Re-trigger once when the hand appears so the player gets

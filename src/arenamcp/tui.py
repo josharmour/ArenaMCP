@@ -445,7 +445,9 @@ class Sidebar(Vertical):
             yield Button("Debug (F7)", id="btn-debug", variant="default")
             yield Button("Analyze Screen (F3)", id="btn-screenshot", variant="primary")
             yield Button("Analyze Match", id="btn-analyze", variant="warning")
+            yield Button("Update", id="btn-update", variant="warning")
             yield Button("Restart", id="btn-restart", variant="error")
+            yield Button("", id="btn-win-plan", variant="warning", disabled=True)
 
 
 class ArenaApp(App):
@@ -486,6 +488,20 @@ class ArenaApp(App):
         padding: 0 1;
         min-height: 1;
         border: none;
+    }
+
+    #btn-update {
+        display: none;
+    }
+
+    #btn-win-plan:disabled {
+        display: none;
+    }
+
+    #btn-win-plan {
+        background: $warning-darken-1;
+        color: $text;
+        text-style: bold;
     }
 
     #main-area {
@@ -530,8 +546,7 @@ class ArenaApp(App):
         ("f6", "cycle_voice", "Voice"),
         ("f7", "copy_debug", "Debug"),
         ("f8", "cycle_speed", "Speed"),
-        ("keypad_2", "cycle_model", "Model"),
-        ("keypad_0", "read_win_plan", "Win Plan"),
+        ("ctrl+0", "read_win_plan", "Win Plan"),
     ]
 
     def __init__(self, args):
@@ -541,6 +556,7 @@ class ArenaApp(App):
         self.log_widget = None
         self.game_state_widget = None
         self._restart_requested = False
+        self._pending_remote_version: str | None = None
 
         # Fetch proxy models before UI renders
         Sidebar.load_model_options()
@@ -562,14 +578,65 @@ class ArenaApp(App):
         """Start the coach thread when the app mounts."""
         self.log_widget = self.query_one("#log-view", SelectableRichLog)
         self.game_state_widget = self.query_one("#game-state-display", GameStateDisplay)
-        
-        self.write_log("[bold green]Initializing MTGA Coach...[/]")
-        
+
+        from arenamcp import __version__
+        self.title = f"ArenaMCP v{__version__}"
+        self.write_log(f"[bold]ArenaMCP v{__version__}[/]")
+
+        # Check for updates in background (non-blocking)
+        threading.Thread(target=self._check_for_update, daemon=True).start()
+
         # Start initial coach logic in a thread
         threading.Thread(target=self.start_coach, daemon=True).start()
-        
+
         # Start game state polling
         threading.Thread(target=self._poll_game_state, daemon=True).start()
+
+    def _check_for_update(self):
+        """Background thread: check for a newer version on origin."""
+        from arenamcp.updater import check_for_update
+
+        try:
+            available, local_ver, remote_ver = check_for_update()
+            if available:
+                self._pending_remote_version = remote_ver
+                self.call_from_thread(
+                    self.write_log,
+                    f"[bold yellow]Update available: v{local_ver} \u2192 v{remote_ver}[/]",
+                )
+                self.call_from_thread(
+                    self.write_log,
+                    "[yellow]Type /update or click the Update button to download and restart.[/]",
+                )
+                # Unhide the sidebar button
+                def _show_btn():
+                    try:
+                        btn = self.query_one("#btn-update", Button)
+                        btn.label = f"Update \u2192 v{remote_ver}"
+                        btn.display = True
+                    except Exception:
+                        pass
+                self.call_from_thread(_show_btn)
+            else:
+                self.call_from_thread(
+                    self.write_log,
+                    f"[dim]Up to date (v{local_ver})[/]",
+                )
+        except Exception as exc:
+            logger.debug("Update check failed: %s", exc)
+
+    def _do_apply_update(self):
+        """Background thread: run git pull and restart on success."""
+        from arenamcp.updater import apply_update
+
+        self.call_from_thread(self.write_log, "[yellow]Pulling latest changes...[/]")
+        success, message = apply_update()
+        if success:
+            self.call_from_thread(self.write_log, f"[bold green]Updated: {message}[/]")
+            self.call_from_thread(self.write_log, "[green]Restarting...[/]")
+            self.call_from_thread(self.action_restart)
+        else:
+            self.call_from_thread(self.write_log, f"[bold red]Update failed: {message}[/]")
 
     def _poll_game_state(self):
         """Poll game state and update display every 500ms."""
@@ -773,6 +840,14 @@ class ArenaApp(App):
             self.sub_title = value
         elif key == "SEAT_INFO":
             self.query_one("#status-seat", Static).update(f"Seat: {value}")
+        elif key == "WIN-PLAN":
+            btn = self.query_one("#btn-win-plan", Button)
+            if value:
+                btn.label = value
+                btn.disabled = False
+            else:
+                btn.label = ""
+                btn.disabled = True
 
     # --- Actions ---
 
@@ -795,8 +870,13 @@ class ArenaApp(App):
             self.action_analyze_screen()
         elif btn_id == "btn-analyze":
             self.action_stop_recording()
+        elif btn_id == "btn-update":
+            if self._pending_remote_version:
+                threading.Thread(target=self._do_apply_update, daemon=True).start()
         elif btn_id == "btn-restart":
             self.action_restart()
+        elif btn_id == "btn-win-plan":
+            self.action_read_win_plan()
 
     def _cycle_provider(self) -> None:
         """Cycle to next provider/model on click."""
@@ -862,10 +942,26 @@ class ArenaApp(App):
         text = event.value.strip()
         if not text:
             return
-            
+
         event.input.value = ""
+
+        # Handle /update command
+        if text.lower() == "/update":
+            self.write_log(f"\n[bold cyan]YOU: {text}[/]")
+            if self._pending_remote_version:
+                threading.Thread(target=self._do_apply_update, daemon=True).start()
+            else:
+                self.write_log("[dim]No update available. Already up to date.[/]")
+            return
+
+        # Handle /bugreport command
+        if text.lower() == "/bugreport":
+            self.write_log(f"\n[bold cyan]YOU: {text}[/]")
+            threading.Thread(target=self._do_submit_bugreport, daemon=True).start()
+            return
+
         self.write_log(f"\n[bold cyan]YOU: {text}[/]")
-        
+
         if self.coach and self.coach._mcp:
             # Run in thread to avoid blocking UI
             threading.Thread(
@@ -923,10 +1019,105 @@ class ArenaApp(App):
                 file_url = f"file:///{str(bug_path).replace(chr(92), '/')}"
                 self.call_from_thread(self.write_log, "[green]Bug report saved.[/]")
                 self.call_from_thread(self.write_log, f"[dim]{file_url}[/] (copied to clipboard)")
+                self.call_from_thread(
+                    self.write_log,
+                    "[yellow]Type /bugreport to submit to GitHub.[/]",
+                )
             else:
                 self.call_from_thread(self.write_log, "[red]Failed to save debug report[/]")
         else:
             self.call_from_thread(self.write_log, "[yellow]Coach not available for debug report[/]")
+
+    def _do_submit_bugreport(self):
+        """Submit the most recent bug report as a GitHub issue."""
+        import shutil
+        from pathlib import Path
+
+        bug_dir = LOG_DIR / "bug_reports"
+        if not bug_dir.exists():
+            self.call_from_thread(self.write_log, "[red]No bug reports found. Press F7 first.[/]")
+            return
+
+        # Find the most recent bug report JSON
+        reports = sorted(bug_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not reports:
+            self.call_from_thread(self.write_log, "[red]No bug reports found. Press F7 first.[/]")
+            return
+
+        report_path = reports[0]
+        try:
+            import json as _json
+            report_data = _json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.call_from_thread(self.write_log, f"[red]Failed to read bug report: {exc}[/]")
+            return
+
+        timestamp = report_data.get("timestamp", report_path.stem)
+        title = f"Bug Report: {timestamp}"
+        # Build a concise body from the report
+        body_parts = [f"**Timestamp:** {timestamp}"]
+        if report_data.get("trigger"):
+            body_parts.append(f"**Trigger:** {report_data['trigger']}")
+        if report_data.get("backend"):
+            body_parts.append(f"**Backend:** {report_data['backend']}")
+        if report_data.get("model"):
+            body_parts.append(f"**Model:** {report_data['model']}")
+        body_parts.append("")
+        body_parts.append("*(Full report JSON was too large to include — see attached file)*")
+        body = "\n".join(body_parts)
+
+        repo = "josharmour/ArenaMCP"
+
+        # Try gh CLI first
+        gh_bin = shutil.which("gh")
+        if gh_bin:
+            self.call_from_thread(self.write_log, "[yellow]Creating GitHub issue via gh CLI...[/]")
+            try:
+                import subprocess
+                result = subprocess.run(
+                    [gh_bin, "issue", "create", "--repo", repo, "--title", title, "--body", body],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0:
+                    issue_url = result.stdout.strip()
+                    self.call_from_thread(
+                        self.write_log,
+                        f"[bold green]Issue created: {issue_url}[/]",
+                    )
+                    return
+                else:
+                    err = (result.stderr or result.stdout or "").strip()
+                    self.call_from_thread(
+                        self.write_log,
+                        f"[yellow]gh CLI failed: {err}. Falling back to browser...[/]",
+                    )
+            except Exception as exc:
+                self.call_from_thread(
+                    self.write_log,
+                    f"[yellow]gh CLI error: {exc}. Falling back to browser...[/]",
+                )
+
+        # Fallback: open browser with pre-filled issue
+        import urllib.parse
+        import webbrowser
+
+        params = urllib.parse.urlencode({"title": title, "body": body})
+        url = f"https://github.com/{repo}/issues/new?{params}"
+        try:
+            webbrowser.open(url)
+            self.call_from_thread(
+                self.write_log,
+                "[green]Opened GitHub new issue page in browser.[/]",
+            )
+        except Exception as exc:
+            self.call_from_thread(
+                self.write_log,
+                f"[red]Failed to open browser: {exc}[/]",
+            )
+            self.call_from_thread(
+                self.write_log,
+                f"[dim]Manual URL: https://github.com/{repo}/issues/new[/]",
+            )
 
     def action_restart(self) -> None:
         """Handle restart request - cleanly stops coach and exits app for restart."""
@@ -1441,7 +1632,7 @@ class ArenaApp(App):
         self._cycle_provider()
 
     def action_read_win_plan(self) -> None:
-        """Read pending win plan aloud (Numpad 0)."""
+        """Read pending win plan aloud (Ctrl+0 or click)."""
         if self.coach:
             threading.Thread(target=self.coach._on_read_win_plan, daemon=True).start()
 

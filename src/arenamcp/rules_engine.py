@@ -23,9 +23,9 @@ class RulesEngine:
         battlefield = game_state.get("battlefield", [])
         pool = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0, "C": 0, "Any": 0, "total": 0}
         turn_num = game_state.get("turn", {}).get("turn_number", 0)
-        for card in battlefield:
-            if card.get("owner_seat_id") != local_seat:
-                continue
+        creature_mana_source_count = 0
+        your_cards = [c for c in battlefield if c.get("owner_seat_id") == local_seat]
+        for card in your_cards:
             if card.get("is_tapped"):
                 continue
             type_line = card.get("type_line", "").lower()
@@ -34,25 +34,44 @@ class RulesEngine:
             is_land = "land" in type_line
             is_creature = "creature" in type_line
             has_mana_ability = bool(re.search(r'\{T\}.*[Aa]dd\s+(\{|one |two |three )', oracle))
+            # Detect lands with basic subtypes but no explicit "add" (e.g. Multiversal Passage)
+            if is_land and not has_mana_ability:
+                for basic in ("plains", "island", "swamp", "mountain", "forest"):
+                    if basic in type_line:
+                        has_mana_ability = True
+                        break
             entered = card.get("turn_entered_battlefield", -1)
             has_haste = "haste" in oracle.lower()
             is_sick = is_creature and (entered == turn_num) and not has_haste
             if is_land or (is_creature and has_mana_ability and not is_sick):
                 pool["total"] += 1
-                if "Plains" in name or "{W}" in oracle:
+                if is_creature and has_mana_ability and not is_sick:
+                    creature_mana_source_count += 1
+                if "Plains" in name or "plains" in type_line or "{W}" in oracle:
                     pool["W"] += 1
-                if "Island" in name or "{U}" in oracle:
+                if "Island" in name or "island" in type_line or "{U}" in oracle:
                     pool["U"] += 1
-                if "Swamp" in name or "{B}" in oracle:
+                if "Swamp" in name or "swamp" in type_line or "{B}" in oracle:
                     pool["B"] += 1
-                if "Mountain" in name or "{R}" in oracle:
+                if "Mountain" in name or "mountain" in type_line or "{R}" in oracle:
                     pool["R"] += 1
-                if "Forest" in name or "{G}" in oracle:
+                if "Forest" in name or "forest" in type_line or "{G}" in oracle:
                     pool["G"] += 1
                 if "{C}" in oracle:
                     pool["C"] += 1
                 if "any color" in oracle.lower():
                     pool["Any"] += 1
+
+        # Detect bonus-mana effects: "whenever you tap a creature for mana, add"
+        if creature_mana_source_count > 0:
+            for card in your_cards:
+                oracle_lower = card.get("oracle_text", "").lower()
+                bonus_match = re.search(r"whenever you tap a creature for mana,?\s*add an additional \{(\w)\}", oracle_lower)
+                if bonus_match:
+                    bonus_color = bonus_match.group(1).upper()
+                    pool["total"] += creature_mana_source_count
+                    if bonus_color in pool:
+                        pool[bonus_color] += creature_mana_source_count
         return pool
 
     @staticmethod

@@ -577,10 +577,10 @@ def enrich_with_oracle_text(grp_id: int) -> dict[str, Any]:
         if mtgjson_card:
             return {
                 "grp_id": grp_id,
-                "name": mtgjson_card.name,
-                "oracle_text": mtgjson_card.oracle_text,
-                "type_line": mtgjson_card.type_line,
-                "mana_cost": mtgjson_card.mana_cost,
+                "name": mtgjson_card.name or f"Unknown ({grp_id})",
+                "oracle_text": mtgjson_card.oracle_text or "",
+                "type_line": mtgjson_card.type_line or "",
+                "mana_cost": mtgjson_card.mana_cost or "",
             }
 
     # Try MTGA local DB for name, then look up oracle text by name from MTGJSON
@@ -588,19 +588,19 @@ def enrich_with_oracle_text(grp_id: int) -> dict[str, Any]:
     if mtgadb.available:
         mtga_card = mtgadb.get_card(grp_id)
         if mtga_card:
-            # Got simple card data from MTGA DB. 
+            # Got simple card data from MTGA DB.
             # Ideally we enrich it with Scryfall/MTGJSON for formatted mana costs and clean text.
-            
+
             # Try MTGJSON by name
             if mtgjson.available:
                 mtgjson_card = mtgjson.get_card_by_name(mtga_card.name)
                 if mtgjson_card:
                     return {
                         "grp_id": grp_id,
-                        "name": mtga_card.name,
-                        "oracle_text": mtgjson_card.oracle_text,
-                        "type_line": mtgjson_card.type_line,
-                        "mana_cost": mtgjson_card.mana_cost,
+                        "name": mtga_card.name or f"Unknown ({grp_id})",
+                        "oracle_text": mtgjson_card.oracle_text or "",
+                        "type_line": mtgjson_card.type_line or "",
+                        "mana_cost": mtgjson_card.mana_cost or "",
                     }
 
             # Try Scryfall for oracle text - first by arena_id, then by name
@@ -614,19 +614,19 @@ def enrich_with_oracle_text(grp_id: int) -> dict[str, Any]:
             if scryfall_card:
                 return {
                     "grp_id": grp_id,
-                    "name": mtga_card.name,
-                    "oracle_text": scryfall_card.oracle_text,
-                    "type_line": scryfall_card.type_line,
-                    "mana_cost": scryfall_card.mana_cost,
+                    "name": mtga_card.name or f"Unknown ({grp_id})",
+                    "oracle_text": scryfall_card.oracle_text or "",
+                    "type_line": scryfall_card.type_line or "",
+                    "mana_cost": scryfall_card.mana_cost or "",
                 }
             else:
                 # MTGA DB Fallback: Use the text we resolved from AbilityIds
                 # This handles digital-only cards (Alchemy) or new sets not yet in Scryfall
                 return {
                     "grp_id": grp_id,
-                    "name": mtga_card.name,
-                    "oracle_text": mtga_card.oracle_text,  # Now populated via local DB!
-                    "type_line": mtga_card.types,          # Use raw types from DB
+                    "name": mtga_card.name or f"Unknown ({grp_id})",
+                    "oracle_text": mtga_card.oracle_text or "",
+                    "type_line": mtga_card.types or "",
                     "mana_cost": "", # TODO: Parse OldSchoolManaText if needed
                 }
         
@@ -656,10 +656,10 @@ def enrich_with_oracle_text(grp_id: int) -> dict[str, Any]:
 
     return {
         "grp_id": grp_id,
-        "name": card.name,
-        "oracle_text": card.oracle_text,
-        "type_line": card.type_line,
-        "mana_cost": card.mana_cost,
+        "name": card.name or f"Unknown ({grp_id})",
+        "oracle_text": card.oracle_text or "",
+        "type_line": card.type_line or "",
+        "mana_cost": card.mana_cost or "",
     }
 
 
@@ -690,10 +690,10 @@ def _serialize_game_object(obj) -> dict[str, Any]:
     result = {
         "instance_id": obj.instance_id,
         "grp_id": obj.grp_id,
-        "name": enriched["name"],
-        "oracle_text": enriched["oracle_text"],
-        "type_line": enriched["type_line"],
-        "mana_cost": enriched["mana_cost"],
+        "name": enriched.get("name") or f"Unknown ({obj.grp_id})",
+        "oracle_text": enriched.get("oracle_text") or "",
+        "type_line": enriched.get("type_line") or "",
+        "mana_cost": enriched.get("mana_cost") or "",
         "owner_seat_id": obj.owner_seat_id,
         "controller_seat_id": obj.controller_seat_id,
         "power": obj.power,
@@ -832,12 +832,12 @@ def get_card_info(arena_id: int) -> dict[str, Any]:
         return {"error": f"Card not found for arena_id {arena_id}"}
 
     return {
-        "name": card.name,
-        "oracle_text": card.oracle_text,
-        "type_line": card.type_line,
-        "mana_cost": card.mana_cost,
-        "cmc": card.cmc,
-        "colors": card.colors,
+        "name": card.name or f"Unknown ({arena_id})",
+        "oracle_text": card.oracle_text or "",
+        "type_line": card.type_line or "",
+        "mana_cost": card.mana_cost or "",
+        "cmc": card.cmc or 0,
+        "colors": card.colors or [],
         "scryfall_uri": card.scryfall_uri,
     }
 

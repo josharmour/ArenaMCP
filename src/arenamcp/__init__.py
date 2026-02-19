@@ -19,6 +19,7 @@ from arenamcp.coach import (
     create_backend,
     ClaudeCodeBackend,
     GeminiCliBackend,
+    CodexCliBackend,
 )
 # Optional modules — these have extra dependencies that may not be installed.
 # They are lazily imported so the core package works without them.
@@ -52,7 +53,7 @@ except ImportError:
 
 from arenamcp.gamestate import save_match_state, load_match_state, mark_match_ended
 
-__version__ = "0.1.0"
+__version__ = "0.2.1"
 
 
 def create_log_pipeline(
@@ -119,6 +120,7 @@ __all__ = [
     "create_backend",
     "ClaudeCodeBackend",
     "GeminiCliBackend",
+    "CodexCliBackend",
     "save_match_state",
     "load_match_state",
     "mark_match_ended",

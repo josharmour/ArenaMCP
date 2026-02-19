@@ -19,16 +19,133 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# -- Constants ----------------------------------------------------------------
 
-ROOT = Path(__file__).resolve().parent
-VENV_DIR = ROOT / "venv"
+GITHUB_REPO = "https://github.com/josharmour/ArenaMCP.git"
 IS_WIN = sys.platform == "win32"
-PIP_PATH = VENV_DIR / ("Scripts" if IS_WIN else "bin") / ("pip.exe" if IS_WIN else "pip")
-PYTHON_PATH = VENV_DIR / ("Scripts" if IS_WIN else "bin") / ("python.exe" if IS_WIN else "python")
-ENV_FILE = ROOT / ".env"
 SETTINGS_DIR = Path.home() / ".arenamcp"
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
+
+# ROOT is resolved at runtime -- see _resolve_root().
+# These are set by _init_paths() after ROOT is known.
+ROOT: Path = Path(".")
+VENV_DIR: Path = Path(".")
+PIP_PATH: Path = Path(".")
+PYTHON_PATH: Path = Path(".")
+ENV_FILE: Path = Path(".")
+
+
+def _is_repo_dir(p: Path) -> bool:
+    """Return True if *p* looks like the ArenaMCP repo root."""
+    return (p / "pyproject.toml").exists() and (p / "src" / "arenamcp").is_dir()
+
+
+def _running_as_exe() -> bool:
+    """True when bundled by PyInstaller."""
+    return getattr(sys, "frozen", False)
+
+
+def _find_system_python() -> str:
+    """Return the path to a real Python interpreter.
+
+    When running as a PyInstaller exe, sys.executable is the .exe itself,
+    which cannot be used to create venvs or run ``-m pip``.  This function
+    finds the actual system Python.
+    """
+    if not _running_as_exe():
+        return sys.executable
+
+    # Try common names in order of preference
+    for name in ("python", "python3", "py"):
+        found = shutil.which(name)
+        if found:
+            # Verify it's a real interpreter, not us
+            try:
+                result = subprocess.run(
+                    [found, "--version"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and "Python" in result.stdout:
+                    return found
+            except Exception:
+                continue
+    # Last resort
+    return "python"
+
+
+def _resolve_root() -> Path:
+    """Figure out where the ArenaMCP repo lives.
+
+    Priority:
+    1. If the script/exe sits inside the repo, use that.
+    2. If an existing clone is recorded in settings, reuse it.
+    3. Ask the user to point at an existing clone or pick a directory
+       for a fresh ``git clone``.
+    """
+    # When running as PyInstaller exe, __file__ is inside a temp dir.
+    # Use the directory containing the exe instead.
+    if _running_as_exe():
+        exe_dir = Path(sys.executable).resolve().parent
+    else:
+        exe_dir = Path(__file__).resolve().parent
+
+    # 1. Already inside the repo?
+    if _is_repo_dir(exe_dir):
+        return exe_dir
+
+    # 2. Previous install recorded in settings?
+    settings = load_settings()
+    saved = settings.get("install_dir")
+    if saved:
+        saved_path = Path(saved)
+        if _is_repo_dir(saved_path):
+            return saved_path
+
+    # 3. Interactive -- ask the user
+    print()
+    print("    The setup wizard needs to know where ArenaMCP is (or should be).")
+    print()
+    print("    [1] I already have a git clone -- let me type the path")
+    print("    [2] Clone fresh into a folder I choose")
+    print()
+    choice = prompt_choice(["Existing clone", "Clone fresh"])
+
+    if choice == 1:
+        while True:
+            raw = prompt_input("Path to ArenaMCP folder")
+            p = Path(raw).expanduser().resolve()
+            if _is_repo_dir(p):
+                return p
+            print(f"    '{p}' doesn't look like the ArenaMCP repo (no pyproject.toml + src/arenamcp).")
+            if not prompt_yn("Try another path?", default=True):
+                sys.exit(1)
+    else:
+        default_parent = Path.home()
+        parent = Path(prompt_input("Parent folder for clone", str(default_parent))).expanduser().resolve()
+        parent.mkdir(parents=True, exist_ok=True)
+        dest = parent / "ArenaMCP"
+        if dest.exists() and _is_repo_dir(dest):
+            print(f"    Found existing clone at {dest}")
+            return dest
+        print(f"    Cloning {GITHUB_REPO} into {dest} ...")
+        result = subprocess.run(
+            ["git", "clone", GITHUB_REPO, str(dest)],
+            timeout=120,
+        )
+        if result.returncode != 0:
+            print("    ERROR: git clone failed.")
+            sys.exit(1)
+        return dest
+
+
+def _init_paths(root: Path) -> None:
+    """Set the module-level path constants from the resolved ROOT."""
+    global ROOT, VENV_DIR, PIP_PATH, PYTHON_PATH, ENV_FILE
+    ROOT = root
+    VENV_DIR = ROOT / "venv"
+    PIP_PATH = VENV_DIR / ("Scripts" if IS_WIN else "bin") / ("pip.exe" if IS_WIN else "pip")
+    PYTHON_PATH = VENV_DIR / ("Scripts" if IS_WIN else "bin") / ("python.exe" if IS_WIN else "python")
+    ENV_FILE = ROOT / ".env"
 MTGA_LOG_DEFAULT = (
     Path(os.environ.get("APPDATA", "")) / "LocalLow" / "Wizards Of The Coast" / "MTGA" / "Player.log"
     if IS_WIN else Path.home() / ".wine" / "MTGA" / "Player.log"  # unlikely but placeholder
@@ -54,11 +171,11 @@ LANGUAGES = [
 ]
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# -- Helpers ------------------------------------------------------------------
 
 def print_header(step_num: int, title: str) -> None:
     """Print a colored section header."""
-    bar = "\u2500" * (50 - len(title) - 1)
+    bar = "-" * (50 - len(title) - 1)
     print(f"\n[{step_num}] {title.upper()} {bar}")
 
 
@@ -98,11 +215,11 @@ def prompt_yn(label: str, default: bool = False) -> bool:
 
 
 def ok(msg: str) -> None:
-    print(f"    \u2713 {msg}")
+    print(f"    [OK] {msg}")
 
 
 def fail(msg: str) -> None:
-    print(f"    \u2717 {msg}")
+    print(f"    [!!] {msg}")
 
 
 def info(msg: str) -> None:
@@ -199,7 +316,7 @@ def save_settings(data: dict) -> None:
         json.dump(data, f, indent=2)
 
 
-# ── Detection ────────────────────────────────────────────────────────────────
+# -- Detection ----------------------------------------------------------------
 
 def detect_backends() -> dict[str, dict]:
     """Auto-detect which LLM backends are available.
@@ -255,20 +372,53 @@ def detect_backends() -> dict[str, dict]:
         "models": [],  # Gemini CLI handles its own models
     }
 
+    # 5. Codex CLI
+    codex_bin = shutil.which("codex")
+    backends["codex-cli"] = {
+        "available": bool(codex_bin),
+        "running": True if codex_bin else False,
+        "details": "found" if codex_bin else "not installed",
+        "models": [],  # Codex CLI handles its own models
+    }
+
     return backends
 
 
-# ── Steps ────────────────────────────────────────────────────────────────────
+# -- Steps --------------------------------------------------------------------
 
 def step_check_python() -> bool:
     """Step 1: Verify Python version."""
     print_header(1, "Check Python")
-    v = sys.version_info
-    if v < (3, 10):
-        fail(f"Python {v.major}.{v.minor}.{v.micro} — version 3.10+ required")
-        info("Please install Python 3.10+ from https://python.org")
-        return False
-    ok(f"Python {v.major}.{v.minor}.{v.micro}")
+
+    if _running_as_exe():
+        # We can't trust sys.version_info (it's the bundled Python).
+        # Find and verify the system Python instead.
+        python = _find_system_python()
+        try:
+            result = subprocess.run(
+                [python, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"],
+                capture_output=True, text=True, timeout=5,
+            )
+            ver_str = result.stdout.strip()
+            parts = tuple(int(x) for x in ver_str.split("."))
+            if parts < (3, 10):
+                fail(f"Python {ver_str} -- version 3.10+ required")
+                info("Please install Python 3.10+ from https://python.org")
+                return False
+            ok(f"Python {ver_str} (system: {python})")
+        except Exception as exc:
+            fail(f"Could not find a system Python: {exc}")
+            info("Please install Python 3.10+ from https://python.org")
+            info("Make sure 'python' is on your PATH.")
+            return False
+    else:
+        v = sys.version_info
+        if v < (3, 10):
+            fail(f"Python {v.major}.{v.minor}.{v.micro} -- version 3.10+ required")
+            info("Please install Python 3.10+ from https://python.org")
+            return False
+        ok(f"Python {v.major}.{v.minor}.{v.micro}")
+
     return True
 
 
@@ -279,9 +429,10 @@ def step_virtual_environment() -> bool:
     if VENV_DIR.exists() and PIP_PATH.exists():
         ok("venv/ exists")
     else:
-        info("Creating venv...")
+        python = _find_system_python()
+        info(f"Creating venv (using {python})...")
         result = subprocess.run(
-            [sys.executable, "-m", "venv", str(VENV_DIR)],
+            [python, "-m", "venv", str(VENV_DIR)],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
@@ -304,15 +455,108 @@ def step_virtual_environment() -> bool:
     if result.returncode == 0:
         ok("pip upgraded")
     else:
-        # Non-fatal — pip may already be current
+        # Non-fatal -- pip may already be current
         info("pip upgrade skipped (may already be up to date)")
 
     return True
 
 
+def step_update_code() -> bool:
+    """Step 3: Pull latest code from git before installing dependencies."""
+    print_header(3, "Update Code")
+
+    git_bin = shutil.which("git")
+    if not git_bin:
+        info("git not found on PATH -- skipping auto-update.")
+        return True
+
+    # Check if we're inside a git repo
+    check = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True, cwd=str(ROOT),
+    )
+    if check.returncode != 0:
+        info("Not a git repository -- skipping auto-update.")
+        return True
+
+    # Show current version
+    info("Checking for updates...")
+    result = subprocess.run(
+        ["git", "ls-remote", "--tags", "origin"],
+        capture_output=True, text=True, timeout=10, cwd=str(ROOT),
+    )
+    if result.returncode != 0:
+        info("Could not reach remote -- skipping update (will install from local code).")
+        return True
+
+    # Parse remote tags to find latest version
+    best = (0, 0, 0)
+    best_str = ""
+    for line in result.stdout.splitlines():
+        parts = line.split("refs/tags/")
+        if len(parts) != 2:
+            continue
+        tag = parts[1].strip()
+        if tag.endswith("^{}"):
+            continue
+        ver_str = tag.lstrip("v")
+        try:
+            ver_tuple = tuple(int(x) for x in ver_str.split("."))
+            if ver_tuple > best:
+                best = ver_tuple
+                best_str = ver_str
+        except (ValueError, TypeError):
+            continue
+
+    # Read local version from pyproject.toml (no package import needed)
+    local_ver = "0.0.0"
+    pyproject = ROOT / "pyproject.toml"
+    if pyproject.exists():
+        for line in pyproject.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("version"):
+                # version = "0.2.0"
+                local_ver = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+
+    local_tuple = tuple(int(x) for x in local_ver.split("."))
+
+    if best > local_tuple and best_str:
+        info(f"Update available: v{local_ver} -> v{best_str}")
+        if prompt_yn("Pull latest code before installing?", default=True):
+            info("Running git pull --ff-only ...")
+            pull = subprocess.run(
+                ["git", "pull", "--ff-only", "origin", "master"],
+                capture_output=True, text=True, timeout=60, cwd=str(ROOT),
+            )
+            if pull.returncode == 0:
+                ok(f"Updated to latest code")
+                # Show summary line
+                summary = pull.stdout.strip().splitlines()[-1] if pull.stdout.strip() else ""
+                if summary:
+                    info(summary)
+            else:
+                stderr = pull.stderr.strip()
+                fail("git pull failed -- installing from current code")
+                if "not possible to fast-forward" in stderr or "divergent" in stderr:
+                    info("Local branch has diverged. Run 'git pull' manually to resolve.")
+                elif "uncommitted changes" in stderr or "dirty" in stderr:
+                    info("You have uncommitted local changes. Commit or stash them first.")
+                else:
+                    info(stderr[:200] if stderr else "Unknown error")
+        else:
+            info("Skipping update.")
+    elif best_str:
+        ok(f"Already up to date (v{local_ver})")
+    else:
+        info("No remote tags found -- skipping version check.")
+
+    return True
+
+
 def step_install_dependencies() -> bool:
-    """Step 3: Install packages from pyproject.toml and extras."""
-    print_header(3, "Install Dependencies")
+    """Step 4: Install packages from pyproject.toml and extras."""
+    print_header(4, "Install Dependencies")
 
     info("Installing core + voice + LLM packages...")
     result = run_pip(["install", "-e", ".[full]"])
@@ -338,40 +582,38 @@ def step_install_dependencies() -> bool:
 
 
 def step_detect_and_choose_backend(settings: dict) -> tuple[str, str]:
-    """Step 4: Auto-detect backends, let user choose. Returns (backend, model)."""
-    print_header(4, "LLM Backend")
+    """Step 5: Auto-detect backends, let user choose. Returns (backend, model)."""
+    print_header(5, "LLM Backend")
 
     info("Scanning for available backends...\n")
     backends = detect_backends()
 
-    # Display detection results
-    options = []
-    option_keys = []
+    # Show three categories
+    ollama_be = backends["ollama"]
+    ollama_tag = f" [{ollama_be['details']}]" if ollama_be["available"] else ""
+    cli_available = []
+    for key, cmd_name in [("claude-code", "Claude"), ("gemini-cli", "Gemini"), ("codex-cli", "Codex")]:
+        if key in backends and backends[key]["available"]:
+            cli_available.append(cmd_name)
+    cli_tag = f" [{', '.join(cli_available)} detected]" if cli_available else ""
 
-    for key, label, desc in [
-        ("ollama", "Ollama (local, free)", "Run models on your GPU. No internet needed."),
-        ("proxy", "CLI Proxy", "Routes to Claude/Gemini/GPT via local proxy server."),
-        ("claude-code", "Claude CLI", "Uses the 'claude' command directly."),
-        ("gemini-cli", "Gemini CLI", "Uses the 'gemini' command directly."),
-    ]:
-        be = backends[key]
-        status = "\u2713" if be["available"] else "\u2717"
-        detail = be["details"]
-        tag = f" [{detail}]" if detail else ""
-        options.append(f"{label}{tag}")
-        option_keys.append(key)
-        print(f"    {status} [{len(options)}] {label} — {desc}{tag}")
+    print(f"    [1] Ollama (Local){ollama_tag}")
+    print(f"        Run models on your GPU, no internet needed")
+    print(f"    [2] CLI Subscription{cli_tag}")
+    print(f"        Claude CLI / Gemini CLI / Codex CLI")
+    print(f"    [3] API Endpoint (Advanced)")
+    print(f"        Any OpenAI-compatible endpoint (URL + API key)")
 
     print()
-    choice = prompt_choice(options, "Select backend")
-    backend = option_keys[choice - 1]
-    be = backends[backend]
-
-    # ── Backend-specific setup ──
+    choice = prompt_choice(["Ollama (Local)", "CLI Subscription", "API Endpoint"], "Select category")
 
     model = ""
 
-    if backend == "ollama":
+    # -- Category 1: Ollama --
+    if choice == 1:
+        backend = "ollama"
+        be = ollama_be
+
         if not be["available"]:
             fail("Ollama not found on PATH")
             info("Install from https://ollama.ai then re-run this wizard.")
@@ -385,7 +627,6 @@ def step_detect_and_choose_backend(settings: dict) -> tuple[str, str]:
             print()
             info("Enter the number of a model above, or type a model name.")
             raw = prompt_input("Model", be["models"][0])
-            # If user typed a number, map to model name
             try:
                 idx = int(raw)
                 if 1 <= idx <= len(be["models"]):
@@ -397,62 +638,85 @@ def step_detect_and_choose_backend(settings: dict) -> tuple[str, str]:
         else:
             fail("No models pulled yet")
             if prompt_yn("Pull llama3.2 (recommended)?", default=True):
-                info("Pulling llama3.2 — this may take a while...")
+                info("Pulling llama3.2 -- this may take a while...")
                 pull = subprocess.run(["ollama", "pull", "llama3.2"])
                 if pull.returncode == 0:
                     ok("llama3.2 ready")
                     model = "llama3.2"
                 else:
-                    fail("Pull failed — retry manually: ollama pull llama3.2")
+                    fail("Pull failed -- retry manually: ollama pull llama3.2")
             if not model:
                 model = prompt_input("Model name", "llama3.2")
 
-        # Save Ollama URL to settings
         ollama_url = prompt_input("Ollama API URL", OLLAMA_DEFAULT_URL)
         settings["ollama_url"] = ollama_url
 
-    elif backend == "proxy":
-        if not be["running"]:
-            fail("Proxy not reachable at " + PROXY_DEFAULT_URL)
-            info("Start cli-proxy-api or enter a custom URL.\n")
+    # -- Category 2: CLI Subscription --
+    elif choice == 2:
+        cli_options = []
+        cli_keys = []
+        for key, label, cmd_name in [
+            ("claude-code", "Claude CLI", "claude"),
+            ("gemini-cli", "Gemini CLI", "gemini"),
+            ("codex-cli", "Codex CLI", "codex"),
+        ]:
+            be = backends.get(key, {"available": False, "details": "not installed"})
+            status = "[OK]" if be.get("available") else "[!!]"
+            detail = be.get("details", "not installed")
+            cli_options.append(f"{label} [{detail}]")
+            cli_keys.append(key)
+            print(f"    {status} [{len(cli_options)}] {label} -- {detail}")
 
-        url = prompt_input("Proxy URL", be.get("url", PROXY_DEFAULT_URL))
-        key = prompt_input("API key (leave empty if none)", PROXY_DEFAULT_KEY)
-        settings["proxy_url"] = url
-        settings["proxy_api_key"] = key
+        print()
+        sub_choice = prompt_choice(cli_options, "Select CLI")
+        backend = cli_keys[sub_choice - 1]
+        be = backends.get(backend, {"available": False})
 
-        # Write to .env too for backward compatibility
-        env = read_env(ENV_FILE)
-        env["PROXY_BASE_URL"] = url
-        env["PROXY_API_KEY"] = key
-        write_env(ENV_FILE, env)
-
-        # Re-fetch models with possibly updated URL/key
-        models = fetch_models_from_url(url, key)
-        if models:
-            ok(f"{len(models)} model(s) available:")
-            for m in models[:10]:
-                info(f"  {m}")
-            model = prompt_input("Model", models[0])
-        else:
-            model = prompt_input("Model name", "claude-sonnet-4-5-20250929")
-
-    elif backend in ("claude-code", "gemini-cli"):
-        if not be["available"]:
-            cmd = "claude" if backend == "claude-code" else "gemini"
+        if not be.get("available"):
+            cmd_map = {"claude-code": "claude", "gemini-cli": "gemini", "codex-cli": "codex"}
+            cmd = cmd_map.get(backend, backend)
             fail(f"'{cmd}' not found on PATH")
             info(f"Install the {cmd} CLI first.")
             if not prompt_yn("Continue anyway?"):
                 return backend, model
-        ok(f"{backend} ready")
+        else:
+            ok(f"{backend} ready")
         model = prompt_input("Model (leave empty for default)", "")
+
+    # -- Category 3: API Endpoint --
+    else:
+        backend = "api"
+        url = prompt_input("Base URL", "https://api.openai.com/v1")
+        key = prompt_input("API key (leave empty if none)", "")
+        settings["api_url"] = url
+        settings["api_key"] = key
+
+        # Try to list models from the endpoint
+        models = fetch_models_from_url(url, key)
+        if models:
+            ok(f"{len(models)} model(s) available:")
+            for i, m in enumerate(models[:10], 1):
+                info(f"  [{i}] {m}")
+            print()
+            raw = prompt_input("Model", models[0])
+            try:
+                idx = int(raw)
+                if 1 <= idx <= len(models):
+                    model = models[idx - 1]
+                else:
+                    model = raw
+            except ValueError:
+                model = raw
+        else:
+            info("Could not fetch models from endpoint (you can enter one manually).")
+            model = prompt_input("Model name", "gpt-4o")
 
     return backend, model
 
 
 def step_language(settings: dict) -> str:
-    """Step 5: Choose spoken language for TTS and STT."""
-    print_header(5, "Language")
+    """Step 6: Choose spoken language for TTS and STT."""
+    print_header(6, "Language")
 
     info("Choose the language for voice output (TTS) and input (STT).\n")
     for i, (code, name) in enumerate(LANGUAGES, 1):
@@ -468,8 +732,8 @@ def step_language(settings: dict) -> str:
 
 
 def step_voice_mode(settings: dict) -> str:
-    """Step 6: Choose voice input mode."""
-    print_header(6, "Voice Input")
+    """Step 7: Choose voice input mode."""
+    print_header(7, "Voice Input")
 
     info("How do you want to talk to the coach?\n")
     print(textwrap.dedent("""\
@@ -489,8 +753,8 @@ def step_voice_mode(settings: dict) -> str:
 
 
 def step_verify(settings: dict) -> None:
-    """Step 7: Quick connectivity and path checks."""
-    print_header(7, "Verify")
+    """Step 8: Quick connectivity and path checks."""
+    print_header(8, "Verify")
 
     backend = settings.get("backend", "proxy")
 
@@ -524,6 +788,20 @@ def step_verify(settings: dict) -> None:
             ok("gemini CLI found")
         else:
             fail("gemini CLI not found on PATH")
+    elif backend == "codex-cli":
+        info("Checking codex CLI...")
+        if shutil.which("codex"):
+            ok("codex CLI found")
+        else:
+            fail("codex CLI not found on PATH")
+    elif backend == "api":
+        api_url = settings.get("api_url") or "https://api.openai.com/v1"
+        info("Testing API endpoint...")
+        api_key = settings.get("api_key") or ""
+        if check_url(f"{api_url.rstrip('/')}/models"):
+            ok(f"API responding ({api_url})")
+        else:
+            fail(f"API not reachable at {api_url} (check URL and key)")
 
     # Test MTGA log path
     info("Checking MTGA log path...")
@@ -536,7 +814,7 @@ def step_verify(settings: dict) -> None:
 
     # Success banner
     print()
-    print("    " + "\u2550" * 44)
+    print("    " + "=" * 44)
     print("    Setup complete! Configuration saved to:")
     print(f"      {SETTINGS_FILE}")
     print()
@@ -545,11 +823,39 @@ def step_verify(settings: dict) -> None:
     if backend == "ollama":
         info("")
         info(f"  Or: python -m arenamcp.standalone --backend ollama --model {settings.get('model', 'llama3.2')}")
-    print("    " + "\u2550" * 44)
+    print("    " + "=" * 44)
     print()
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+def step_desktop_shortcut() -> None:
+    """Step 9: Optionally create a desktop shortcut."""
+    print_header(9, "Desktop Shortcut")
+
+    if not IS_WIN:
+        info("Desktop shortcut creation is only supported on Windows.")
+        return
+
+    if not prompt_yn("Create a desktop shortcut?", default=True):
+        info("Skipping shortcut.")
+        return
+
+    desktop = Path.home() / "Desktop"
+    if not desktop.exists():
+        fail("Desktop folder not found -- skipping.")
+        return
+
+    shortcut_path = desktop / "ArenaMCP Coach.bat"
+    content = f'@echo off\ncd /d "{ROOT}"\ncall coach.bat %*\n'
+
+    try:
+        with open(shortcut_path, "w") as f:
+            f.write(content)
+        ok(f"Shortcut created: {shortcut_path}")
+    except Exception as exc:
+        fail(f"Failed to create shortcut: {exc}")
+
+
+# -- Main ---------------------------------------------------------------------
 
 def main() -> int:
     print()
@@ -557,8 +863,52 @@ def main() -> int:
     print("  ArenaMCP Setup Wizard")
     print("=" * 52)
 
-    # Load existing settings as starting point
+    # Step 0: Resolve where the repo lives (handles exe-from-Downloads, etc.)
+    root = _resolve_root()
+    _init_paths(root)
+    ok(f"Repo: {ROOT}")
+
+    # Persist install dir so re-runs find it automatically
     settings = load_settings()
+    settings["install_dir"] = str(ROOT)
+    save_settings(settings)
+
+    # -- Existing repo detected -> offer quick update --
+    has_venv = VENV_DIR.exists() and PIP_PATH.exists()
+    has_settings = bool(settings.get("backend"))
+
+    if has_venv or has_settings:
+        print()
+        print("    Existing installation detected.")
+        if has_venv:
+            print(f"      venv:    {VENV_DIR}")
+        if has_settings:
+            print(f"      backend: {settings.get('backend')}/{settings.get('model', 'default')}")
+        print()
+        print("    [1] Quick update (pull code + reinstall deps)")
+        print("    [2] Full setup  (reconfigure everything)")
+        print()
+        mode = prompt_choice(["Quick update", "Full setup"])
+
+        if mode == 1:
+            # Quick update: python check -> venv -> pull -> deps -> done
+            if not step_check_python():
+                return 1
+            if not step_virtual_environment():
+                return 1
+            if not step_update_code():
+                return 1
+            if not step_install_dependencies():
+                return 1
+            print()
+            print("    " + "=" * 44)
+            print("    Update complete! Run the coach with:")
+            print("      coach.bat")
+            print("    " + "=" * 44)
+            print()
+            return 0
+
+    # -- Full setup --
 
     # Step 1: Python
     if not step_check_python():
@@ -568,21 +918,25 @@ def main() -> int:
     if not step_virtual_environment():
         return 1
 
-    # Step 3: Dependencies
+    # Step 3: Update code from git (before installing deps)
+    if not step_update_code():
+        return 1
+
+    # Step 4: Dependencies
     if not step_install_dependencies():
         return 1
 
-    # Step 4: Backend + model
+    # Step 5: Backend + model
     backend, model = step_detect_and_choose_backend(settings)
     settings["backend"] = backend
     if model:
         settings["model"] = model
 
-    # Step 5: Language
+    # Step 6: Language
     lang = step_language(settings)
     settings["language"] = lang
 
-    # Step 6: Voice mode
+    # Step 7: Voice mode
     voice_mode = step_voice_mode(settings)
     settings["voice_mode"] = voice_mode
 
@@ -597,15 +951,36 @@ def main() -> int:
     save_settings(settings)
     ok(f"Settings saved to {SETTINGS_FILE}")
 
-    # Step 7: Verify
+    # Step 8: Verify
     step_verify(settings)
+
+    # Step 9: Desktop shortcut
+    step_desktop_shortcut()
 
     return 0
 
 
+def _pause() -> None:
+    """Wait for Enter so the console window doesn't vanish."""
+    print()
+    try:
+        input("    Press Enter to exit...")
+    except EOFError:
+        pass
+
+
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        code = main()
+        _pause()
+        sys.exit(code)
     except KeyboardInterrupt:
         print("\n\n    Setup cancelled.")
+        _pause()
+        sys.exit(1)
+    except Exception as exc:
+        print(f"\n    FATAL ERROR: {exc}")
+        import traceback
+        traceback.print_exc()
+        _pause()
         sys.exit(1)

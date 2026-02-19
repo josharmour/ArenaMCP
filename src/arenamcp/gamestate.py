@@ -919,12 +919,20 @@ class GameState:
                 logger.info(f"Inferred lands_played={lands_played} for seat {seat_id} (Arena reported 0)")
 
         # Extract mana pool if present, otherwise preserve existing
+        # GRE uses "color" field with values like "ManaColor_Green" → map to WUBRG/C
+        _MANA_COLOR_MAP = {
+            "ManaColor_White": "W", "ManaColor_Blue": "U",
+            "ManaColor_Black": "B", "ManaColor_Red": "R",
+            "ManaColor_Green": "G", "ManaColor_Colorless": "C",
+            "ManaColor_Any": "Any",
+        }
         if "manaPool" in player_data:
             mana_pool = {}
             for mana_data in player_data["manaPool"]:
-                mana_type = mana_data.get("type", "unknown")
+                raw_color = mana_data.get("color", mana_data.get("type", ""))
+                mana_type = _MANA_COLOR_MAP.get(raw_color, raw_color or "unknown")
                 mana_count = mana_data.get("count", 0)
-                mana_pool[mana_type] = mana_count
+                mana_pool[mana_type] = mana_pool.get(mana_type, 0) + mana_count
         elif existing:
             mana_pool = existing.mana_pool
         else:
@@ -1021,16 +1029,23 @@ class GameState:
             details = ann.get("details", [])
             affected_ids = ann.get("affectedIds", [])
             # Build a quick detail lookup
+            # GRE protobuf repeated fields (valueInt32, valueInt64) may arrive
+            # as lists instead of scalars — unwrap single-element lists.
             detail_map = {}
             for d in details:
                 key = d.get("key", "")
                 if key:
-                    detail_map[key] = d.get("valueInt32", d.get("valueString", d.get("valueInt64", "")))
+                    raw = d.get("valueInt32", d.get("valueString", d.get("valueInt64", "")))
+                    # Unwrap single-element lists to scalar (protobuf repeated fields)
+                    if isinstance(raw, list):
+                        raw = raw[0] if len(raw) == 1 else (sum(raw) if raw and all(isinstance(x, (int, float)) for x in raw) else raw)
+                    detail_map[key] = raw
 
             for ann_type in ann_types:
                 if ann_type == "AnnotationType_DamageDealt":
                     # Track damage: who dealt how much to whom
-                    damage_amount = detail_map.get("damage", 0)
+                    _raw_dmg = detail_map.get("damage", 0)
+                    damage_amount = _raw_dmg if isinstance(_raw_dmg, int) else int(_raw_dmg[0]) if isinstance(_raw_dmg, list) and _raw_dmg else 0
                     source_id = detail_map.get("sourceId", 0)
                     target_id = detail_map.get("targetId", affected_ids[0] if affected_ids else 0)
                     # If target is a player seat, track cumulative damage
@@ -1067,7 +1082,8 @@ class GameState:
 
                 elif ann_type in ("AnnotationType_CounterAdded", "AnnotationType_CounterRemoved"):
                     counter_type = detail_map.get("counterType", "unknown")
-                    counter_count = detail_map.get("counterCount", detail_map.get("count", 1))
+                    _raw_cnt = detail_map.get("counterCount", detail_map.get("count", 1))
+                    counter_count = _raw_cnt if isinstance(_raw_cnt, int) else int(_raw_cnt[0]) if isinstance(_raw_cnt, list) and _raw_cnt else 1
                     is_added = "Added" in ann_type
                     for obj_id in affected_ids:
                         obj = self.game_objects.get(obj_id)
@@ -1245,15 +1261,30 @@ class GameState:
             if explicit_active:
                 new_active = turn_data["activePlayer"]
             else:
-                # Turn changed without active player update.
-                # This implies either:
-                # 1. Active player didn't change (Extra Turn) -> Diff omission
-                # 2. Partial update race condition (Turn sent before Active)
-                #
-                # Case 2 causes "Wrong Turn Advice" (reporting Turn N with Turn N-1's owner).
-                # We invalidate to 0 to prevent this hallucination.
-                new_active = 0
-                logger.debug(f"Turn change ({self.turn_info.turn_number}->{new_turn}) without activePlayer. Invalidating active_player to 0.")
+                # Turn changed without explicit activePlayer in this diff.
+                # In a 2-player game, turns normally alternate between seats.
+                # Infer the new active player by swapping to the other seat.
+                # This is correct for normal turns and only wrong for Extra Turns
+                # (which are rare and will be corrected by the next diff that
+                # includes activePlayer).  Previously we set active_player=0
+                # which guaranteed wrong "whose turn" advice until a follow-up
+                # diff arrived — often too late, causing the coach to think it
+                # was always the opponent's turn.
+                prev_active = self.turn_info.active_player
+                other_seat = self.opponent_seat_id if prev_active == self.local_seat_id else self.local_seat_id
+                if other_seat is not None and prev_active != 0:
+                    new_active = other_seat
+                    logger.info(f"Turn change ({self.turn_info.turn_number}->{new_turn}) without activePlayer. Inferred active_player={new_active} (alternating from {prev_active}).")
+                elif prev_active != 0:
+                    # Can't determine other seat but have a valid previous value — keep it
+                    new_active = prev_active
+                    logger.warning(f"Turn change ({self.turn_info.turn_number}->{new_turn}) without activePlayer. Keeping previous active_player={prev_active} (opponent seat unknown).")
+                else:
+                    # Previous was already 0 (unknown) — nothing to alternate from.
+                    # Guess local player (turn 1 is usually the play-first player,
+                    # but any value > 0 is better than 0).
+                    new_active = self.local_seat_id or 0
+                    logger.warning(f"Turn change ({self.turn_info.turn_number}->{new_turn}) without activePlayer. Previous was 0, guessing local_seat={new_active}.")
         else:
             # Turn didn't change, use update or keep existing
             new_active = turn_data.get("activePlayer", self.turn_info.active_player)
@@ -1298,6 +1329,14 @@ class GameState:
                     msg += f" (skipped {skipped_count} with untap prevention)"
                 logger.info(msg)
         
+        # Reset lands_played to 0 for all players when the turn changes.
+        # GRE diff messages often omit landsPlayedThisTurn, so _update_player
+        # falls back to existing.lands_played — carrying over the stale value
+        # from the previous turn. Resetting here ensures a clean slate.
+        if new_turn != self.turn_info.turn_number:
+            for player in self.players.values():
+                player.lands_played = 0
+
         turn_changed = new_turn != self.turn_info.turn_number
         self.turn_info.turn_number = new_turn
         self.turn_info.active_player = new_active
@@ -1328,7 +1367,7 @@ class GameState:
         # Safety: auto-clear mulligan decision once the game has started (turn >= 1)
         # SubmitDeckResp is client→server so it never reaches the GRE handler;
         # this auto-clear is the primary mechanism for clearing mulligans.
-        if self.pending_decision == "Mulligan" and new_turn >= 1:
+        if self.pending_decision in ("Mulligan", "Mulligan Bottom") and new_turn >= 1:
             logger.info(f"Auto-clearing Mulligan decision (game started, turn {new_turn})")
             self.pending_decision = None
             self.decision_seat_id = None
@@ -1538,12 +1577,36 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                     "context_raw": context_data,
                 }
                 
+            elif msg_type == "GREMessageType_GroupReq":
+                # London Mulligan "choose cards to put on bottom" step,
+                # or other group selection during the game.
+                import time
+                req = msg.get("groupReq", {})
+                if game_state.turn_info.turn_number < 1:
+                    # During mulligan phase, this is "select cards to bottom"
+                    logger.info(f"Captured Decision: Mulligan Bottom Cards ({msg_type})")
+                    game_state.pending_decision = "Mulligan Bottom"
+                    game_state.decision_seat_id = game_state.local_seat_id
+                    game_state.decision_timestamp = time.time()
+                    game_state.decision_context = {
+                        "type": "mulligan_bottom",
+                        "raw": {k: v for k, v in req.items()},
+                    }
+                else:
+                    logger.info(f"Captured Decision: Group Selection ({msg_type})")
+                    game_state.pending_decision = "Group Selection"
+                    game_state.decision_timestamp = time.time()
+                    game_state.decision_context = {
+                        "type": "group_selection",
+                        "raw": {k: v for k, v in req.items()},
+                    }
+
             elif msg_type == "GREMessageType_GroupOptionReq":
                 # PHASE 1: Capture modal spell options
                 import time
                 req = msg.get("groupOptionReq", {})
                 options = req.get("options", [])
-                
+
                 logger.info(f"Captured Decision: Choose Mode ({len(options)} options)")
                 game_state.pending_decision = "Choose Mode"
                 game_state.decision_timestamp = time.time()
@@ -1842,7 +1905,8 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                 "GREMessageType_MulliganReq", "GREMessageType_SubmitDeckReq",
                 "GREMessageType_IntermissionReq", "GREMessageType_PromptReq",
                 "GREMessageType_SelectTargetsReq", "GREMessageType_SelectNReq",
-                "GREMessageType_GroupOptionReq", "GREMessageType_ActionsAvailableReq",
+                "GREMessageType_GroupReq", "GREMessageType_GroupOptionReq",
+                "GREMessageType_ActionsAvailableReq",
                 "GREMessageType_DeclareAttackersReq", "GREMessageType_DeclareBlockersReq",
                 "GREMessageType_AssignDamageReq", "GREMessageType_OrderCombatDamageReq",
                 "GREMessageType_PayCostsReq", "GREMessageType_SearchReq",
