@@ -424,6 +424,9 @@ class StandaloneCoach:
         # decision_required added - scry, discard, target choices need immediate advice
         CRITICAL_PRIORITY = {"stack_spell", "stack_spell_yours", "stack_spell_opponent", "low_life", "opponent_low_life", "decision_required", "threat_detected"}
 
+        # Match ID tracking — reset coaching state when match changes
+        last_match_id = None
+
         # Draft/Sealed detection state
         in_draft_mode = False
         in_sealed_mode = False
@@ -556,7 +559,22 @@ class StandaloneCoach:
                 turn = curr_state.get("turn", {})
                 turn_num = turn.get("turn_number", 0)
                 phase = turn.get("phase", "")
-                
+                curr_match_id = curr_state.get("match_id")
+
+                # Detect new match via match_id change (most reliable signal)
+                if curr_match_id and curr_match_id != last_match_id:
+                    if last_match_id is not None:
+                        logger.info(f"New match detected via match_id change ({last_match_id} -> {curr_match_id}), resetting coaching state")
+                        prev_state = {}
+                        last_advice_turn = 0
+                        last_advice_phase = ""
+                        seat_announced = False
+                        self._advice_history = []
+                        self._deck_analyzed = False
+                        if self._coach:
+                            self._coach.clear_deck_strategy()
+                    last_match_id = curr_match_id
+
                 # Debug: Log if turn_num is 0 (every 30 seconds)
                 if turn_num == 0:
                     if not hasattr(self, '_last_turn0_log'):
@@ -565,9 +583,10 @@ class StandaloneCoach:
                         logger.debug(f"turn_num=0, players={len(curr_state.get('players', []))}, battlefield={len(curr_state.get('battlefield', []))}")
                         self._last_turn0_log = time.time()
 
-                # Detect new game (turn number decreased) and reset advice tracking
+                # Detect new game (turn number decreased) — fallback for same-match restarts
                 if turn_num > 0 and turn_num < last_advice_turn:
                     logger.info(f"New game detected in coaching loop (turn {last_advice_turn} -> {turn_num}), resetting advice tracking")
+                    prev_state = {}
                     last_advice_turn = 0
                     last_advice_phase = ""
                     seat_announced = False  # Re-announce seat for new game

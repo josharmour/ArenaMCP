@@ -282,8 +282,8 @@ class GameStateDisplay(Static):
                     life = p.get("life_total", 20)
                     is_you = p.get("is_local", False)
                     label = f"[bold green]YOU[/]" if is_you else f"[yellow]OPP[/]"
-                    dmg = damage_taken.get(str(seat), damage_taken.get(seat, 0))
-                    dmg_str = f" (-{dmg})" if dmg else ""
+                    net_change = life - 20
+                    dmg_str = f" ({net_change:+d})" if net_change != 0 else ""
                     life_parts.append(f"{label}:{life}{dmg_str}")
                 lines.append(" | ".join(life_parts))
 

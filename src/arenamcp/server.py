@@ -771,6 +771,7 @@ def get_game_state() -> dict[str, Any]:
     _save_match_state_if_needed()
 
     return {
+        "match_id": game_state.match_id,
         "turn": turn,
         "players": players,
         "battlefield": battlefield,
@@ -782,6 +783,7 @@ def get_game_state() -> dict[str, Any]:
         "pending_decision": game_state.pending_decision if game_state.decision_seat_id == game_state.local_seat_id else None,
         "decision_context": game_state.decision_context if game_state.decision_seat_id == game_state.local_seat_id else None,
         "deck_cards": game_state.deck_cards,
+        "damage_taken": dict(game_state.damage_taken),
     }
 
 
