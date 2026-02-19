@@ -1062,9 +1062,6 @@ class ArenaApp(App):
             body_parts.append(f"**Backend:** {report_data['backend']}")
         if report_data.get("model"):
             body_parts.append(f"**Model:** {report_data['model']}")
-        body_parts.append("")
-        body_parts.append("*(Full report JSON was too large to include — see attached file)*")
-        body = "\n".join(body_parts)
 
         repo = "josharmour/ArenaMCP"
 
@@ -1074,6 +1071,23 @@ class ArenaApp(App):
             self.call_from_thread(self.write_log, "[yellow]Creating GitHub issue via gh CLI...[/]")
             try:
                 import subprocess
+
+                # Upload bug report JSON as a gist
+                gist_url = None
+                gist_result = subprocess.run(
+                    [gh_bin, "gist", "create", "--public", "--desc",
+                     f"ArenaMCP Bug Report {timestamp}", str(report_path)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if gist_result.returncode == 0:
+                    gist_url = gist_result.stdout.strip()
+                    body_parts.append("")
+                    body_parts.append(f"**Debug Report:** {gist_url}")
+                else:
+                    body_parts.append("")
+                    body_parts.append("*(Failed to upload debug report gist)*")
+
+                body = "\n".join(body_parts)
                 result = subprocess.run(
                     [gh_bin, "issue", "create", "--repo", repo, "--title", title, "--body", body],
                     capture_output=True, text=True, timeout=30,
@@ -1101,6 +1115,11 @@ class ArenaApp(App):
         import urllib.parse
         import webbrowser
 
+        # Ensure body is set for the browser fallback (gh path may not have run)
+        if not body_parts[-1].startswith("**Debug"):
+            body_parts.append("")
+            body_parts.append("*(Please attach the bug report JSON from your ~/.arenamcp/bug_reports/ folder)*")
+        body = "\n".join(body_parts)
         params = urllib.parse.urlencode({"title": title, "body": body})
         url = f"https://github.com/{repo}/issues/new?{params}"
         try:
