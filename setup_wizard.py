@@ -127,6 +127,20 @@ def _resolve_root() -> Path:
         if dest.exists() and _is_repo_dir(dest):
             print(f"    Found existing clone at {dest}")
             return dest
+        if not shutil.which("git"):
+            print()
+            print("    ERROR: git is not installed (or not on your PATH).")
+            print()
+            if IS_WIN:
+                print("    Install it from https://git-scm.com/download/win")
+                print("    or run:  winget install Git.Git")
+            else:
+                print("    Install it with your package manager, e.g.:")
+                print("      sudo apt install git   # Debian/Ubuntu")
+                print("      brew install git        # macOS")
+            print()
+            print("    After installing, restart this wizard.")
+            sys.exit(1)
         print(f"    Cloning {GITHUB_REPO} into {dest} ...")
         result = subprocess.run(
             ["git", "clone", GITHUB_REPO, str(dest)],
