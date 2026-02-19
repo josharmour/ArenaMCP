@@ -259,6 +259,7 @@ class StandaloneCoach:
         self.settings.set("voice_mode", self._voice_mode, save=False)
         self.settings.set("advice_frequency", self._advice_frequency, save=True)
 
+        self._start_time = datetime.now()
         self._running = False
         self._restart_requested = False
         self._deck_analyzed = False
@@ -1294,16 +1295,18 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
     def _collect_debug_info(self) -> dict:
         """Collect comprehensive debug information for bug reports."""
         import platform
+        from arenamcp import __version__
 
         report = {
             "timestamp": datetime.now().isoformat(),
-            "version": "1.0.0",  # TODO: pull from package
+            "version": __version__,
 
             # System info
             "system": {
                 "platform": platform.platform(),
                 "python_version": platform.python_version(),
                 "machine": platform.machine(),
+                "packages": self._get_package_versions(),
             },
 
             # Coach configuration
@@ -1321,8 +1324,14 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             # Settings from disk
             "settings": dict(self.settings._data) if self.settings else {},
 
+            # MTGA log file status
+            "mtga_log": self._get_mtga_log_status(),
+
             # Current game state
             "game_state": self._mcp.get_game_state() if self._mcp else {},
+
+            # Match context
+            "match_context": self._get_match_context(),
 
             # Draft state if active
             "draft_state": self._mcp.get_draft_pack() if self._mcp else {},
@@ -1346,9 +1355,73 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
 
             # Error state
             "errors": list(self._recent_errors) if hasattr(self, '_recent_errors') else [],
+
+            # Uptime
+            "uptime_seconds": (datetime.now() - self._start_time).total_seconds() if hasattr(self, '_start_time') else None,
         }
 
         return report
+
+    @staticmethod
+    def _get_package_versions() -> dict[str, str]:
+        """Get versions of key installed packages."""
+        packages = [
+            "textual", "openai", "mcp", "watchdog", "requests",
+            "faster_whisper", "kokoro", "anthropic", "google.genai",
+        ]
+        versions: dict[str, str] = {}
+        for pkg in packages:
+            try:
+                mod = __import__(pkg)
+                versions[pkg] = getattr(mod, "__version__", "installed")
+            except ImportError:
+                versions[pkg] = "not installed"
+        return versions
+
+    def _get_mtga_log_status(self) -> dict:
+        """Get MTGA Player.log file status."""
+        import os
+        log_path = os.environ.get(
+            "MTGA_LOG_PATH",
+            str(Path(os.environ.get("APPDATA", "")) / "LocalLow"
+                / "Wizards Of The Coast" / "MTGA" / "Player.log"),
+        )
+        result: dict = {"path": log_path}
+        try:
+            p = Path(log_path)
+            result["exists"] = p.exists()
+            if p.exists():
+                stat = p.stat()
+                result["size_bytes"] = stat.st_size
+                result["last_modified"] = datetime.fromtimestamp(stat.st_mtime).isoformat()
+        except Exception as e:
+            result["error"] = str(e)
+        return result
+
+    def _get_match_context(self) -> dict:
+        """Get match-level context: match ID, opponent cards, recent events."""
+        ctx: dict = {}
+        try:
+            if not self._mcp:
+                return ctx
+            from arenamcp.server import game_state
+            ctx["match_id"] = getattr(game_state, "match_id", None)
+            ctx["local_seat_id"] = getattr(game_state, "local_seat_id", None)
+            ctx["seat_source"] = game_state.get_seat_source_name() if hasattr(game_state, "get_seat_source_name") else None
+            # Opponent played cards
+            try:
+                from arenamcp.server import get_opponent_played_cards
+                opp = get_opponent_played_cards()
+                ctx["opponent_played_cards"] = opp if opp else []
+            except Exception:
+                ctx["opponent_played_cards"] = []
+            # Recent game events
+            snapshot = game_state.get_snapshot() if hasattr(game_state, "get_snapshot") else {}
+            ctx["recent_events"] = snapshot.get("recent_events", [])[-20:]
+            ctx["damage_taken"] = snapshot.get("damage_taken", {})
+        except Exception as e:
+            ctx["error"] = str(e)
+        return ctx
 
     def _get_llm_context(self) -> dict:
         """Get the LLM context from the most recent advice (what the LLM actually saw).

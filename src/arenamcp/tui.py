@@ -985,10 +985,11 @@ class ArenaApp(App):
                 self.write_log("[dim]No update available. Already up to date.[/]")
             return
 
-        # Handle /bugreport command
-        if text.lower() == "/bugreport":
+        # Handle /bugreport command (optional message after the command)
+        if text.lower().startswith("/bugreport"):
             self.write_log(f"\n[bold cyan]YOU: {text}[/]")
-            threading.Thread(target=self._do_submit_bugreport, daemon=True).start()
+            user_msg = text[len("/bugreport"):].strip() or None
+            threading.Thread(target=self._do_submit_bugreport, args=(user_msg,), daemon=True).start()
             return
 
         self.write_log(f"\n[bold cyan]YOU: {text}[/]")
@@ -1059,8 +1060,13 @@ class ArenaApp(App):
         else:
             self.call_from_thread(self.write_log, "[yellow]Coach not available for debug report[/]")
 
-    def _do_submit_bugreport(self):
-        """Submit the most recent bug report as a GitHub issue."""
+    def _do_submit_bugreport(self, user_message: str = None):
+        """Submit the most recent bug report as a GitHub issue.
+
+        Args:
+            user_message: Optional user description (from ``/bugreport <msg>``).
+                          Used in the issue title and body when provided.
+        """
         import shutil
         from pathlib import Path
 
@@ -1084,15 +1090,78 @@ class ArenaApp(App):
             return
 
         timestamp = report_data.get("timestamp", report_path.stem)
-        title = f"Bug Report: {timestamp}"
-        # Build a concise body from the report
-        body_parts = [f"**Timestamp:** {timestamp}"]
-        if report_data.get("trigger"):
-            body_parts.append(f"**Trigger:** {report_data['trigger']}")
-        if report_data.get("backend"):
-            body_parts.append(f"**Backend:** {report_data['backend']}")
-        if report_data.get("model"):
-            body_parts.append(f"**Model:** {report_data['model']}")
+        version = report_data.get("version", "unknown")
+        if user_message:
+            title = f"Bug Report: {user_message}"
+        else:
+            title = f"Bug Report: {timestamp}"
+
+        # Build a rich issue body from the report
+        config = report_data.get("config", {})
+        system = report_data.get("system", {})
+        mtga_log = report_data.get("mtga_log", {})
+        match_ctx = report_data.get("match_context", {})
+        game_state = report_data.get("game_state", {})
+        errors = report_data.get("errors", [])
+
+        body_parts = []
+        if user_message:
+            body_parts.append(f"**Description:** {user_message}")
+            body_parts.append("")
+        body_parts.append(f"**Timestamp:** {timestamp}")
+        body_parts.append(f"**Version:** {version}")
+
+        if report_data.get("reason"):
+            body_parts.append(f"**Trigger:** {report_data['reason']}")
+        body_parts.append(f"**Backend:** {config.get('backend', 'unknown')}")
+        body_parts.append(f"**Model:** {config.get('model', 'unknown')}")
+
+        # System
+        body_parts.append("")
+        body_parts.append("### System")
+        body_parts.append(f"- OS: {system.get('platform', 'unknown')}")
+        body_parts.append(f"- Python: {system.get('python_version', 'unknown')}")
+        body_parts.append(f"- Arch: {system.get('machine', 'unknown')}")
+        pkgs = system.get("packages", {})
+        if pkgs:
+            missing = [p for p, v in pkgs.items() if v == "not installed"]
+            if missing:
+                body_parts.append(f"- Missing packages: {', '.join(missing)}")
+
+        # MTGA log
+        if mtga_log:
+            body_parts.append("")
+            body_parts.append("### MTGA Log")
+            body_parts.append(f"- Path: `{mtga_log.get('path', 'unknown')}`")
+            body_parts.append(f"- Exists: {mtga_log.get('exists', 'unknown')}")
+            if mtga_log.get("size_bytes") is not None:
+                size_mb = mtga_log["size_bytes"] / (1024 * 1024)
+                body_parts.append(f"- Size: {size_mb:.1f} MB")
+                body_parts.append(f"- Last modified: {mtga_log.get('last_modified', 'unknown')}")
+
+        # Game state summary
+        if game_state:
+            turn = game_state.get("turn", {})
+            players = game_state.get("players", [])
+            body_parts.append("")
+            body_parts.append("### Game State")
+            body_parts.append(f"- Turn: {turn.get('turn_number', '?')} | Phase: {turn.get('phase', '?')}")
+            for p in players:
+                label = "You" if p.get("is_local") else "Opp"
+                body_parts.append(f"- {label} (Seat {p.get('seat_id', '?')}): {p.get('life_total', '?')} life")
+            hand = game_state.get("hand", [])
+            bf = game_state.get("battlefield", [])
+            body_parts.append(f"- Hand: {len(hand)} | Battlefield: {len(bf)}")
+            if match_ctx.get("match_id"):
+                body_parts.append(f"- Match ID: `{match_ctx['match_id']}`")
+
+        # Errors
+        if errors:
+            body_parts.append("")
+            body_parts.append("### Recent Errors")
+            for err in errors[-5:]:
+                err_str = str(err)[:200]
+                body_parts.append(f"- `{err_str}`")
 
         repo = "josharmour/ArenaMCP"
 
