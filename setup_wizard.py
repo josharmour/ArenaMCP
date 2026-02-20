@@ -9,6 +9,7 @@ selection, language configuration, and settings persistence.
 Runs with system Python (no venv needed). Uses only stdlib modules.
 """
 
+import io
 import json
 import os
 import shutil
@@ -18,6 +19,19 @@ import textwrap
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+# Prevent UnicodeEncodeError on Windows consoles using cp1252/cp437/etc.
+# Replace unencodable characters with '?' instead of crashing.
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(errors="replace")
+    except Exception:
+        pass
 
 # -- Constants ----------------------------------------------------------------
 
