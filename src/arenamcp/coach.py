@@ -1134,7 +1134,8 @@ CRITICAL STRATEGY RULES:
 - LETHAL CHECK: Before anything else, count your total attack power vs opponent life and blockers.
   If you can deal lethal, go aggressive — remove a blocker or just attack. Don't play defensively!
 - ONLY claim "lethal" if the combat summary line shows "Atk: ... vs LETHAL".
-- ATTACK DEFAULT: When declaring attackers, attack with ALL eligible creatures (listed after "can attack:" in the Atk: line) unless you have a concrete reason to hold one back (e.g., need it to block a lethal crackback). Do NOT suggest attacking with only one creature when multiple are available without explaining why the others should stay back.
+- TRADE CHECK: Read the "If X blocks Y:" lines below the Atk: summary. Lines marked "BAD" mean the attacker dies for free or bounces off. Do NOT attack into a BAD trade unless it enables lethal or a critical strategy. If every possible block is BAD, don't attack with that creature.
+- ATTACK DEFAULT: When declaring attackers, attack with ALL eligible creatures (listed after "can attack:" in the Atk: line) unless you have a concrete reason to hold one back (e.g., BAD trade, need it to block a lethal crackback). Do NOT suggest attacking with only one creature when multiple are available without explaining why the others should stay back.
 - CRACKBACK CHECK: Before attacking, count opponent's total power on board vs YOUR life total.
   If opponent can kill you on their next attack and you need creatures to block, do NOT attack with them.
   Holding back blockers to survive is more important than dealing a few damage.
@@ -1169,7 +1170,8 @@ STRATEGY:
 - LETHAL CHECK: Before anything else, count your total attack power vs opponent life and blockers.
   If you can deal lethal, go aggressive — remove a blocker or just attack. Don't play defensively!
 - ONLY claim "lethal" if the combat summary line shows "Atk: ... vs LETHAL".
-- ATTACK DEFAULT: Attack with ALL eligible creatures (listed after "can attack:" in the Atk: line) unless you need to hold back a specific blocker to survive crackback. Never say a creature is your "only" attacker without checking the full list.
+- TRADE CHECK: Read "If X blocks Y:" lines. "BAD" = attacker dies for free. Don't attack into BAD trades unless it enables lethal.
+- ATTACK DEFAULT: Attack with ALL eligible creatures (listed after "can attack:" in the Atk: line) unless the trade is BAD or you need to hold back a blocker to survive crackback. Never say a creature is your "only" attacker without checking the full list.
 - CRACKBACK CHECK: Before attacking, count opponent's total power vs YOUR life. If they can kill you next turn and you need blockers to survive, do NOT attack with those creatures.
 - Bounce/removal spells can target OPPONENT creatures too. Bouncing a blocker for lethal > saving your creature.
 - When opponent has a removal spell on the stack, weigh "save my creature" vs "ignore it and go for the kill."
@@ -2288,6 +2290,58 @@ class CoachEngine:
                     lines.append(
                         f"Atk: {len(valid_attackers)}cr/{your_attack_power}pwr vs {lethal} — can attack: {attacker_list}"
                     )
+                    # Trade analysis for attacks: show what happens if each blocker blocks each attacker
+                    if valid_attackers and opp_blockers:
+                        for atk in valid_attackers:
+                            atk_name = atk.get("name", "?")
+                            atk_pow = atk.get("power") or 0
+                            atk_tgh = atk.get("toughness") or 0
+                            atk_oracle = self._remove_reminder_text(
+                                atk.get("oracle_text", "")
+                            ).lower()
+                            atk_has_fly = "flying" in atk_oracle
+                            atk_has_dth = "deathtouch" in atk_oracle
+                            atk_has_trample = "trample" in atk_oracle
+                            atk_has_fs = "first strike" in atk_oracle or "double strike" in atk_oracle
+                            for blk in opp_blockers:
+                                blk_name = blk.get("name", "?")
+                                blk_pow = blk.get("power") or 0
+                                blk_tgh = blk.get("toughness") or 0
+                                blk_oracle = self._remove_reminder_text(
+                                    blk.get("oracle_text", "")
+                                ).lower()
+                                blk_has_fly = "flying" in blk_oracle
+                                blk_has_reach = "reach" in blk_oracle
+                                blk_has_dth = "deathtouch" in blk_oracle
+                                blk_has_fs = "first strike" in blk_oracle or "double strike" in blk_oracle
+                                # Skip if blocker can't legally block (flying vs no fly/reach)
+                                if atk_has_fly and not blk_has_fly and not blk_has_reach:
+                                    continue
+                                # Determine outcomes
+                                atk_dies = (blk_pow >= atk_tgh) or blk_has_dth
+                                blk_dies = (atk_pow >= blk_tgh) or atk_has_dth
+                                if atk_has_fs and not blk_has_fs:
+                                    if atk_pow >= blk_tgh or atk_has_dth:
+                                        atk_dies = False
+                                elif blk_has_fs and not atk_has_fs:
+                                    if blk_pow >= atk_tgh or blk_has_dth:
+                                        blk_dies = False
+                                if atk_dies and blk_dies:
+                                    result = "TRADE (both die)"
+                                elif atk_dies:
+                                    result = f"BAD — {atk_name} dies, {blk_name} lives ({blk_tgh - atk_pow} left)"
+                                elif blk_dies:
+                                    trample_note = ""
+                                    if atk_has_trample:
+                                        spillover = atk_pow - blk_tgh
+                                        if spillover > 0:
+                                            trample_note = f", {spillover} trample through"
+                                    result = f"GOOD — {blk_name} dies, {atk_name} lives ({atk_tgh - blk_pow} left){trample_note}"
+                                else:
+                                    result = f"BAD — both live, {atk_name} just bounces off"
+                                lines.append(
+                                    f"  If {blk_name} {blk_pow}/{blk_tgh} blocks {atk_name} {atk_pow}/{atk_tgh}: {result}"
+                                )
                 else:
                     lines.append(f"Atk: None (T/SS)")
 
