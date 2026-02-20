@@ -28,8 +28,14 @@ from arenamcp.sealed_eval import analyze_sealed_pool, format_sealed_recommendati
 from arenamcp.mtgadb import MTGADatabase
 from arenamcp.mtgjson import MTGJSONDatabase, get_mtgjson
 from arenamcp.watcher import MTGALogWatcher
-from arenamcp.voice import VoiceInput
-from arenamcp.tts import VoiceOutput
+try:
+    from arenamcp.voice import VoiceInput
+except ImportError:
+    VoiceInput = None  # type: ignore[assignment,misc]
+try:
+    from arenamcp.tts import VoiceOutput
+except ImportError:
+    VoiceOutput = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
