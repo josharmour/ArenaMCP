@@ -2299,8 +2299,28 @@ class CoachEngine:
                     local_player.get("life_total", 20) if local_player else 20
                 )
                 if opp_attack_power > 0:
+                    # Determine which of your creatures would be tapped (unavailable
+                    # to block) if you attack with all valid attackers
+                    non_attackers = [
+                        c for c in your_creatures if c not in valid_attackers
+                    ]
+                    non_attacker_power = sum(
+                        c.get("power") or 0 for c in non_attackers
+                    )
+                    # Unblocked opponent damage if only non-attackers can block
+                    unblocked_opp_dmg = max(
+                        0, opp_attack_power - non_attacker_power
+                    )
+                    life_after_allout = your_life - unblocked_opp_dmg
+
                     life_margin = your_life - opp_attack_power
-                    if life_margin <= 0:
+                    if life_after_allout <= 0:
+                        lines.append(
+                            f"⚠️ Crackback: opp has {opp_attack_power}pwr, your life {your_life} — "
+                            f"if you attack with all, only {len(non_attackers)} blocker(s) back "
+                            f"({non_attacker_power}pwr) → LETHAL on crackback! Hold blockers!"
+                        )
+                    elif life_margin <= 0:
                         lines.append(
                             f"Crackback: {opp_attack_power}pwr vs your {your_life} life — LETHAL if no blockers held!"
                         )
@@ -2352,9 +2372,23 @@ class CoachEngine:
                 if attacking:
                     fly_dmg = sum(c.get("power") or 0 for c in flying_atk)
                     gnd_dmg = sum(c.get("power") or 0 for c in ground_atk)
+                    total_incoming = fly_dmg + gnd_dmg
+                    your_life = (
+                        local_player.get("life_total", 20) if local_player else 20
+                    )
                     lines.append(
                         f"Blk: {fly_dmg}fly/{gnd_dmg}gnd dmg | {len(flyer_blockers)}FLY-blk avail"
                     )
+                    # Show total incoming damage and post-combat life if unblocked
+                    life_after_no_blocks = your_life - total_incoming
+                    if life_after_no_blocks <= 0:
+                        lines.append(
+                            f"⚠️ No blocks → {total_incoming} dmg → DEAD (from {your_life} life)! Must block!"
+                        )
+                    else:
+                        lines.append(
+                            f"No blocks → take {total_incoming} dmg → {life_after_no_blocks} life remaining"
+                        )
                     if flying_atk and not flyer_blockers:
                         lines.append(f"⚠️ {fly_dmg} UNBLOCKABLE!")
                     # Deathtouch warning — critical for blocking decisions
@@ -2413,6 +2447,24 @@ class CoachEngine:
                                 lines.append(
                                     f"  If {blk_name} {blk_pow}/{blk_tgh} blocks {atk_name} {atk_pow}/{atk_tgh}: {result}"
                                 )
+
+                    # Next-turn danger: opponent's non-attacking creatures can
+                    # attack again next turn alongside any surviving attackers
+                    opp_non_attacking = [
+                        c for c in opp_cards
+                        if "creature" in c.get("type_line", "").lower()
+                        and c not in attacking
+                    ]
+                    opp_next_turn_power = (
+                        sum(c.get("power") or 0 for c in attacking)
+                        + sum(c.get("power") or 0 for c in opp_non_attacking)
+                    )
+                    if opp_next_turn_power > 0 and life_after_no_blocks > 0:
+                        if opp_next_turn_power >= life_after_no_blocks:
+                            lines.append(
+                                f"⚠️ Next turn: opp can attack for up to {opp_next_turn_power}pwr — "
+                                f"LETHAL if you're at {life_after_no_blocks} life after this combat! Preserve blockers!"
+                            )
         else:
             lines.append("")
             lines.append("BOARD: Empty")
@@ -2876,6 +2928,8 @@ class CoachEngine:
         # Gemini CLI uses a subprocess which has startup overhead
         if isinstance(self._backend, GeminiCliBackend):
             api_timeout = 20
+        elif isinstance(self._backend, ProxyBackend) and getattr(self._backend, '_api_key', None) == "ollama":
+            api_timeout = 45  # Local Ollama models need much more time
         elif isinstance(self._backend, ProxyBackend):
             api_timeout = 15  # Proxy adds ~1-2s overhead to upstream calls
         else:
@@ -2890,8 +2944,10 @@ class CoachEngine:
         try:
             response = future.result(timeout=api_timeout)
         except concurrent.futures.TimeoutError:
+            is_ollama = isinstance(self._backend, ProxyBackend) and getattr(self._backend, '_api_key', None) == "ollama"
+            hint = " — try a smaller model (e.g. llama3.2:1b) or use a cloud backend" if is_ollama else ""
             logger.warning(
-                f"LLM API call timed out after {api_timeout}s (model may be too slow for real-time coaching)"
+                f"LLM API call timed out after {api_timeout}s (model may be too slow for real-time coaching){hint}"
             )
             response = ""
         # Don't wait for thread completion — shutdown(wait=True) would block
@@ -2963,6 +3019,8 @@ class CoachEngine:
             api_timeout = 45
         elif is_thinking:
             api_timeout = 90
+        elif isinstance(be, ProxyBackend) and getattr(be, '_api_key', None) == "ollama":
+            api_timeout = 90  # Local Ollama models need much more time
         elif isinstance(be, ProxyBackend):
             api_timeout = 45
         else:
