@@ -237,8 +237,21 @@ class StandaloneCoach:
 
         # Resolve configuration (Args > Settings > Defaults)
         self._backend_name = backend or self.settings.get("backend", "auto")
-        self._model_name = model or self.settings.get("model")
         self._voice_mode = voice_mode or self.settings.get("voice_mode", "ptt")
+
+        # Model resolution: only carry over saved model if the backend matches.
+        # A model from one backend (e.g. "llama3.2" from Ollama) makes no sense
+        # for another (e.g. claude-code), and passing it via --model can break
+        # the CLI subprocess entirely.
+        if model:
+            self._model_name = model
+        else:
+            saved_model = self.settings.get("model")
+            saved_backend = self.settings.get("backend", "auto")
+            if saved_model and saved_backend == self._backend_name:
+                self._model_name = saved_model
+            else:
+                self._model_name = None
 
         self.draft_mode = draft_mode
         self.set_code = set_code.upper() if set_code else None
