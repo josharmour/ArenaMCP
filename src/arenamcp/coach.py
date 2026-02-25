@@ -1001,6 +1001,156 @@ def fetch_proxy_models() -> list[tuple[str, str]]:
     ]
 
 
+# ── Provider / model enumeration for the two-toggle UI ──────────────
+
+# Static model lists for CLI backends (they don't expose a listing endpoint).
+# Each entry is (display_name, model_id_or_None).  None = "provider default".
+_CLI_MODELS: dict[str, list[tuple[str, Optional[str]]]] = {
+    "claude-code": [
+        ("Default", None),
+        ("Opus 4.6", "claude-opus-4-6"),
+        ("Sonnet 4.6", "claude-sonnet-4-6"),
+        ("Sonnet 4.5", "claude-sonnet-4-5-20250929"),
+        ("Haiku 4.5", "claude-haiku-4-5-20251001"),
+    ],
+    "gemini-cli": [
+        ("Default", None),
+        ("Gemini 2.5 Pro", "gemini-2.5-pro"),
+        ("Gemini 2.5 Flash", "gemini-2.5-flash"),
+        ("Gemini 2.0 Flash", "gemini-2.0-flash"),
+    ],
+    "codex-cli": [
+        ("Default", None),
+        ("o4-mini", "o4-mini"),
+        ("GPT-4.1", "gpt-4.1"),
+    ],
+}
+
+
+def get_available_providers() -> list[tuple[str, str]]:
+    """Return providers actually available on this system.
+
+    Returns list of ``(display_name, provider_id)`` tuples.
+    Only includes backends whose binary / endpoint is reachable.
+    """
+    from arenamcp.backend_detect import detect_backends_quick, load_custom_endpoints
+
+    detected = detect_backends_quick()
+
+    _ALL = [
+        ("Claude Code", "claude-code"),
+        ("Gemini CLI", "gemini-cli"),
+        ("Codex CLI", "codex-cli"),
+        ("Ollama", "ollama"),
+    ]
+    providers = [(d, pid) for d, pid in _ALL if detected.get(pid)]
+
+    endpoints = load_custom_endpoints()
+    if endpoints:
+        if endpoints.get("proxy_url"):
+            providers.append(("Proxy", "proxy"))
+        if endpoints.get("api_url"):
+            providers.append(("API", "api"))
+
+    # Always offer at least Ollama
+    if not providers:
+        providers.append(("Ollama", "ollama"))
+
+    return providers
+
+
+def get_models_for_provider(provider: str) -> list[tuple[str, Optional[str]]]:
+    """Return models available for *provider*.
+
+    Returns list of ``(display_name, model_id_or_None)`` tuples.
+    ``None`` means "use the provider's default model".
+
+    CLI backends use a static list; proxy / ollama / api query their
+    endpoint dynamically and fall back to a sensible default.
+    """
+    import urllib.request as _urlreq
+
+    provider = provider.lower()
+
+    # CLI backends — static lists
+    if provider in _CLI_MODELS:
+        return list(_CLI_MODELS[provider])
+
+    # Proxy — query /v1/models
+    if provider == "proxy":
+        try:
+            from arenamcp.settings import get_settings
+            from arenamcp.backend_detect import load_custom_endpoints
+            ep = load_custom_endpoints()
+            base_url = (ep.get("proxy_url") if ep else None) or "http://127.0.0.1:8080/v1"
+            api_key = (ep.get("proxy_api_key") if ep else None) or "your-api-key-1"
+            req = _urlreq.Request(
+                f"{base_url}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            with _urlreq.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read())
+            models: list[tuple[str, Optional[str]]] = []
+            for m in data.get("data", []):
+                mid = m["id"]
+                models.append((mid, mid))
+            if models:
+                return models
+        except Exception:
+            pass
+        return [("claude-sonnet-4-5-20250929", "claude-sonnet-4-5-20250929")]
+
+    # Ollama — query /v1/models, fall back to /api/tags
+    if provider == "ollama":
+        try:
+            from arenamcp.settings import get_settings
+            ollama_url = get_settings().get("ollama_url") or "http://localhost:11434/v1"
+        except Exception:
+            ollama_url = "http://localhost:11434/v1"
+        try:
+            req = _urlreq.Request(f"{ollama_url}/models")
+            with _urlreq.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read())
+            models = [(m["id"], m["id"]) for m in data.get("data", []) if m.get("id")]
+            if models:
+                return models
+        except Exception:
+            pass
+        try:
+            req = _urlreq.Request("http://localhost:11434/api/tags")
+            with _urlreq.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read())
+            models = [(m["name"], m["name"]) for m in data.get("models", []) if m.get("name")]
+            if models:
+                return models
+        except Exception:
+            pass
+        return [("llama3.2", "llama3.2")]
+
+    # Generic API endpoint
+    if provider == "api":
+        try:
+            from arenamcp.settings import get_settings
+            s = get_settings()
+            api_url = s.get("api_url") or ""
+            api_key_val = s.get("api_key") or ""
+            if api_url:
+                headers: dict[str, str] = {}
+                if api_key_val:
+                    headers["Authorization"] = f"Bearer {api_key_val}"
+                req = _urlreq.Request(f"{api_url.rstrip('/')}/models", headers=headers)
+                with _urlreq.urlopen(req, timeout=3) as resp:
+                    data = json.loads(resp.read())
+                models = [(m["id"], m["id"]) for m in data.get("data", []) if m.get("id")]
+                if models:
+                    return models
+        except Exception:
+            pass
+        return [("gpt-4o", "gpt-4o")]
+
+    return [("Default", None)]
+
+
 THINKING_MODEL_PREFERENCE = [
     "claude-opus-4-6",
     "claude-sonnet-4-5-20250929",

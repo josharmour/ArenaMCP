@@ -465,6 +465,7 @@ class Sidebar(Vertical):
 
         with Vertical(id="actions-panel"):
             yield Button("Provider: detecting...", id="btn-provider", variant="primary")
+            yield Button("Model: (default)", id="btn-model", variant="primary")
             yield Button("Voice: loading...", id="btn-voice-select", variant="success")
             yield Button("Mute (F5)", id="btn-mute", variant="success")
             yield Button("Speed 1.0x (F8)", id="btn-speed", variant="success")
@@ -750,25 +751,32 @@ class ArenaApp(App):
         if not self.coach:
             return
 
-        # Build composite provider string
+        # Build provider / model display strings
         current_backend = self.coach.backend_name
         current_model = self.coach.model_name
 
-        # Update provider button label
-        combo = f"{current_backend}/{current_model}" if current_model else current_backend
-        display_name = current_model or current_backend
-        # Try to find a friendly display name from MODEL_OPTIONS
-        for name, val in Sidebar.MODEL_OPTIONS:
-            if str(val) == combo or str(val) == current_backend:
-                display_name = name.split("(")[0].strip() if "(" in name else name
+        # Provider friendly name
+        provider_display = current_backend
+        from arenamcp.coach import get_available_providers
+        for name, pid in get_available_providers():
+            if pid == current_backend:
+                provider_display = name
                 break
         try:
             btn = self.query_one("#btn-provider", Button)
-            btn.label = f"Provider: {display_name}"
+            btn.label = f"Provider: {provider_display}"
         except Exception:
             pass
 
-        # Sync model status
+        # Model button
+        model_label = current_model or "(default)"
+        try:
+            mbtn = self.query_one("#btn-model", Button)
+            mbtn.label = f"Model: {model_label}"
+        except Exception:
+            pass
+
+        # Status bar
         model_display = f"{current_backend}/{current_model}" if current_model else current_backend
         self.update_status("MODEL", model_display)
         self.update_status("STYLE", self.coach.advice_style.upper())
@@ -922,6 +930,8 @@ class ArenaApp(App):
         btn_id = event.button.id
         if btn_id == "btn-provider":
             self._cycle_provider()
+        elif btn_id == "btn-model":
+            self._cycle_model()
         elif btn_id == "btn-voice-select":
             self._cycle_voice_select()
         elif btn_id == "btn-mute":
@@ -943,51 +953,78 @@ class ArenaApp(App):
             self.action_read_win_plan()
 
     def _cycle_provider(self) -> None:
-        """Cycle to next provider on click.
+        """Cycle to next backend provider on click (model resets to default)."""
+        from arenamcp.coach import get_available_providers
 
-        Cycles through simple providers (Ollama, Claude Code, Gemini CLI, Codex CLI)
-        plus any advanced proxy/api models if configured via endpoints.json.
-        """
-        options = Sidebar.MODEL_OPTIONS
-        if not options:
+        if not hasattr(self, '_provider_list') or not self._provider_list:
+            self._provider_list = get_available_providers()
+
+        providers = self._provider_list
+        if not providers:
             return
 
         current_backend = self.coach.backend_name
-        current_model = self.coach.model_name
-        current_combo = f"{current_backend}/{current_model}" if current_model else current_backend
 
-        # Find current index
         idx = -1
-        for i, (_, val) in enumerate(options):
-            if str(val) == current_combo:
+        for i, (_, pid) in enumerate(providers):
+            if pid == current_backend:
                 idx = i
                 break
-        if idx == -1:
-            for i, (_, val) in enumerate(options):
-                if str(val).startswith(current_backend):
-                    idx = i
-                    break
 
-        next_idx = ((idx if idx >= 0 else 0) + 1) % len(options)
-        display_name, next_val = options[next_idx]
-
-        # Parse provider/model
-        selection = str(next_val)
-        if "/" in selection:
-            new_provider, new_model = selection.split("/", 1)
-        else:
-            new_provider = selection
-            new_model = None
+        next_idx = (idx + 1) % len(providers)
+        display_name, new_provider = providers[next_idx]
 
         # Show "switching..." while verifying in background
         btn = self.query_one("#btn-provider", Button)
         btn.label = f"Provider: switching..."
 
-        # Switch backend in thread (button label updated on success/failure)
         threading.Thread(
             target=self._verify_and_switch,
-            args=(new_provider, new_model),
-            daemon=True
+            args=(new_provider, None),
+            daemon=True,
+        ).start()
+
+    def _cycle_model(self) -> None:
+        """Cycle to next model within the current provider."""
+        from arenamcp.coach import get_models_for_provider
+
+        provider = self.coach.backend_name
+
+        if getattr(self, '_model_list_for', None) != provider:
+            self._model_list = get_models_for_provider(provider)
+            self._model_list_for = provider
+
+        models = self._model_list
+        if len(models) <= 1:
+            self.call_from_thread(
+                self.write_log,
+                f"[yellow]Only one model for {provider}[/]",
+            )
+            return
+
+        current_model = self.coach.model_name
+
+        idx = -1
+        for i, (_, mid) in enumerate(models):
+            if mid == current_model:
+                idx = i
+                break
+        if idx == -1 and current_model is None:
+            for i, (_, mid) in enumerate(models):
+                if mid is None:
+                    idx = i
+                    break
+
+        next_idx = (idx + 1) % len(models)
+        display_name, new_model = models[next_idx]
+
+        btn = self.query_one("#btn-model", Button)
+        btn.label = f"Model: switching..."
+
+        threading.Thread(
+            target=self._verify_and_switch,
+            args=(provider, new_model),
+            daemon=True,
         ).start()
 
     def _cycle_voice_select(self) -> None:
@@ -1110,38 +1147,56 @@ class ArenaApp(App):
 
         # Proceed with switch
         self.coach.set_backend(provider, model)
-        # Update button label AND model status on the main thread
-        display_name = provider
-        for name, val in Sidebar.MODEL_OPTIONS:
-            if str(val) == provider:
-                display_name = name.split("(")[0].strip() if "(" in name else name
-                break
-        # Build model display string from actual coach state
+        # Resolve display names from actual coach state
         actual_backend = self.coach.backend_name
         actual_model = self.coach.model_name
+
+        # Provider display name
+        provider_display = actual_backend
+        from arenamcp.coach import get_available_providers
+        for name, pid in get_available_providers():
+            if pid == actual_backend:
+                provider_display = name
+                break
+
+        # Model display name
+        model_label = actual_model or "(default)"
         model_display = f"{actual_backend}/{actual_model}" if actual_model else actual_backend
+
+        # Invalidate cached model list so Model button rebuilds
+        self._model_list_for = None
+
         def _update_btn():
             try:
                 btn = self.query_one("#btn-provider", Button)
-                btn.label = f"Provider: {display_name}"
+                btn.label = f"Provider: {provider_display}"
+                mbtn = self.query_one("#btn-model", Button)
+                mbtn.label = f"Model: {model_label}"
                 self.update_status("MODEL", model_display)
             except Exception:
                 pass
         self.call_from_thread(_update_btn)
 
     def _revert_provider_button(self):
-        """Revert the Provider button label to the current active backend."""
+        """Revert Provider and Model buttons to the current active backend."""
         if not self.coach:
             return
         current = self.coach.backend_name
-        display_name = current
-        for name, val in Sidebar.MODEL_OPTIONS:
-            if str(val) == current:
-                display_name = name.split("(")[0].strip() if "(" in name else name
+        current_model = self.coach.model_name
+
+        provider_display = current
+        from arenamcp.coach import get_available_providers
+        for name, pid in get_available_providers():
+            if pid == current:
+                provider_display = name
                 break
+
+        model_label = current_model or "(default)"
         try:
             btn = self.query_one("#btn-provider", Button)
-            btn.label = f"Provider: {display_name}"
+            btn.label = f"Provider: {provider_display}"
+            mbtn = self.query_one("#btn-model", Button)
+            mbtn.label = f"Model: {model_label}"
         except Exception:
             pass
 

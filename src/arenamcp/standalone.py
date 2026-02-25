@@ -2443,39 +2443,75 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
 
         return False
 
-    def _on_model_cycle_hotkey(self) -> None:
-        """F12 - Cycle through all available provider/model combinations."""
+    def _on_provider_cycle_hotkey(self) -> None:
+        """F11 - Cycle through available backend providers."""
         if self.draft_mode:
             return
 
-        # Unified logic: Cycle through the same list as the TUI dropdown
-        # Format: (provider, model_name)
-        # Build combo list dynamically from proxy
-        if not hasattr(self, '_combo_list'):
-            from arenamcp.coach import fetch_proxy_models
-            combos = []
-            for _, val in fetch_proxy_models():
-                # val is "proxy/model-id"
-                parts = val.split("/", 1)
-                if len(parts) == 2:
-                    combos.append((parts[0], parts[1]))
-            self._combo_list = combos
+        # Build / cache provider list
+        if not hasattr(self, '_provider_list') or not self._provider_list:
+            from arenamcp.coach import get_available_providers
+            self._provider_list = get_available_providers()
 
-        combo_list = self._combo_list
+        providers = self._provider_list
+        if not providers:
+            return
 
         # Find current index
         current_idx = -1
-        for i, (p, m) in enumerate(combo_list):
-            if p == self.backend_name and m == self.model_name:
+        for i, (_, pid) in enumerate(providers):
+            if pid == self.backend_name:
                 current_idx = i
                 break
-        
-        # Next index
-        next_idx = (current_idx + 1) % len(combo_list)
-        new_provider, new_model = combo_list[next_idx]
-        
-        # Switch
-        self.set_backend(new_provider, new_model)
+
+        next_idx = (current_idx + 1) % len(providers)
+        display_name, new_provider = providers[next_idx]
+
+        # Switch provider — model resets to provider default
+        self.ui.log(f"\n[PROVIDER] Switching to {display_name}...")
+        self.set_backend(new_provider, None)
+        # Invalidate cached model list so F12 rebuilds for new provider
+        self._model_list_for: Optional[str] = None
+        self._model_list: list = []
+
+    def _on_model_cycle_hotkey(self) -> None:
+        """F12 - Cycle through models within the current provider."""
+        if self.draft_mode:
+            return
+
+        from arenamcp.coach import get_models_for_provider
+
+        provider = self.backend_name
+
+        # Rebuild model list when provider changes
+        if getattr(self, '_model_list_for', None) != provider:
+            self._model_list = get_models_for_provider(provider)
+            self._model_list_for = provider
+
+        models = self._model_list
+        if len(models) <= 1:
+            self.ui.log(f"\n[MODEL] Only one model available for {provider}\n")
+            return
+
+        # Find current index
+        current_idx = -1
+        for i, (_, mid) in enumerate(models):
+            if mid == self.model_name:
+                current_idx = i
+                break
+        # If current model is None (default), match the None entry
+        if current_idx == -1 and self.model_name is None:
+            for i, (_, mid) in enumerate(models):
+                if mid is None:
+                    current_idx = i
+                    break
+
+        next_idx = (current_idx + 1) % len(models)
+        display_name, new_model = models[next_idx]
+
+        self.set_backend(provider, new_model)
+        label = display_name if display_name != "Default" else "(default)"
+        self.ui.log(f"\n[MODEL] {provider} -> {label}\n")
 
 
     def _on_style_toggle_hotkey(self) -> None:
@@ -2540,6 +2576,7 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             keyboard.on_press_key("f7", lambda _: self._on_bug_report_hotkey(), suppress=False)
             keyboard.on_press_key("f8", lambda _: self._on_swap_seat_hotkey(), suppress=False)
             keyboard.on_press_key("f10", lambda _: self.run_speed_test(), suppress=False)
+            keyboard.on_press_key("f11", lambda _: self._on_provider_cycle_hotkey(), suppress=False)
             keyboard.on_press_key("f12", lambda _: self._on_model_cycle_hotkey(), suppress=False)
             keyboard.add_hotkey("ctrl+0", lambda: self._on_read_win_plan(), suppress=False)
             logger.info("Hotkeys registered")
