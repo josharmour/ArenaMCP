@@ -1020,18 +1020,17 @@ class ArenaApp(App):
 
         # Fast path: skip validation when cycling models within the same
         # provider — the provider is already validated and running.
+        # set_backend is instant for same-provider swaps so no thread needed.
         self.coach.set_backend(provider, new_model)
 
         model_label = new_model or "(default)"
         model_display = f"{provider}/{new_model}" if new_model else provider
         self._model_list_for = None  # invalidate cache
-        def _update():
-            try:
-                self.query_one("#btn-model", Button).label = f"Model: {model_label}"
-                self.update_status("MODEL", model_display)
-            except Exception:
-                pass
-        self.call_from_thread(_update)
+        try:
+            self.query_one("#btn-model", Button).label = f"Model: {model_label}"
+            self.update_status("MODEL", model_display)
+        except Exception:
+            pass
 
     def _cycle_voice_select(self) -> None:
         """Cycle to next TTS voice on click."""

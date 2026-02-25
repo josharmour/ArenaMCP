@@ -32,6 +32,34 @@ class LLMBackend(Protocol):
         return []
 
 
+def _kill_proc_tree(proc: subprocess.Popen) -> None:
+    """Kill a subprocess and all its children, suppressing console windows.
+
+    On Windows, ``terminate()`` only kills the top-level process.  If the
+    CLI is a ``.cmd``/``.ps1`` wrapper, its child (Node.js / Python) survives
+    and may flash a console window.  ``taskkill /T /F`` kills the whole tree.
+    """
+    pid = proc.pid
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(pid)],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            return
+        except Exception:
+            pass  # fall through to generic terminate
+    try:
+        proc.terminate()
+        proc.wait(timeout=2.0)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 class ClaudeCodeBackend:
     """LLM backend using Claude Code CLI (subscription session, no API key).
 
@@ -106,6 +134,10 @@ class ClaudeCodeBackend:
                if k not in ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY")}
 
         try:
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = subprocess.CREATE_NO_WINDOW
+
             self._proc = subprocess.Popen(
                 args,
                 stdin=subprocess.PIPE,
@@ -114,6 +146,7 @@ class ClaudeCodeBackend:
                 text=True,
                 bufsize=1,
                 env=env,
+                creationflags=creationflags,
             )
         except FileNotFoundError:
             raise FileNotFoundError(
@@ -279,14 +312,7 @@ class ClaudeCodeBackend:
     def close(self) -> None:
         if self._proc is None:
             return
-        try:
-            self._proc.terminate()
-            self._proc.wait(timeout=2.0)
-        except Exception:
-            try:
-                self._proc.kill()
-            except Exception:
-                pass
+        _kill_proc_tree(self._proc)
         self._proc = None
 
     def __del__(self) -> None:
@@ -561,12 +587,17 @@ class GeminiCliBackend:
                if k not in ("GOOGLE_API_KEY", "GEMINI_API_KEY")}
 
         try:
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = subprocess.CREATE_NO_WINDOW
+
             result = subprocess.run(
                 args,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_s,
                 env=env,
+                creationflags=creationflags,
             )
         except FileNotFoundError:
             if self.progress_callback:
@@ -596,14 +627,7 @@ class GeminiCliBackend:
     def close(self) -> None:
         if self._proc is None:
             return
-        try:
-            self._proc.terminate()
-            self._proc.wait(timeout=2.0)
-        except Exception:
-            try:
-                self._proc.kill()
-            except Exception:
-                pass
+        _kill_proc_tree(self._proc)
         self._proc = None
 
 

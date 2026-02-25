@@ -2353,6 +2353,9 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
                     old_backend.close()
                 old_backend.model = model
                 old_backend._turns = 0
+                # Reset persistent-mode failure flag so new model gets a fresh try
+                if hasattr(old_backend, '_persistent_failed'):
+                    old_backend._persistent_failed = False
                 actual_model = model or 'default'
             else:
                 # Full switch: close old backend, create new one
