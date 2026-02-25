@@ -1514,10 +1514,7 @@ class CoachEngine:
                 oracle = oracle_by_name.get(name, "")
                 is_basic = "basic" in (card_type or "").lower()
                 if oracle and not is_basic:
-                    # Strip reminder text and truncate for token budget
                     oracle_short = self._remove_reminder_text(oracle).strip()
-                    if len(oracle_short) > 120:
-                        oracle_short = oracle_short[:117] + "..."
                     if oracle_short:
                         line += f" — {oracle_short}"
                 deck_lines.append(line)
@@ -1553,10 +1550,6 @@ class CoachEngine:
                     f"Deck analysis returned error-like response: {strategy[:80]}"
                 )
                 return None
-
-            # Truncate if too long
-            if len(strategy) > 400:
-                strategy = strategy[:397] + "..."
 
             self._deck_strategy = strategy
             elapsed = (time.perf_counter() - start) * 1000
@@ -1665,13 +1658,10 @@ class CoachEngine:
                 from arenamcp.rules_engine import RulesEngine
 
                 valid_moves = RulesEngine.get_legal_actions(game_state)
-                # OPTIMIZATION: Join inline instead of list, limit to 8 most important
                 if not valid_moves:
                     valid_moves_str = 'NONE — say "pass priority"'
                 else:
-                    valid_moves_str = ", ".join(valid_moves[:8])
-                    if len(valid_moves) > 8:
-                        valid_moves_str += f"... (+{len(valid_moves) - 8})"
+                    valid_moves_str = ", ".join(valid_moves)
             except Exception as e:
                 logger.error(f"RulesEngine error: {e}")
                 valid_moves = []
@@ -2247,8 +2237,7 @@ class CoachEngine:
                             if w
                         )
                         if not keyword_only and len(stripped) > 0:
-                            oracle_compact = stripped[:200] + ("..." if len(stripped) > 200 else "")
-                            lines.append(f"    {oracle_compact}")
+                            lines.append(f"    {stripped}")
 
             else:
                 lines.append("  (empty)")
@@ -2379,8 +2368,7 @@ class CoachEngine:
                             if w
                         )
                         if not keyword_only and len(stripped) > 0:
-                            oracle_compact = stripped[:200] + ("..." if len(stripped) > 200 else "")
-                            lines.append(f"    {oracle_compact}")
+                            lines.append(f"    {stripped}")
             else:
                 lines.append("  (empty)")
 
@@ -3009,15 +2997,11 @@ class CoachEngine:
                     or name in ["Plains", "Island", "Swamp", "Mountain", "Forest"]
                 )
                 is_aura = "enchantment" in type_line and "aura" in type_line
-                # Auras ALWAYS show oracle text — targeting (own vs opponent) depends on effect
-                # Check length AFTER removing reminder text so cards with long keyword
-                # reminders (e.g. Harmonize) aren't wrongly hidden
+                # Always show oracle text for non-basic-land cards (truncated if long).
+                # Hiding oracle entirely causes the LLM to miss critical abilities
+                # (e.g. Mockingbird being a clone, X-cost tutor effects).
                 oracle_stripped = self._remove_reminder_text(oracle_text) if oracle_text else ""
-                show_oracle = (
-                    oracle_text
-                    and not is_basic_land
-                    and (is_aura or len(oracle_stripped) < 200)
-                )
+                show_oracle = bool(oracle_text) and not is_basic_land
 
                 # Type tag for non-creature, non-land cards so LLM knows what it is
                 type_tag = ""
@@ -3045,15 +3029,10 @@ class CoachEngine:
                     f"  {display_name}{type_tag} {cost} [{timing},{castable}]{removal_info}"
                 )
                 if show_oracle:
-                    # Use pre-stripped text (reminder text already removed above)
-                    oracle_compact = oracle_stripped
-                    if is_aura:
-                        # Auras: show full text (targeting depends on knowing effect)
-                        if len(oracle_compact) > 160:
-                            oracle_compact = oracle_compact[:157] + "..."
-                    elif len(oracle_compact) > 150:
-                        oracle_compact = oracle_compact[:147] + "..."
-                    lines.append(f"    {oracle_compact}")
+                    # Full oracle text (reminder text already removed above).
+                    # No truncation — game context is a few KB total, well within
+                    # any model's context window. Truncating hides critical abilities.
+                    lines.append(f"    {oracle_stripped}")
         else:
             lines.append("  (empty)")
 
@@ -3458,8 +3437,7 @@ class CoachEngine:
             if snap.get("battlefield_count"):
                 board_info = f" Board:{snap['battlefield_count']} Hand:{snap.get('hand_count', '?')}"
 
-            # Include enough context for LLM to understand the board position
-            ctx_snippet = ctx[:800] + "..." if len(ctx) > 800 else ctx
+            ctx_snippet = ctx
 
             lines.append(f"\n--- Turn {turn}, {phase} [{trigger}]{life_str}{board_info} ---")
             if ctx_snippet:
@@ -3468,9 +3446,8 @@ class CoachEngine:
 
         user_message = "\n".join(lines)
 
-        # Allow larger context for better analysis quality
-        if len(user_message) > 24000:
-            user_message = user_message[:24000] + "\n\n[... truncated ...]"
+        # No truncation — post-match analysis benefits from full context
+        # and all backends have large enough context windows.
 
         logger.info(
             f"[POST-MATCH] Generating analysis: {len(advice_history)} entries, "

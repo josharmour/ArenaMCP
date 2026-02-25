@@ -1979,9 +1979,6 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             else:
                 mana = info.get("mana_cost", "")
                 oracle = info.get("oracle_text", "")
-                # Truncate long oracle text
-                if len(oracle) > 120:
-                    oracle = oracle[:117] + "..."
                 detail = f"  {count}x {name}"
                 if mana:
                     detail += f" {mana}"
