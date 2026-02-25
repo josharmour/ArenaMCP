@@ -538,7 +538,9 @@ class ArenaApp(App):
     }
 
     #game-state-display {
-        height: 6;
+        height: auto;
+        min-height: 4;
+        max-height: 14;
         border: solid $success;
         background: $surface-darken-1;
         padding: 0 1;
