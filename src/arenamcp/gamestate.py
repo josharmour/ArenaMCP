@@ -287,7 +287,7 @@ class GameState:
 
         # 2. Save a snapshot of the full state before reset wipes it
         try:
-            self._pre_reset_snapshot = self.to_dict()
+            self._pre_reset_snapshot = self.get_snapshot()
         except Exception as e:
             logger.warning(f"Failed to capture pre-reset snapshot: {e}")
             self._pre_reset_snapshot = None
