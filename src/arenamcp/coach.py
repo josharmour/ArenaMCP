@@ -3474,15 +3474,13 @@ class CoachEngine:
                 "Do NOT second-guess yourself in the text (e.g., \"Wait, I need to check...\").\n"
                 "Be authoritative and decisive. Start your response immediately with the command.",
 
-                "Provide detailed strategic reasoning in 4-5 sentences.\n"
-                "State the recommended play, then explain WHY it's the best option.\n"
-                "Mention what alternatives you considered and why they're worse.\n"
-                "If relevant, preview the next 1-2 turns of the plan.\n"
-                "Be authoritative but educational — help the player understand the strategy.",
+                "Give your recommended play in 2-3 sentences, then add a one-sentence reason.\n"
+                "Be authoritative and decisive. Start with the action.\n"
+                "This is spoken aloud — keep it natural, under 50 words total.",
             )
             .replace(
                 "Output directly as the coach. No preamble, no meta-commentary.",
-                "Output as the coach. Include strategic reasoning and brief explanation.",
+                "Output as the coach. State the play, then briefly say why.",
             )
         )
 
@@ -3687,6 +3685,7 @@ class CoachEngine:
         final_life_totals: Optional[dict] = None,
         opponent_played_cards: Optional[list[str]] = None,
         backend: Optional[Any] = None,
+        missed_decisions: Optional[list[dict]] = None,
     ) -> str:
         """Generate a post-match strategic analysis from the advice log.
 
@@ -3698,6 +3697,7 @@ class CoachEngine:
             final_life_totals: {seat_id: life} at match end
             opponent_played_cards: Card names the opponent revealed
             backend: Optional dedicated backend (avoids lock contention)
+            missed_decisions: Vision watchdog detections (unmapped decision points)
 
         Returns:
             Analysis string from the LLM, or "" on failure.
@@ -3749,6 +3749,18 @@ class CoachEngine:
             if ctx_snippet:
                 lines.append(f"Context: {ctx_snippet}")
             lines.append(f"Advice: {advice_text}")
+
+        if missed_decisions:
+            lines.append(f"\nVISION WATCHDOG DETECTIONS ({len(missed_decisions)} missed decision points):")
+            lines.append("These are moments where the game was waiting for player input")
+            lines.append("but no trigger fired — detected by tempo anomaly + VLM screen analysis.")
+            for i, md in enumerate(missed_decisions, 1):
+                lines.append(
+                    f"  {i}. Turn {md.get('turn', '?')}, {md.get('phase', '?')}: "
+                    f"{md.get('decision_type', 'unknown')} — "
+                    f"\"{md.get('prompt_text', '')}\" "
+                    f"(stall={md.get('stall_duration_s', '?')}s, conf={md.get('confidence', '?')})"
+                )
 
         user_message = "\n".join(lines)
 

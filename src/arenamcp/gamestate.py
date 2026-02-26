@@ -511,6 +511,7 @@ class GameState:
                 "graveyard": [enrich_obj(obj) for obj in self.graveyard],
                 "exile": [enrich_obj(obj) for obj in self.get_objects_in_zone(ZoneType.EXILE)],
                 "command": [enrich_obj(obj) for obj in self.command],
+                "library_count": len(self.get_objects_in_zone(ZoneType.LIBRARY, self.local_seat_id)) if self.local_seat_id else "?",
             },
             "pending_decision": self.pending_decision,
             "decision_seat_id": self.decision_seat_id,

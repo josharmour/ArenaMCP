@@ -94,10 +94,11 @@ def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
-def print_banner(restart_count=0):
+def print_banner(restart_count=0, autopilot=False):
     """Print startup banner."""
+    title = "MTGA Autopilot Launcher" if autopilot else "MTGA Coach Launcher"
     print("=" * 50)
-    print("  MTGA Coach Launcher")
+    print(f"  {title}")
     print("=" * 50)
     if restart_count > 0:
         print(f"  Restart #{restart_count}")
@@ -114,9 +115,24 @@ def main():
     parser = argparse.ArgumentParser(description="MTGA Coach Launcher")
     parser.add_argument("--watch", "-w", action="store_true",
                         help="Auto-restart when .py files change")
+    parser.add_argument("--autopilot", action="store_true",
+                        help="Enable autopilot mode (AI clicks for you)")
+    parser.add_argument("--afk", action="store_true",
+                        help="AFK mode - no confirmation before clicks")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Dry run - plan actions but don't click")
     parser.add_argument("args", nargs="*", help="Arguments to pass to coach")
 
     args = parser.parse_args()
+
+    # Build pass-through arguments for the coach subprocess
+    passthrough = list(args.args)
+    if args.autopilot:
+        passthrough.append("--autopilot")
+    if args.afk:
+        passthrough.append("--afk")
+    if args.dry_run:
+        passthrough.append("--dry-run")
 
     # Setup file watcher if requested
     observer = None
@@ -133,10 +149,10 @@ def main():
     try:
         while True:
             clear_screen()
-            print_banner(restart_count)
+            print_banner(restart_count, autopilot=args.autopilot)
 
             # Run the coach
-            exit_code = run_coach(args.args)
+            exit_code = run_coach(passthrough)
 
             # Check why it exited
             if exit_code == RESTART_EXIT_CODE:

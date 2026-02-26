@@ -460,7 +460,7 @@ class Sidebar(Vertical):
         with Vertical(id="status-panel"):
             yield Static("Seat: Searching...", id="status-seat", classes="status-line")
             yield Static("Model: Default", id="status-model", classes="status-line")
-            yield Static("Style: VERBOSE", id="status-style", classes="status-line")
+            yield Static("Style: CONCISE", id="status-style", classes="status-line")
             yield Static("Voice: Initializing...", id="status-voice", classes="status-line")
 
         with Vertical(id="actions-panel"):
@@ -888,11 +888,11 @@ class ArenaApp(App):
             match_id = gs.get("match_id") or f"auto_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             start_recording(match_id)
 
-            # Update analyze button to show recording is active
+            # Keep analyze button functional — just note recording in log
             try:
                 btn = self.query_one("#btn-analyze", Button)
-                btn.label = "Recording..."
-                btn.variant = "error"
+                btn.label = "Analyze Match"
+                btn.variant = "warning"
             except:
                 pass
 
@@ -1456,6 +1456,13 @@ class ArenaApp(App):
             self.write_log("[yellow]Coach not initialized.[/]")
             return
 
+        # Show watchdog summary before launching analysis
+        missed = getattr(self.coach, '_missed_decisions', [])
+        if missed:
+            self.write_log(
+                f"[bold yellow]Including {len(missed)} vision watchdog "
+                f"detection(s) in analysis[/]"
+            )
         self.write_log("[bold green]Generating match analysis...[/]")
         self.coach.trigger_match_analysis()
 

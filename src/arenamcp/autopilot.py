@@ -22,6 +22,9 @@ from arenamcp.action_planner import ActionPlan, ActionPlanner, ActionType, GameA
 from arenamcp.input_controller import ClickResult, InputController
 from arenamcp.screen_mapper import FixedCoordinates, ScreenCoord, ScreenMapper
 
+# Type alias: mapper can be ScreenMapper or VisionMapper (duck-typed)
+from typing import Union
+
 logger = logging.getLogger(__name__)
 
 
@@ -113,6 +116,9 @@ class AutopilotEngine:
         # double-triggers when game state hasn't updated yet
         self._land_drop_last_turn: int = -1
 
+        # Vision scan: track if mapper supports layout scanning
+        self._has_vision_scan = hasattr(self._mapper, 'scan_layout')
+
     @property
     def afk_mode(self) -> bool:
         """Whether AFK mode is active."""
@@ -138,6 +144,52 @@ class AutopilotEngine:
         logger.info(f"Land-drop mode toggled: {status}")
         self._notify("LAND_DROP", status)
         return self._config.land_drop_mode
+
+    def _capture_screenshot(self) -> Optional[bytes]:
+        """Capture MTGA window as PNG bytes for VLM analysis."""
+        try:
+            window_rect = self._mapper.window_rect
+            if not window_rect:
+                window_rect = self._mapper.refresh_window()
+            if not window_rect:
+                return None
+
+            left, top, width, height = window_rect
+            screenshot = ImageGrab.grab(bbox=(left, top, left + width, top + height))
+
+            buf = io.BytesIO()
+            screenshot.save(buf, format='PNG')
+            return buf.getvalue()
+        except Exception as e:
+            logger.error(f"Screenshot capture failed: {e}")
+            return None
+
+    def _scan_layout_if_needed(self, game_state: dict[str, Any]) -> None:
+        """Trigger a VisionMapper layout scan if the mapper supports it.
+
+        Captures a screenshot and asks the VisionMapper to scan for all
+        visible UI elements. The scan only runs when the game state has
+        changed (phase/turn/hand/battlefield) or the cache has expired.
+        """
+        if not self._has_vision_scan:
+            return
+
+        try:
+            if not self._mapper.needs_rescan(game_state):
+                logger.debug("Vision scan: cache still valid, skipping")
+                return
+
+            png_bytes = self._capture_screenshot()
+            if not png_bytes:
+                logger.warning("Vision scan: screenshot capture failed")
+                return
+
+            start = time.perf_counter()
+            self._mapper.scan_layout(png_bytes, game_state)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(f"Vision scan completed: {elapsed_ms:.0f}ms, {self._mapper.cache_size} elements cached")
+        except Exception as e:
+            logger.error(f"Vision scan failed (non-fatal): {e}")
 
     @property
     def state(self) -> AutopilotState:
@@ -269,6 +321,9 @@ class AutopilotEngine:
                 return False
 
             self._clear_events()
+
+            # --- VISION SCAN: refresh layout cache if game state changed ---
+            self._scan_layout_if_needed(game_state)
 
             # --- AFK MODE: auto-pass everything without LLM ---
             if self._config.afk_mode:
@@ -799,27 +854,25 @@ class AutopilotEngine:
             except Exception:
                 pass
 
-    def _get_vision_coord(self, card_name: str) -> Optional[ScreenCoord]:
-        """Capture screenshot and use vision to find a card."""
+    def _get_vision_coord(self, card_name: str, zone: Optional[str] = None) -> Optional[ScreenCoord]:
+        """Capture screenshot and use vision to find a card.
+
+        If VisionMapper is active, routes through its tiered lookup
+        (cache → local VLM → cloud VLM). Otherwise falls back to the
+        legacy single-shot cloud vision call.
+        """
         try:
-            # Capture MTGA window area
-            window_rect = self._mapper.window_rect
-            if not window_rect:
-                window_rect = self._mapper.refresh_window()
-            if not window_rect:
+            png_bytes = self._capture_screenshot()
+            if not png_bytes:
                 return None
 
-            left, top, width, height = window_rect
-            # Grab slightly larger area or full screen if needed, 
-            # but usually client area is best
-            screenshot = ImageGrab.grab(bbox=(left, top, left+width, top+height))
-            
-            # Convert to PNG bytes
-            buf = io.BytesIO()
-            screenshot.save(buf, format='PNG')
-            png_bytes = buf.getvalue()
-            
-            # Use the planner's backend for vision
+            # VisionMapper path: uses tiered cache → local VLM → cloud VLM
+            if self._has_vision_scan and hasattr(self._mapper, 'get_element_coord'):
+                return self._mapper.get_element_coord(
+                    card_name, zone=zone, screenshot_bytes=png_bytes
+                )
+
+            # Legacy path: single-shot cloud vision call
             backend = self._planner._backend
             return self._mapper.get_card_coord_via_vision(card_name, png_bytes, backend)
         except Exception as e:
@@ -968,8 +1021,8 @@ class AutopilotEngine:
             # Vision fallback
             if self._config.enable_vision_fallback:
                 logger.info(f"Trying vision fallback for '{action.card_name}'")
-                coord = self._get_vision_coord(action.card_name)
-            
+                coord = self._get_vision_coord(action.card_name, zone="hand")
+
             if not coord:
                 return ClickResult(False, 0, 0, action.card_name, "Card not found in hand (Heuristic & Vision failed)")
 
@@ -1015,8 +1068,8 @@ class AutopilotEngine:
             # Vision fallback
             if self._config.enable_vision_fallback:
                 logger.info(f"Trying vision fallback for board permanent '{action.card_name}'")
-                coord = self._get_vision_coord(action.card_name)
-            
+                coord = self._get_vision_coord(action.card_name, zone="battlefield_yours")
+
             if not coord:
                 return ClickResult(False, 0, 0, action.card_name, "Permanent not found on battlefield (Heuristic & Vision failed)")
 

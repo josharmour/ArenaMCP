@@ -38,10 +38,10 @@ def _which_cli(name: str) -> Optional[str]:
 CUSTOM_ENDPOINTS_FILE = Path.home() / ".arenamcp" / "endpoints.json"
 
 # Preferred auto-select order (first available wins)
-_AUTO_PRIORITY = ["claude-code", "gemini-cli", "codex-cli", "ollama"]
+_AUTO_PRIORITY = ["ollama", "claude-code", "gemini-cli", "codex-cli"]
 
 # Default Ollama model
-DEFAULT_OLLAMA_MODEL = "llama3.2"
+DEFAULT_OLLAMA_MODEL = "llama3.2:latest"
 
 
 def detect_backends_quick() -> dict[str, bool]:

@@ -214,6 +214,94 @@ class ConsoleAdapter(UIAdapter):
     def subtask(self, status: str) -> None: pass
 
 
+class _TempoTracker:
+    """Tracks game state progression cadence for anomaly detection.
+
+    During normal play, game state transitions happen every 0.3-0.5s
+    (auto-pass, resolves, opponent actions). A stall >1s without any
+    state change likely means the game is waiting for player input
+    that the log parser didn't capture as a decision.
+    """
+
+    def __init__(self, stall_threshold: float = 1.5, min_samples: int = 5):
+        self._stall_threshold = stall_threshold
+        self._min_samples = min_samples
+        self._last_state_hash: Optional[str] = None
+        self._last_change_time: float = 0.0
+        self._intervals: list[float] = []  # Recent inter-change intervals
+        self._max_intervals = 30
+
+    def update(self, game_state: dict) -> bool:
+        """Feed a new game state snapshot.  Returns True if a stall is detected.
+
+        A stall is when:
+          - We have enough baseline samples (min_samples)
+          - Time since last state change exceeds stall_threshold
+          - The game is active (turn > 0)
+        """
+        now = time.time()
+
+        # Cheap hash of the fields that change on every GRE update
+        turn = game_state.get("turn", {})
+        sig = (
+            turn.get("turn_number", 0),
+            turn.get("phase", ""),
+            turn.get("step", ""),
+            turn.get("priority_player", 0),
+            game_state.get("pending_decision"),
+            len(game_state.get("hand", [])),
+            len(game_state.get("battlefield", [])),
+            len(game_state.get("stack", [])),
+        )
+        state_hash = str(sig)
+
+        if state_hash != self._last_state_hash:
+            # State changed — record interval
+            if self._last_change_time > 0:
+                interval = now - self._last_change_time
+                self._intervals.append(interval)
+                if len(self._intervals) > self._max_intervals:
+                    self._intervals.pop(0)
+            self._last_state_hash = state_hash
+            self._last_change_time = now
+            return False
+
+        # State hasn't changed — check for stall
+        if self._last_change_time <= 0:
+            self._last_change_time = now
+            return False
+
+        turn_num = turn.get("turn_number", 0)
+        if turn_num == 0:
+            return False  # Game not active
+
+        elapsed = now - self._last_change_time
+        if len(self._intervals) >= self._min_samples and elapsed > self._stall_threshold:
+            return True
+
+        return False
+
+    @property
+    def avg_interval(self) -> float:
+        """Average seconds between state changes."""
+        if not self._intervals:
+            return 0.0
+        return sum(self._intervals) / len(self._intervals)
+
+    @property
+    def stall_duration(self) -> float:
+        """How long the current stall has lasted."""
+        if self._last_change_time <= 0:
+            return 0.0
+        return time.time() - self._last_change_time
+
+    def reset(self) -> None:
+        """Reset tracker for a new match."""
+        self._last_state_hash = None
+        self._last_change_time = 0.0
+        self._intervals.clear()
+
+
 class StandaloneCoach:
     """Standalone coaching app using MCP client + local LLM."""
 
@@ -263,7 +351,7 @@ class StandaloneCoach:
         self._autopilot: Optional[Any] = None  # AutopilotEngine instance
 
         # State
-        self.advice_style = "verbose"
+        self.advice_style = "concise"
         self._advice_frequency = self.settings.get("advice_frequency", "start_of_turn")
 
         # TTS always enabled
@@ -305,9 +393,17 @@ class StandaloneCoach:
 
         # Post-match analysis
         self._saved_advice_history: list[dict] = []
+        self._saved_missed_decisions: list[dict] = []
         self._last_match_result: Optional[str] = None
         self._last_match_final_state: Optional[dict] = None
         self._game_end_handled: bool = False  # Prevents duplicate triggers
+
+        # Vision watchdog: tempo anomaly detection + missed decision tracking
+        self._tempo_tracker = _TempoTracker()
+        self._missed_decisions: list[dict] = []  # Accumulated per match
+        self._vision_mapper: Optional[Any] = None  # VisionMapper (shared with autopilot)
+        self._vlm_card_cache: dict[int, str] = {}  # grpId -> resolved name (persists per match)
+        self._vlm_card_failures: set[int] = set()  # grpIds we already tried and failed
 
     def speak_advice(self, text: str, blocking: bool = True) -> None:
         """Speak advice using local Kokoro TTS."""
@@ -434,12 +530,138 @@ class StandaloneCoach:
         self._consecutive_errors = 0
         self._max_errors_before_fallback = 3
 
+    def _init_vision_mapper(self) -> None:
+        """Initialize VisionMapper for vision watchdog and autopilot.
+
+        Sets self._vision_mapper if Ollama VLM is available.
+        Called regardless of autopilot mode so coaching-only users
+        still get missed-decision detection.
+        """
+        try:
+            from arenamcp.vision_mapper import VisionMapper
+            backend = self._coach._backend if self._coach else None
+            mapper = VisionMapper(
+                ollama_model="qwen2.5vl:3b",
+                enable_local_vlm=True,
+                enable_cloud_vlm=True,
+            )
+            if backend:
+                mapper.set_cloud_backend(backend)
+            self._vision_mapper = mapper
+            self.ui.log("[bold cyan]VisionMapper enabled (Ollama + cache)[/]")
+        except Exception as e:
+            logger.info(f"VisionMapper unavailable: {e}")
+            self.ui.log(f"[yellow]VisionMapper unavailable ({e}) — vision watchdog disabled[/]")
+
+    def _resolve_unknown_cards(self, game_state: dict) -> None:
+        """Use VLM to identify unknown cards in the game state.
+
+        Scans all zones for cards with names like "Unknown (ID: 123)" or
+        "Card#123" and asks the VLM to read the card name from the screen.
+        Results are cached per grpId so we only try once per unknown card.
+        """
+        if not self._vision_mapper:
+            return
+
+        # Collect unknown cards across all zones
+        import re
+        unknown_pattern = re.compile(r'Unknown|Card#\d+')
+        zones_to_check: dict[str, list[dict]] = {}  # zone_name -> [card_dicts]
+
+        for zone_name in ("hand", "battlefield", "stack", "graveyard", "exile"):
+            cards = game_state.get(zone_name, [])
+            for card in cards:
+                if not isinstance(card, dict):
+                    continue
+                name = card.get("name", "")
+                grp_id = card.get("grp_id", 0)
+                if not grp_id or grp_id in self._vlm_card_cache or grp_id in self._vlm_card_failures:
+                    continue
+                if unknown_pattern.search(name):
+                    zones_to_check.setdefault(zone_name, []).append(card)
+
+        if not zones_to_check:
+            return
+
+        total = sum(len(v) for v in zones_to_check.values())
+        logger.info(f"Found {total} unknown card(s) — attempting VLM identification")
+
+        # Take a screenshot
+        try:
+            mapper = self._vision_mapper
+            window_rect = mapper.window_rect
+            if not window_rect:
+                window_rect = mapper.refresh_window()
+            if not window_rect:
+                return
+
+            from PIL import ImageGrab
+            import io as _io
+            left, top, width, height = window_rect
+            screenshot = ImageGrab.grab(bbox=(left, top, left + width, top + height))
+            buf = _io.BytesIO()
+            screenshot.save(buf, format='PNG')
+            png_bytes = buf.getvalue()
+        except Exception as e:
+            logger.debug(f"Screenshot for card identification failed: {e}")
+            return
+
+        # Ask VLM per zone (batch unknown cards by zone)
+        for zone_name, cards in zones_to_check.items():
+            grp_ids = [c.get("grp_id") for c in cards]
+            hint = f"{len(cards)} unknown card(s), grpIds: {grp_ids}"
+            try:
+                identified = mapper.identify_unknown_cards(png_bytes, zone_name, hint)
+            except Exception as e:
+                logger.debug(f"VLM card identification failed for {zone_name}: {e}")
+                for c in cards:
+                    self._vlm_card_failures.add(c.get("grp_id", 0))
+                continue
+
+            if not identified:
+                for c in cards:
+                    self._vlm_card_failures.add(c.get("grp_id", 0))
+                continue
+
+            # Match identified names back to unknown cards (best effort: order-based)
+            for i, card in enumerate(cards):
+                grp_id = card.get("grp_id", 0)
+                if i < len(identified):
+                    resolved_name = identified[i].get("name", "")
+                    conf = identified[i].get("confidence", 0)
+                    if resolved_name:
+                        self._vlm_card_cache[grp_id] = resolved_name
+                        # Patch the card in-place in game state
+                        card["name"] = f"{resolved_name} (vision)"
+                        self.ui.log(
+                            f"[dim cyan]Vision ID: {resolved_name} "
+                            f"(grpId={grp_id}, {zone_name}, conf={conf:.0%})[/]"
+                        )
+                        # Also try to enrich via Scryfall now that we have a name
+                        self._enrich_vlm_resolved_card(card, resolved_name)
+                        continue
+                self._vlm_card_failures.add(grp_id)
+
+    @staticmethod
+    def _enrich_vlm_resolved_card(card: dict, name: str) -> None:
+        """Try to fill oracle_text from Scryfall using the VLM-resolved name."""
+        try:
+            from arenamcp.server import _get_scryfall
+            scryfall = _get_scryfall()
+            sc = scryfall.get_card_by_name(name)
+            if sc:
+                card["oracle_text"] = sc.oracle_text or card.get("oracle_text", "")
+                card["type_line"] = sc.type_line or card.get("type_line", "")
+                card["mana_cost"] = sc.mana_cost or card.get("mana_cost", "")
+                card["name"] = f"{sc.name} (vision)"  # Use Scryfall's canonical name
+        except Exception:
+            pass  # Best effort
+
     def _init_autopilot(self) -> None:
         """Initialize autopilot components (requires LLM backend + MCP)."""
         try:
             from arenamcp.autopilot import AutopilotEngine, AutopilotConfig
             from arenamcp.action_planner import ActionPlanner
-            from arenamcp.screen_mapper import ScreenMapper
             from arenamcp.input_controller import InputController
 
             backend = self._coach._backend if self._coach else None
@@ -454,7 +676,15 @@ class StandaloneCoach:
             )
 
             planner = ActionPlanner(backend)
-            mapper = ScreenMapper()
+
+            # Reuse shared VisionMapper if available, otherwise fall back to static coords
+            if self._vision_mapper:
+                mapper = self._vision_mapper
+            else:
+                from arenamcp.screen_mapper import ScreenMapper
+                mapper = ScreenMapper()
+                self.ui.log(f"[yellow]Autopilot: using static coords (VisionMapper not available)[/]")
+
             controller = InputController(dry_run=self._autopilot_dry_run)
 
             self._autopilot = AutopilotEngine(
@@ -658,6 +888,13 @@ class StandaloneCoach:
                 phase = turn.get("phase", "")
                 curr_match_id = curr_state.get("match_id")
 
+                # Resolve unknown cards via VLM (cached, only tries once per grpId)
+                if turn_num > 0 and self._vision_mapper:
+                    try:
+                        self._resolve_unknown_cards(curr_state)
+                    except Exception as e:
+                        logger.debug(f"VLM card resolution error: {e}")
+
                 # ── GAME END DETECTION ──
                 # PRIMARY: Check threading.Event set by parser thread
                 # (IntermissionReq or finalMatchResult). This fires immediately
@@ -670,6 +907,7 @@ class StandaloneCoach:
                         game_result = result or "unknown"
                         logger.info(f"Game ended (event signal): {game_result} — launching post-match analysis")
                         self._saved_advice_history = list(self._advice_history)
+                        self._saved_missed_decisions = list(self._missed_decisions)
                         self._last_match_result = game_result
                         # Use pre-reset snapshot (full final state) if available,
                         # otherwise fall back to current (already-reset) state
@@ -692,6 +930,7 @@ class StandaloneCoach:
                     # Trigger analysis if game_end detection above missed it
                     if self._advice_history and not self._saved_advice_history:
                         self._saved_advice_history = list(self._advice_history)
+                        self._saved_missed_decisions = list(self._missed_decisions)
                         self._last_match_result = self._detect_match_result()
                         self._last_match_final_state = dict(prev_state) if prev_state else None
                         threading.Thread(
@@ -706,6 +945,10 @@ class StandaloneCoach:
                     self._advice_history = []
                     self._deck_analyzed = False
                     self._game_end_handled = False
+                    self._tempo_tracker.reset()
+                    self._missed_decisions = []
+                    self._vlm_card_cache.clear()
+                    self._vlm_card_failures.clear()
                     if self._coach:
                         self._coach.clear_deck_strategy()
                 if match_id_changed:
@@ -726,6 +969,7 @@ class StandaloneCoach:
                     # Fallback: trigger analysis if game_end detection above missed it
                     if self._advice_history and not self._saved_advice_history:
                         self._saved_advice_history = list(self._advice_history)
+                        self._saved_missed_decisions = list(self._missed_decisions)
                         self._last_match_result = self._detect_match_result()
                         self._last_match_final_state = dict(prev_state) if prev_state else None
                         threading.Thread(
@@ -741,6 +985,10 @@ class StandaloneCoach:
                     self._advice_history = []
                     self._deck_analyzed = False
                     self._game_end_handled = False
+                    self._tempo_tracker.reset()
+                    self._missed_decisions = []
+                    self._vlm_card_cache.clear()
+                    self._vlm_card_failures.clear()
                     if self._coach:
                         self._coach.clear_deck_strategy()
                     logger.info("Cleared advice history for new match")
@@ -824,11 +1072,106 @@ class StandaloneCoach:
                         logger.debug(f"Draft detection error: {e}")
 
                     triggers = self._trigger.check_triggers(prev_state, curr_state)
-                    
+
                     # Debug: Log trigger results
                     if triggers:
                         logger.info(f"Triggers detected: {triggers}")
-                    else:
+
+                    # TEMPO ANOMALY + VISION WATCHDOG
+                    # Track game progression cadence. When normal pace (0.3-0.5s
+                    # between state changes) stalls for >1.5s, trigger a vision
+                    # check for unmapped decision prompts.
+                    stall_detected = self._tempo_tracker.update(curr_state)
+
+                    # Cooldown: don't fire watchdog more than once per 30s
+                    _watchdog_cooldown = getattr(self, '_watchdog_last_fire', 0)
+                    _watchdog_ready = (time.time() - _watchdog_cooldown) > 30
+
+                    if (
+                        stall_detected
+                        and _watchdog_ready
+                        and self._vision_mapper
+                        and not curr_state.get("pending_decision")
+                        and not triggers
+                        and turn_num > 0
+                    ):
+                        self._watchdog_last_fire = time.time()
+                        stall_dur = self._tempo_tracker.stall_duration
+                        avg = self._tempo_tracker.avg_interval
+                        logger.info(
+                            f"TEMPO ANOMALY: stall {stall_dur:.1f}s "
+                            f"(avg pace {avg:.2f}s) — triggering vision check"
+                        )
+                        self.ui.log(
+                            f"[dim cyan]Watchdog: stall {stall_dur:.1f}s "
+                            f"(avg {avg:.2f}s) — checking vision...[/]"
+                        )
+                        try:
+                            mapper = self._vision_mapper
+                            window_rect = mapper.window_rect
+                            if not window_rect:
+                                window_rect = mapper.refresh_window()
+                            if window_rect:
+                                from PIL import ImageGrab
+                                import io as _io
+                                left, top, width, height = window_rect
+                                screenshot = ImageGrab.grab(
+                                    bbox=(left, top, left + width, top + height)
+                                )
+                                buf = _io.BytesIO()
+                                screenshot.save(buf, format='PNG')
+                                png_bytes = buf.getvalue()
+
+                                decision = mapper.detect_pending_decision(png_bytes)
+                                if decision and decision.get("waiting_for_input"):
+                                    d_type = decision.get("decision_type", "unknown")
+                                    d_prompt = decision.get("prompt_text", "")
+                                    d_conf = decision.get("confidence", 0)
+                                    logger.info(
+                                        f"VISION WATCHDOG: Detected unmapped decision! "
+                                        f"type={d_type}, prompt='{d_prompt}', conf={d_conf:.2f}"
+                                    )
+                                    # Inject synthetic trigger
+                                    curr_state["pending_decision"] = f"Vision: {d_type}"
+                                    curr_state["decision_context"] = {
+                                        "type": d_type,
+                                        "source": "vision_watchdog",
+                                        "prompt_text": d_prompt,
+                                        "num_options": decision.get("num_options", 0),
+                                        "confidence": d_conf,
+                                    }
+                                    triggers.append("decision_required")
+                                    self.ui.log(
+                                        f"[bold magenta]Vision detected decision: "
+                                        f"{d_prompt or d_type} "
+                                        f"(conf={d_conf:.0%}, {d_type})[/]"
+                                    )
+                                    # Record for end-of-match bug filing
+                                    self._missed_decisions.append({
+                                        "timestamp": datetime.now().isoformat(),
+                                        "turn": turn_num,
+                                        "phase": phase,
+                                        "decision_type": d_type,
+                                        "prompt_text": d_prompt,
+                                        "confidence": d_conf,
+                                        "stall_duration_s": round(stall_dur, 2),
+                                        "avg_tempo_s": round(avg, 3),
+                                        "num_options": decision.get("num_options", 0),
+                                    })
+                                else:
+                                    # VLM said no decision pending — show in TUI
+                                    vlm_conf = decision.get("confidence", 0) if decision else 0
+                                    self.ui.log(
+                                        f"[dim]Watchdog: no decision detected "
+                                        f"(conf={vlm_conf:.0%})[/]"
+                                    )
+                            else:
+                                self.ui.log("[dim]Watchdog: MTGA window not found[/]")
+                        except Exception as e:
+                            logger.debug(f"Vision watchdog error: {e}")
+                            self.ui.log(f"[dim red]Watchdog error: {e}[/]")
+
+                    if not triggers:
                         # Log why no triggers (every 30 seconds to avoid spam)
                         if not hasattr(self, '_last_no_trigger_log'):
                             self._last_no_trigger_log = 0
@@ -1390,63 +1733,50 @@ class StandaloneCoach:
             self.ui.log("[BUG] Path copied to clipboard. Paste it anywhere.")
 
     def take_screenshot_analysis(self) -> None:
-        """Capture screen and request visual analysis (e.g. Mulligan)."""
-        # Check if backend supports vision
+        """Capture screen and request visual analysis (e.g. Mulligan).
+
+        Tries local Ollama VLM first (fast, free), then falls back to
+        cloud backends (proxy, claude-code, gemini-cli).
+        """
         backend_lower = self.backend_name.lower()
-        vision_capable = backend_lower in ("claude-code", "gemini-cli", "proxy")
+        has_local_vlm = self._vision_mapper and hasattr(self._vision_mapper, '_local_vlm') and self._vision_mapper._local_vlm.available
+        vision_capable = has_local_vlm or backend_lower in ("claude-code", "gemini-cli", "proxy")
 
         if not vision_capable:
-            self.ui.log("[red]Current backend does not support image analysis.[/]")
+            self.ui.log("[red]No vision backend available. Need Ollama VLM or a cloud backend.[/]")
             return
-             
+
         try:
             from PIL import ImageGrab
             import io
-            
-            # Capture primary screen
-            img = ImageGrab.grab()
-            
-            # Resize if huge to save bandwidth/latency
-            img.thumbnail((1920, 1080)) 
-            
+
+            # Capture MTGA window if possible, otherwise full screen
+            img = None
+            if self._vision_mapper:
+                window_rect = self._vision_mapper.window_rect
+                if not window_rect:
+                    window_rect = self._vision_mapper.refresh_window()
+                if window_rect:
+                    left, top, width, height = window_rect
+                    img = ImageGrab.grab(bbox=(left, top, left + width, top + height))
+
+            if img is None:
+                img = ImageGrab.grab()
+
+            img.thumbnail((1920, 1080))
+
             buf = io.BytesIO()
             img.save(buf, format='PNG')
             png_bytes = buf.getvalue()
 
-            # Save to temp file for CLI backends
-            import tempfile
-            tmp_file = None
-            file_url = None
-            if backend_lower in ("claude-code", "gemini-cli"):
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-                tmp.write(png_bytes)
-                tmp.close()
-                tmp_file = tmp.name
-                file_url = f"file:///{tmp_file.replace(chr(92), '/')}"
-
             self.ui.log("[yellow]Analyzing screenshot...[/]")
-            
+
             # Context
             try:
                 game_state = self.get_game_state()
-            except:
+            except Exception:
                 game_state = {}
 
-            system_prompt = """You are an expert Magic: The Gathering Arena coach. Look at this screenshot and give immediate, actionable advice based on what you see.
-
-DETECT THE SITUATION AND RESPOND:
-- If showing a hand before game starts (7 cards, "Keep/Mulligan" buttons): Start with "KEEP" or "MULLIGAN", then brief reason.
-- If showing a Scry prompt (card with TOP/BOTTOM options): Say "TOP" or "BOTTOM" with one-sentence reasoning.
-- If showing Surveil: Say "GRAVEYARD" or "LIBRARY" based on card value and graveyard synergies.
-- If showing a modal spell or choice (multiple options highlighted): Recommend which option and why.
-- If showing target selection (arrows, glowing borders): Say which target to pick.
-- If showing combat with attackers/blockers: Give combat math and optimal blocks/attacks.
-- If showing the game board during your turn: Recommend the best play sequence.
-- If opponent is acting: Note if you should respond or let it resolve.
-
-BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentences spoken aloud."""
-
-            # We can optionally format game state into the prompt if available
             ctx = ""
             if game_state:
                 turn_num = game_state.get('turn', {}).get('turn_number', '?')
@@ -1458,71 +1788,112 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
                         life_you = p.get('life_total', 20)
                     else:
                         life_opp = p.get('life_total', 20)
-                ctx = f" Turn {turn_num}. Life: You {life_you}, Opp {life_opp}."
+                ctx = f" Turn {turn_num}, {phase}. Life: You {life_you}, Opp {life_opp}."
 
-            user_msg = f"What should I do here?{ctx}"
+            screen_prompt = (
+                "You are an expert Magic: The Gathering Arena coach. "
+                "Look at this screenshot and give immediate, actionable advice.\n\n"
+                "DETECT THE SITUATION AND RESPOND:\n"
+                "- Keep/Mulligan: Start with KEEP or MULLIGAN, then brief reason.\n"
+                "- Scry: Say TOP or BOTTOM with one-sentence reasoning.\n"
+                "- Surveil: Say GRAVEYARD or LIBRARY.\n"
+                "- Modal/choice: Recommend which option and why.\n"
+                "- Target selection: Say which target to pick.\n"
+                "- Combat: Give optimal attacks/blocks.\n"
+                "- Your turn: Recommend the best play.\n"
+                "- Opponent acting: Note if you should respond.\n\n"
+                "BE DECISIVE. 1-2 sentences max, spoken aloud.\n"
+                f"Game context:{ctx}"
+            )
 
-            if backend_lower == "proxy":
-                # Proxy backend: send image as base64 via OpenAI multimodal API
-                from arenamcp.coach import ProxyBackend
-                vision_backend = ProxyBackend(model=self.model_name)
-                self.ui.log("[yellow]Analyzing screenshot via proxy...[/]")
-                advice = vision_backend.complete_with_image(system_prompt, user_msg, png_bytes)
+            advice = None
 
-                if advice and not advice.startswith("Error"):
-                    self.ui.advice(advice, "Visual Analysis")
-                    if self._auto_speak:
-                        self.speak_advice(advice, blocking=False)
+            # Try local Ollama VLM first (fast, free)
+            if has_local_vlm:
+                self.ui.log("[dim cyan]Using local Ollama VLM...[/]")
+                result = self._vision_mapper._local_vlm.analyze(screen_prompt, png_bytes)
+                if result:
+                    # VLM returned JSON — extract text advice
+                    advice = result.get("advice") or result.get("recommendation") or result.get("response") or str(result)
                 else:
-                    self.ui.log(f"[red]Vision analysis failed: {advice or 'empty response'}[/]")
+                    # analyze() returns parsed JSON; for free-text, call raw
+                    try:
+                        import urllib.request
+                        import base64
+                        vlm = self._vision_mapper._local_vlm
+                        b64_image = base64.b64encode(png_bytes).decode("utf-8")
+                        payload = json.dumps({
+                            "model": vlm.model,
+                            "prompt": screen_prompt,
+                            "images": [b64_image],
+                            "stream": False,
+                            "options": {"temperature": 0.3, "num_predict": 200},
+                        }).encode("utf-8")
+                        req = urllib.request.Request(
+                            f"{vlm.endpoint}/api/generate",
+                            data=payload,
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(req, timeout=vlm.timeout) as resp:
+                            raw = json.loads(resp.read())
+                        advice = raw.get("response", "").strip()
+                        if advice:
+                            logger.info(f"[Ollama screen analysis] {len(advice)} chars")
+                    except Exception as e:
+                        logger.error(f"Ollama screen analysis failed: {e}")
+                        self.ui.log(f"[dim red]Ollama VLM failed: {e}[/]")
 
-            elif file_url:
-                # CLI backends that take file paths
-                from arenamcp.coach import create_backend, ClaudeCodeBackend
-                raw_path = tmp_file or ""
+            # Fall back to cloud backends
+            if not advice:
+                system_prompt = screen_prompt
 
-                if backend_lower == "gemini-cli":
-                    from arenamcp.coach import GeminiCliBackend
-                    vision_backend = GeminiCliBackend(
-                        model=self.model_name,
-                        persistent=False,  # One-shot avoids --prompt-interactive stdin conflict
-                    )
-                    vision_backend.timeout_s = float(os.environ.get("VISION_TIMEOUT_S", "20"))
-                    vision_msg = (
-                        f"{system_prompt}\n\n"
-                        f"Image to analyze: {raw_path}\n"
-                        f"{user_msg}"
-                    )
-                    advice = vision_backend.complete(system_prompt, vision_msg)
-                else:
-                    temp_dir = os.path.dirname(tmp_file) if tmp_file else None
-                    add_dirs = [temp_dir] if temp_dir else []
-                    vision_backend = ClaudeCodeBackend(
-                        model=os.environ.get("VISION_BACKEND_MODEL", "sonnet"),
-                        add_dirs=add_dirs,
-                        tools=["Read"],
-                        permission_mode="dontAsk",
-                    )
-                    vision_backend.timeout_s = float(os.environ.get("VISION_TIMEOUT_S", "15"))
-                    vision_msg = (
-                        f"Image path: {raw_path}\n"
-                        f"Image URL: {file_url}\n"
-                        f"{user_msg}\n"
-                        "Use the Read tool to open the image file."
-                    )
-                    advice = vision_backend.complete(system_prompt, vision_msg)
+                if backend_lower == "proxy":
+                    from arenamcp.coach import ProxyBackend
+                    vision_backend = ProxyBackend(model=self.model_name)
+                    self.ui.log("[yellow]Analyzing via proxy...[/]")
+                    advice = vision_backend.complete_with_image(system_prompt, f"What should I do here?{ctx}", png_bytes)
 
-                if hasattr(vision_backend, 'close'):
-                    vision_backend.close()
+                elif backend_lower in ("claude-code", "gemini-cli"):
+                    import tempfile
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+                    tmp.write(png_bytes)
+                    tmp.close()
+                    tmp_file = tmp.name
+                    file_url = f"file:///{tmp_file.replace(chr(92), '/')}"
+                    raw_path = tmp_file
 
-                if advice and not advice.startswith("Error"):
-                    self.ui.advice(advice, "Visual Analysis")
-                    if self._auto_speak:
-                        self.speak_advice(advice, blocking=False)
-                else:
-                    self.ui.log(f"[red]Vision analysis failed: {advice or 'empty response'}[/]")
+                    if backend_lower == "gemini-cli":
+                        from arenamcp.coach import GeminiCliBackend
+                        vision_backend = GeminiCliBackend(
+                            model=self.model_name,
+                            persistent=False,
+                        )
+                        vision_backend.timeout_s = float(os.environ.get("VISION_TIMEOUT_S", "20"))
+                        vision_msg = f"{system_prompt}\n\nImage to analyze: {raw_path}\nWhat should I do here?{ctx}"
+                        advice = vision_backend.complete(system_prompt, vision_msg)
+                    else:
+                        from arenamcp.coach import ClaudeCodeBackend
+                        temp_dir = os.path.dirname(tmp_file)
+                        vision_backend = ClaudeCodeBackend(
+                            model=os.environ.get("VISION_BACKEND_MODEL", "sonnet"),
+                            add_dirs=[temp_dir],
+                            tools=["Read"],
+                            permission_mode="dontAsk",
+                        )
+                        vision_backend.timeout_s = float(os.environ.get("VISION_TIMEOUT_S", "15"))
+                        vision_msg = f"Image path: {raw_path}\nImage URL: {file_url}\nWhat should I do here?{ctx}\nUse the Read tool to open the image file."
+                        advice = vision_backend.complete(system_prompt, vision_msg)
+
+                    if hasattr(vision_backend, 'close'):
+                        vision_backend.close()
+
+            if advice and not advice.startswith("Error"):
+                self.ui.advice(advice, "Visual Analysis")
+                if self._auto_speak:
+                    self.speak_advice(advice, blocking=False)
             else:
-                self.ui.log("[red]Current backend does not support image analysis.[/]")
+                self.ui.log(f"[red]Vision analysis failed: {advice or 'no response'}[/]")
 
         except ImportError:
             self.ui.log("[red]Missing 'Pillow' library. Install with: pip install Pillow[/]")
@@ -1917,6 +2288,7 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
                 final_life_totals=final_life,
                 opponent_played_cards=opponent_cards,
                 backend=analysis_backend,
+                missed_decisions=self._saved_missed_decisions,
             )
 
             if hasattr(analysis_backend, 'close'):
@@ -1953,14 +2325,126 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
 
             logger.info(f"Post-match analysis complete: {len(analysis)} chars")
 
+            # Offer to file GH issue for missed decisions detected by vision watchdog
+            self._offer_missed_decision_issue()
+
         except Exception as e:
             logger.error(f"Post-match analysis error: {e}", exc_info=True)
             self.ui.status("ANALYSIS", "")
         finally:
             # Clear saved data
             self._saved_advice_history = []
+            self._saved_missed_decisions = []
             self._last_match_result = None
             self._last_match_final_state = None
+
+    def _offer_missed_decision_issue(self) -> None:
+        """Offer to file a GH issue if vision detected missed decisions this match."""
+        missed = self._saved_missed_decisions
+        if not missed:
+            return
+
+        count = len(missed)
+        self.ui.log("")
+        self.ui.log(f"[bold yellow]Vision watchdog detected {count} missed decision point(s) this match.[/]")
+        self.ui.log("[yellow]Filing GitHub issue with details...[/]")
+
+        try:
+            self._file_missed_decision_gh_issue(missed)
+        except Exception as e:
+            logger.error(f"Failed to file GH issue for missed decisions: {e}")
+            self.ui.log(f"[red]Failed to file GH issue: {e}[/]")
+            # Fall back to saving a local bug report
+            self._save_missed_decisions_local(missed)
+
+    def _file_missed_decision_gh_issue(self, missed: list[dict]) -> None:
+        """File a GitHub issue with missed decision details."""
+        # Build issue body
+        lines = [
+            "## Missed Decision Points Detected by Vision Watchdog",
+            "",
+            f"**Match date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            f"**Decisions detected:** {len(missed)}",
+            "",
+            "The vision watchdog detected game states where Arena was waiting for player input,",
+            "but no predefined trigger fired. These represent gaps in the trigger/GRE message mapping.",
+            "",
+            "### Details",
+            "",
+        ]
+
+        for i, d in enumerate(missed, 1):
+            lines.append(f"#### Decision {i}")
+            lines.append(f"- **Timestamp:** {d.get('timestamp', 'N/A')}")
+            lines.append(f"- **Turn:** {d.get('turn', 'N/A')}")
+            lines.append(f"- **Phase:** {d.get('phase', 'N/A')}")
+            lines.append(f"- **Type:** {d.get('decision_type', 'N/A')}")
+            lines.append(f"- **Prompt:** {d.get('prompt_text', 'N/A')}")
+            lines.append(f"- **Confidence:** {d.get('confidence', 'N/A')}")
+            lines.append(f"- **Stall duration:** {d.get('stall_duration_s', 'N/A')}s")
+            lines.append(f"- **Avg tempo:** {d.get('avg_tempo_s', 'N/A')}s")
+            lines.append(f"- **Num options:** {d.get('num_options', 'N/A')}")
+            lines.append("")
+
+        lines.append("### Suggested Action")
+        lines.append("")
+        lines.append("Add trigger mappings or GRE message handlers for the above decision types")
+        lines.append("so the coaching agent proactively offers advice at these points.")
+        lines.append("")
+        lines.append("---")
+        lines.append("*Auto-filed by ArenaMCP vision watchdog*")
+
+        body = "\n".join(lines)
+
+        # Determine unique decision types for the title
+        types = sorted(set(d.get("decision_type", "unknown") for d in missed))
+        types_str = ", ".join(types[:3])
+        if len(types) > 3:
+            types_str += f" (+{len(types) - 3} more)"
+        title = f"Missed decision points: {types_str}"
+        if len(title) > 70:
+            title = title[:67] + "..."
+
+        result = subprocess.run(
+            ["gh", "issue", "create",
+             "--repo", "josharmour/ArenaMCP",
+             "--title", title,
+             "--label", "bug,vision-watchdog",
+             "--body", body],
+            capture_output=True, text=True, timeout=30,
+        )
+
+        if result.returncode == 0:
+            issue_url = result.stdout.strip()
+            self.ui.log(f"[bold green]GitHub issue filed: {issue_url}[/]")
+            logger.info(f"Filed GH issue for {len(missed)} missed decisions: {issue_url}")
+        else:
+            # Label might not exist yet — retry without labels
+            if "label" in result.stderr.lower():
+                result2 = subprocess.run(
+                    ["gh", "issue", "create",
+                     "--repo", "josharmour/ArenaMCP",
+                     "--title", title,
+                     "--body", body],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result2.returncode == 0:
+                    issue_url = result2.stdout.strip()
+                    self.ui.log(f"[bold green]GitHub issue filed: {issue_url}[/]")
+                    logger.info(f"Filed GH issue for {len(missed)} missed decisions: {issue_url}")
+                    return
+            raise RuntimeError(f"gh issue create failed: {result.stderr.strip()}")
+
+    def _save_missed_decisions_local(self, missed: list[dict]) -> None:
+        """Save missed decisions to a local file as fallback when GH filing fails."""
+        bug_dir = LOG_DIR / "bug_reports"
+        bug_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = bug_dir / f"missed_decisions_{timestamp}.json"
+        with open(path, "w") as f:
+            json.dump({"missed_decisions": missed, "timestamp": timestamp}, f, indent=2)
+        self.ui.log(f"[yellow]Saved missed decisions locally: {path}[/]")
+        logger.info(f"Saved {len(missed)} missed decisions to {path}")
 
     def trigger_match_analysis(self) -> None:
         """Manually trigger post-match analysis (from Analyze Match button).
@@ -1976,6 +2460,7 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             return
 
         self._saved_advice_history = list(self._advice_history)
+        self._saved_missed_decisions = list(self._missed_decisions)
         self._last_match_result = self._detect_match_result()
         try:
             game_state = self._mcp.get_game_state()
@@ -2703,6 +3188,9 @@ BE DECISIVE. Start with your recommendation immediately. Keep it to 1-2 sentence
             # Get actual model name from backend
             if self._coach and hasattr(self._coach, '_backend'):
                 actual_model = getattr(self._coach._backend, 'model', self.model_name)
+
+            # Initialize VisionMapper (shared: watchdog + autopilot)
+            self._init_vision_mapper()
 
             # Initialize autopilot if enabled
             if self._autopilot_enabled:
