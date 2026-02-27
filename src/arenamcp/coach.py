@@ -1494,6 +1494,50 @@ Compare each mode's impact:
 - Consider mana efficiency and follow-up plays
 Answer: "Choose mode [X]" with brief reason (1 sentence).
 """,
+    "sacrifice": """
+SACRIFICE DECISION: Choose which permanent(s) to sacrifice.
+- Sacrifice the LEAST valuable permanent for the current board state
+- Keep: key synergy pieces, win conditions, blockers you need
+- Sacrifice: redundant creatures, tokens, low-impact permanents
+Answer: "Sacrifice [card name]" with brief reason (1 sentence).
+""",
+    "exile": """
+EXILE DECISION: Choose which card(s) to exile.
+- Consider: exiled cards are much harder to recover than destroyed/discarded ones
+- Exile: least impactful or already-used cards
+- Keep: anything with graveyard synergy or future utility
+Answer: "Exile [card name]" with brief reason (1 sentence).
+""",
+    "destroy": """
+DESTROY DECISION: Choose which permanent(s) to destroy.
+- Target the biggest threat or most impactful permanent
+- Consider: indestructible, regeneration, death triggers
+Answer: "Destroy [card name]" with brief reason (1 sentence).
+""",
+    "return": """
+RETURN DECISION: Choose which permanent(s) to return.
+- Return: least impactful or cheapest to replay
+- Keep: expensive/critical permanents on the battlefield
+Answer: "Return [card name]" with brief reason (1 sentence).
+""",
+    "choose_creature": """
+CHOOSE CREATURE: Select a creature.
+- Evaluate board impact: which creature matters most right now?
+- Consider power/toughness, abilities, synergies
+Answer: "Choose [card name]" with brief reason (1 sentence).
+""",
+    "choose_permanent": """
+CHOOSE PERMANENT: Select a permanent.
+- Evaluate which permanent has the most board impact
+- Consider card types, abilities, and current game state
+Answer: "Choose [card name]" with brief reason (1 sentence).
+""",
+    "choose": """
+CHOOSE: Make a selection from the available options.
+- Evaluate which option best advances your game plan
+- Consider immediate impact and future implications
+Answer: "Choose [option]" with brief reason (1 sentence).
+""",
 }
 
 WIN_PLAN_PROMPT = """You are a Magic: The Gathering strategic planner. Given the board state, hand, mana, and library summary, outline a concrete plan to win in {n} turns.
@@ -2092,6 +2136,56 @@ class CoachEngine:
                 elif dec_type == "choose_starting_player":
                     lines.append("!!! DECISION: PLAY OR DRAW !!!")
                     lines.append("Aggro decks: PLAY (tempo). Control/limited: DRAW (card advantage)")
+
+                elif dec_type == "sacrifice":
+                    count = decision_context.get("count", 1)
+                    opts = decision_context.get("option_cards")
+                    lines.append(f"!!! DECISION: SACRIFICE {count} !!!")
+                    if opts:
+                        lines.append(f"Options: {', '.join(opts[:8])}")
+                    lines.append("Choose: sacrifice least valuable permanent for the board state")
+
+                elif dec_type == "exile":
+                    count = decision_context.get("count", 1)
+                    opts = decision_context.get("option_cards")
+                    lines.append(f"!!! DECISION: EXILE {count} !!!")
+                    if opts:
+                        lines.append(f"Options: {', '.join(opts[:8])}")
+                    lines.append("Choose: exile least impactful card")
+
+                elif dec_type == "destroy":
+                    count = decision_context.get("count", 1)
+                    opts = decision_context.get("option_cards")
+                    lines.append(f"!!! DECISION: DESTROY {count} !!!")
+                    if opts:
+                        lines.append(f"Options: {', '.join(opts[:8])}")
+                    lines.append("Choose: destroy biggest threat on the board")
+
+                elif dec_type == "return":
+                    count = decision_context.get("count", 1)
+                    opts = decision_context.get("option_cards")
+                    lines.append(f"!!! DECISION: RETURN {count} !!!")
+                    if opts:
+                        lines.append(f"Options: {', '.join(opts[:8])}")
+                    lines.append("Choose: return least important permanent")
+
+                elif dec_type == "mill":
+                    count = decision_context.get("count", 1)
+                    lines.append(f"!!! DECISION: MILL {count} !!!")
+
+                elif dec_type == "explore":
+                    lines.append("!!! DECISION: EXPLORE !!!")
+                    lines.append("Keep land on top if needed, otherwise bottom for a better draw")
+
+                elif dec_type in ("choose_creature", "choose_land", "choose_enchantment",
+                                  "choose_artifact", "choose_permanent", "choose"):
+                    count = decision_context.get("count", 1)
+                    label = dec_type.replace("choose_", "").upper() or "ITEM"
+                    opts = decision_context.get("option_cards")
+                    lines.append(f"!!! DECISION: CHOOSE {label} ({count}) !!!")
+                    if opts:
+                        lines.append(f"Options: {', '.join(opts[:8])}")
+                    lines.append("Choose: pick the option that best advances your game plan")
 
                 elif dec_type == "select_replacement":
                     lines.append("!!! DECISION: ORDER REPLACEMENT EFFECTS !!!")

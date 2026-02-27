@@ -52,6 +52,9 @@ from arenamcp.settings import get_settings
 LOG_DIR = Path.home() / ".arenamcp"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "standalone.log"
+WATCHDOG_SCREENSHOT_DIR = LOG_DIR / "watchdog_screenshots"
+WATCHDOG_SCREENSHOT_DIR.mkdir(exist_ok=True)
+WATCHDOG_SCREENSHOT_MAX = 20  # Keep last N screenshots (pruned at match end)
 
 file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
 file_handler.setLevel(logging.DEBUG)
@@ -404,6 +407,8 @@ class StandaloneCoach:
         self._vision_mapper: Optional[Any] = None  # VisionMapper (shared with autopilot)
         self._vlm_card_cache: dict[int, str] = {}  # grpId -> resolved name (persists per match)
         self._vlm_card_failures: set[int] = set()  # grpIds we already tried and failed
+        self._recent_gre_log: list[str] = []  # Ring buffer of recent GRE/decision log lines
+        self._recent_gre_log_max = 30
 
     def speak_advice(self, text: str, blocking: bool = True) -> None:
         """Speak advice using local Kokoro TTS."""
@@ -947,6 +952,7 @@ class StandaloneCoach:
                     self._game_end_handled = False
                     self._tempo_tracker.reset()
                     self._missed_decisions = []
+                    self._recent_gre_log.clear()
                     self._vlm_card_cache.clear()
                     self._vlm_card_failures.clear()
                     if self._coach:
@@ -987,6 +993,7 @@ class StandaloneCoach:
                     self._game_end_handled = False
                     self._tempo_tracker.reset()
                     self._missed_decisions = []
+                    self._recent_gre_log.clear()
                     self._vlm_card_cache.clear()
                     self._vlm_card_failures.clear()
                     if self._coach:
@@ -1077,6 +1084,23 @@ class StandaloneCoach:
                     if triggers:
                         logger.info(f"Triggers detected: {triggers}")
 
+                    # Feed the GRE log ring buffer for watchdog context
+                    _turn = curr_state.get("turn", {})
+                    _gre_line = (
+                        f"{datetime.now().strftime('%H:%M:%S')} "
+                        f"T{_turn.get('turn_number', 0)} "
+                        f"{_turn.get('phase', '')} "
+                        f"{_turn.get('step', '')} "
+                        f"active={_turn.get('active_player', '?')} "
+                        f"prio={_turn.get('priority_player', '?')} "
+                        f"decision={curr_state.get('pending_decision')} "
+                        f"last_cleared={curr_state.get('last_cleared_decision')} "
+                        f"triggers={triggers or 'none'}"
+                    )
+                    self._recent_gre_log.append(_gre_line)
+                    if len(self._recent_gre_log) > self._recent_gre_log_max:
+                        self._recent_gre_log.pop(0)
+
                     # TEMPO ANOMALY + VISION WATCHDOG
                     # Track game progression cadence. When normal pace (0.3-0.5s
                     # between state changes) stalls for >1.5s, trigger a vision
@@ -1087,9 +1111,25 @@ class StandaloneCoach:
                     _watchdog_cooldown = getattr(self, '_watchdog_last_fire', 0)
                     _watchdog_ready = (time.time() - _watchdog_cooldown) > 30
 
+                    # Only fire when WE have priority — stalls on opponent's
+                    # turn are normal (they're thinking) and shouldn't trigger
+                    # vision checks.
+                    _turn_info = curr_state.get("turn", {})
+                    _priority_player = _turn_info.get("priority_player", 0)
+                    _local_seat_wd = None
+                    for _p in curr_state.get("players", []):
+                        if _p.get("is_local"):
+                            _local_seat_wd = _p.get("seat_id")
+                            break
+                    _we_have_priority = (
+                        _local_seat_wd is not None
+                        and _priority_player == _local_seat_wd
+                    )
+
                     if (
                         stall_detected
                         and _watchdog_ready
+                        and _we_have_priority
                         and self._vision_mapper
                         and not curr_state.get("pending_decision")
                         and not triggers
@@ -1123,13 +1163,63 @@ class StandaloneCoach:
                                 png_bytes = buf.getvalue()
 
                                 decision = mapper.detect_pending_decision(png_bytes)
-                                if decision and decision.get("waiting_for_input"):
+
+                                # Build validation context for this detection
+                                _active_player = _turn_info.get("active_player", 0)
+                                _step = _turn_info.get("step", "")
+                                _is_our_turn = (_active_player == _local_seat_wd) if _local_seat_wd else None
+                                _last_gre_decision = curr_state.get("last_cleared_decision")  # set by gamestate
+
+                                # Save screenshot to rotating cache for verification
+                                _wd_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                _wd_detected = bool(decision and decision.get("waiting_for_input"))
+                                _wd_label = "HIT" if _wd_detected else "MISS"
+                                _wd_filename = f"wd_{_wd_ts}_T{turn_num}_{_wd_label}.png"
+                                _wd_path = WATCHDOG_SCREENSHOT_DIR / _wd_filename
+                                try:
+                                    screenshot.save(str(_wd_path), format='PNG')
+                                    # Write sidecar metadata with validation context
+                                    _wd_meta = {
+                                        "timestamp": _wd_ts,
+                                        "turn": turn_num, "phase": phase, "step": _step,
+                                        "local_seat": _local_seat_wd,
+                                        "active_player": _active_player,
+                                        "priority_player": _priority_player,
+                                        "is_our_turn": _is_our_turn,
+                                        "we_have_priority": _we_have_priority,
+                                        "stall_s": round(stall_dur, 2),
+                                        "avg_tempo_s": round(avg, 3),
+                                        "detected": _wd_detected,
+                                        "last_gre_decision": _last_gre_decision,
+                                        "vlm_response": decision,
+                                        "log_context": list(self._recent_gre_log[-10:]),
+                                    }
+                                    (_wd_path.with_suffix(".json")).write_text(
+                                        json.dumps(_wd_meta, indent=2, default=str)
+                                    )
+                                    # Prune old screenshots beyond WATCHDOG_SCREENSHOT_MAX
+                                    _existing = sorted(
+                                        WATCHDOG_SCREENSHOT_DIR.glob("wd_*.png"),
+                                        key=lambda p: p.stat().st_mtime,
+                                    )
+                                    while len(_existing) > WATCHDOG_SCREENSHOT_MAX:
+                                        _old = _existing.pop(0)
+                                        _old.unlink(missing_ok=True)
+                                        _old.with_suffix(".json").unlink(missing_ok=True)
+                                except Exception as _save_err:
+                                    logger.debug(f"Failed to save watchdog screenshot: {_save_err}")
+
+                                if _wd_detected:
                                     d_type = decision.get("decision_type", "unknown")
                                     d_prompt = decision.get("prompt_text", "")
                                     d_conf = decision.get("confidence", 0)
                                     logger.info(
                                         f"VISION WATCHDOG: Detected unmapped decision! "
-                                        f"type={d_type}, prompt='{d_prompt}', conf={d_conf:.2f}"
+                                        f"type={d_type}, prompt='{d_prompt}', conf={d_conf:.2f} | "
+                                        f"seat={_local_seat_wd} active={_active_player} "
+                                        f"priority={_priority_player} "
+                                        f"our_turn={_is_our_turn} "
+                                        f"last_gre={_last_gre_decision}"
                                     )
                                     # Inject synthetic trigger
                                     curr_state["pending_decision"] = f"Vision: {d_type}"
@@ -1144,26 +1234,36 @@ class StandaloneCoach:
                                     self.ui.log(
                                         f"[bold magenta]Vision detected decision: "
                                         f"{d_prompt or d_type} "
-                                        f"(conf={d_conf:.0%}, {d_type})[/]"
+                                        f"(conf={d_conf:.0%}, {d_type}) "
+                                        f"— screenshot: {_wd_path.name}[/]"
                                     )
                                     # Record for end-of-match bug filing
                                     self._missed_decisions.append({
                                         "timestamp": datetime.now().isoformat(),
                                         "turn": turn_num,
                                         "phase": phase,
+                                        "step": _step,
                                         "decision_type": d_type,
                                         "prompt_text": d_prompt,
                                         "confidence": d_conf,
                                         "stall_duration_s": round(stall_dur, 2),
                                         "avg_tempo_s": round(avg, 3),
                                         "num_options": decision.get("num_options", 0),
+                                        "screenshot": _wd_filename,
+                                        "local_seat": _local_seat_wd,
+                                        "active_player": _active_player,
+                                        "priority_player": _priority_player,
+                                        "is_our_turn": _is_our_turn,
+                                        "last_gre_decision": _last_gre_decision,
+                                        "log_context": list(self._recent_gre_log[-10:]),
                                     })
                                 else:
                                     # VLM said no decision pending — show in TUI
                                     vlm_conf = decision.get("confidence", 0) if decision else 0
                                     self.ui.log(
                                         f"[dim]Watchdog: no decision detected "
-                                        f"(conf={vlm_conf:.0%})[/]"
+                                        f"(conf={vlm_conf:.0%}) "
+                                        f"— screenshot: {_wd_path.name}[/]"
                                     )
                             else:
                                 self.ui.log("[dim]Watchdog: MTGA window not found[/]")
@@ -2377,22 +2477,48 @@ class StandaloneCoach:
         ]
 
         for i, d in enumerate(missed, 1):
+            local_seat = d.get("local_seat", "?")
+            active = d.get("active_player", "?")
+            priority = d.get("priority_player", "?")
+            is_ours = d.get("is_our_turn")
+            turn_owner = "OURS" if is_ours else ("OPPONENT" if is_ours is False else "?")
+            last_gre = d.get("last_gre_decision", "none")
+            screenshot = d.get("screenshot", "")
+
             lines.append(f"#### Decision {i}")
             lines.append(f"- **Timestamp:** {d.get('timestamp', 'N/A')}")
             lines.append(f"- **Turn:** {d.get('turn', 'N/A')}")
             lines.append(f"- **Phase:** {d.get('phase', 'N/A')}")
+            lines.append(f"- **Step:** {d.get('step', '')}")
             lines.append(f"- **Type:** {d.get('decision_type', 'N/A')}")
             lines.append(f"- **Prompt:** {d.get('prompt_text', 'N/A')}")
             lines.append(f"- **Confidence:** {d.get('confidence', 'N/A')}")
             lines.append(f"- **Stall duration:** {d.get('stall_duration_s', 'N/A')}s")
             lines.append(f"- **Avg tempo:** {d.get('avg_tempo_s', 'N/A')}s")
             lines.append(f"- **Num options:** {d.get('num_options', 'N/A')}")
+            lines.append(f"- **Validation context:**")
+            lines.append(f"  - Local seat: {local_seat} | Active player: {active} | Priority: {priority}")
+            lines.append(f"  - Turn owner: **{turn_owner}** | We have priority: {priority == local_seat}")
+            lines.append(f"  - Last cleared GRE decision: `{last_gre}`")
+            if screenshot:
+                lines.append(f"  - Screenshot: `~/.arenamcp/watchdog_screenshots/{screenshot}`")
+            log_ctx = d.get("log_context", [])
+            if log_ctx:
+                # Show last 5 in GH issue (full 10 in local JSON sidecar)
+                trimmed = log_ctx[-5:]
+                lines.append(f"- **Game log ({len(trimmed)} of {len(log_ctx)} states before detection):**")
+                lines.append("```")
+                for log_line in trimmed:
+                    lines.append(log_line)
+                lines.append("```")
             lines.append("")
 
         lines.append("### Suggested Action")
         lines.append("")
-        lines.append("Add trigger mappings or GRE message handlers for the above decision types")
-        lines.append("so the coaching agent proactively offers advice at these points.")
+        lines.append("Review each detection's validation context. Detections where turn owner is OPPONENT")
+        lines.append("or where a GRE decision was recently cleared are likely **false positives**.")
+        lines.append("True positives (our turn, our priority, no recent GRE decision) indicate gaps")
+        lines.append("in the trigger/GRE message mapping.")
         lines.append("")
         lines.append("---")
         lines.append("*Auto-filed by ArenaMCP vision watchdog*")
