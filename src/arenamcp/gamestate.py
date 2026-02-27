@@ -194,6 +194,7 @@ class GameState:
         # PHASE 1: Enhanced decision context
         self.decision_context: Optional[dict] = None  # Rich context: source_card, options, etc.
         self.decision_timestamp: float = 0  # Track when decision was set
+        self.last_cleared_decision: Optional[str] = None  # For watchdog validation
         self.legal_actions: list[str] = [] # List of exact legal actions from GRE
 
         # Match tracking (to avoid stale state across matches)
@@ -516,6 +517,7 @@ class GameState:
             "pending_decision": self.pending_decision,
             "decision_seat_id": self.decision_seat_id,
             "decision_context": self.decision_context,
+            "last_cleared_decision": self.last_cleared_decision,
             "legal_actions": self.legal_actions,
             # Annotation-derived data
             "recent_events": self.recent_events[-10:],  # Last 10 events for display
@@ -1637,28 +1639,94 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                 }
                 
             elif msg_type == "GREMessageType_SelectNReq":
-                # PHASE 1: Capture rich context for N-selection (discard, scry, etc.)
+                # Capture rich context for N-selection decisions.
+                # MTGA sends PromptReq (e.g. "Choose a creature") right before
+                # SelectNReq.  We merge both to get the most descriptive text.
                 import time
                 req = msg.get("selectNReq", {})
                 context_data = req.get("context", {})
                 num_to_select = req.get("count", 1)
                 min_select = req.get("minCount", num_to_select)
                 max_select = req.get("maxCount", num_to_select)
-                
-                # Try to determine the type of selection (discard, scry, etc.)
-                # This is heuristic-based on MTGA's context strings
+                option_ids = req.get("ids", [])
+
+                # Build combined context from selectNReq AND any preceding PromptReq
                 context_str = str(context_data).lower()
+                prior_prompt = ""
+                if (game_state.pending_decision
+                        and game_state.decision_context
+                        and game_state.decision_context.get("type") == "prompt"):
+                    prior_prompt = game_state.decision_context.get("text", "").lower()
+                    context_str = f"{context_str} {prior_prompt}"
+
+                # Determine selection type — more specific keywords first
                 if "discard" in context_str:
                     selection_type = "discard"
+                    decision_text = "Discard"
+                elif "sacrifice" in context_str:
+                    selection_type = "sacrifice"
+                    decision_text = "Sacrifice"
+                elif "exile" in context_str:
+                    selection_type = "exile"
+                    decision_text = "Exile"
+                elif "destroy" in context_str:
+                    selection_type = "destroy"
+                    decision_text = "Destroy"
+                elif "return" in context_str:
+                    selection_type = "return"
+                    decision_text = "Return"
                 elif "scry" in context_str:
                     selection_type = "scry"
+                    decision_text = "Scry"
                 elif "surveil" in context_str:
                     selection_type = "surveil"
+                    decision_text = "Surveil"
+                elif "mill" in context_str:
+                    selection_type = "mill"
+                    decision_text = "Mill"
+                elif "explore" in context_str:
+                    selection_type = "explore"
+                    decision_text = "Explore"
+                elif "creature" in context_str:
+                    selection_type = "choose_creature"
+                    decision_text = "Choose Creature"
+                elif "land" in context_str:
+                    selection_type = "choose_land"
+                    decision_text = "Choose Land"
+                elif "enchantment" in context_str:
+                    selection_type = "choose_enchantment"
+                    decision_text = "Choose Enchantment"
+                elif "artifact" in context_str:
+                    selection_type = "choose_artifact"
+                    decision_text = "Choose Artifact"
+                elif "permanent" in context_str:
+                    selection_type = "choose_permanent"
+                    decision_text = "Choose Permanent"
+                elif "choose" in context_str:
+                    selection_type = "choose"
+                    decision_text = "Choose"
+                elif prior_prompt:
+                    # Fall back to the PromptReq text directly
+                    selection_type = "select_n"
+                    decision_text = game_state.decision_context.get("text", "Select Items")
                 else:
                     selection_type = "select_n"
-                
-                logger.info(f"Captured Decision: Select {num_to_select} Items ({selection_type})")
-                game_state.pending_decision = "Select Items"
+                    decision_text = "Select Items"
+
+                # Resolve selectable instance IDs to card names for coaching
+                option_cards: list[str] = []
+                for oid in option_ids[:20]:  # cap to avoid perf issues
+                    obj = game_state.game_objects.get(oid)
+                    if obj and obj.grp_id:
+                        try:
+                            from arenamcp import server
+                            info = server.get_card_info(obj.grp_id)
+                            option_cards.append(info.get("name", f"Card#{obj.grp_id}"))
+                        except Exception:
+                            option_cards.append(f"Card#{obj.grp_id}")
+
+                logger.info(f"Captured Decision: {decision_text} ({num_to_select} items, type={selection_type}, options={option_cards or option_ids[:5]})")
+                game_state.pending_decision = decision_text
                 game_state.decision_timestamp = time.time()
                 game_state.decision_context = {
                     "type": selection_type,
@@ -1666,6 +1734,8 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                     "min": min_select,
                     "max": max_select,
                     "context_raw": context_data,
+                    "prior_prompt": prior_prompt or None,
+                    "option_cards": option_cards or None,
                 }
                 
             elif msg_type == "GREMessageType_GroupReq":
@@ -2072,6 +2142,7 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                         pass
                     else:
                         logger.debug(f"Clearing decision '{game_state.pending_decision}' due to {msg_type}")
+                        game_state.last_cleared_decision = game_state.pending_decision
                         game_state.pending_decision = None
                         game_state.decision_seat_id = None
                         game_state.decision_context = None
