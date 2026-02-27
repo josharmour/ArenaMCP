@@ -1343,7 +1343,8 @@ CRITICAL GAME RULES:
 - NEVER suggest actions not in the Legal: line. If you want to cast a spell, it MUST appear as "Cast [card name]" in Legal:.
 - Do NOT hallucinate actions like "flash in" or "hold up" unless they are explicitly legal actions.
 - Creatures tagged [SS] have SUMMONING SICKNESS — they CANNOT attack or use tap abilities this turn.
-- Do NOT suggest attacking with [SS] creatures. Check the "Declare Attackers:" list for legal attackers.
+- Creatures tagged [LOCKED] are enchanted by an opponent aura that PREVENTS UNTAPPING. They are permanently tapped and CANNOT attack, block, or use tap abilities until the aura is removed. Do NOT suggest using LOCKED creatures. The ">>" lines below a creature show what auras are attached to it.
+- Do NOT suggest attacking with [SS] or [LOCKED] creatures. Check the "Declare Attackers:" list for legal attackers.
 - DEFAULT: You can only play ONE LAND per turn unless a card grants additional land drops.
 - Check the LAND DROP status to see if a land can still be played this turn.
 - LAND DROP PRIORITY: If the LAND status shows 'AVAILABLE' and you have lands in hand, ALWAYS suggest playing a land FIRST before any spell. Land drops are free and should not be skipped. Say 'Play [land name]' as your advice when a land drop is available, UNLESS you specifically need to cast a spell first for strategic reasons (e.g., you need to tap specific lands before playing a new one).
@@ -2445,6 +2446,14 @@ class CoachEngine:
         else:
             lines.append("Land: N/A (opp turn)")
 
+        # Build attachment map: instance_id -> list of attached aura/equipment cards
+        # so we can show "doesn't untap" effects under the creature they're on.
+        _attachments: dict[int, list[dict]] = {}
+        for card in battlefield:
+            parent_id = card.get("parent_instance_id")
+            if parent_id is not None:
+                _attachments.setdefault(parent_id, []).append(card)
+
         # OPTIMIZATION: Compact battlefield display with symbols
         # T=tapped, FLY=flying, RCH=reach, SS=summoning sick, ATK=attacking, BLK=blocking
         if battlefield:
@@ -2529,6 +2538,17 @@ class CoachEngine:
                     if card.get("is_blocking"):
                         flags.append("BLK")
 
+                    # Check for "doesn't untap" auras attached to this card
+                    inst_id = card.get("instance_id")
+                    attached = _attachments.get(inst_id, [])
+                    _locked = any(
+                        "doesn't untap" in (a.get("oracle_text") or "").lower()
+                        or "doesn't untap" in (a.get("oracle_text") or "").lower()
+                        for a in attached
+                    )
+                    if _locked:
+                        flags.append("LOCKED")
+
                     # Token and counter annotations
                     obj_kind = card.get("object_kind", "")
                     if obj_kind == "TOKEN":
@@ -2561,6 +2581,18 @@ class CoachEngine:
                         )
                         if not keyword_only and len(stripped) > 0:
                             lines.append(f"    {stripped}")
+
+                    # Show auras/equipment attached to this permanent
+                    if attached:
+                        for att in attached:
+                            att_name = att.get("name", "Unknown")
+                            att_oracle = self._remove_reminder_text(
+                                att.get("oracle_text", "")
+                            ).strip()
+                            att_owner = "OPP" if att.get("owner_seat_id") != local_seat else "YOUR"
+                            lines.append(f"    >> {att_owner} AURA: {att_name}")
+                            if att_oracle:
+                                lines.append(f"       {att_oracle}")
 
             else:
                 lines.append("  (empty)")
@@ -2663,6 +2695,12 @@ class CoachEngine:
                     if card.get("is_blocking"):
                         flags.append("BLK")
 
+                    # Check for "doesn't untap" auras on opponent creatures
+                    opp_inst_id = card.get("instance_id")
+                    opp_attached = _attachments.get(opp_inst_id, [])
+                    if any("doesn't untap" in (a.get("oracle_text") or "").lower() for a in opp_attached):
+                        flags.append("LOCKED")
+
                     # Token and counter annotations (opponent)
                     obj_kind = card.get("object_kind", "")
                     if obj_kind == "TOKEN":
@@ -2692,6 +2730,18 @@ class CoachEngine:
                         )
                         if not keyword_only and len(stripped) > 0:
                             lines.append(f"    {stripped}")
+
+                    # Show auras/equipment attached to opponent permanents
+                    if opp_attached:
+                        for att in opp_attached:
+                            att_name = att.get("name", "Unknown")
+                            att_oracle = self._remove_reminder_text(
+                                att.get("oracle_text", "")
+                            ).strip()
+                            att_owner = "YOUR" if att.get("owner_seat_id") == local_seat else "OPP"
+                            lines.append(f"    >> {att_owner} AURA: {att_name}")
+                            if att_oracle:
+                                lines.append(f"       {att_oracle}")
             else:
                 lines.append("  (empty)")
 

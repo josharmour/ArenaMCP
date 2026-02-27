@@ -100,6 +100,8 @@ class GameObject:
         }
         if self.counters:
             result["counters"] = self.counters
+        if self.parent_instance_id is not None:
+            result["parent_instance_id"] = self.parent_instance_id
         return result
 
 
