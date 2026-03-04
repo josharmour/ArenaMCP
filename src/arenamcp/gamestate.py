@@ -4,6 +4,7 @@ This module provides the GameState class that maintains a complete
 snapshot of the current game state from parsed MTGA log events.
 """
 
+import copy
 import json
 import logging
 import threading
@@ -225,6 +226,11 @@ class GameState:
         # post-match analysis has the final board state even after reset clears it.
         self._pre_reset_snapshot: Optional[dict] = None
 
+        # Published immutable snapshot for lock-safe readers
+        self._state_lock = threading.RLock()
+        self._published_snapshot: dict[str, Any] = {}
+        self.publish_snapshot()
+
     def reset(self) -> None:
         """Reset the game state to essentially empty (for new match)."""
         logger.info("Resetting GameState for new match")
@@ -261,6 +267,7 @@ class GameState:
         self.recent_events = []
         self.damage_taken = {}
         self.revealed_cards = {}
+        self.publish_snapshot()
         # NOTE: last_game_result is intentionally NOT cleared here.
         # The coaching loop reads it after reset() to detect the match outcome.
         # It is cleared by the coaching loop once consumed.
@@ -462,76 +469,108 @@ class GameState:
         Returns list of dicts with 'step', 'active_player', 'turn' keys.
         This allows catching fast combat phases that happen between polls.
         """
-        return self._pending_combat_steps.copy()
+        snap = self.get_published_snapshot()
+        return list(snap.get("pending_combat_steps", []))
 
-    def get_snapshot(self) -> dict:
-        """Get a complete, serializable snapshot of the current game state.
-        
-        This 'flattens' the state into a single JSON-ready dictionary, 
-        serving as the 'State Anchor' for the middleware.
+    def _build_raw_snapshot_locked(self) -> dict:
+        """Build a complete serializable snapshot from mutable state.
+
+        Must be called with ``self._state_lock`` held.
         """
-        # Resolve owners
-        local_player = self.players.get(self.local_seat_id) if self.local_seat_id else None
         opponent_seat = self.opponent_seat_id
-        
-        # Enrich objects with card names for TUI display
-        def enrich_obj(obj):
-            """Add card name to object dict for TUI."""
-            data = obj.to_dict()
-            # Lazy import to avoid circular dependency
-            from arenamcp import server
-            card_info = server.get_card_info(obj.grp_id)
-            data["name"] = card_info.get("name", f"Unknown ({obj.grp_id})")
-            data["type_line"] = card_info.get("type_line", "")
-            return data
-        
-        # Serialize zones of interest
-        # We group by meaningful logical zones rather than just raw zone IDs
-        
-        # Manually serialize players to include is_local flag for TUI
+
         players_list = []
         for p in self.players.values():
             p_dict = p.to_dict()
             p_dict["is_local"] = (p.seat_id == self.local_seat_id)
             players_list.append(p_dict)
-            
-        # Serialize revealed cards (sets -> lists for JSON)
+
         revealed = {}
         for seat_id, grp_ids in self.revealed_cards.items():
             revealed[seat_id] = list(grp_ids)
 
-        snapshot = {
+        return {
             "match_id": self.match_id,
             "local_seat_id": self.local_seat_id,
             "opponent_seat_id": opponent_seat,
             "turn_info": self.turn_info.to_dict(),
             "players": players_list,
             "zones": {
-                "battlefield": [enrich_obj(obj) for obj in self.battlefield],
-                "my_hand": [enrich_obj(obj) for obj in self.hand] if self.local_seat_id else [],
+                "battlefield": [obj.to_dict() for obj in self.battlefield],
+                "my_hand": [obj.to_dict() for obj in self.hand] if self.local_seat_id else [],
                 "opponent_hand_count": len(self.get_objects_in_zone(ZoneType.HAND, opponent_seat)) if opponent_seat else 0,
-                "stack": [enrich_obj(obj) for obj in self.stack],
-                "graveyard": [enrich_obj(obj) for obj in self.graveyard],
-                "exile": [enrich_obj(obj) for obj in self.get_objects_in_zone(ZoneType.EXILE)],
-                "command": [enrich_obj(obj) for obj in self.command],
+                "stack": [obj.to_dict() for obj in self.stack],
+                "graveyard": [obj.to_dict() for obj in self.graveyard],
+                "exile": [obj.to_dict() for obj in self.get_objects_in_zone(ZoneType.EXILE)],
+                "command": [obj.to_dict() for obj in self.command],
                 "library_count": len(self.get_objects_in_zone(ZoneType.LIBRARY, self.local_seat_id)) if self.local_seat_id else "?",
             },
             "pending_decision": self.pending_decision,
             "decision_seat_id": self.decision_seat_id,
             "decision_context": self.decision_context,
             "last_cleared_decision": self.last_cleared_decision,
-            "legal_actions": self.legal_actions,
-            # Annotation-derived data
-            "recent_events": self.recent_events[-10:],  # Last 10 events for display
-            "damage_taken": self.damage_taken,
+            "legal_actions": list(self.legal_actions),
+            "pending_combat_steps": self._pending_combat_steps.copy(),
+            "recent_events": self.recent_events[-10:],
+            "damage_taken": dict(self.damage_taken),
             "revealed_cards": revealed,
             "last_game_result": self.last_game_result,
+            "deck_cards": list(self.deck_cards),
         }
-        return snapshot
+
+    def publish_snapshot(self) -> None:
+        """Publish a consistent immutable snapshot for readers."""
+        with self._state_lock:
+            self._published_snapshot = self._build_raw_snapshot_locked()
+
+    def get_published_snapshot(self) -> dict:
+        """Return a deep-copied immutable snapshot."""
+        with self._state_lock:
+            return copy.deepcopy(self._published_snapshot)
+
+    def get_snapshot(self) -> dict:
+        """Get a TUI-friendly snapshot with lazy card-name enrichment.
+
+        Reads only from the published immutable snapshot to avoid mixed-frame
+        reads while parser updates are in flight.
+        """
+        raw = self.get_published_snapshot()
+
+        def enrich_obj(data: dict) -> dict:
+            enriched = dict(data)
+            grp_id = int(enriched.get("grp_id", 0) or 0)
+            if grp_id:
+                try:
+                    from arenamcp import server
+                    card_info = server.get_card_info(grp_id)
+                    enriched["name"] = card_info.get("name", f"Unknown ({grp_id})")
+                    enriched["type_line"] = card_info.get("type_line", "")
+                except Exception:
+                    enriched["name"] = f"Unknown ({grp_id})"
+                    enriched["type_line"] = ""
+            else:
+                enriched.setdefault("name", "Unknown")
+                enriched.setdefault("type_line", "")
+            return enriched
+
+        zones = raw.get("zones", {})
+        raw["zones"] = {
+            "battlefield": [enrich_obj(o) for o in zones.get("battlefield", [])],
+            "my_hand": [enrich_obj(o) for o in zones.get("my_hand", [])],
+            "opponent_hand_count": zones.get("opponent_hand_count", 0),
+            "stack": [enrich_obj(o) for o in zones.get("stack", [])],
+            "graveyard": [enrich_obj(o) for o in zones.get("graveyard", [])],
+            "exile": [enrich_obj(o) for o in zones.get("exile", [])],
+            "command": [enrich_obj(o) for o in zones.get("command", [])],
+            "library_count": zones.get("library_count", "?"),
+        }
+        return raw
 
     def clear_pending_combat_steps(self) -> None:
         """Clear the pending combat steps after processing."""
-        self._pending_combat_steps.clear()
+        with self._state_lock:
+            self._pending_combat_steps.clear()
+            self._published_snapshot = self._build_raw_snapshot_locked()
     
     def get_seat_source_name(self) -> str:
         """Get human-readable name of the seat ID source."""
@@ -543,7 +582,7 @@ class GameState:
 
     def set_local_seat_id(self, seat_id: int, source: int = 2) -> None:
         """Explicitly set the local player's seat ID if source priority allows.
-        
+
         Source levels:
         1: Inferred (from hand visibility)
         2: System (from MatchCreated events)
@@ -553,29 +592,32 @@ class GameState:
             seat_id: The local player's seat ID.
             source: Priority level (default 2=System).
         """
-        # Only overwrite if new source is >= current source
-        if source >= self._seat_source:
-            self.local_seat_id = seat_id
-            self._seat_source = source
-            source_name = self.get_seat_source_name()
-            logger.info(f"Set local_seat_id to {seat_id} (Source: {source_name})")
-        else:
-            logger.info(f"Ignored seat update to {seat_id} (Source {source} < Current {self._seat_source})")
+        with self._state_lock:
+            if source >= self._seat_source:
+                self.local_seat_id = seat_id
+                self._seat_source = source
+                source_name = self.get_seat_source_name()
+                logger.info(f"Set local_seat_id to {seat_id} (Source: {source_name})")
+            else:
+                logger.info(f"Ignored seat update to {seat_id} (Source {source} < Current {self._seat_source})")
+            self._published_snapshot = self._build_raw_snapshot_locked()
 
     def reset_local_player(self, force: bool = False) -> None:
         """Reset local_seat_id logic.
-        
+
         Args:
             force: If True, reset EVERYTHING (used for full restart).
-                   If False, only reset INFERRED (1) sources. 
+                   If False, only reset INFERRED (1) sources.
                    System (2) and User (3) are preserved across game resets (e.g. BO3).
         """
-        if force or self._seat_source <= 1:
-            self.local_seat_id = None
-            self._seat_source = 0
-            logger.info("Reset local_seat_id (cleared)")
-        else:
-            logger.info(f"Preserving local_seat_id={self.local_seat_id} (Source: {self.get_seat_source_name()})")
+        with self._state_lock:
+            if force or self._seat_source <= 1:
+                self.local_seat_id = None
+                self._seat_source = 0
+                logger.info("Reset local_seat_id (cleared)")
+            else:
+                logger.info(f"Preserving local_seat_id={self.local_seat_id} (Source: {self.get_seat_source_name()})")
+            self._published_snapshot = self._build_raw_snapshot_locked()
 
     def ensure_local_seat_id(self) -> None:
         """Ensure local_seat_id is set by inferring from existing data.
@@ -622,45 +664,48 @@ class GameState:
         Args:
             message: The GameStateMessage dict from parsed log event.
         """
-        # Extract type (full vs diff) - not currently used but logged
-        msg_type = message.get("type", "Unknown")
-        logger.debug(f"Processing GameStateMessage type: {msg_type}")
+        with self._state_lock:
+            # Extract type (full vs diff) - not currently used but logged
+            msg_type = message.get("type", "Unknown")
+            logger.debug(f"Processing GameStateMessage type: {msg_type}")
 
-        # Update turn info FIRST so that zone updates use the correct turn number
-        turn_info = message.get("turnInfo")
-        if turn_info:
-            self._update_turn_info(turn_info)
+            # Update turn info FIRST so that zone updates use the correct turn number
+            turn_info = message.get("turnInfo")
+            if turn_info:
+                self._update_turn_info(turn_info)
 
-        # Update game objects
-        game_objects = message.get("gameObjects", [])
-        for obj_data in game_objects:
-            self._update_game_object(obj_data)
+            # Update game objects
+            game_objects = message.get("gameObjects", [])
+            for obj_data in game_objects:
+                self._update_game_object(obj_data)
 
-        # Update zones
-        zones = message.get("zones", [])
-        for zone_data in zones:
-            self._update_zone(zone_data)
+            # Update zones
+            zones = message.get("zones", [])
+            for zone_data in zones:
+                self._update_zone(zone_data)
 
-        # Update players
-        players = message.get("players", [])
-        for player_data in players:
-            self._update_player(player_data)
-        
-        # Ensure lands_played is correct even when Arena omits player data
-        self._infer_lands_played()
+            # Update players
+            players = message.get("players", [])
+            for player_data in players:
+                self._update_player(player_data)
 
-        # Process annotations (damage, counters, zone transfers, reveals, etc.)
-        annotations = message.get("annotations", [])
-        if annotations:
-            self._process_annotations(annotations)
+            # Ensure lands_played is correct even when Arena omits player data
+            self._infer_lands_played()
 
-        # Clear untap step flag after processing all objects in this message
-        self._in_untap_step = False
+            # Process annotations (damage, counters, zone transfers, reveals, etc.)
+            annotations = message.get("annotations", [])
+            if annotations:
+                self._process_annotations(annotations)
 
-        # MEMORY OPTIMIZATION: Periodically clean up stale objects
-        # Objects can accumulate when tokens die or cards are exiled from exile
-        if len(self.game_objects) > 200:  # Only cleanup when dict gets large
-            self._cleanup_stale_objects()
+            # Clear untap step flag after processing all objects in this message
+            self._in_untap_step = False
+
+            # MEMORY OPTIMIZATION: Periodically clean up stale objects
+            # Objects can accumulate when tokens die or cards are exiled from exile
+            if len(self.game_objects) > 200:  # Only cleanup when dict gets large
+                self._cleanup_stale_objects()
+
+            self._published_snapshot = self._build_raw_snapshot_locked()
 
     def _update_game_object(self, obj_data: dict) -> None:
         """Update or create a game object from message data.
@@ -2157,6 +2202,8 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
         if "gameObjects" in payload or "zones" in payload or "players" in payload:
             game_state.update_from_message(payload)
         
+        game_state.publish_snapshot()
+
         # Record frame if recording is active
         try:
             from arenamcp.match_validator import record_frame

@@ -683,7 +683,7 @@ class CodexCliBackend:
         combined = (
             f"SYSTEM INSTRUCTIONS:\n{system_prompt}\n\nUSER MESSAGE:\n{user_message}"
         )
-        args = self._build_args() + ["-q", combined]
+        args = self._build_args()
         if self.model:
             args += ["--model", self.model]
 
@@ -694,13 +694,10 @@ class CodexCliBackend:
         env = {k: v for k, v in os.environ.items()
                if k not in ("OPENAI_API_KEY",)}
 
-        try:
-            creationflags = 0
-            if os.name == "nt":
-                creationflags = subprocess.CREATE_NO_WINDOW
-
-            result = subprocess.run(
-                args,
+        def _run(run_args: list[str], input_text: Optional[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                run_args,
+                input=input_text,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -708,6 +705,48 @@ class CodexCliBackend:
                 creationflags=creationflags,
                 env=env,
             )
+
+        try:
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = subprocess.CREATE_NO_WINDOW
+
+            # Compatibility matrix across Codex CLI variants:
+            # - Some support `-q -` (stdin)
+            # - Some support `-q <prompt>`
+            # - Some reject `-q` entirely and accept stdin/plain args only
+            attempts: list[tuple[list[str], Optional[str], str]] = [
+                (args + ["-q", "-"], combined, "q-stdin"),
+                (args + ["-q", combined], None, "q-inline"),
+                (args + [combined], None, "positional-prompt"),
+                (args, combined, "stdin-no-flag"),
+            ]
+
+            errors: list[str] = []
+            result: Optional[subprocess.CompletedProcess[str]] = None
+
+            for run_args, input_text, label in attempts:
+                # Skip gigantic inline/positional variants on Windows.
+                if os.name == "nt" and input_text is None and len(combined) > 7000:
+                    continue
+                try:
+                    result = _run(run_args, input_text)
+                except subprocess.TimeoutExpired:
+                    errors.append(f"{label}: timed out")
+                    continue
+
+                out = (result.stdout or "").strip()
+                err = (result.stderr or "").strip()
+                if result.returncode == 0 and out:
+                    break
+
+                msg = (err or out or f"exit code {result.returncode}").strip()
+                errors.append(f"{label}: {msg}")
+                result = None
+
+            if result is None:
+                detail = " | ".join(errors[-3:]) if errors else "unknown invocation failure"
+                return f"Error: Codex CLI failed: {detail}"
         except FileNotFoundError:
             if self.progress_callback:
                 self.progress_callback("")
@@ -732,6 +771,7 @@ class CodexCliBackend:
             return f"Error: Codex CLI failed: {err}"
 
         return (result.stdout or "").strip()
+
 
     def list_models(self) -> list[str]:
         return []
@@ -1048,6 +1088,10 @@ _CLI_MODELS: dict[str, list[tuple[str, Optional[str]]]] = {
     ],
     "codex-cli": [
         ("Default", None),
+        ("GPT-5.3 Codex", "gpt-5.3-codex"),
+        ("GPT-5 Codex", "gpt-5-codex"),
+        ("GPT-5 Mini", "gpt-5-mini"),
+        ("GPT-5 Nano", "gpt-5-nano"),
         ("o4-mini", "o4-mini"),
         ("GPT-4.1", "gpt-4.1"),
     ],
@@ -4320,6 +4364,7 @@ class CoachEngine:
                 turn = game_state.get("turn", {})
                 phase = turn.get("phase", "")
                 step = turn.get("step", "")
+                pending_decision = str(game_state.get("pending_decision", "") or "").lower()
                 players = game_state.get("players", [])
                 local_player = next((p for p in players if p.get("is_local")), None)
                 local_seat = local_player.get("seat_id") if local_player else None
@@ -4336,13 +4381,21 @@ class CoachEngine:
                 ):
                     score += 90
                 if "block with" in act and "combat" in phase and "declareblock" in step:
-                    score += 90
+                    score += 120
+                if "block with" in act and "declare blockers" in pending_decision:
+                    score += 120
 
                 # Casting is generally higher priority than activating
                 if act.startswith("cast "):
                     score += 60
                 if act.startswith("activate "):
                     score += 40
+                if act.startswith("activate ") and (
+                    ("combat" in phase and "declareblock" in step)
+                    or ("declare blockers" in pending_decision)
+                ):
+                    # During blocker declaration, avoid replacing with activations.
+                    score -= 100
 
                 # Penalize "wait/pass" actions if anything else exists
                 if "wait" in act or "pass priority" in act:
@@ -4402,7 +4455,25 @@ class CoachEngine:
 
             if not matches:
                 # Force to best legal action to avoid illegal recommendations
-                best = max(legal_actions, key=_score_action)
+                turn = game_state.get("turn", {})
+                phase = str(turn.get("phase", "") or "").lower()
+                step = str(turn.get("step", "") or "").lower()
+                pending_decision = str(game_state.get("pending_decision", "") or "").lower()
+
+                in_declare_blockers = (
+                    ("combat" in phase and "declareblock" in step)
+                    or ("declare blockers" in pending_decision)
+                )
+                if in_declare_blockers:
+                    blocker_actions = [
+                        a for a in legal_actions if a.lower().startswith("block with:")
+                    ]
+                    if blocker_actions:
+                        best = max(blocker_actions, key=_score_action)
+                    else:
+                        best = max(legal_actions, key=_score_action)
+                else:
+                    best = max(legal_actions, key=_score_action)
                 logger.info(f"Replaced illegal advice with legal action: {best} (original: {advice[:80]})")
                 advice = best
         else:

@@ -120,8 +120,7 @@ output a JSON action plan that the autopilot will execute by clicking in the MTG
 CRITICAL RULES:
 - ONLY suggest actions that appear in the "Legal:" line. Never hallucinate actions.
 - ONE ACTION PER PLAN: You must suggest only ONE card to play or ONE button to click per JSON response.
-- EXCEPTION: For "declare_attackers" or "declare_blockers", you MUST list all creatures to attack/block with, AND THEN add a final action to click "1 attacker", "2 attackers", or "done" to confirm.
-  - Example: [{"action_type": "declare_attackers", "attacker_names": ["Elf", "Bear"]}, {"action_type": "click_button", "card_name": "done"}]
+- EXCEPTION: For "declare_attackers" or "declare_blockers", provide the full attacker/blocker set in one action. Do NOT add a separate "done" click action (the executor handles confirmation).
 - DO NOT sequence plays (e.g. do not suggest "play land" AND "cast spell"). Suggest the land, wait for the next trigger, then suggest the spell.
 - Creatures tagged [SS] have SUMMONING SICKNESS — they CANNOT attack.
 - Tokens are prefixed with * (e.g. "*Soldier"). Counters shown as [3P1P] = 3 +1/+1 counters.
@@ -189,9 +188,16 @@ class ActionPlanner:
             return ActionPlan(trigger=trigger)
 
         # Parse response
-        plan = self._parse_response(response)
+        plan = self._parse_response(response, legal_actions or [])
         plan.trigger = trigger
         plan.turn_number = game_state.get("turn", {}).get("turn_number", 0)
+
+        if not plan.actions:
+            fallback = self._fallback_plan(response, legal_actions or [])
+            fallback.trigger = trigger
+            fallback.turn_number = plan.turn_number
+            if fallback.actions:
+                plan = fallback
 
         logger.info(f"Planned {len(plan.actions)} actions: {plan.overall_strategy}")
         return plan
@@ -327,7 +333,7 @@ class ActionPlanner:
 
         return "\n".join(parts)
 
-    def _parse_response(self, response: str) -> ActionPlan:
+    def _parse_response(self, response: str, legal_actions: list[str]) -> ActionPlan:
         """Parse LLM response into an ActionPlan.
 
         Handles markdown fences, trailing commas, missing fields, and
@@ -362,6 +368,106 @@ class ActionPlanner:
                 plan.actions.append(action)
 
         return plan
+
+    def _fallback_plan(self, response: str, legal_actions: list[str]) -> ActionPlan:
+        """Fallback parser for non-JSON backend output.
+
+        Works across backends that may return plain text / markdown advice.
+        """
+        plan = ActionPlan()
+        if not legal_actions:
+            return plan
+
+        selected = self._match_legal_action_in_text(response, legal_actions)
+        if not selected:
+            selected = self._pick_preferred_legal_action(legal_actions)
+        if not selected:
+            return plan
+
+        action = self._legal_action_to_action(selected)
+        if not action:
+            return plan
+
+        plan.actions = [action]
+        plan.overall_strategy = f"Fallback from legal action: {selected}"
+        return plan
+
+    @staticmethod
+    def _match_legal_action_in_text(response: str, legal_actions: list[str]) -> Optional[str]:
+        text = (response or "").lower()
+        if not text:
+            return None
+        # Prefer longer legal actions to avoid matching generic fragments first.
+        for legal in sorted(legal_actions, key=len, reverse=True):
+            if legal.lower() in text:
+                return legal
+        return None
+
+    @staticmethod
+    def _pick_preferred_legal_action(legal_actions: list[str]) -> Optional[str]:
+        """Pick a deterministic fallback action when model output is invalid."""
+        if not legal_actions:
+            return None
+
+        def score(action: str) -> int:
+            a = action.lower().strip()
+            if a.startswith("play land:"):
+                return 100
+            if a.startswith("cast "):
+                return 90
+            if a.startswith("declare attackers:") or a.startswith("attack with:"):
+                return 80
+            if a.startswith("activate "):
+                return 70
+            if a.startswith("select target:"):
+                return 60
+            if "choose: play" in a or "choose: draw" in a:
+                return 55
+            if "done" in a or "auto-pay" in a:
+                return 40
+            if "pass" in a or "wait" in a:
+                return 30
+            return 10
+
+        return max(legal_actions, key=score)
+
+    def _legal_action_to_action(self, legal_action: str) -> Optional[GameAction]:
+        """Convert a rules-engine legal action string into a GameAction."""
+        act = (legal_action or "").strip()
+        lower = act.lower()
+
+        if lower.startswith("play land:"):
+            return GameAction(
+                action_type=ActionType.PLAY_LAND,
+                card_name=act.split(":", 1)[1].strip(),
+            )
+        if lower.startswith("cast "):
+            return GameAction(action_type=ActionType.CAST_SPELL, card_name=act[5:].strip())
+        if lower.startswith("activate "):
+            return GameAction(action_type=ActionType.ACTIVATE_ABILITY, card_name=act[9:].strip())
+        if lower.startswith("declare attackers:"):
+            names = [n.strip() for n in act.split(":", 1)[1].split(",") if n.strip()]
+            return GameAction(action_type=ActionType.DECLARE_ATTACKERS, attacker_names=names)
+        if lower.startswith("attack with:"):
+            names = [n.strip() for n in act.split(":", 1)[1].split(",") if n.strip()]
+            return GameAction(action_type=ActionType.DECLARE_ATTACKERS, attacker_names=names)
+        if lower.startswith("select target:"):
+            return GameAction(
+                action_type=ActionType.SELECT_TARGET,
+                target_names=[act.split(":", 1)[1].strip()],
+            )
+        if "choose: play" in lower:
+            return GameAction(action_type=ActionType.CHOOSE_STARTING_PLAYER, play_or_draw="play")
+        if "choose: draw" in lower:
+            return GameAction(action_type=ActionType.CHOOSE_STARTING_PLAYER, play_or_draw="draw")
+        if "done" in lower:
+            return GameAction(action_type=ActionType.CLICK_BUTTON, card_name="done")
+        if "resolve" in lower:
+            return GameAction(action_type=ActionType.RESOLVE)
+        if "pass" in lower or "wait" in lower:
+            return GameAction(action_type=ActionType.PASS_PRIORITY)
+
+        return None
 
     def _parse_action(self, data: dict[str, Any]) -> Optional[GameAction]:
         """Parse a single action dict into a GameAction."""

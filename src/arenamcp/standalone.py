@@ -397,12 +397,16 @@ class StandaloneCoach:
         # Match tracking for LLM context
         self._match_number: int = 0  # Incremented on each new match
 
+        # Rolling in-match advice history (used for post-match analysis)
+        self._advice_history: list[dict] = []
+
         # Post-match analysis
         self._saved_advice_history: list[dict] = []
         self._saved_missed_decisions: list[dict] = []
         self._last_match_result: Optional[str] = None
         self._last_match_final_state: Optional[dict] = None
         self._game_end_handled: bool = False  # Prevents duplicate triggers
+        self._last_game_end_check_error: str = ""
 
         # Vision watchdog: tempo anomaly detection + missed decision tracking
         self._tempo_tracker = _TempoTracker()
@@ -412,6 +416,41 @@ class StandaloneCoach:
         self._vlm_card_failures: set[int] = set()  # grpIds we already tried and failed
         self._recent_gre_log: list[str] = []  # Ring buffer of recent GRE/decision log lines
         self._recent_gre_log_max = 30
+
+        # Backend health status (deduped to avoid noisy UI writes)
+        self._last_backend_status: str = ""
+        self._last_backend_error: str = ""
+
+        # Autopilot decision backstop: force decision triggers when parser noise
+        # causes missed trigger edges after an executed action.
+        self._last_forced_decision_sig: Optional[str] = None
+        self._last_forced_decision_ts: float = 0.0
+
+    def _set_backend_status(self, status: str) -> None:
+        """Update backend status in UI only when the value actually changes."""
+        if status == self._last_backend_status:
+            return
+        self._last_backend_status = status
+        try:
+            self.ui.status("BACKEND", status)
+        except Exception:
+            pass
+
+    def _report_backend_failure(self, detail: str) -> None:
+        """Surface backend failures in UI/logs with deduping."""
+        self._set_backend_status(f"ERROR ({self.backend_name})")
+        short = (detail or "backend failure").strip().replace("\n", " ")[:180]
+        if short and short != self._last_backend_error:
+            self._last_backend_error = short
+            try:
+                self.ui.log(f"\n[BACKEND] {short}\n")
+            except Exception:
+                pass
+
+    def _mark_backend_healthy(self) -> None:
+        """Clear backend failure status after successful responses."""
+        self._last_backend_error = ""
+        self._set_backend_status(f"OK ({self.backend_name})")
 
     @staticmethod
     def _is_garbled(text: str, threshold: float = 0.4) -> bool:
@@ -938,7 +977,10 @@ class StandaloneCoach:
                             daemon=True,
                         ).start()
                 except Exception as e:
-                    logger.debug(f"Game-end event check failed: {e}")
+                    msg = str(e)
+                    if msg != self._last_game_end_check_error:
+                        self._last_game_end_check_error = msg
+                        logger.warning(f"Game-end event check failed: {e}")
 
                 # SECONDARY: Detect match boundary via match_id change.
                 # Two cases:
@@ -1097,6 +1139,31 @@ class StandaloneCoach:
                         logger.debug(f"Draft detection error: {e}")
 
                     triggers = self._trigger.check_triggers(prev_state, curr_state)
+
+                    # BACKSTOP: If a pending decision exists but trigger detection
+                    # missed it (e.g. malformed GRE chunks), force a
+                    # decision_required trigger so autopilot can continue after
+                    # the first move.
+                    pending_now = curr_state.get("pending_decision")
+                    if self._autopilot_enabled and self._autopilot and pending_now:
+                        if "decision_required" not in triggers:
+                            dec_ctx = curr_state.get("decision_context") or {}
+                            dec_type = dec_ctx.get("type", "")
+                            legal = curr_state.get("legal_actions", []) or []
+                            sig = f"{pending_now}|{dec_type}|{len(legal)}"
+                            now = time.time()
+                            if (
+                                sig != self._last_forced_decision_sig
+                                or (now - self._last_forced_decision_ts) > 2.0
+                            ):
+                                triggers.append("decision_required")
+                                self._last_forced_decision_sig = sig
+                                self._last_forced_decision_ts = now
+                                logger.info(
+                                    f"Autopilot backstop: forced decision_required for '{pending_now}'"
+                                )
+                    else:
+                        self._last_forced_decision_sig = None
 
                     # Debug: Log trigger results
                     if triggers:
@@ -1470,7 +1537,11 @@ class StandaloneCoach:
                         # NOTE: "new_turn" is excluded — when the player's turn starts, they
                         # always need advice even if a stale ability is still on the stack.
                         stack = curr_state.get("stack", [])
-                        if stack and trigger in ("land_played", "spell_resolved", "priority_gained"):
+                        if (
+                            stack
+                            and trigger in ("land_played", "spell_resolved", "priority_gained")
+                            and not has_pending_decision
+                        ):
                             has_instants = self._trigger._has_castable_instants(curr_state)
                             if not has_instants:
                                 logger.info(f"Quiet: {trigger} (stack active, no responses)")
@@ -1482,7 +1553,7 @@ class StandaloneCoach:
                         # opponent's board/plan, not a "can you respond?" check. Players always
                         # benefit from knowing what the opponent is doing.
                         QUIET_TRIGGERS = {"stack_spell_yours", "stack_spell_opponent", "priority_gained", "spell_resolved"}
-                        if trigger in QUIET_TRIGGERS:
+                        if trigger in QUIET_TRIGGERS and not has_pending_decision:
                             has_instants = self._trigger._has_castable_instants(curr_state)
                             stack = curr_state.get("stack", [])
 
@@ -1620,6 +1691,7 @@ class StandaloneCoach:
                                     f"Empty advice response ({self._consecutive_errors}/{max_errors}) — "
                                     "model timeout or backend hung"
                                 )
+                                self._report_backend_failure("Empty advice response (model timeout or backend hung)")
                                 if self._consecutive_errors >= max_errors:
                                     # Try restarting the backend process first
                                     logger.warning("Too many empty responses, restarting backend...")
@@ -1650,6 +1722,7 @@ class StandaloneCoach:
                                 or (_is_err(advice) and len(advice) < 200)
                             ):
                                 logger.warning(f"Suppressing error advice from TTS: {advice[:80]}")
+                                self._report_backend_failure(advice)
                                 self.ui.error(advice)
                             else:
                                 # Advice was successfully generated — NOW update dedup state
@@ -1657,6 +1730,7 @@ class StandaloneCoach:
                                 last_advice_turn = turn_num
                                 last_advice_phase = phase
                                 self._record_advice(advice, trigger, game_state=curr_state)
+                                self._mark_backend_healthy()
                                 self.ui.advice(advice, seat_info)
                                 # Non-blocking TTS: lets the loop poll for new
                                 # game states (e.g. Select Targets) immediately.
@@ -1765,10 +1839,12 @@ class StandaloneCoach:
                         or (_is_err2(advice) and len(advice) < 200)
                     )
                     if not self.check_advice_for_backend_failure(advice) and not is_error_response:
+                        self._mark_backend_healthy()
                         self.ui.advice(advice, seat_info)
                         self.speak_advice(advice)
                     elif is_error_response:
                         logger.warning(f"Suppressing error advice from voice TTS: {advice[:80]}")
+                        self._report_backend_failure(advice)
                         self.ui.error(advice)
 
                     # Record for debug history with the same game state
@@ -3157,6 +3233,7 @@ class StandaloneCoach:
         if is_query_failure_retriable(advice) and (
             advice.startswith("Error") or len(advice) < 200
         ):
+            self._report_backend_failure(advice)
             self._consecutive_errors = getattr(self, '_consecutive_errors', 0) + 1
             max_errors = getattr(self, '_max_errors_before_fallback', 3)
             logger.warning(
@@ -3169,6 +3246,7 @@ class StandaloneCoach:
         else:
             # Reset counter on successful response
             self._consecutive_errors = 0
+            self._mark_backend_healthy()
 
         return False
 
