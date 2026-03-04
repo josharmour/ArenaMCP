@@ -462,6 +462,7 @@ class Sidebar(Vertical):
             yield Static("Model: Default", id="status-model", classes="status-line")
             yield Static("Style: CONCISE", id="status-style", classes="status-line")
             yield Static("Voice: Initializing...", id="status-voice", classes="status-line")
+            yield Static("Backend: Starting...", id="status-backend", classes="status-line")
 
         with Vertical(id="actions-panel"):
             yield Button("Provider: detecting...", id="btn-provider", variant="primary")
@@ -569,12 +570,16 @@ class ArenaApp(App):
 
     BINDINGS = [
         ("ctrl+q", "quit", "Quit"),
+        ("f1", "autopilot_cancel", "AP Cancel"),
         ("f2", "toggle_style", "Style"),
         ("f3", "analyze_screen", "Screen"),
+        ("f4", "autopilot_abort", "AP Abort"),
         ("f5", "toggle_mute", "Mute"),
         ("f6", "cycle_voice", "Voice"),
         ("f7", "copy_debug", "Debug"),
         ("f8", "cycle_speed", "Speed"),
+        ("f9", "autopilot_toggle_afk", "AP AFK"),
+        ("f10", "autopilot_toggle_land", "AP Land"),
         ("ctrl+0", "read_win_plan", "Win Plan"),
     ]
 
@@ -782,6 +787,7 @@ class ArenaApp(App):
         model_display = f"{current_backend}/{current_model}" if current_model else current_backend
         self.update_status("MODEL", model_display)
         self.update_status("STYLE", self.coach.advice_style.upper())
+        self.update_status("BACKEND", f"OK ({current_backend})")
 
         # Sync voice output
         if self.coach._voice_output:
@@ -914,6 +920,8 @@ class ArenaApp(App):
             self.sub_title = value
         elif key == "SEAT_INFO":
             self.query_one("#status-seat", Static).update(f"Seat: {value}")
+        elif key == "BACKEND":
+            self.query_one("#status-backend", Static).update(f"Backend: {value}")
         elif key == "WIN-PLAN":
             btn = self.query_one("#btn-win-plan", Button)
             if value:
@@ -1100,8 +1108,10 @@ class ArenaApp(App):
                 or "didn't catch that" in advice
                 or (is_query_failure_retriable(advice) and len(advice) < 200)
             ):
+                self.call_from_thread(self.update_status, "BACKEND", f"ERROR ({self.coach.backend_name})")
                 self.call_from_thread(self.write_log, f"[red]Backend error: {advice}[/]")
             else:
+                self.call_from_thread(self.update_status, "BACKEND", f"OK ({self.coach.backend_name})")
                 self.call_from_thread(self.write_advice, advice, "Chat Response")
         except Exception as e:
             self.call_from_thread(self.write_log, f"[red]Chat error: {e}[/]")
@@ -1513,6 +1523,61 @@ class ArenaApp(App):
         """Read pending win plan aloud (Ctrl+0 or click)."""
         if self.coach:
             threading.Thread(target=self.coach._on_read_win_plan, daemon=True).start()
+
+    def _get_autopilot(self):
+        if not self.coach:
+            return None
+        return getattr(self.coach, "_autopilot", None)
+
+    def action_autopilot_cancel(self) -> None:
+        """Cancel pending autopilot countdown/confirmation."""
+        ap = self._get_autopilot()
+        if not ap:
+            self.write_log("[dim]Autopilot not enabled[/]")
+            return
+        try:
+            ap.on_spacebar()
+            self.write_log("[yellow]Autopilot: cancel requested[/]")
+        except Exception as e:
+            self.write_log(f"[red]Autopilot cancel failed: {e}[/]")
+
+    def action_autopilot_abort(self) -> None:
+        """Abort current autopilot plan immediately."""
+        ap = self._get_autopilot()
+        if not ap:
+            self.write_log("[dim]Autopilot not enabled[/]")
+            return
+        try:
+            ap.on_abort()
+            self.write_log("[yellow]Autopilot: abort requested[/]")
+        except Exception as e:
+            self.write_log(f"[red]Autopilot abort failed: {e}[/]")
+
+    def action_autopilot_toggle_afk(self) -> None:
+        """Toggle autopilot AFK mode."""
+        ap = self._get_autopilot()
+        if not ap:
+            self.write_log("[dim]Autopilot not enabled[/]")
+            return
+        try:
+            enabled = ap.toggle_afk()
+            state = "ON" if enabled else "OFF"
+            self.write_log(f"[cyan]Autopilot AFK: {state}[/]")
+        except Exception as e:
+            self.write_log(f"[red]Autopilot AFK toggle failed: {e}[/]")
+
+    def action_autopilot_toggle_land(self) -> None:
+        """Toggle autopilot land-drop-only mode."""
+        ap = self._get_autopilot()
+        if not ap:
+            self.write_log("[dim]Autopilot not enabled[/]")
+            return
+        try:
+            enabled = ap.toggle_land_drop()
+            state = "ON" if enabled else "OFF"
+            self.write_log(f"[cyan]Autopilot Land-drop: {state}[/]")
+        except Exception as e:
+            self.write_log(f"[red]Autopilot land-drop toggle failed: {e}[/]")
 
     def action_quit(self) -> None:
         if self.coach:

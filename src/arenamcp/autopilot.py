@@ -517,6 +517,23 @@ class AutopilotEngine:
                     self._state = AutopilotState.IDLE
                     return False
 
+                # Some backends still emit an extra "click done" after actions
+                # whose handlers already click Done internally.
+                if (
+                    i > 0
+                    and action.action_type == ActionType.CLICK_BUTTON
+                    and action.card_name.lower().strip() == "done"
+                    and plan.actions[i - 1].action_type
+                    in (
+                        ActionType.DECLARE_ATTACKERS,
+                        ActionType.DECLARE_BLOCKERS,
+                        ActionType.SELECT_N,
+                        ActionType.ORDER_BLOCKERS,
+                    )
+                ):
+                    logger.info("Skipping redundant Done action after auto-confirming handler")
+                    continue
+
                 self._current_action_idx = i
 
                 action_text = f"[{i+1}/{len(plan.actions)}] {action}"

@@ -799,43 +799,66 @@ def get_game_state() -> dict[str, Any]:
     # Ensure local player is detected before serializing
     game_state.ensure_local_seat_id()
 
-    # Serialize turn info
+    # Read from published immutable snapshot to avoid mixed-frame reads
+    snap = game_state.get_published_snapshot()
+    turn_info = snap.get("turn_info", {})
+    zones = snap.get("zones", {})
+    players = list(snap.get("players", []))
+
     turn = {
-        "turn_number": game_state.turn_info.turn_number,
-        "active_player": game_state.turn_info.active_player,
-        "priority_player": game_state.turn_info.priority_player,
-        "phase": game_state.turn_info.phase,
-        "step": game_state.turn_info.step,
-        "pending_combat_steps": game_state.get_pending_combat_steps(),
+        "turn_number": turn_info.get("turn_number", 0),
+        "active_player": turn_info.get("active_player", 0),
+        "priority_player": turn_info.get("priority_player", 0),
+        "phase": turn_info.get("phase", ""),
+        "step": turn_info.get("step", ""),
+        "pending_combat_steps": list(snap.get("pending_combat_steps", [])),
     }
 
-    # Serialize players
-    players = []
-    for player in game_state.players.values():
-        players.append({
-            "seat_id": player.seat_id,
-            "life_total": player.life_total,
-            "mana_pool": player.mana_pool,
-            "is_local": player.seat_id == game_state.local_seat_id,
-            "lands_played": player.lands_played,
-        })
+    def _serialize_snapshot_obj(obj: dict[str, Any]) -> dict[str, Any]:
+        grp_id = int(obj.get("grp_id", 0) or 0)
+        enriched = enrich_with_oracle_text(grp_id)
+        result = {
+            "instance_id": obj.get("instance_id"),
+            "grp_id": grp_id,
+            "name": enriched.get("name") or f"Unknown ({grp_id})",
+            "oracle_text": enriched.get("oracle_text") or "",
+            "type_line": enriched.get("type_line") or "",
+            "mana_cost": enriched.get("mana_cost") or "",
+            "owner_seat_id": obj.get("owner_seat_id"),
+            "controller_seat_id": obj.get("controller_seat_id"),
+            "power": obj.get("power"),
+            "toughness": obj.get("toughness"),
+            "is_tapped": obj.get("is_tapped", False),
+            "is_attacking": obj.get("is_attacking", False),
+            "is_blocking": obj.get("is_blocking", False),
+            "card_types": obj.get("card_types", []),
+            "subtypes": obj.get("subtypes", []),
+            "object_kind": obj.get("object_kind", "UNKNOWN"),
+            "counters": obj.get("counters", {}),
+        }
+        if obj.get("parent_instance_id") is not None:
+            result["parent_instance_id"] = obj.get("parent_instance_id")
+        return result
 
-    # Serialize zones with oracle text enrichment
     battlefield = [
-        _serialize_game_object(obj) for obj in game_state.battlefield
-        if obj.object_kind != GameObjectKind.ABILITY
+        _serialize_snapshot_obj(o)
+        for o in zones.get("battlefield", [])
+        if o.get("object_kind") != "ABILITY"
     ]
-    hand = [_serialize_game_object(obj) for obj in game_state.hand]
-    graveyard = [_serialize_game_object(obj) for obj in game_state.graveyard]
-    stack = [_serialize_game_object(obj) for obj in game_state.stack]
-    exile = [_serialize_game_object(obj) for obj in game_state.get_objects_in_zone(ZoneType.EXILE)]
-    command = [_serialize_game_object(obj) for obj in game_state.command]
+    hand = [_serialize_snapshot_obj(o) for o in zones.get("my_hand", [])]
+    graveyard = [_serialize_snapshot_obj(o) for o in zones.get("graveyard", [])]
+    stack = [_serialize_snapshot_obj(o) for o in zones.get("stack", [])]
+    exile = [_serialize_snapshot_obj(o) for o in zones.get("exile", [])]
+    command = [_serialize_snapshot_obj(o) for o in zones.get("command", [])]
 
     # Save match state on turn changes for recovery
     _save_match_state_if_needed()
 
+    local_seat_id = snap.get("local_seat_id")
+    decision_seat_id = snap.get("decision_seat_id")
+
     return {
-        "match_id": game_state.match_id,
+        "match_id": snap.get("match_id"),
         "turn": turn,
         "players": players,
         "battlefield": battlefield,
@@ -844,12 +867,11 @@ def get_game_state() -> dict[str, Any]:
         "stack": stack,
         "exile": exile,
         "command": command,
-        "pending_decision": game_state.pending_decision if game_state.decision_seat_id == game_state.local_seat_id else None,
-        "decision_context": game_state.decision_context if game_state.decision_seat_id == game_state.local_seat_id else None,
-        "deck_cards": game_state.deck_cards,
-        "damage_taken": dict(game_state.damage_taken),
+        "pending_decision": snap.get("pending_decision") if decision_seat_id == local_seat_id else None,
+        "decision_context": snap.get("decision_context") if decision_seat_id == local_seat_id else None,
+        "deck_cards": list(snap.get("deck_cards", [])),
+        "damage_taken": dict(snap.get("damage_taken", {})),
     }
-
 
 def clear_pending_combat_steps() -> None:
     """Clear pending combat steps after they've been processed.
