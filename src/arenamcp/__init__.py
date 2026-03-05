@@ -11,14 +11,9 @@ from arenamcp.draftstate import DraftState, create_draft_handler
 from arenamcp.mtgadb import MTGADatabase, MTGACard
 from arenamcp.draft_eval import evaluate_pack, format_pick_recommendation, CardEvaluation
 from arenamcp.server import mcp, start_watching, stop_watching
-try:
-    from arenamcp.voice import VoiceInput
-except ImportError:
-    pass
-try:
-    from arenamcp.tts import VoiceOutput, KokoroTTS
-except ImportError:
-    pass
+# Voice/TTS imports deferred — sounddevice initializes PortAudio on import
+# which can hang if an audio device/driver is misbehaving.
+# These are imported lazily on first use instead.
 from arenamcp.coach import (
     CoachEngine,
     GameStateTrigger,
@@ -62,7 +57,7 @@ except ImportError:
 
 from arenamcp.gamestate import save_match_state, load_match_state, mark_match_ended
 
-__version__ = "0.5.7"
+__version__ = "0.5.8"
 
 
 def create_log_pipeline(

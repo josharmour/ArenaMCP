@@ -770,8 +770,32 @@ class StandaloneCoach:
             self._autopilot_enabled = False
 
     def _init_voice(self) -> None:
-        """Initialize voice I/O components."""
+        """Initialize voice I/O components.
+
+        Uses a timeout to detect when sounddevice/PortAudio hangs during
+        audio device enumeration (e.g. problematic ASIO/virtual drivers).
+        """
         logger.info(f"_init_voice called, backend_name={self.backend_name}")
+
+        # Pre-check: import sounddevice with a timeout to detect PortAudio hangs
+        import threading
+        sd_ok = threading.Event()
+
+        def _try_sd():
+            try:
+                import sounddevice  # noqa: F401
+                sd_ok.set()
+            except Exception as e:
+                logger.warning(f"sounddevice import failed: {e}")
+
+        t = threading.Thread(target=_try_sd, daemon=True)
+        t.start()
+        t.join(timeout=8)
+        if not sd_ok.is_set():
+            logger.error("sounddevice hung during PortAudio init (>8s) — disabling voice")
+            self.ui.status("VOICE", "Audio init hung — voice disabled")
+            self.ui.error("Audio driver issue: voice/TTS disabled. Check audio devices.")
+            return
 
         from arenamcp.tts import VoiceOutput
 

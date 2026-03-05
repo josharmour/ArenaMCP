@@ -15,7 +15,6 @@ import logging
 
 # Import core logic
 from arenamcp.standalone import StandaloneCoach, UIAdapter, LOG_FILE, LOG_DIR
-from arenamcp.tts import VoiceOutput
 from arenamcp.match_validator import start_recording, get_current_recording
 
 logger = logging.getLogger(__name__)
