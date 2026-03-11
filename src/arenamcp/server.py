@@ -5,6 +5,7 @@ implementing the Calculator + Coach pattern: deterministic code tracks state
 while the LLM provides strategic analysis.
 """
 
+import copy
 import logging
 import threading
 import time
@@ -44,8 +45,20 @@ draft_state: DraftState = DraftState()
 parser: LogParser = LogParser()
 watcher: Optional[MTGALogWatcher] = None
 
+
+class _NullScryfallCache:
+    """No-op Scryfall cache used when initialization fails."""
+
+    def get_card_by_arena_id(self, arena_id: int):  # noqa: ARG002
+        return None
+
+    def get_card_by_name(self, name: str):  # noqa: ARG002
+        return None
+
 # Lazy-loaded caches (avoid blocking startup with bulk downloads)
-_scryfall: Optional[ScryfallCache] = None
+_scryfall: Optional[ScryfallCache | _NullScryfallCache] = None
+_scryfall_failed: bool = False
+_scryfall_lock = threading.Lock()
 _draft_stats: Optional[DraftStatsCache] = None
 _mtgadb: Optional[MTGADatabase] = None
 
@@ -76,13 +89,28 @@ _draft_helper_last_pack: int = 0
 _draft_helper_last_pick: int = 0
 
 
-def _get_scryfall() -> ScryfallCache:
+def _get_scryfall() -> ScryfallCache | _NullScryfallCache:
     """Get or initialize the Scryfall cache (lazy loading)."""
-    global _scryfall
-    if _scryfall is None:
+    global _scryfall, _scryfall_failed
+    if _scryfall is not None:
+        return _scryfall
+
+    with _scryfall_lock:
+        if _scryfall is not None:
+            return _scryfall
+        if _scryfall_failed:
+            _scryfall = _NullScryfallCache()
+            return _scryfall
+
         logger.info("Initializing Scryfall cache...")
-        _scryfall = ScryfallCache()
-    return _scryfall
+        try:
+            _scryfall = ScryfallCache()
+        except Exception as e:
+            # Disable Scryfall for this process and degrade gracefully.
+            _scryfall_failed = True
+            logger.error(f"Scryfall init failed; disabling Scryfall fallback for this session: {e}")
+            _scryfall = _NullScryfallCache()
+        return _scryfall
 
 
 def _get_draft_stats() -> DraftStatsCache:
@@ -796,10 +824,10 @@ def get_game_state() -> dict[str, Any]:
     game_state.ensure_local_seat_id()
 
     # Read from published immutable snapshot to avoid mixed-frame reads
-    snap = game_state.get_published_snapshot()
+    snap = game_state.get_published_snapshot(deep_copy=False)
     turn_info = snap.get("turn_info", {})
     zones = snap.get("zones", {})
-    players = list(snap.get("players", []))
+    players = [dict(p) for p in snap.get("players", [])]
 
     turn = {
         "turn_number": turn_info.get("turn_number", 0),
@@ -852,6 +880,9 @@ def get_game_state() -> dict[str, Any]:
 
     local_seat_id = snap.get("local_seat_id")
     decision_seat_id = snap.get("decision_seat_id")
+    decision_context = snap.get("decision_context")
+    if decision_context is not None:
+        decision_context = copy.deepcopy(decision_context)
 
     return {
         "match_id": snap.get("match_id"),
@@ -864,7 +895,7 @@ def get_game_state() -> dict[str, Any]:
         "exile": exile,
         "command": command,
         "pending_decision": snap.get("pending_decision") if decision_seat_id == local_seat_id else None,
-        "decision_context": snap.get("decision_context") if decision_seat_id == local_seat_id else None,
+        "decision_context": decision_context if decision_seat_id == local_seat_id else None,
         "deck_cards": list(snap.get("deck_cards", [])),
         "damage_taken": dict(snap.get("damage_taken", {})),
     }

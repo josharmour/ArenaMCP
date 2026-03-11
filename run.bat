@@ -1,19 +1,25 @@
 @echo off
 setlocal
 
-echo ArenaMCP v0.2.0
+echo ArenaMCP v0.5.10
 echo.
 
+:: Change to script directory (handles running from shortcut)
+cd /d "%~dp0"
+
 :: Check if venv exists
-if not exist "venv\Scripts\activate.bat" (
-    echo ERROR: Virtual environment not found
-    echo Please run install.bat first
-    pause
-    exit /b 1
+if exist "venv\Scripts\python.exe" (
+    set "PY=venv\Scripts\python.exe"
+) else (
+    python --version >nul 2>&1
+    if errorlevel 1 (
+        echo ERROR: Python not found in PATH
+        echo Please run install.bat first
+        pause
+        exit /b 1
+    )
+    set "PY=python"
 )
 
-:: Activate venv and run
-call venv\Scripts\activate.bat
-
 :: Run standalone coach with all arguments passed through
-python -m arenamcp.standalone %*
+%PY% -m arenamcp.standalone %*

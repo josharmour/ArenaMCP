@@ -1,9 +1,10 @@
 
-import sounddevice as sd
-import numpy as np
 import time
 
-def test_audio():
+def audio_diagnostic():
+    import numpy as np
+    import sounddevice as sd
+
     print("=== Audio Diagnostic Test ===")
     
     # 1. Check Default Device
@@ -61,4 +62,4 @@ def test_audio():
         print(f"Playback 2 Failed: {e}")
 
 if __name__ == "__main__":
-    test_audio()
+    audio_diagnostic()

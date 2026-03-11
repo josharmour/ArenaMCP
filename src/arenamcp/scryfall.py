@@ -6,6 +6,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, Optional
 
@@ -98,9 +99,15 @@ class ScryfallCache:
         response.raise_for_status()
 
         bulk_path = self._get_bulk_data_path()
-        with open(bulk_path, "wb") as f:
+        temp_path = bulk_path.with_suffix(".json.tmp")
+        with open(temp_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Atomic swap avoids leaving a truncated cache file on interrupted downloads.
+        os.replace(temp_path, bulk_path)
 
         logger.info(f"Bulk data saved to {bulk_path}")
 
@@ -122,18 +129,48 @@ class ScryfallCache:
 
     def _load_or_download_bulk_data(self) -> None:
         """Load bulk data from cache or download if stale/missing."""
+        bulk_path = self._get_bulk_data_path()
+        downloaded = False
+
         if self._is_cache_stale():
             try:
                 self._download_bulk_data()
+                downloaded = True
             except Exception as e:
                 logger.warning(f"Failed to download bulk data: {e}")
-                # If download fails but we have cached data, use it
-                if self._get_bulk_data_path().exists():
+                # If download fails but we have cached data, use it.
+                if bulk_path.exists():
                     logger.info("Using stale cached data")
                 else:
                     raise
 
-        self._load_bulk_data()
+        try:
+            self._load_bulk_data()
+            return
+        except JSONDecodeError as e:
+            # Corrupted cache can happen after interrupted writes from older versions.
+            logger.warning(f"Corrupted Scryfall cache detected ({bulk_path}): {e}")
+        except OSError as e:
+            logger.warning(f"Failed reading Scryfall cache ({bulk_path}): {e}")
+
+        # One recovery attempt: redownload and reload.
+        try:
+            if bulk_path.exists():
+                try:
+                    bad_path = bulk_path.with_name(
+                        f"default_cards.corrupt.{int(time.time())}.json"
+                    )
+                    os.replace(bulk_path, bad_path)
+                    logger.warning(f"Moved corrupted cache aside to: {bad_path}")
+                except OSError as move_err:
+                    logger.warning(f"Could not move corrupted cache file: {move_err}")
+            if not downloaded:
+                self._download_bulk_data()
+            self._load_bulk_data()
+        except Exception as e:
+            # Keep running without bulk index; API fallback still works.
+            logger.error(f"Scryfall cache recovery failed, continuing without bulk index: {e}")
+            self._arena_index.clear()
 
     def _card_dict_to_scryfall_card(self, card: dict[str, Any]) -> ScryfallCard:
         """Convert raw Scryfall JSON dict to ScryfallCard dataclass.
@@ -271,4 +308,3 @@ class ScryfallCache:
         except requests.RequestException as e:
             logger.warning(f"API request failed for name '{name}': {e}")
             return None
-

@@ -1087,13 +1087,8 @@ _CLI_MODELS: dict[str, list[tuple[str, Optional[str]]]] = {
         ("Gemini 2.0 Flash", "gemini-2.0-flash"),
     ],
     "codex-cli": [
-        ("Default", None),
+        ("GPT-5.4 Pro", "gpt-5.4-pro"),
         ("GPT-5.3 Codex", "gpt-5.3-codex"),
-        ("GPT-5 Codex", "gpt-5-codex"),
-        ("GPT-5 Mini", "gpt-5-mini"),
-        ("GPT-5 Nano", "gpt-5-nano"),
-        ("o4-mini", "o4-mini"),
-        ("GPT-4.1", "gpt-4.1"),
     ],
 }
 

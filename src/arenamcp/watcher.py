@@ -7,6 +7,7 @@ delivering new content via callback as it's written.
 import os
 import logging
 import re
+import glob
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -20,21 +21,75 @@ MATCH_START_PATTERN = re.compile(
     r'\[UnityCrossThreadLogger\].*(?:MatchGameRoomStateChanged|MatchCreated|Event_Join)'
 )
 
+_WINDOWS_ABS_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _is_wsl() -> bool:
+    """Return True when running under WSL."""
+    if os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/version").read_text(encoding="utf-8").lower()
+    except OSError:
+        return False
+
+
+def _windows_path_to_wsl(path: str) -> Path:
+    """Convert a Windows absolute path (C:\\...) to WSL mount path (/mnt/c/...)."""
+    drive = path[0].lower()
+    rest = path[2:].lstrip("\\/")
+    rest = rest.replace("\\", "/")
+    return Path(f"/mnt/{drive}/{rest}")
+
+
+def _default_log_path() -> str:
+    """Best-effort default MTGA Player.log path for Windows/WSL."""
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    if local_appdata:
+        return os.path.join(
+            os.path.dirname(local_appdata),
+            "LocalLow",
+            "Wizards Of The Coast",
+            "MTGA",
+            "Player.log",
+        )
+
+    if _is_wsl():
+        wsl_candidates = glob.glob(
+            "/mnt/c/Users/*/AppData/LocalLow/Wizards Of The Coast/MTGA/Player.log"
+        )
+        if wsl_candidates:
+            return wsl_candidates[0]
+
+    userprofile = os.environ.get("USERPROFILE", "")
+    if userprofile:
+        return os.path.join(
+            userprofile,
+            "AppData",
+            "LocalLow",
+            "Wizards Of The Coast",
+            "MTGA",
+            "Player.log",
+        )
+
+    # Last-resort fallback (legacy behavior)
+    return r"C:\Users\joshu\AppData\LocalLow\Wizards Of The Coast\MTGA\Player.log"
+
+
+def _normalize_log_path(path: str) -> Path:
+    """Normalize log path across Windows and WSL environments."""
+    expanded = os.path.expandvars(os.path.expanduser(path))
+
+    # In WSL, a raw "C:\..." path is interpreted as relative by pathlib.
+    # Convert it explicitly so the watcher targets the real Player.log path.
+    if _is_wsl() and _WINDOWS_ABS_PATH_RE.match(expanded):
+        return _windows_path_to_wsl(expanded)
+
+    return Path(expanded).resolve()
+
 # Default MTGA log path on Windows
 # Use LOCALAPPDATA approach which is more reliable than APPDATA/../LocalLow
-_local_appdata = os.environ.get("LOCALAPPDATA", "")
-if _local_appdata:
-    # LOCALAPPDATA is C:\Users\<user>\AppData\Local, we need LocalLow sibling
-    DEFAULT_LOG_PATH = os.path.join(
-        os.path.dirname(_local_appdata),
-        "LocalLow",
-        "Wizards Of The Coast",
-        "MTGA",
-        "Player.log"
-    )
-else:
-    # Fallback to hardcoded path for joshu user
-    DEFAULT_LOG_PATH = r"C:\Users\joshu\AppData\LocalLow\Wizards Of The Coast\MTGA\Player.log"
+DEFAULT_LOG_PATH = _default_log_path()
 
 
 class MTGALogHandler(FileSystemEventHandler):
@@ -48,7 +103,7 @@ class MTGALogHandler(FileSystemEventHandler):
             callback: Function called with new log content as it's written.
         """
         super().__init__()
-        self.log_path = Path(log_path).resolve()
+        self.log_path = _normalize_log_path(log_path)
         self.callback = callback
         self.file_position: int = 0
 
@@ -168,7 +223,7 @@ class MTGALogWatcher:
         if log_path is None:
             log_path = os.environ.get("MTGA_LOG_PATH", DEFAULT_LOG_PATH)
 
-        self.log_path = Path(log_path).resolve()
+        self.log_path = _normalize_log_path(log_path)
         self.callback = callback
         self._backfill_enabled = backfill
         self._resume_offset = resume_offset

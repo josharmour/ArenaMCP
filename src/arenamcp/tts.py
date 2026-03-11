@@ -10,6 +10,8 @@ NOTE: Model files must be downloaded manually (~300MB total):
 Place files in ~/.cache/kokoro/ or specify paths explicitly.
 """
 
+import os
+import subprocess
 import threading
 from pathlib import Path
 from typing import Optional
@@ -275,11 +277,85 @@ class VoiceOutput:
         self._stop_requested = False
         self._stream: Optional[sd.OutputStream] = None
         self._playback_thread: Optional[threading.Thread] = None
+        self._windows_tts_proc: Optional[subprocess.Popen] = None
+        self._fallback_tts_error_logged = False
 
     def _ensure_tts(self) -> None:
         """Initialize TTS on first use."""
         if self._tts_engine is None:
             self._tts_engine = KokoroTTS(voice=self._voice, speed=self._speed, lang=self._lang)
+
+    def _windows_rate(self) -> int:
+        """Map Kokoro speed multiplier to Windows SpeechSynthesizer rate."""
+        rate = int(round((self._speed - 1.0) * 8))
+        return max(-10, min(10, rate))
+
+    def _try_windows_tts_fallback(self, text: str, blocking: bool) -> bool:
+        """Fallback to built-in Windows SAPI TTS when Kokoro isn't available."""
+        if os.name != "nt":
+            return False
+
+        script = (
+            "Add-Type -AssemblyName System.Speech; "
+            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            f"$s.Rate = {self._windows_rate()}; "
+            "$inputText = [Console]::In.ReadToEnd(); "
+            "if (-not [string]::IsNullOrWhiteSpace($inputText)) { $s.Speak($inputText) }"
+        )
+        cmd = ["powershell.exe", "-NoProfile", "-Command", script]
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        try:
+            if blocking:
+                with self._lock:
+                    self._is_speaking = True
+                    self._stop_requested = False
+                subprocess.run(
+                    cmd,
+                    input=text,
+                    text=True,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creationflags,
+                )
+                with self._lock:
+                    self._is_speaking = False
+                return True
+
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                creationflags=creationflags,
+            )
+            if proc.stdin is not None:
+                proc.stdin.write(text)
+                proc.stdin.close()
+
+            with self._lock:
+                self._windows_tts_proc = proc
+                self._is_speaking = True
+                self._stop_requested = False
+
+            def _wait_proc() -> None:
+                proc.wait()
+                with self._lock:
+                    if self._windows_tts_proc is proc:
+                        self._windows_tts_proc = None
+                    self._is_speaking = False
+
+            threading.Thread(target=_wait_proc, daemon=True).start()
+            return True
+        except Exception as e:
+            if not self._fallback_tts_error_logged:
+                logger.error(f"Windows TTS fallback failed: {e}")
+                self._fallback_tts_error_logged = True
+            with self._lock:
+                self._is_speaking = False
+            return False
 
     @property
     def muted(self) -> bool:
@@ -440,7 +516,13 @@ class VoiceOutput:
             self.stop()
 
             # Synthesize
-            samples, sample_rate = self._tts_engine.synthesize(text)
+            try:
+                samples, sample_rate = self._tts_engine.synthesize(text)
+            except (ImportError, FileNotFoundError) as e:
+                logger.warning(f"Kokoro unavailable ({e}); trying Windows TTS fallback")
+                if self._try_windows_tts_fallback(text, blocking=True):
+                    return
+                raise
             if len(samples) == 0:
                 return
 
@@ -492,7 +574,13 @@ class VoiceOutput:
             self.stop()
 
             # Synthesize
-            samples, sample_rate = self._tts_engine.synthesize(text)
+            try:
+                samples, sample_rate = self._tts_engine.synthesize(text)
+            except (ImportError, FileNotFoundError) as e:
+                logger.warning(f"Kokoro unavailable ({e}); trying Windows TTS fallback")
+                if self._try_windows_tts_fallback(text, blocking=False):
+                    return
+                raise
             if len(samples) == 0:
                 return
 
@@ -566,9 +654,18 @@ class VoiceOutput:
         with self._lock:
             self._stop_requested = True
             thread = self._playback_thread
+            win_proc = self._windows_tts_proc
+            self._windows_tts_proc = None
 
         # Stop sounddevice blocking playback
         sd.stop()
+
+        if win_proc is not None and win_proc.poll() is None:
+            try:
+                win_proc.terminate()
+                win_proc.wait(timeout=0.5)
+            except Exception:
+                pass
 
         # Wait for async thread to finish
         if thread is not None:

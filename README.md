@@ -17,7 +17,7 @@ An AI-powered coach for Magic: The Gathering Arena that watches your live games 
 
 ### Standalone Installer (Recommended)
 
-Download [**ArenaMCP-Setup.exe**](https://github.com/josharmour/ArenaMCP/releases/download/v0.2.0/ArenaMCP-Setup.exe) and double-click to run. No Python install needed — the wizard handles everything (cloning, venv, dependencies, configuration). The app auto-updates via `/update` in the TUI.
+Download [**ArenaMCP-Setup.exe**](https://github.com/josharmour/ArenaMCP/releases/latest/download/ArenaMCP-Setup.exe) and double-click to run. No Python install needed — the wizard handles everything (cloning, venv, dependencies, configuration). The app auto-updates via `/update` in the TUI.
 
 ### Manual Setup
 

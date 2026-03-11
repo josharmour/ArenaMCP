@@ -3,8 +3,6 @@ import os
 import asyncio
 import logging
 import traceback
-from google import genai
-from google.genai import types
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,12 +25,15 @@ if env_path.exists():
 API_KEY = os.environ.get("GOOGLE_API_KEY")
 MODEL = "gemini-2.0-flash-exp"
 
-async def test_connect():
+async def connect():
     if not API_KEY:
         print("GOOGLE_API_KEY not set")
         return
 
     print(f"Testing connection to {MODEL}...")
+
+    from google import genai
+    from google.genai import types
     
     client = genai.Client(api_key=API_KEY, http_options={"api_version": "v1alpha"})
     
@@ -65,6 +66,6 @@ async def test_connect():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(test_connect())
+        asyncio.run(connect())
     except KeyboardInterrupt:
         pass

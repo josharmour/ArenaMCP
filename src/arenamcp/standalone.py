@@ -56,15 +56,18 @@ WATCHDOG_SCREENSHOT_DIR = LOG_DIR / "watchdog_screenshots"
 WATCHDOG_SCREENSHOT_DIR.mkdir(exist_ok=True)
 WATCHDOG_SCREENSHOT_MAX = 20  # Keep last N screenshots (pruned at match end)
 
+LOG_LEVEL_NAME = os.getenv("ARENAMCP_LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.INFO)
+
 file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
-file_handler.setLevel(logging.DEBUG)
+file_handler.setLevel(LOG_LEVEL)
 file_handler.setFormatter(logging.Formatter(
     '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 ))
 
 root_logger = logging.getLogger()
-root_logger.setLevel(logging.DEBUG)
+root_logger.setLevel(LOG_LEVEL)
 for h in root_logger.handlers[:]:
     root_logger.removeHandler(h)
 root_logger.addHandler(file_handler)
@@ -82,6 +85,38 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 # root_logger.addHandler(console_handler)
 
 logger = logging.getLogger(__name__)
+
+
+def _probe_sounddevice_import(timeout_seconds: float = 8.0) -> tuple[bool, str]:
+    """Probe sounddevice import in a subprocess.
+
+    Importing sounddevice can block inside PortAudio initialization when an audio
+    driver is misbehaving. Probing in a subprocess keeps the main process safe.
+    """
+    cmd = [sys.executable, "-c", "import sounddevice"]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"timeout after {int(timeout_seconds)}s"
+    except Exception as e:
+        return False, str(e)
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if detail:
+            # Keep only the final line to avoid flooding logs/UI.
+            detail = detail.splitlines()[-1]
+        else:
+            detail = f"exit code {result.returncode}"
+        return False, detail
+
+    return True, "ok"
 
 
 def copy_to_clipboard(text: str) -> bool:
@@ -107,8 +142,15 @@ def copy_to_clipboard(text: str) -> bool:
             stdin=subprocess.PIPE,
             shell=True
         )
-        process.communicate(input=text.encode('utf-8'))
+        process.communicate(input=text.encode('utf-8'), timeout=2)
         return process.returncode == 0
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except Exception:
+            pass
+        logger.debug("clip command timed out")
+        return False
     except Exception as e:
         logger.debug(f"clip command failed: {e}")
         return False
@@ -341,6 +383,31 @@ class StandaloneCoach:
             saved_backend = self.settings.get("backend", "auto")
             if saved_model and saved_backend == self._backend_name:
                 self._model_name = saved_model
+                if self._backend_name in {"claude-code", "gemini-cli", "codex-cli"}:
+                    try:
+                        from arenamcp.coach import get_models_for_provider
+
+                        available_models = get_models_for_provider(self._backend_name)
+                        valid_model_ids = {mid for _, mid in available_models}
+                        if saved_model not in valid_model_ids:
+                            replacement_model = next(
+                                (mid for _, mid in available_models if mid is not None),
+                                None,
+                            )
+                            logger.info(
+                                "Saved model %s is no longer valid for %s; using %s instead",
+                                saved_model,
+                                self._backend_name,
+                                replacement_model or "default",
+                            )
+                            self._model_name = replacement_model
+                    except Exception as e:
+                        logger.warning(
+                            "Could not validate saved model %s for %s: %s",
+                            saved_model,
+                            self._backend_name,
+                            e,
+                        )
             else:
                 self._model_name = None
 
@@ -364,8 +431,7 @@ class StandaloneCoach:
 
         # Save validated configuration back to settings (ensure consistency)
         self.settings.set("backend", self._backend_name, save=False)
-        if self._model_name:
-            self.settings.set("model", self._model_name, save=False)
+        self.settings.set("model", self._model_name, save=False)
         self.settings.set("voice_mode", self._voice_mode, save=False)
         self.settings.set("advice_frequency", self._advice_frequency, save=True)
 
@@ -772,46 +838,50 @@ class StandaloneCoach:
     def _init_voice(self) -> None:
         """Initialize voice I/O components.
 
-        Uses a timeout to detect when sounddevice/PortAudio hangs during
-        audio device enumeration (e.g. problematic ASIO/virtual drivers).
+        Uses a subprocess probe to detect when sounddevice/PortAudio hangs
+        during audio device enumeration (e.g. problematic ASIO/virtual drivers).
         """
         logger.info(f"_init_voice called, backend_name={self.backend_name}")
 
-        # Pre-check: import sounddevice with a timeout to detect PortAudio hangs
-        import threading
-        sd_ok = threading.Event()
-
-        def _try_sd():
-            try:
-                import sounddevice  # noqa: F401
-                sd_ok.set()
-            except Exception as e:
-                logger.warning(f"sounddevice import failed: {e}")
-
-        t = threading.Thread(target=_try_sd, daemon=True)
-        t.start()
-        t.join(timeout=8)
-        if not sd_ok.is_set():
-            logger.error("sounddevice hung during PortAudio init (>8s) — disabling voice")
-            self.ui.status("VOICE", "Audio init hung — voice disabled")
+        sd_ok, sd_reason = _probe_sounddevice_import(timeout_seconds=8.0)
+        if not sd_ok:
+            logger.error(f"sounddevice probe failed - disabling voice: {sd_reason}")
+            self.ui.status("VOICE", "Audio init failed - voice disabled")
             self.ui.error("Audio driver issue: voice/TTS disabled. Check audio devices.")
             return
 
-        from arenamcp.tts import VoiceOutput
+        try:
+            from arenamcp.tts import VoiceOutput
+        except Exception as e:
+            logger.error(f"TTS import failed - disabling voice: {e}")
+            self.ui.status("VOICE", "TTS unavailable - voice disabled")
+            self.ui.error("Voice/TTS modules unavailable. Check install/audio setup.")
+            return
 
         # Initialize local TTS
-        logger.info("Initializing TTS...")
-        self._voice_output = VoiceOutput()
+        try:
+            logger.info("Initializing TTS...")
+            self._voice_output = VoiceOutput()
 
-        voice_id, voice_desc = self._voice_output.current_voice
-        logger.info(f"TTS voice: {voice_desc}")
-        self.ui.status("VOICE", f"TTS Voice: {voice_desc}")
+            voice_id, voice_desc = self._voice_output.current_voice
+            logger.info(f"TTS voice: {voice_desc}")
+            self.ui.status("VOICE", f"TTS Voice: {voice_desc}")
+        except Exception as e:
+            logger.error(f"TTS init failed - disabling voice: {e}")
+            self._voice_output = None
+            self.ui.status("VOICE", "TTS init failed - voice disabled")
+            self.ui.error("TTS failed to initialize. Check audio devices/drivers.")
+            return
 
         # Initialize local STT (Whisper via VoiceInput) only if PTT/VOX mode
         if self._voice_mode in ("ptt", "vox"):
-            from arenamcp.voice import VoiceInput
-            logger.info(f"Initializing voice input ({self.voice_mode})...")
-            self._voice_input = VoiceInput(mode=self.voice_mode)
+            try:
+                from arenamcp.voice import VoiceInput
+                logger.info(f"Initializing voice input ({self.voice_mode})...")
+                self._voice_input = VoiceInput(mode=self.voice_mode)
+            except Exception as e:
+                logger.error(f"Voice input init failed - keeping TTS only: {e}")
+                self._voice_input = None
         else:
             logger.info(f"Voice input disabled (mode={self._voice_mode})")
 

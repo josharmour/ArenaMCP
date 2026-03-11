@@ -2,6 +2,7 @@
 import time
 
 from arenamcp.gamestate import GameState
+from arenamcp.gamestate import create_game_state_handler
 
 
 def test_published_snapshot_is_frame_consistent_under_concurrency() -> None:
@@ -58,3 +59,70 @@ def test_published_snapshot_is_frame_consistent_under_concurrency() -> None:
     rt.join(timeout=1)
 
     assert not mismatches, f"Observed mixed-frame snapshot(s): {mismatches[:5]}"
+
+
+def test_handler_avoids_redundant_publish_after_gamestate_update(monkeypatch) -> None:
+    """Pure GameStateMessage payloads should not trigger an extra publish pass."""
+    gs = GameState()
+    handler = create_game_state_handler(gs)
+
+    publish_calls = {"count": 0}
+    original_publish = gs.publish_snapshot
+
+    def _counting_publish() -> None:
+        publish_calls["count"] += 1
+        original_publish()
+
+    monkeypatch.setattr(gs, "publish_snapshot", _counting_publish)
+
+    payload = {
+        "greToClientEvent": {
+            "greToClientMessages": [
+                {
+                    "type": "GREMessageType_GameStateMessage",
+                    "gameStateMessage": {
+                        "turnInfo": {
+                            "turnNumber": 1,
+                            "activePlayer": 1,
+                            "priorityPlayer": 1,
+                        },
+                        "players": [{"seatId": 1, "lifeTotal": 20}],
+                    },
+                }
+            ]
+        }
+    }
+
+    handler(payload)
+
+    assert publish_calls["count"] == 0
+
+
+def test_handler_publishes_for_decision_only_messages(monkeypatch) -> None:
+    """Decision messages without state diffs still need snapshot publication."""
+    gs = GameState()
+    handler = create_game_state_handler(gs)
+
+    publish_calls = {"count": 0}
+    original_publish = gs.publish_snapshot
+
+    def _counting_publish() -> None:
+        publish_calls["count"] += 1
+        original_publish()
+
+    monkeypatch.setattr(gs, "publish_snapshot", _counting_publish)
+
+    payload = {
+        "greToClientEvent": {
+            "greToClientMessages": [
+                {
+                    "type": "GREMessageType_PromptReq",
+                    "promptReq": {"prompt": {"text": "Choose one"}},
+                }
+            ]
+        }
+    }
+
+    handler(payload)
+
+    assert publish_calls["count"] == 1

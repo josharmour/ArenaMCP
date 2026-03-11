@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -18,10 +19,26 @@ from pathlib import Path
 
 # Build configuration
 PROJECT_NAME = "ArenaMCP"
-VERSION = "0.1.0"
+PROJECT_URL = "https://github.com/josharmour/ArenaMCP"
 SPEC_FILE = "arenamcp.spec"
 DIST_DIR = Path("dist")
 BUILD_DIR = Path("build")
+PACKAGE_INIT = Path(__file__).parent / "src" / "arenamcp" / "__init__.py"
+
+
+def get_version() -> str:
+    """Read the package version from the source tree."""
+    match = re.search(
+        r'^__version__\s*=\s*"([^"]+)"',
+        PACKAGE_INIT.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if not match:
+        raise RuntimeError(f"Could not find __version__ in {PACKAGE_INIT}")
+    return match.group(1)
+
+
+VERSION = get_version()
 
 
 def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -136,7 +153,7 @@ ANTHROPIC_API_KEY=your_anthropic_api_key_here
    - Run with --show-log to see recent log entries
 
 For full documentation, visit:
-https://github.com/yourusername/ArenaMCP
+{PROJECT_URL}
 """)
 
     # Create the zip

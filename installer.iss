@@ -2,9 +2,9 @@
 ; Download Inno Setup from: https://jrsoftware.org/isinfo.php
 
 #define MyAppName "ArenaMCP"
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "0.5.10"
 #define MyAppPublisher "ArenaMCP"
-#define MyAppURL "https://github.com/yourusername/ArenaMCP"
+#define MyAppURL "https://github.com/josharmour/ArenaMCP"
 #define MyAppExeName "ArenaMCP.exe"
 
 [Setup]
@@ -20,7 +20,7 @@ DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 LicenseFile=LICENSE
 OutputDir=dist
-OutputBaseFilename=ArenaMCP-{#MyAppVersion}-setup
+OutputBaseFilename=ArenaMCP-Setup
 SetupIconFile=assets\icon.ico
 Compression=lzma
 SolidCompression=yes

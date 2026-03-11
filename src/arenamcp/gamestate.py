@@ -469,7 +469,7 @@ class GameState:
         Returns list of dicts with 'step', 'active_player', 'turn' keys.
         This allows catching fast combat phases that happen between polls.
         """
-        snap = self.get_published_snapshot()
+        snap = self.get_published_snapshot(deep_copy=False)
         return list(snap.get("pending_combat_steps", []))
 
     def _build_raw_snapshot_locked(self) -> dict:
@@ -523,10 +523,18 @@ class GameState:
         with self._state_lock:
             self._published_snapshot = self._build_raw_snapshot_locked()
 
-    def get_published_snapshot(self) -> dict:
-        """Return a deep-copied immutable snapshot."""
+    def get_published_snapshot(self, deep_copy: bool = True) -> dict:
+        """Return the latest published snapshot.
+
+        Args:
+            deep_copy: When True (default), return a deep copy suitable for
+                callers that may mutate data. When False, return a read-only
+                reference for fast internal reads.
+        """
         with self._state_lock:
-            return copy.deepcopy(self._published_snapshot)
+            if deep_copy:
+                return copy.deepcopy(self._published_snapshot)
+            return self._published_snapshot
 
     def get_snapshot(self) -> dict:
         """Get a TUI-friendly snapshot with lazy card-name enrichment.
@@ -1548,16 +1556,29 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
         # GreToClientEvent contains greToClientMessages array
         gre_event = payload.get("greToClientEvent", {})
         messages = gre_event.get("greToClientMessages", [])
+        snapshot_dirty = False
+
+        def apply_game_state_update(msg_payload: dict) -> None:
+            """Apply a state diff/full update and publish exactly once."""
+            nonlocal snapshot_dirty
+            game_state.update_from_message(msg_payload)
+            snapshot_dirty = False
 
         # Process each message in the array
         for msg in messages:
             msg_type = msg.get("type", "")
+            if (
+                msg_type.endswith("Req")
+                or msg_type in ("GREMessageType_ConnectResp", "GREMessageType_OptionalActionMessage")
+                or ("Resp" in msg_type and game_state.pending_decision)
+            ):
+                snapshot_dirty = True
 
             # Handle GameStateMessage
             if msg_type == "GREMessageType_GameStateMessage":
                 game_state_msg = msg.get("gameStateMessage")
                 if game_state_msg:
-                    game_state.update_from_message(game_state_msg)
+                    apply_game_state_update(game_state_msg)
                     # Auto-clear stale decisions whose source is no longer on the stack.
                     # Client→server responses (SelectTargetsResp etc.) never reach this
                     # handler, so we detect resolution by checking if the source left the stack.
@@ -1608,6 +1629,7 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                             game_state.decision_seat_id = None
                             game_state.decision_context = None
                             game_state.decision_timestamp = 0
+                            snapshot_dirty = True
             
             # Handle Mulligan (MulliganReq or legacy SubmitDeckReq)
             elif msg_type in ("GREMessageType_MulliganReq", "GREMessageType_SubmitDeckReq"):
@@ -2131,7 +2153,7 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                 # Queued state updates that arrive during animations/resolution
                 game_state_msg = msg.get("gameStateMessage")
                 if game_state_msg:
-                    game_state.update_from_message(game_state_msg)
+                    apply_game_state_update(game_state_msg)
 
             elif msg_type == "GREMessageType_UIMessage":
                 # Hover/highlight UI events — safe to ignore
@@ -2200,9 +2222,12 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
 
         # Also handle direct GameStateMessage events (legacy format)
         if "gameObjects" in payload or "zones" in payload or "players" in payload:
-            game_state.update_from_message(payload)
-        
-        game_state.publish_snapshot()
+            apply_game_state_update(payload)
+
+        # Publish once for decision/action-only messages that mutate state
+        # without a full/diff GameState update.
+        if snapshot_dirty:
+            game_state.publish_snapshot()
 
         # Record frame if recording is active
         try:

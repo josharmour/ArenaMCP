@@ -590,6 +590,7 @@ class ArenaApp(App):
         self.game_state_widget = None
         self._restart_requested = False
         self._pending_remote_version: str | None = None
+        self._debug_report_in_progress = False
 
         # Fetch proxy models before UI renders
         Sidebar.load_model_options()
@@ -1228,25 +1229,33 @@ class ArenaApp(App):
         if not self.coach:
             self.write_log("[yellow]Coach not initialized[/]")
             return
+        if self._debug_report_in_progress:
+            self.write_log("[yellow]Debug report already in progress...[/]")
+            return
 
+        self._debug_report_in_progress = True
+        self.write_log("[yellow]Generating debug report...[/]")
         threading.Thread(target=self._do_copy_debug, daemon=True).start()
 
     def _do_copy_debug(self):
         """Save debug report and copy path to clipboard."""
-        if self.coach and hasattr(self.coach, 'save_bug_report'):
-            bug_path = self.coach.save_bug_report("Copy Debug (F7)")
-            if bug_path:
-                file_url = f"file:///{str(bug_path).replace(chr(92), '/')}"
-                self.call_from_thread(self.write_log, "[green]Bug report saved.[/]")
-                self.call_from_thread(self.write_log, f"[dim]{file_url}[/] (copied to clipboard)")
-                self.call_from_thread(
-                    self.write_log,
-                    "[yellow]Type /bugreport to submit to GitHub.[/]",
-                )
+        try:
+            if self.coach and hasattr(self.coach, 'save_bug_report'):
+                bug_path = self.coach.save_bug_report("Copy Debug (F7)")
+                if bug_path:
+                    file_url = f"file:///{str(bug_path).replace(chr(92), '/')}"
+                    self.call_from_thread(self.write_log, "[green]Bug report saved.[/]")
+                    self.call_from_thread(self.write_log, f"[dim]{file_url}[/] (copied to clipboard)")
+                    self.call_from_thread(
+                        self.write_log,
+                        "[yellow]Type /bugreport to submit to GitHub.[/]",
+                    )
+                else:
+                    self.call_from_thread(self.write_log, "[red]Failed to save debug report[/]")
             else:
-                self.call_from_thread(self.write_log, "[red]Failed to save debug report[/]")
-        else:
-            self.call_from_thread(self.write_log, "[yellow]Coach not available for debug report[/]")
+                self.call_from_thread(self.write_log, "[yellow]Coach not available for debug report[/]")
+        finally:
+            self._debug_report_in_progress = False
 
     def _do_submit_bugreport(self, user_message: str = None):
         """Submit the most recent bug report as a GitHub issue.

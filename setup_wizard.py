@@ -543,7 +543,7 @@ def step_update_code() -> bool:
         for line in pyproject.read_text().splitlines():
             line = line.strip()
             if line.startswith("version"):
-                # version = "0.2.0"
+                # version = "x.y.z"
                 local_ver = line.split("=", 1)[1].strip().strip('"').strip("'")
                 break
 
