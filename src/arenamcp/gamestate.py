@@ -1625,9 +1625,14 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                     # battlefield). Without a hold window, the decision is cleared
                     # before the coaching loop (1.5s poll) ever sees it.
                     MIN_DECISION_HOLD_S = 5  # seconds — must survive at least 2 poll cycles
+                    # Never auto-clear decisions set by ActionsAvailableReq or PayCostsReq
+                    # from GameStateMessage — they should only be replaced by the next *Req.
+                    _decision_type = (game_state.decision_context or {}).get("type", "")
+                    _skip_auto_clear = _decision_type in ("actions_available", "pay_costs")
                     if (game_state.pending_decision
                             and game_state.pending_decision != "Mulligan"
-                            and game_state.decision_context):
+                            and game_state.decision_context
+                            and not _skip_auto_clear):
                         import time
                         decision_age = (
                             time.time() - game_state.decision_timestamp
@@ -1893,10 +1898,14 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
             elif msg_type == "GREMessageType_ActionsAvailableReq":
                 # PHASE 1: Capture the exact list of actions Arena says are legal right now.
                 # This is the "Ground Truth" for the autopilot.
+                # RE insight: ActionsAvailableReq IS a decision — the GRE is waiting
+                # for the player to choose an action.  Setting pending_decision here
+                # ensures the coach/autopilot knows the game needs input.
+                import time as _time
                 req = msg.get("actionsAvailableReq", {})
                 raw_actions = req.get("actions", [])
                 game_state.legal_actions_raw = copy.deepcopy(raw_actions) if raw_actions else []
-                
+
                 legal_list = []
                 for action in raw_actions:
                     atype = action.get("actionType", "")
@@ -1928,10 +1937,34 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                         # Fallback for other types
                         clean_type = atype.replace("ActionType_", "")
                         legal_list.append(f"Action: {clean_type}")
-                
+
                 if legal_list:
                     game_state.legal_actions = legal_list
                     logger.info(f"Captured {len(legal_list)} legal actions from GRE: {legal_list}")
+
+                # Set pending_decision: the GRE is waiting for the player to act.
+                # Only set if we have actual actions (not an empty req).
+                if raw_actions:
+                    # Determine a descriptive decision name from available actions
+                    action_types = {a.get("actionType", "") for a in raw_actions}
+                    if action_types == {"ActionType_Pass"}:
+                        decision_label = "Priority (Pass Only)"
+                    elif "ActionType_Cast" in action_types or "ActionType_Play" in action_types:
+                        decision_label = "Priority"
+                    elif "ActionType_AttackWithGroup" in action_types or "ActionType_Attack" in action_types:
+                        decision_label = "Declare Attackers"
+                    elif "ActionType_BlockWithGroup" in action_types or "ActionType_Block" in action_types:
+                        decision_label = "Declare Blockers"
+                    else:
+                        decision_label = "Choose Action"
+                    game_state.pending_decision = decision_label
+                    game_state.decision_timestamp = _time.time()
+                    game_state.decision_context = {
+                        "type": "actions_available",
+                        "num_actions": len(raw_actions),
+                        "action_types": sorted(action_types),
+                    }
+                    snapshot_dirty = True
 
             elif msg_type == "GREMessageType_ConnectResp":
                 connect_resp = msg.get("connectResp", {})
@@ -2011,19 +2044,58 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
             # --- Additional Decision Messages ---
 
             elif msg_type == "GREMessageType_PayCostsReq":
+                # RE insight: PayCostsReq proto has NO sourceId field.
+                # The source is in manaCost[].objectId.  The proto fields are:
+                #   manaCost: RepeatedField<ManaRequirement>  (color, count, costId, objectId, abilityGrpId)
+                #   paymentActions: ActionsAvailableReq  (which lands/abilities can produce mana)
+                #   autoTapActionsReq: AutoTapActionsAvailableReq  (pre-computed tap solutions)
+                #   shouldCancel: bool
                 import time
                 req = msg.get("payCostsReq", {})
-                source_id = req.get("sourceId", 0)
-                source_obj = game_state.game_objects.get(source_id)
+
+                # Extract source from manaCost[0].objectId (the card being cast)
+                mana_cost = req.get("manaCost", [])
+                source_id = 0
+                for mc in mana_cost:
+                    oid = mc.get("objectId", 0)
+                    if oid:
+                        source_id = oid
+                        break
+
+                source_obj = game_state.game_objects.get(source_id) if source_id else None
                 source_name = game_state._resolve_card_name(source_obj.grp_id) if source_obj else "Unknown"
-                logger.info(f"Captured Decision: Pay Costs (source: {source_name})")
+
+                # Build human-readable mana cost string from requirements
+                _MANA_ABBREV = {
+                    "ManaColor_White": "W", "ManaColor_Blue": "U",
+                    "ManaColor_Black": "B", "ManaColor_Red": "R",
+                    "ManaColor_Green": "G", "ManaColor_Colorless": "C",
+                    "ManaColor_Any": "Any",
+                }
+                mana_parts = []
+                for mc in mana_cost:
+                    colors = mc.get("color", [])
+                    count = mc.get("count", 1)
+                    if colors:
+                        symbols = [_MANA_ABBREV.get(c, c) for c in colors]
+                        mana_parts.append(f"{count}x{''.join(symbols)}")
+                    else:
+                        mana_parts.append(f"{count}")
+                mana_str = ", ".join(mana_parts) if mana_parts else "unknown"
+
+                has_autotap = bool(req.get("autoTapActionsReq", {}).get("autoTapSolutions"))
+                logger.info(
+                    f"Captured Decision: Pay Costs (source: {source_name}, "
+                    f"mana: {mana_str}, autotap={has_autotap})"
+                )
                 game_state.pending_decision = "Pay Costs"
                 game_state.decision_timestamp = time.time()
                 game_state.decision_context = {
                     "type": "pay_costs",
                     "source_card": source_name,
-                    "source_id": source_id,
-                    "raw": {k: v for k, v in req.items()},
+                    "source_id": source_id if source_id else None,  # None → uses longer timeout
+                    "mana_cost": mana_str,
+                    "has_autotap": has_autotap,
                 }
 
             elif msg_type == "GREMessageType_SearchReq":

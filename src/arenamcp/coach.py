@@ -2235,8 +2235,14 @@ class CoachEngine:
 
                 elif dec_type == "pay_costs":
                     source = decision_context.get("source_card", "spell")
-                    lines.append(f"!!! DECISION: PAY COSTS for {source} !!!")
-                    lines.append("Choose: tap lands that leave best mana open for responses")
+                    mana_cost = decision_context.get("mana_cost", "")
+                    has_autotap = decision_context.get("has_autotap", False)
+                    cost_str = f" ({mana_cost})" if mana_cost else ""
+                    lines.append(f"!!! DECISION: PAY COSTS for {source}{cost_str} !!!")
+                    if has_autotap:
+                        lines.append("Auto-tap available — confirm or tap manually for better mana efficiency")
+                    else:
+                        lines.append("Choose: tap lands that leave best mana open for responses")
 
                 elif dec_type == "search":
                     lines.append("!!! DECISION: SEARCH LIBRARY !!!")
@@ -2336,6 +2342,12 @@ class CoachEngine:
 
                 elif dec_type == "gather":
                     lines.append("!!! DECISION: GATHER !!!")
+
+                elif dec_type == "actions_available":
+                    # ActionsAvailableReq — GRE is waiting for player to choose an action.
+                    # The legal actions are already shown separately, so keep this brief.
+                    n_actions = decision_context.get("num_actions", "?")
+                    lines.append(f"!!! YOUR PRIORITY — {n_actions} legal actions available !!!")
 
                 else:
                     # Fallback for other decision types

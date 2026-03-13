@@ -495,6 +495,7 @@ class Sidebar(Vertical):
             yield Button("Speed 1.0x (F8)", id="btn-speed", variant="success")
             yield Button("Debug (F7)", id="btn-debug", variant="default")
             yield Button("Analyze Screen (F3)", id="btn-screenshot", variant="primary")
+            yield Button("Autopilot: OFF", id="btn-autopilot", variant="warning")
             yield Button("Analyze Match", id="btn-analyze", variant="warning")
             yield Button("Update", id="btn-update", variant="warning")
             yield Button("Restart", id="btn-restart", variant="error")
@@ -603,7 +604,7 @@ class ArenaApp(App):
         ("f8", "cycle_speed", "Speed"),
         ("f9", "autopilot_toggle_afk", "AP AFK"),
         ("f10", "autopilot_toggle_land", "AP Land"),
-        ("f11", "autopilot_toggle", "AP On/Off"),
+        ("f12", "autopilot_toggle", "AP On/Off"),
         ("ctrl+0", "read_win_plan", "Win Plan"),
     ]
 
@@ -977,6 +978,19 @@ class ArenaApp(App):
             self.action_copy_debug()
         elif btn_id == "btn-screenshot":
             self.action_analyze_screen()
+        elif btn_id == "btn-autopilot":
+            self.action_autopilot_toggle()
+            # Update button label to reflect new state
+            try:
+                btn = self.query_one("#btn-autopilot", Button)
+                if self.coach and hasattr(self.coach, '_autopilot_enabled') and self.coach._autopilot_enabled:
+                    btn.label = "Autopilot: ON"
+                    btn.variant = "success"
+                else:
+                    btn.label = "Autopilot: OFF"
+                    btn.variant = "warning"
+            except Exception:
+                pass
         elif btn_id == "btn-analyze":
             self.action_analyze_match()
         elif btn_id == "btn-update":
@@ -1634,7 +1648,7 @@ class ArenaApp(App):
             self.write_log(f"[red]Autopilot land-drop toggle failed: {e}[/]")
 
     def action_autopilot_toggle(self) -> None:
-        """Toggle autopilot on/off at runtime (F11)."""
+        """Toggle autopilot on/off at runtime (button or F12)."""
         if not self.coach:
             self.write_log("[dim]Coach not running[/]")
             return
