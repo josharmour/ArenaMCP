@@ -828,6 +828,9 @@ class ArenaApp(App):
             self._update_speed_button(self.coach._voice_output._speed)
             self.sub_title = desc
 
+        # Autopilot button
+        self._sync_autopilot_button()
+
         # Start seat info polling
         threading.Thread(target=self._poll_seat_info, daemon=True).start()
 
@@ -980,17 +983,6 @@ class ArenaApp(App):
             self.action_analyze_screen()
         elif btn_id == "btn-autopilot":
             self.action_autopilot_toggle()
-            # Update button label to reflect new state
-            try:
-                btn = self.query_one("#btn-autopilot", Button)
-                if self.coach and hasattr(self.coach, '_autopilot_enabled') and self.coach._autopilot_enabled:
-                    btn.label = "Autopilot: ON"
-                    btn.variant = "success"
-                else:
-                    btn.label = "Autopilot: OFF"
-                    btn.variant = "warning"
-            except Exception:
-                pass
         elif btn_id == "btn-analyze":
             self.action_analyze_match()
         elif btn_id == "btn-update":
@@ -1647,6 +1639,19 @@ class ArenaApp(App):
         except Exception as e:
             self.write_log(f"[red]Autopilot land-drop toggle failed: {e}[/]")
 
+    def _sync_autopilot_button(self) -> None:
+        """Sync the Autopilot button label/variant with actual state."""
+        try:
+            btn = self.query_one("#btn-autopilot", Button)
+            if self.coach and hasattr(self.coach, '_autopilot_enabled') and self.coach._autopilot_enabled:
+                btn.label = "Autopilot: ON"
+                btn.variant = "success"
+            else:
+                btn.label = "Autopilot: OFF"
+                btn.variant = "warning"
+        except Exception:
+            pass
+
     def action_autopilot_toggle(self) -> None:
         """Toggle autopilot on/off at runtime (button or F12)."""
         if not self.coach:
@@ -1658,6 +1663,7 @@ class ArenaApp(App):
                 self.write_log("[bold green]Autopilot: ON[/]")
             else:
                 self.write_log("[bold yellow]Autopilot: OFF[/]")
+            self._sync_autopilot_button()
         except Exception as e:
             self.write_log(f"[red]Autopilot toggle failed: {e}[/]")
 
