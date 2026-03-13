@@ -364,13 +364,27 @@ class AutopilotEngine:
             # --- Quick shortcuts: auto-pass/resolve without LLM ---
             # These save 5-15s by not calling the LLM for obvious actions.
             pending = game_state.get("pending_decision")
-            has_decision = pending is not None and pending != "Action Required"
+            has_decision = (
+                pending is not None
+                and pending != "Action Required"
+                and pending != "Priority (Pass Only)"
+            )
             turn = game_state.get("turn", {})
             local_seat = None
             for p in game_state.get("players", []):
                 if p.get("is_local"):
                     local_seat = p.get("seat_id")
             is_my_turn = turn.get("active_player") == local_seat if local_seat else False
+
+            # "Priority (Pass Only)" means only Pass is legal — auto-pass immediately
+            # without LLM planning. MTGA may also auto-pass these, so speed is key.
+            if pending == "Priority (Pass Only)":
+                logger.info("Autopilot: auto-passing (pass-only priority)")
+                if not self._config.dry_run:
+                    self._controller.focus_mtga_window()
+                    time.sleep(0.15)
+                self._exec_pass_priority()
+                return True
 
             # NEVER auto-pass when there's a pending decision (scry, discard, target, etc.)
             if not has_decision:
