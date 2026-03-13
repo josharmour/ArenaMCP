@@ -2385,6 +2385,9 @@ class StandaloneCoach:
             # Card enrichment failures (oracle text lookups that failed)
             "enrichment_failures": self._get_enrichment_failures(),
 
+            # Autopilot state
+            "autopilot": self._collect_autopilot_info(),
+
             # Error state
             "errors": list(self._recent_errors) if hasattr(self, '_recent_errors') else [],
 
@@ -2393,6 +2396,22 @@ class StandaloneCoach:
         }
 
         return report
+
+    def _collect_autopilot_info(self) -> dict:
+        """Collect autopilot state for bug reports."""
+        ap = getattr(self, '_autopilot', None)
+        info: dict = {
+            "enabled": getattr(self, '_autopilot_enabled', False),
+            "dry_run": getattr(self, '_autopilot_dry_run', False),
+            "afk": getattr(self, '_autopilot_afk', False),
+            "initialized": ap is not None,
+        }
+        if ap:
+            try:
+                info["engine"] = ap.get_debug_info()
+            except Exception as e:
+                info["engine_error"] = str(e)
+        return info
 
     @staticmethod
     def _get_package_versions() -> dict[str, str]:

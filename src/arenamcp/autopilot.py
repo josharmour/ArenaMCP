@@ -233,6 +233,74 @@ class AutopilotEngine:
         """Execution path usage statistics."""
         return dict(self._path_stats)
 
+    def get_debug_info(self) -> dict[str, Any]:
+        """Collect comprehensive autopilot state for bug reports."""
+        info: dict[str, Any] = {
+            "state": self._state.value,
+            "config": {
+                "dry_run": self._config.dry_run,
+                "afk_mode": self._config.afk_mode,
+                "land_drop_mode": self._config.land_drop_mode,
+                "auto_pass_priority": self._config.auto_pass_priority,
+                "auto_resolve": self._config.auto_resolve,
+                "auto_execute_delay": self._config.auto_execute_delay,
+                "planning_timeout": self._config.planning_timeout,
+                "prefer_deterministic": self._config.prefer_deterministic,
+                "enable_vision_fallback": self._config.enable_vision_fallback,
+            },
+            "stats": {
+                "actions_executed": self._actions_executed,
+                "actions_skipped": self._actions_skipped,
+                "plans_completed": self._plans_completed,
+                "consecutive_failed_verifications": self._consecutive_failed_verifications,
+                "path_stats": dict(self._path_stats),
+            },
+            "current_action_idx": self._current_action_idx,
+            "land_drop_last_turn": self._land_drop_last_turn,
+            "has_vision_scan": self._has_vision_scan,
+        }
+
+        # Current plan details
+        plan = self._current_plan
+        if plan:
+            info["current_plan"] = {
+                "trigger": plan.trigger,
+                "turn_number": plan.turn_number,
+                "strategy": plan.overall_strategy,
+                "num_actions": len(plan.actions),
+                "actions": [
+                    {
+                        "type": a.action_type.value,
+                        "card_name": a.card_name,
+                        "target_names": a.target_names,
+                        "reasoning": a.reasoning,
+                        "confidence": a.confidence,
+                        "has_gre_ref": a.gre_action_ref is not None,
+                    }
+                    for a in plan.actions
+                ],
+            }
+        else:
+            info["current_plan"] = None
+
+        # Screen mapper state
+        try:
+            info["screen_mapper"] = {
+                "window_rect": self._mapper.window_rect,
+                "cache_size": getattr(self._mapper, 'cache_size', 0),
+            }
+        except Exception:
+            info["screen_mapper"] = {"error": "unavailable"}
+
+        # Planner backend info
+        try:
+            backend = self._planner._backend
+            info["planner_backend"] = type(backend).__name__
+        except Exception:
+            info["planner_backend"] = "unknown"
+
+        return info
+
     def _log_execution_path(self, path: str, action_desc: str) -> None:
         """Log which execution path was used for an action."""
         logger.info(f"[{path}] {action_desc}")
