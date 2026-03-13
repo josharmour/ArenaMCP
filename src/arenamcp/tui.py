@@ -603,6 +603,7 @@ class ArenaApp(App):
         ("f8", "cycle_speed", "Speed"),
         ("f9", "autopilot_toggle_afk", "AP AFK"),
         ("f10", "autopilot_toggle_land", "AP Land"),
+        ("f11", "autopilot_toggle", "AP On/Off"),
         ("ctrl+0", "read_win_plan", "Win Plan"),
     ]
 
@@ -1631,6 +1632,20 @@ class ArenaApp(App):
             self.write_log(f"[cyan]Autopilot Land-drop: {state}[/]")
         except Exception as e:
             self.write_log(f"[red]Autopilot land-drop toggle failed: {e}[/]")
+
+    def action_autopilot_toggle(self) -> None:
+        """Toggle autopilot on/off at runtime (F11)."""
+        if not self.coach:
+            self.write_log("[dim]Coach not running[/]")
+            return
+        try:
+            enabled = self.coach.toggle_autopilot()
+            if enabled:
+                self.write_log("[bold green]Autopilot: ON[/]")
+            else:
+                self.write_log("[bold yellow]Autopilot: OFF[/]")
+        except Exception as e:
+            self.write_log(f"[red]Autopilot toggle failed: {e}[/]")
 
     def action_quit(self) -> None:
         if self.coach:

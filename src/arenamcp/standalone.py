@@ -427,6 +427,7 @@ class StandaloneCoach:
 
         # TTS always enabled
         self._auto_speak = True
+        self._screenshot_analysis_in_progress = False
 
         self.ui = ui_adapter or CLIAdapter()
 
@@ -847,6 +848,28 @@ class StandaloneCoach:
             self.ui.log(f"[red]Autopilot init failed: {e}[/]")
             logger.error(f"Autopilot init failed: {e}", exc_info=True)
             self._autopilot_enabled = False
+
+    def toggle_autopilot(self) -> bool:
+        """Toggle autopilot on/off at runtime. Returns new enabled state."""
+        if self._autopilot_enabled and self._autopilot:
+            # Turn OFF: abort any in-flight plan, disable
+            self._autopilot.on_abort()
+            self._autopilot_enabled = False
+            logger.info("Autopilot toggled OFF")
+            return False
+        else:
+            # Turn ON: initialize if needed, then enable
+            if not self._autopilot:
+                self._autopilot_dry_run = False
+                self._autopilot_afk = False
+                self._init_autopilot()
+            if self._autopilot:
+                self._autopilot_enabled = True
+                logger.info("Autopilot toggled ON")
+                return True
+            else:
+                logger.warning("Autopilot toggle failed: init unsuccessful")
+                return False
 
     def _init_voice(self) -> None:
         """Initialize voice I/O components.
@@ -2123,12 +2146,18 @@ class StandaloneCoach:
         Tries local Ollama VLM first (fast, free), then falls back to
         cloud backends (proxy, claude-code, gemini-cli).
         """
+        if self._screenshot_analysis_in_progress:
+            self.ui.log("[yellow]Screenshot analysis already in progress...[/]")
+            return
+
+        self._screenshot_analysis_in_progress = True
         backend_lower = self.backend_name.lower()
         has_local_vlm = self._vision_mapper and hasattr(self._vision_mapper, '_local_vlm') and self._vision_mapper._local_vlm.available
         vision_capable = has_local_vlm or backend_lower in ("claude-code", "gemini-cli", "proxy")
 
         if not vision_capable:
             self.ui.log("[red]No vision backend available. Need Ollama VLM or a cloud backend.[/]")
+            self._screenshot_analysis_in_progress = False
             return
 
         try:
@@ -2155,6 +2184,7 @@ class StandaloneCoach:
             png_bytes = buf.getvalue()
 
             self.ui.log("[yellow]Analyzing screenshot...[/]")
+            self.ui.subtask("Analyzing screenshot")
 
             # Context
             try:
@@ -2196,38 +2226,33 @@ class StandaloneCoach:
             # Try local Ollama VLM first (fast, free)
             if has_local_vlm:
                 self.ui.log("[dim cyan]Using local Ollama VLM...[/]")
-                result = self._vision_mapper._local_vlm.analyze(screen_prompt, png_bytes)
-                if result:
-                    # VLM returned JSON — extract text advice
-                    advice = result.get("advice") or result.get("recommendation") or result.get("response") or str(result)
-                else:
-                    # analyze() returns parsed JSON; for free-text, call raw
-                    try:
-                        import urllib.request
-                        import base64
-                        vlm = self._vision_mapper._local_vlm
-                        b64_image = base64.b64encode(png_bytes).decode("utf-8")
-                        payload = json.dumps({
-                            "model": vlm.model,
-                            "prompt": screen_prompt,
-                            "images": [b64_image],
-                            "stream": False,
-                            "options": {"temperature": 0.3, "num_predict": 200},
-                        }).encode("utf-8")
-                        req = urllib.request.Request(
-                            f"{vlm.endpoint}/api/generate",
-                            data=payload,
-                            headers={"Content-Type": "application/json"},
-                            method="POST",
-                        )
-                        with urllib.request.urlopen(req, timeout=vlm.timeout) as resp:
-                            raw = json.loads(resp.read())
-                        advice = raw.get("response", "").strip()
-                        if advice:
-                            logger.info(f"[Ollama screen analysis] {len(advice)} chars")
-                    except Exception as e:
-                        logger.error(f"Ollama screen analysis failed: {e}")
-                        self.ui.log(f"[dim red]Ollama VLM failed: {e}[/]")
+                try:
+                    import urllib.request
+                    import base64
+
+                    vlm = self._vision_mapper._local_vlm
+                    b64_image = base64.b64encode(png_bytes).decode("utf-8")
+                    payload = json.dumps({
+                        "model": vlm.model,
+                        "prompt": screen_prompt,
+                        "images": [b64_image],
+                        "stream": False,
+                        "options": {"temperature": 0.3, "num_predict": 200},
+                    }).encode("utf-8")
+                    req = urllib.request.Request(
+                        f"{vlm.endpoint}/api/generate",
+                        data=payload,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=vlm.timeout) as resp:
+                        raw = json.loads(resp.read())
+                    advice = raw.get("response", "").strip()
+                    if advice:
+                        logger.info(f"[Ollama screen analysis] {len(advice)} chars")
+                except Exception as e:
+                    logger.error(f"Ollama screen analysis failed: {e}")
+                    self.ui.log(f"[dim red]Ollama VLM failed: {e}[/]")
 
             # Fall back to cloud backends
             if not advice:
@@ -2292,6 +2317,9 @@ class StandaloneCoach:
             self.ui.log(f"[red]Screenshot error: {e}[/]")
             import traceback
             print(f"Screenshot Error: {e}")
+        finally:
+            self.ui.subtask("")
+            self._screenshot_analysis_in_progress = False
 
     def _collect_debug_info(self) -> dict:
         """Collect comprehensive debug information for bug reports."""
