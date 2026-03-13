@@ -610,16 +610,28 @@ class StandaloneCoach:
         logger.info("Initializing MCP server...")
         self._mcp = MCPClient()
 
-        # Pre-initialize card databases to avoid lazy-load delays during gameplay
-        logger.info("Pre-loading card databases...")
+        # Warm local databases in the background so the TUI becomes usable
+        # immediately. Scryfall stays fully lazy to avoid startup downloads.
+        if not getattr(self, "_card_cache_warm_started", False):
+            self._card_cache_warm_started = True
+            threading.Thread(
+                target=self._warm_local_card_caches,
+                daemon=True,
+                name="card-cache-warm",
+            ).start()
+
+    def _warm_local_card_caches(self) -> None:
+        """Warm local card data sources without blocking startup."""
+        logger.info("Warming local card databases in background...")
         try:
             from arenamcp.mtgjson import get_mtgjson
-            from arenamcp.server import _get_scryfall, _get_mtgadb
-            get_mtgjson()  # Load MTGJSON (primary source, updated daily)
-            _get_mtgadb()  # Load MTGA local database
-            _get_scryfall()  # Load Scryfall cache (fallback)
+            from arenamcp.server import _get_mtgadb
+
+            get_mtgjson()
+            _get_mtgadb()
+            logger.info("Local card database warmup complete")
         except Exception as e:
-            logger.warning(f"Failed to pre-load databases: {e}")
+            logger.warning(f"Failed to warm local card databases: {e}")
 
     def _init_llm(self) -> None:
         """Initialize LLM backend for coaching."""
@@ -884,6 +896,53 @@ class StandaloneCoach:
                 self._voice_input = None
         else:
             logger.info(f"Voice input disabled (mode={self._voice_mode})")
+
+    # --- Urgency-aware polling intervals ---
+    _POLL_URGENT = 0.5      # Pending decision, mulligan, stack interaction
+    _POLL_ACTIVE = 1.0      # Our turn with priority, combat phase
+    _POLL_NORMAL = 1.5      # Opponent's turn, calm board state
+    _POLL_IDLE = 2.5        # No active match
+
+    def _get_poll_interval(self, game_state: dict[str, Any]) -> float:
+        """Determine polling interval based on game state urgency.
+
+        Uses short-lived bursts during high-urgency windows (pending decisions,
+        combat, stack) and calmer intervals during idle or opponent turns.
+
+        Args:
+            game_state: Current game state dict.
+
+        Returns:
+            Sleep interval in seconds.
+        """
+        # No match active — idle polling
+        turn = game_state.get("turn", {})
+        turn_num = turn.get("turn_number", 0)
+        if turn_num == 0:
+            return self._POLL_IDLE
+
+        # Pending decision — urgent (player must act)
+        if game_state.get("pending_decision"):
+            return self._POLL_URGENT
+
+        # Stack has items — something is resolving, need quick updates
+        stack = game_state.get("stack", [])
+        if stack:
+            return self._POLL_URGENT
+
+        # Combat phase — fast transitions between declare/block/damage
+        phase = turn.get("phase", "")
+        if "Combat" in phase:
+            return self._POLL_ACTIVE
+
+        # Our turn with priority — we may need to act
+        local_seat = game_state.get("local_seat_id")
+        priority = turn.get("priority_player")
+        if local_seat and priority == local_seat:
+            return self._POLL_ACTIVE
+
+        # Default: opponent's turn or calm state
+        return self._POLL_NORMAL
 
     def _coaching_loop(self) -> None:
         """Poll MCP for game state and provide coaching, with auto-draft detection."""
@@ -1838,7 +1897,13 @@ class StandaloneCoach:
                 logger.debug(traceback.format_exc())
                 self._record_error(str(e), "coaching_loop")
 
-            time.sleep(1.5)
+            # Urgency-aware polling: shorter sleep during decisions/combat,
+            # longer sleep during idle/opponent turns
+            try:
+                poll_interval = self._get_poll_interval(curr_state)
+            except NameError:
+                poll_interval = self._POLL_NORMAL
+            time.sleep(poll_interval)
 
         logger.info("Coaching loop stopped")
 
@@ -1986,10 +2051,20 @@ class StandaloneCoach:
         else:
             self.ui.status("SPEED", "TTS not enabled")
 
-    def save_bug_report(self, reason: str = "User Request") -> Optional["Path"]:
-        """Save comprehensive bug report and return path."""
+    def save_bug_report(
+        self,
+        reason: str = "User Request",
+        *,
+        announce: bool = True,
+    ) -> Optional["Path"]:
+        """Save comprehensive bug report and return path.
+
+        When ``announce`` is false, skip UI logging and only write the report.
+        This is used by the TUI background worker so all widget updates stay on
+        the Textual thread.
+        """
         bug_dir = LOG_DIR / "bug_reports"
-        bug_dir.mkdir(exist_ok=True)
+        bug_dir.mkdir(parents=True, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         bug_file = bug_dir / f"bug_{timestamp}.json"
@@ -2008,16 +2083,18 @@ class StandaloneCoach:
 
             clipboard_success = copy_to_clipboard(file_url)
 
-            if clipboard_success:
-                self.ui.log(f"\n[BUG] Saved: {clickable}")
-                self.ui.log(f"[BUG] Link copied to clipboard: {file_url}\n")
-            else:
-                self.ui.log(f"\n[BUG] Saved: {clickable}")
-                self.ui.log(f"[BUG] Link: {file_url}\n")
+            if announce:
+                if clipboard_success:
+                    self.ui.log(f"\n[BUG] Saved: {clickable}")
+                    self.ui.log(f"[BUG] Link copied to clipboard: {file_url}\n")
+                else:
+                    self.ui.log(f"\n[BUG] Saved: {clickable}")
+                    self.ui.log(f"[BUG] Link: {file_url}\n")
 
             return bug_file
         except Exception as e:
-            self.ui.error(f"\n[BUG] Failed: {e}\n")
+            if announce:
+                self.ui.error(f"\n[BUG] Failed: {e}\n")
             logger.exception("Bug report failed")
             return None
 

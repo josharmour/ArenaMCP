@@ -19,6 +19,7 @@ from arenamcp.coach import CoachEngine, GameStateTrigger, create_backend
 from arenamcp.gamestate import (
     GameState, GameObjectKind, ZoneType, create_game_state_handler,
     save_match_state, load_match_state, mark_match_ended,
+    validate_log_identity,
 )
 from arenamcp.parser import LogParser
 from arenamcp.scryfall import ScryfallCache
@@ -210,7 +211,8 @@ def _save_match_state_if_needed() -> None:
     if current_turn != _last_saved_turn and game_state.match_id:
         _last_saved_turn = current_turn
         offset = watcher.file_position if watcher else 0
-        save_match_state(game_state, log_offset=offset)
+        log_path = str(watcher.log_path) if watcher else None
+        save_match_state(game_state, log_offset=offset, log_path=log_path)
 
 
 def _background_coaching_loop(
@@ -581,15 +583,45 @@ def start_watching() -> None:
     resume_offset = None
     saved_state = load_match_state()
     if saved_state:
-        resume_offset = saved_state.get("log_offset")
-        if saved_state.get("local_seat_id") is not None:
-            game_state.set_local_seat_id(saved_state["local_seat_id"], source=2)
-        if saved_state.get("match_id"):
-            game_state.match_id = saved_state["match_id"]
-        logger.info(
-            f"Resuming match {saved_state.get('match_id')} "
-            f"from offset {resume_offset}"
-        )
+        # Validate log identity before trusting the saved offset
+        # Use the watcher's resolved log path for comparison
+        import os
+        from arenamcp.watcher import _normalize_log_path, DEFAULT_LOG_PATH
+        raw_log_path = os.environ.get("MTGA_LOG_PATH", DEFAULT_LOG_PATH)
+        current_log_path = str(_normalize_log_path(raw_log_path))
+
+        resume_decision = validate_log_identity(saved_state, current_log_path)
+        logger.info(f"Resume decision: {resume_decision}")
+
+        if resume_decision in ("resume_same_session", "resume_no_identity"):
+            resume_offset = saved_state.get("log_offset")
+            if saved_state.get("local_seat_id") is not None:
+                game_state.set_local_seat_id(saved_state["local_seat_id"], source=2)
+            if saved_state.get("match_id"):
+                game_state.match_id = saved_state["match_id"]
+            logger.info(
+                f"Resuming match {saved_state.get('match_id')} "
+                f"from offset {resume_offset} ({resume_decision})"
+            )
+        elif resume_decision == "resume_append_mode_ambiguous":
+            # Appendlog mode: allow resume but log a warning
+            resume_offset = saved_state.get("log_offset")
+            if saved_state.get("local_seat_id") is not None:
+                game_state.set_local_seat_id(saved_state["local_seat_id"], source=2)
+            if saved_state.get("match_id"):
+                game_state.match_id = saved_state["match_id"]
+            logger.warning(
+                f"Resuming match {saved_state.get('match_id')} "
+                f"from offset {resume_offset} — appendlog mode suspected, "
+                "offset may be stale"
+            )
+        else:
+            # fresh_log_after_restart, resume_invalid_path, etc.
+            logger.info(
+                f"Discarding saved resume state: {resume_decision} "
+                f"(match={saved_state.get('match_id')}, "
+                f"offset={saved_state.get('log_offset')})"
+            )
 
     # Create and start the watcher
     watcher = MTGALogWatcher(

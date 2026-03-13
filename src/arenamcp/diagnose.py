@@ -284,6 +284,83 @@ def check_ollama_models() -> bool:
         return False
 
 
+def check_log_health() -> bool:
+    """Check for MTGA logging mode issues that break ArenaMCP assumptions.
+
+    Detects:
+    - Log file not growing while MTGA may be running (nolog mode)
+    - Custom log path that doesn't match default
+    - Stale log file suggesting disabled logging
+    """
+    custom = os.environ.get("MTGA_LOG_PATH")
+
+    # Resolve default path
+    local_low = os.environ.get("LOCALAPPDATA", "")
+    if local_low:
+        default_path = Path(local_low).parent / "LocalLow" / "Wizards Of The Coast" / "MTGA" / "Player.log"
+    else:
+        default_path = Path.home() / "AppData" / "LocalLow" / "Wizards Of The Coast" / "MTGA" / "Player.log"
+
+    # Warn if custom path differs from default
+    if custom:
+        custom_path = Path(custom)
+        try:
+            if custom_path.resolve() != default_path.resolve():
+                _check(
+                    "Custom log path",
+                    WARN,
+                    f"MTGA_LOG_PATH={custom} differs from default"
+                )
+                _fix(
+                    "If MTGA uses -logfile, set MTGA_LOG_PATH to match.\n"
+                    "If MTGA uses -nolog, ArenaMCP cannot track games.\n"
+                    "If MTGA uses -appendlog, resume after restart may be less reliable."
+                )
+        except (OSError, ValueError):
+            pass
+
+    # Check the active log file for staleness
+    log_path = Path(custom) if custom else default_path
+    if log_path.exists():
+        try:
+            stat = log_path.stat()
+            age_seconds = __import__("time").time() - stat.st_mtime
+            size_mb = stat.st_size / (1024 * 1024)
+
+            if age_seconds > 3600 and size_mb < 0.01:
+                _check(
+                    "Log file health",
+                    WARN,
+                    f"Log is tiny ({size_mb:.2f} MB) and stale ({age_seconds/60:.0f} min) "
+                    "— MTGA may be using -nolog"
+                )
+                _fix(
+                    "Launch MTGA without -nolog flag.\n"
+                    "Check MTGA shortcut/launcher for custom command-line arguments."
+                )
+                return False
+            elif age_seconds > 600:
+                _check(
+                    "Log file health",
+                    INFO,
+                    f"Last modified {age_seconds/60:.0f} min ago "
+                    f"({size_mb:.1f} MB) — MTGA may not be running"
+                )
+            else:
+                _check(
+                    "Log file health",
+                    PASS,
+                    f"Active ({size_mb:.1f} MB, modified {age_seconds:.0f}s ago)"
+                )
+        except OSError as e:
+            _check("Log file health", WARN, str(e))
+    else:
+        # Already reported by check_mtga_log()
+        pass
+
+    return True
+
+
 def check_log_file() -> bool:
     """Check the ArenaMCP log file for recent errors."""
     log_file = Path.home() / ".arenamcp" / "standalone.log"
@@ -395,6 +472,7 @@ def run_diagnostics() -> int:
     if not check_settings_json():
         issues += 1
     check_mtga_log()
+    check_log_health()
 
     # Dependencies
     _header("Core Dependencies")

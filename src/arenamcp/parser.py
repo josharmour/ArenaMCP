@@ -68,6 +68,8 @@ class LogParser:
         self._buffer: list[str] = []
         self._brace_depth: int = 0
         self._in_json: bool = False
+        self._in_string: bool = False  # Track string state across lines
+        self._escape_next: bool = False  # Track escape state across lines
         self._current_event_type: Optional[str] = None
         self._pending_line: str = ""  # Incomplete line from previous chunk
         self._last_event_hint: Optional[str] = None  # Event type from previous line
@@ -182,12 +184,18 @@ class LogParser:
             json_start: The beginning of the JSON (starting with '{').
         """
         self._in_json = True
+        self._in_string = False
+        self._escape_next = False
         self._buffer = [json_start]
         self._brace_depth = self._count_brace_delta(json_start)
 
         # Check if JSON completes on same line
         if self._brace_depth == 0:
             self._complete_json_block()
+
+    # Maximum lines to accumulate before assuming corruption and resetting.
+    # Largest MTGA JSON blocks are ~5000 lines; 20000 gives generous headroom.
+    _MAX_BUFFER_LINES = 20000
 
     def _accumulate_json(self, line: str) -> None:
         """Accumulate a line into the current JSON block.
@@ -204,22 +212,64 @@ class LogParser:
             self._reset_json_state()
             return
 
+        # Guard against runaway accumulation from malformed JSON
+        if len(self._buffer) > self._MAX_BUFFER_LINES:
+            logger.warning(
+                f"JSON buffer exceeded {self._MAX_BUFFER_LINES} lines "
+                f"(depth={self._brace_depth}), resetting parser state"
+            )
+            self._reset_json_state()
+            return
+
         if self._brace_depth == 0:
             self._complete_json_block()
 
-    def _count_brace_delta(self, text: str) -> int:
-        """Count net brace depth change in text.
+    def _count_brace_delta(self, text: str, stateful: bool = True) -> int:
+        """Count net brace depth change in text, string-aware.
 
-        Note: This is a simple counter that doesn't account for braces
-        inside strings. MTGA logs are well-formed enough that this works.
+        Tracks whether we're inside a JSON string to avoid counting
+        braces that appear inside string values (e.g. card text with "{T}").
+        Honors backslash-escaped quotes inside strings.
+
+        When stateful=True (default during JSON accumulation), maintains
+        in_string/escape state across calls so multi-line strings are
+        handled correctly.
 
         Args:
             text: Text to count braces in.
+            stateful: If True, use and update self._in_string/_escape_next.
 
         Returns:
             Net change in brace depth (opens - closes).
         """
-        return text.count('{') - text.count('}')
+        delta = 0
+        in_string = self._in_string if stateful else False
+        escape = self._escape_next if stateful else False
+
+        for ch in text:
+            if escape:
+                escape = False
+                continue
+
+            if ch == '\\' and in_string:
+                escape = True
+                continue
+
+            if ch == '"':
+                in_string = not in_string
+                continue
+
+            if not in_string:
+                if ch == '{':
+                    delta += 1
+                elif ch == '}':
+                    delta -= 1
+
+        if stateful:
+            self._in_string = in_string
+            self._escape_next = escape
+
+        return delta
 
     def _complete_json_block(self) -> None:
         """Parse completed JSON block and emit event."""
@@ -240,6 +290,8 @@ class LogParser:
         self._buffer = []
         self._brace_depth = 0
         self._in_json = False
+        self._in_string = False
+        self._escape_next = False
         self._current_event_type = None
 
     def _emit_event(self, event_type: str, payload: dict) -> None:

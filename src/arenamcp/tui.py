@@ -1241,11 +1241,11 @@ class ArenaApp(App):
         """Save debug report and copy path to clipboard."""
         try:
             if self.coach and hasattr(self.coach, 'save_bug_report'):
-                bug_path = self.coach.save_bug_report("Copy Debug (F7)")
+                bug_path = self.coach.save_bug_report("Copy Debug (F7)", announce=False)
                 if bug_path:
                     file_url = f"file:///{str(bug_path).replace(chr(92), '/')}"
                     self.call_from_thread(self.write_log, "[green]Bug report saved.[/]")
-                    self.call_from_thread(self.write_log, f"[dim]{file_url}[/] (copied to clipboard)")
+                    self.call_from_thread(self.write_log, f"[dim]{file_url}[/]")
                     self.call_from_thread(
                         self.write_log,
                         "[yellow]Type /bugreport to submit to GitHub.[/]",
@@ -1255,7 +1255,7 @@ class ArenaApp(App):
             else:
                 self.call_from_thread(self.write_log, "[yellow]Coach not available for debug report[/]")
         finally:
-            self._debug_report_in_progress = False
+            self.call_from_thread(setattr, self, "_debug_report_in_progress", False)
 
     def _do_submit_bugreport(self, user_message: str = None):
         """Submit the most recent bug report as a GitHub issue.
@@ -1368,6 +1368,19 @@ class ArenaApp(App):
             self.call_from_thread(self.write_log, "[yellow]Creating GitHub issue via gh CLI...[/]")
             try:
                 import subprocess
+                # Skip gh path quickly when auth is missing/invalid.
+                auth_result = subprocess.run(
+                    [gh_bin, "auth", "status", "-h", "github.com"],
+                    capture_output=True, text=True, timeout=8,
+                )
+                if auth_result.returncode != 0:
+                    msg = (auth_result.stderr or auth_result.stdout or "").strip()
+                    if msg:
+                        self.call_from_thread(
+                            self.write_log,
+                            f"[yellow]gh not authenticated: {msg.splitlines()[0]}[/]",
+                        )
+                    raise RuntimeError("gh auth unavailable")
 
                 # Upload bug report JSON as a gist
                 gist_url = None
@@ -1425,6 +1438,10 @@ class ArenaApp(App):
                 self.write_log,
                 "[green]Opened GitHub new issue page in browser.[/]",
             )
+            self.call_from_thread(
+                self.write_log,
+                f"[dim]Using debug report: {report_path}[/]",
+            )
         except Exception as exc:
             self.call_from_thread(
                 self.write_log,
@@ -1433,6 +1450,10 @@ class ArenaApp(App):
             self.call_from_thread(
                 self.write_log,
                 f"[dim]Manual URL: https://github.com/{repo}/issues/new[/]",
+            )
+            self.call_from_thread(
+                self.write_log,
+                f"[dim]Attach this file: {report_path}[/]",
             )
 
     def action_restart(self) -> None:

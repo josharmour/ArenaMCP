@@ -8,6 +8,7 @@ import os
 import logging
 import re
 import glob
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -230,6 +231,11 @@ class MTGALogWatcher:
         self._observer: Optional[Observer] = None
         self._handler: Optional[MTGALogHandler] = None
 
+        # No-growth detection: track when we last saw the file grow
+        self._last_known_size: int = 0
+        self._last_growth_time: float = time.time()
+        self._no_growth_warned: bool = False
+
         logger.info(f"MTGALogWatcher initialized for: {self.log_path}")
 
     def find_last_match_start(self) -> int:
@@ -290,12 +296,42 @@ class MTGALogWatcher:
             logger.warning(f"Error scanning log for match start: {e}")
             return 0
 
+    def _is_fresh_log(self) -> bool:
+        """Detect if the log file is freshly created (MTGA just launched).
+
+        A fresh log is small (< 100KB) and was modified recently (< 60s).
+        When MTGA launches, it creates a new Player.log with w+ mode,
+        so the file starts near-empty and grows quickly.
+
+        Returns:
+            True if the log appears freshly created.
+        """
+        if not self.log_path.exists():
+            return False
+        try:
+            stat = self.log_path.stat()
+            age = time.time() - stat.st_mtime
+            is_fresh = stat.st_size < 100 * 1024 and age < 60
+            if is_fresh:
+                logger.info(
+                    f"Fresh log detected: size={stat.st_size}, "
+                    f"age={age:.1f}s — skipping backfill"
+                )
+            return is_fresh
+        except OSError:
+            return False
+
     def start(self) -> None:
         """Start watching the log file.
 
         Creates a watchdog Observer that monitors the directory containing
         the log file for modifications. If backfill is enabled, first processes
         existing log content from the last match start.
+
+        Startup modes:
+        - resume_same_session: read from saved offset (fastest)
+        - fresh_log: skip backfill, start from beginning (fast)
+        - backfill: scan for last match start (slower but recovers state)
         """
         if self._observer is not None:
             logger.warning("Watcher already started")
@@ -313,7 +349,7 @@ class MTGALogWatcher:
         if self._resume_offset is not None and self.log_path.exists():
             file_size = self.log_path.stat().st_size
             if self._resume_offset <= file_size:
-                logger.info(f"Resuming from saved offset {self._resume_offset}")
+                logger.info(f"Startup mode: resumed_session (offset {self._resume_offset})")
                 self._handler.read_from_position(self._resume_offset)
             else:
                 logger.warning(
@@ -324,8 +360,14 @@ class MTGALogWatcher:
                     start_pos = self.find_last_match_start()
                     self._handler.read_from_position(start_pos)
         elif self._backfill_enabled and self.log_path.exists():
-            start_pos = self.find_last_match_start()
-            self._handler.read_from_position(start_pos)
+            # Fast path: skip expensive backfill scan for freshly created logs
+            if self._is_fresh_log():
+                logger.info("Startup mode: fresh_launch (reading from start)")
+                self._handler.read_from_position(0)
+            else:
+                logger.info("Startup mode: backfill (scanning for last match)")
+                start_pos = self.find_last_match_start()
+                self._handler.read_from_position(start_pos)
 
         self._observer = Observer()
 
@@ -357,6 +399,44 @@ class MTGALogWatcher:
         if self._handler:
             return self._handler.file_position
         return 0
+
+    def check_log_health(self) -> Optional[str]:
+        """Check if the log file is growing as expected.
+
+        Call periodically (e.g. every poll cycle) to detect no-growth conditions
+        that suggest nolog mode or a wrong log path.
+
+        Returns:
+            Warning message if log hasn't grown in >120s, else None.
+        """
+        if not self.log_path.exists():
+            return None
+
+        try:
+            current_size = self.log_path.stat().st_size
+            now = time.time()
+
+            if current_size > self._last_known_size:
+                self._last_known_size = current_size
+                self._last_growth_time = now
+                self._no_growth_warned = False
+                return None
+
+            stale_seconds = now - self._last_growth_time
+            if stale_seconds > 120 and not self._no_growth_warned:
+                self._no_growth_warned = True
+                msg = (
+                    f"Log file has not grown in {stale_seconds:.0f}s. "
+                    "MTGA may be using -nolog, a custom -logfile path, "
+                    "or may not be running."
+                )
+                logger.warning(msg)
+                return msg
+
+        except OSError:
+            pass
+
+        return None
 
     def poll(self) -> None:
         """Manually poll for new log content.

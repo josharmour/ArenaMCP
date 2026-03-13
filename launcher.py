@@ -18,6 +18,8 @@ import sys
 import time
 import signal
 import subprocess
+import json
+import ctypes
 from pathlib import Path
 
 # Constants
@@ -26,11 +28,265 @@ SRC_DIR = REPO_DIR / "src" / "arenamcp"
 RESTART_EXIT_CODE = 42  # Special exit code meaning "please restart"
 WATCH_EXTENSIONS = {".py"}
 WATCH_DEBOUNCE_MS = 500
+LOCK_DIR = Path.home() / ".arenamcp"
+LOCK_FILE = LOCK_DIR / "launcher.lock"
+DEFAULT_PLAYER_LOG_MAX_MB = 64
+DEFAULT_PLAYER_LOG_KEEP_MB = 8
+
+
+class SingleInstanceGuard:
+    """Prevent multiple launcher instances from running concurrently."""
+
+    def __init__(self, lock_path: Path):
+        self.lock_path = lock_path
+        self._handle = None
+
+    def acquire(self) -> bool:
+        """Acquire the singleton lock for this launcher process."""
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = open(self.lock_path, "a+", encoding="utf-8")
+
+        try:
+            self._lock_handle()
+        except OSError:
+            self._close_handle()
+            return False
+
+        self._write_owner_metadata()
+        return True
+
+    def release(self) -> None:
+        """Release the singleton lock."""
+        if self._handle is None:
+            return
+
+        try:
+            self._unlock_handle()
+        except OSError:
+            pass
+        finally:
+            self._close_handle()
+
+    def describe_owner(self) -> str | None:
+        """Return a short description of the current lock owner if readable."""
+        try:
+            payload = json.loads(self.lock_path.read_text(encoding="utf-8") or "{}")
+        except Exception:
+            return None
+
+        pid = payload.get("pid")
+        started = payload.get("started_at")
+        if pid and started:
+            return f"PID {pid} (started {started})"
+        if pid:
+            return f"PID {pid}"
+        return None
+
+    def _write_owner_metadata(self) -> None:
+        if self._handle is None:
+            return
+
+        payload = {
+            "pid": os.getpid(),
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "cwd": str(REPO_DIR),
+        }
+        self._handle.seek(0)
+        self._handle.truncate()
+        self._handle.write(json.dumps(payload))
+        self._handle.flush()
+
+    def _lock_handle(self) -> None:
+        assert self._handle is not None
+        self._handle.seek(0)
+
+        if os.name == "nt":
+            import msvcrt
+
+            file_size = self._handle.seek(0, os.SEEK_END)
+            if file_size == 0:
+                self._handle.write("\0")
+                self._handle.flush()
+            self._handle.seek(0)
+            msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+            self._handle.seek(0)
+        else:
+            import fcntl
+
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock_handle(self) -> None:
+        assert self._handle is not None
+
+        if os.name == "nt":
+            import msvcrt
+
+            self._handle.seek(0)
+            msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+
+    def _close_handle(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+
+
+def notify_already_running(owner: str | None = None) -> None:
+    """Show a visible warning when a second launcher is started."""
+    message = "ArenaMCP is already running."
+    if owner:
+        message += f"\n\nExisting launcher: {owner}"
+    message += "\n\nClose the existing window first."
+
+    print(message)
+    if os.name == "nt":
+        try:
+            ctypes.windll.user32.MessageBoxW(None, message, "ArenaMCP", 0x30)
+        except Exception:
+            pass
 
 
 def get_python_executable():
     """Get the Python executable path."""
     return sys.executable
+
+
+def get_mtga_log_path() -> Path:
+    """Best-effort MTGA Player.log path for launcher maintenance."""
+    custom = os.environ.get("MTGA_LOG_PATH")
+    if custom:
+        return Path(os.path.expandvars(os.path.expanduser(custom)))
+
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    if local_appdata:
+        return (
+            Path(local_appdata).parent
+            / "LocalLow"
+            / "Wizards Of The Coast"
+            / "MTGA"
+            / "Player.log"
+        )
+
+    userprofile = os.environ.get("USERPROFILE", "")
+    if userprofile:
+        return (
+            Path(userprofile)
+            / "AppData"
+            / "LocalLow"
+            / "Wizards Of The Coast"
+            / "MTGA"
+            / "Player.log"
+        )
+
+    return (
+        Path.home()
+        / "AppData"
+        / "LocalLow"
+        / "Wizards Of The Coast"
+        / "MTGA"
+        / "Player.log"
+    )
+
+
+def is_mtga_running() -> bool:
+    """Return True when MTGA.exe appears to be running."""
+    if os.name != "nt":
+        return False
+
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq MTGA.exe"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return False
+
+    output = f"{result.stdout}\n{result.stderr}"
+    return "MTGA.exe" in output
+
+
+def _env_mb(name: str, default_mb: int) -> int:
+    """Read a positive integer megabyte value from the environment."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default_mb
+    try:
+        value = int(raw)
+    except ValueError:
+        return default_mb
+    return max(0, value)
+
+
+def trim_player_log_if_needed(
+    log_path: Path | None = None,
+    *,
+    max_mb: int | None = None,
+    keep_mb: int | None = None,
+) -> str:
+    """Trim Player.log before launch when it has grown too large.
+
+    Returns a short status string for launcher logging.
+    """
+    if os.environ.get("ARENAMCP_TRIM_PLAYER_LOG", "1").strip().lower() in {"0", "false", "no"}:
+        return "disabled"
+
+    if is_mtga_running():
+        return "skipped: MTGA is running"
+
+    log_path = log_path or get_mtga_log_path()
+    max_mb = _env_mb("ARENAMCP_PLAYER_LOG_MAX_MB", DEFAULT_PLAYER_LOG_MAX_MB) if max_mb is None else max_mb
+    keep_mb = _env_mb("ARENAMCP_PLAYER_LOG_KEEP_MB", DEFAULT_PLAYER_LOG_KEEP_MB) if keep_mb is None else keep_mb
+
+    if max_mb <= 0 or keep_mb <= 0:
+        return "disabled"
+
+    try:
+        if not log_path.exists():
+            return "skipped: log missing"
+
+        file_size = log_path.stat().st_size
+        max_bytes = max_mb * 1024 * 1024
+        keep_bytes = keep_mb * 1024 * 1024
+
+        if file_size <= max_bytes:
+            return f"skipped: {file_size // (1024 * 1024)}MB <= {max_mb}MB"
+
+        keep_bytes = min(keep_bytes, file_size)
+        start_offset = file_size - keep_bytes
+        temp_path = log_path.with_name(log_path.name + ".trimtmp")
+
+        with open(log_path, "rb") as src:
+            src.seek(start_offset)
+            tail = src.read()
+
+        if start_offset > 0:
+            newline_idx = tail.find(b"\n")
+            if newline_idx != -1 and newline_idx + 1 < len(tail):
+                tail = tail[newline_idx + 1 :]
+
+        with open(temp_path, "wb") as dst:
+            dst.write(tail)
+            dst.flush()
+            os.fsync(dst.fileno())
+
+        os.replace(temp_path, log_path)
+        final_bytes = log_path.stat().st_size
+        return (
+            f"trimmed: {file_size // (1024 * 1024)}MB -> "
+            f"{max(1, final_bytes // (1024 * 1024))}MB"
+        )
+    except Exception as exc:
+        try:
+            temp_path.unlink(missing_ok=True)  # type: ignore[name-defined]
+        except Exception:
+            pass
+        return f"failed: {exc}"
 
 
 def run_coach(extra_args=None):
@@ -121,22 +377,30 @@ def main():
                         help="AFK mode - no confirmation before clicks")
     parser.add_argument("--dry-run", action="store_true",
                         help="Dry run - plan actions but don't click")
-    parser.add_argument("args", nargs="*", help="Arguments to pass to coach")
+    # parse_known_args allows forwarding arbitrary standalone flags.
+    args, passthrough = parser.parse_known_args()
 
-    args = parser.parse_args()
+    def append_once(items, value):
+        if value not in items:
+            items.append(value)
 
-    # Build pass-through arguments for the coach subprocess
-    passthrough = list(args.args)
+    # Build pass-through arguments for the coach subprocess.
     if args.autopilot:
-        passthrough.append("--autopilot")
+        append_once(passthrough, "--autopilot")
     if args.afk:
-        passthrough.append("--afk")
+        append_once(passthrough, "--afk")
     if args.dry_run:
-        passthrough.append("--dry-run")
+        append_once(passthrough, "--dry-run")
 
     # Setup file watcher if requested
     observer = None
     check_changed = lambda: False
+    instance_guard = SingleInstanceGuard(LOCK_FILE)
+
+    if not instance_guard.acquire():
+        notify_already_running(instance_guard.describe_owner())
+        return 1
+
     if args.watch:
         observer, check_changed = watch_for_changes()
         if observer:
@@ -148,8 +412,12 @@ def main():
 
     try:
         while True:
+            trim_status = trim_player_log_if_needed()
             clear_screen()
             print_banner(restart_count, autopilot=args.autopilot)
+            if trim_status.startswith("trimmed:"):
+                print(f"[Launcher] Player.log {trim_status}")
+                print()
 
             # Run the coach
             exit_code = run_coach(passthrough)
@@ -190,6 +458,7 @@ def main():
         if observer:
             observer.stop()
             observer.join()
+        instance_guard.release()
 
     print("\nGoodbye!")
     return 0

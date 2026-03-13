@@ -142,6 +142,11 @@ Legacy configuration, still supported. Settings.json takes priority where both e
 | `GEMINI_CLI_CMD` | Path to Gemini CLI | `gemini` |
 | `VOICE_MODE` | Voice input mode (`ptt`/`vox`/`none`) | `ptt` |
 | `MTGA_LOG_PATH` | Custom MTGA log path | auto-detected |
+| `ARENAMCP_TRIM_PLAYER_LOG` | Auto-trim `Player.log` before launcher start when MTGA is not running | `1` |
+| `ARENAMCP_PLAYER_LOG_MAX_MB` | Trim threshold for `Player.log` | `64` |
+| `ARENAMCP_PLAYER_LOG_KEEP_MB` | Tail size preserved during trim | `8` |
+
+The launcher only trims `Player.log` before startup and only when `MTGA.exe` is not already running. It preserves the newest tail of the file and replaces the original atomically.
 
 ### Language Support
 
@@ -215,6 +220,17 @@ Make sure Ollama is running: `ollama serve`
 1. Check the server runs: `python -m arenamcp.server`
 2. Verify path in MCP config
 3. Restart your MCP client after config changes
+
+### MTGA custom logging modes
+MTGA supports command-line flags that change logging behavior. These can break ArenaMCP:
+
+| Flag | Effect | Impact on ArenaMCP |
+|------|--------|--------------------|
+| `-nolog` | Disables Player.log entirely | **ArenaMCP cannot track games** |
+| `-appendlog` | Appends to existing log instead of rotating | Resume after restart may pick up stale data |
+| `-logfile <path>` | Writes to a custom path | Set `MTGA_LOG_PATH` to match |
+
+If ArenaMCP reports "log file not growing" or game state isn't updating, check your MTGA shortcut for these flags. Run `python -m arenamcp.diagnose` to verify your setup.
 
 ## Development
 

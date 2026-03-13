@@ -184,6 +184,10 @@ class GameState:
         # Combat step tracking - captures steps that happen between polls
         # This ensures fast combat phases aren't missed
         self._pending_combat_steps: list[str] = []
+        self._last_combat_step_time: float = 0  # When last combat step was queued
+
+        # Stack update tracking for delay-tolerant clearing
+        self._last_stack_update_time: float = 0  # When stack was last modified
 
         # Untap prevention tracking: instance_ids that MTGA explicitly kept tapped
         # during the untap step (e.g., creatures with Blossombind "can't become untapped").
@@ -256,6 +260,8 @@ class GameState:
         self.played_cards.clear()
         self._seen_instances.clear()
         self._pending_combat_steps.clear()
+        self._last_combat_step_time = 0
+        self._last_stack_update_time = 0
         self._untap_prevention.clear()
         self._in_untap_step = False
         self.pending_decision = None
@@ -386,19 +392,42 @@ class GameState:
             if obj.owner_seat_id == seat_id
         ]
 
-    def _clear_stale_stack(self) -> None:
-        """Clear the stack zone on turn boundaries.
+    # Grace period (seconds) before clearing the stack on phase transitions.
+    # If the stack was modified very recently, the entries might be real
+    # (delayed log flush), not stale ghosts.
+    _STACK_CLEAR_GRACE_S = 2.0
+
+    def _clear_stale_stack(self, force: bool = False) -> None:
+        """Clear the stack zone on turn/phase boundaries.
 
         In Magic, the stack is always empty when a new turn begins.
         MTGA often doesn't send zone updates for resolved triggered/activated
         abilities, leaving ghost entries that cause the formatter to show
         Legal: NONE (can't cast at sorcery speed with non-empty stack).
+
+        Args:
+            force: If True, clear immediately (turn boundaries). If False,
+                   respect grace period for recently-updated stacks (phase transitions).
         """
         for zone in self.zones.values():
             if zone.zone_type == ZoneType.STACK and zone.object_instance_ids:
+                # On phase transitions (not turn boundaries), defer clearing
+                # if the stack was just updated — likely real, not stale.
+                if not force and self._last_stack_update_time:
+                    age = time.time() - self._last_stack_update_time
+                    if age < self._STACK_CLEAR_GRACE_S:
+                        logger.debug(
+                            f"Deferring stack clear — last update {age:.1f}s ago "
+                            f"(grace={self._STACK_CLEAR_GRACE_S}s)"
+                        )
+                        return
+
                 count = len(zone.object_instance_ids)
                 zone.object_instance_ids = []
-                logger.info(f"Cleared {count} stale stack entries on turn change")
+                logger.info(
+                    f"Cleared {count} stale stack entries "
+                    f"({'forced' if force else 'phase transition'})"
+                )
 
     def _cleanup_stale_objects(self) -> None:
         """Remove game objects that are no longer in any zone.
@@ -968,6 +997,10 @@ class GameState:
         self.zones[zone_id] = zone
         logger.debug(f"Updated zone {zone_id} ({zone_type.name})")
 
+        # Track stack update time for delay-tolerant clearing
+        if zone_type == ZoneType.STACK and object_instance_ids:
+            self._last_stack_update_time = time.time()
+
         # Track battlefield entry for summoning sickness
         if zone_type == ZoneType.BATTLEFIELD:
             current_turn = self.turn_info.turn_number
@@ -1472,12 +1505,9 @@ class GameState:
         self.turn_info.active_player = new_active
         self.turn_info.priority_player = turn_data.get("priorityPlayer", self.turn_info.priority_player)
         if turn_changed:
-            # Clear stale stack entries on turn change.
-            # In Magic, the stack is always empty when a new turn begins.
-            # MTGA often doesn't send zone updates to remove resolved abilities
-            # (triggered/activated), leaving ghost entries that cause
-            # Legal: NONE and "pass priority" advice on the player's turn.
-            self._clear_stale_stack()
+            # Clear stale stack entries on turn change (forced — stack is always
+            # empty at turn boundaries in Magic).
+            self._clear_stale_stack(force=True)
             # Turn changed, reset phase/step if not provided (prevent stale phase leakage)
             if "phase" in turn_data:
                 new_phase = turn_data["phase"]
@@ -1510,8 +1540,10 @@ class GameState:
             # Clear stale stack on phase transitions to Main phases.
             # The stack must be empty before any phase change in Magic.
             # Main phases are when advice matters most (cast spells, play lands).
+            # Use grace period: if the stack was just updated, defer clearing
+            # to avoid discarding real entries from delayed log writes.
             if "Main" in new_phase:
-                self._clear_stale_stack()
+                self._clear_stale_stack(force=False)
             # If step is not explicitly in the update AND we didn't just reset it above,
             # we should clear it to avoid stale steps (e.g. Step_Draw in Phase_Main1)
             # But if we just set it to Untap above, keep it.
@@ -1528,6 +1560,7 @@ class GameState:
                     "active_player": self.turn_info.active_player,
                     "turn": new_turn
                 })
+                self._last_combat_step_time = time.time()
                 logger.info(f"Queued combat step: {new_step} (active_player={self.turn_info.active_player})")
 
         self.turn_info.phase = new_phase
@@ -1617,12 +1650,20 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                                     )
                         elif game_state.decision_timestamp:
                             # Decisions without source_id (prompt, scry, etc.):
-                            # clear after 15s — player has certainly responded by then
-                            if decision_age > 15:
+                            # Use longer timeout during combat (complex blocking
+                            # decisions) or when the stack is non-empty (resolving
+                            # triggers may re-prompt). Default: 15s; combat: 25s.
+                            is_busy = (
+                                "Combat" in game_state.turn_info.phase
+                                or len(game_state.stack) > 0
+                            )
+                            no_source_timeout = 25 if is_busy else 15
+                            if decision_age > no_source_timeout:
                                 should_clear = True
                                 logger.info(
                                     f"Auto-clearing stale decision '{game_state.pending_decision}' "
-                                    f"(no source_id, age={decision_age:.0f}s)"
+                                    f"(no source_id, age={decision_age:.0f}s, "
+                                    f"timeout={no_source_timeout}s)"
                                 )
                         if should_clear:
                             game_state.pending_decision = None
@@ -2283,15 +2324,17 @@ MATCH_STATE_MAX_AGE = 1800  # 30 minutes
 def save_match_state(
     game_state: GameState,
     log_offset: int = 0,
+    log_path: Optional[str] = None,
 ) -> None:
     """Save current match state for recovery after restart.
 
-    Writes match_id, local_seat_id, log_offset, turn info, and timestamp
-    to ~/.arenamcp/last_match.json.
+    Writes match_id, local_seat_id, log_offset, log identity metadata,
+    turn info, and timestamp to ~/.arenamcp/last_match.json.
 
     Args:
         game_state: Current GameState instance.
         log_offset: Current file position in the log file.
+        log_path: Path to the log file (for session identity validation on resume).
     """
     if not game_state.match_id:
         return
@@ -2306,6 +2349,20 @@ def save_match_state(
         "status": "active",
     }
 
+    # Attach log identity for session-aware resume validation
+    if log_path:
+        try:
+            log_p = Path(log_path)
+            if log_p.exists():
+                stat = log_p.stat()
+                state["log_identity"] = {
+                    "path": str(log_p),
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                }
+        except OSError:
+            pass
+
     try:
         MATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(MATCH_STATE_PATH, "w", encoding="utf-8") as f:
@@ -2315,12 +2372,99 @@ def save_match_state(
         logger.warning(f"Failed to save match state: {e}")
 
 
+def validate_log_identity(
+    saved_state: dict[str, Any],
+    current_log_path: Optional[str] = None,
+) -> str:
+    """Validate whether saved resume state matches the current log session.
+
+    Compares saved log identity metadata against the current log file to
+    determine if the offset is safe to resume from.
+
+    Args:
+        saved_state: Previously saved match state dict.
+        current_log_path: Path to the current log file.
+
+    Returns:
+        One of:
+        - "resume_same_session": offset is valid, same log session
+        - "fresh_log_after_restart": log was recreated, offset invalid
+        - "resume_invalid_path": log path changed or missing
+        - "resume_no_identity": no log identity saved (legacy state), allow resume
+        - "resume_append_mode_ambiguous": file grew but mtime changed significantly
+    """
+    saved_identity = saved_state.get("log_identity")
+    if not saved_identity:
+        logger.info("No log identity in saved state (legacy format) — allowing resume")
+        return "resume_no_identity"
+
+    if not current_log_path:
+        logger.warning("No current log path provided for identity check")
+        return "resume_invalid_path"
+
+    try:
+        current_path = Path(current_log_path)
+        if not current_path.exists():
+            logger.warning(f"Current log file does not exist: {current_path}")
+            return "resume_invalid_path"
+
+        stat = current_path.stat()
+        saved_path = saved_identity.get("path", "")
+        saved_size = saved_identity.get("size", 0)
+        saved_mtime = saved_identity.get("mtime", 0)
+
+        # Path mismatch (different log file entirely)
+        if str(current_path) != saved_path:
+            logger.info(
+                f"Log path changed: saved={saved_path}, current={current_path}"
+            )
+            return "resume_invalid_path"
+
+        # File is smaller than saved size → file was recreated (MTGA restart)
+        if stat.st_size < saved_size:
+            logger.info(
+                f"Log file shrank: saved_size={saved_size}, current_size={stat.st_size} "
+                "— fresh log after restart"
+            )
+            return "fresh_log_after_restart"
+
+        # mtime jumped significantly backward or forward (>2s tolerance) AND
+        # file is smaller → strong signal of recreation
+        # If file grew and mtime advanced, that's normal append behavior.
+        mtime_delta = abs(stat.st_mtime - saved_mtime)
+
+        # File is same size or larger, mtime advanced normally → same session
+        if stat.st_size >= saved_size and mtime_delta < 300:
+            logger.info(
+                f"Log identity matches: size {saved_size}->{stat.st_size}, "
+                f"mtime delta {mtime_delta:.1f}s — resuming same session"
+            )
+            return "resume_same_session"
+
+        # File grew but mtime jumped a lot — could be appendlog mode
+        if stat.st_size >= saved_size and mtime_delta >= 300:
+            logger.warning(
+                f"Log identity ambiguous: size grew ({saved_size}->{stat.st_size}) "
+                f"but mtime delta is {mtime_delta:.0f}s — possible appendlog mode"
+            )
+            return "resume_append_mode_ambiguous"
+
+        # Default: treat as fresh
+        logger.info("Log identity does not match saved state — treating as fresh")
+        return "fresh_log_after_restart"
+
+    except OSError as e:
+        logger.warning(f"Error checking log identity: {e}")
+        return "resume_invalid_path"
+
+
 def load_match_state() -> Optional[dict[str, Any]]:
     """Load saved match state if valid (< 30 min old, status active).
 
     Returns:
         Dict with match_id, local_seat_id, log_offset, turn_number, phase,
-        timestamp, status. Or None if no valid state exists.
+        timestamp, status, and optionally log_identity. Or None if no valid
+        state exists.
     """
     if not MATCH_STATE_PATH.exists():
         return None
