@@ -915,6 +915,7 @@ def get_game_state() -> dict[str, Any]:
     decision_context = snap.get("decision_context")
     if decision_context is not None:
         decision_context = copy.deepcopy(decision_context)
+    legal_actions_raw = copy.deepcopy(snap.get("legal_actions_raw", []))
 
     return {
         "match_id": snap.get("match_id"),
@@ -928,6 +929,8 @@ def get_game_state() -> dict[str, Any]:
         "command": command,
         "pending_decision": snap.get("pending_decision") if decision_seat_id == local_seat_id else None,
         "decision_context": decision_context if decision_seat_id == local_seat_id else None,
+        "legal_actions": list(snap.get("legal_actions", [])),
+        "legal_actions_raw": legal_actions_raw,
         "deck_cards": list(snap.get("deck_cards", [])),
         "damage_taken": dict(snap.get("damage_taken", {})),
     }

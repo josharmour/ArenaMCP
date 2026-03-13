@@ -17,6 +17,74 @@ from typing import Any, Optional, Protocol
 logger = logging.getLogger(__name__)
 
 
+def _compact_gre_target(target: Any) -> Any:
+    """Reduce GRE target payloads to compact prompt-friendly fields."""
+    if not isinstance(target, dict):
+        return target
+
+    compact = {}
+    for key in ("targetType", "instanceId", "grpId", "zoneId", "seatId", "selection", "index"):
+        value = target.get(key)
+        if value not in (None, "", [], {}):
+            compact[key] = value
+    return compact or target
+
+
+def _compact_legal_action_for_prompt(action: Any) -> Any:
+    """Reduce raw GRE legal actions to the fields most useful to the model."""
+    if not isinstance(action, dict):
+        return action
+
+    compact = {}
+    for key in (
+        "actionType",
+        "grpId",
+        "instanceId",
+        "abilityGrpId",
+        "sourceId",
+        "alternativeGrpId",
+        "selectionType",
+        "selection",
+        "shouldStop",
+        "maxActivations",
+        "isBatchable",
+        "highlight",
+    ):
+        value = action.get(key)
+        if value not in (None, "", [], {}):
+            compact[key] = value
+
+    targets = action.get("targets")
+    if isinstance(targets, list) and targets:
+        compact["targets"] = [_compact_gre_target(t) for t in targets[:4]]
+
+    mana_options = action.get("manaPaymentOptions")
+    if isinstance(mana_options, list) and mana_options:
+        compact["manaPaymentOptionsCount"] = len(mana_options)
+
+    costs = action.get("costs")
+    if isinstance(costs, list) and costs:
+        compact["costCount"] = len(costs)
+
+    return compact or action
+
+
+def _format_legal_actions_raw_for_prompt(
+    actions: list[dict[str, Any]],
+    max_actions: int = 12,
+) -> str:
+    """Format raw GRE legal actions compactly for prompt context."""
+    if not actions:
+        return "[]"
+
+    compact_actions = [
+        _compact_legal_action_for_prompt(action)
+        for action in actions[:max_actions]
+    ]
+    suffix = " …" if len(actions) > max_actions else ""
+    return json.dumps(compact_actions, separators=(",", ":")) + suffix
+
+
 # LLM Backend Protocol and Implementations
 
 
@@ -683,7 +751,7 @@ class CodexCliBackend:
         combined = (
             f"SYSTEM INSTRUCTIONS:\n{system_prompt}\n\nUSER MESSAGE:\n{user_message}"
         )
-        args = self._build_args()
+        args = self._build_args() + ["exec"]
         if self.model:
             args += ["--model", self.model]
 
@@ -711,15 +779,14 @@ class CodexCliBackend:
             if os.name == "nt":
                 creationflags = subprocess.CREATE_NO_WINDOW
 
-            # Compatibility matrix across Codex CLI variants:
-            # - Some support `-q -` (stdin)
-            # - Some support `-q <prompt>`
-            # - Some reject `-q` entirely and accept stdin/plain args only
+            # Use the supported non-interactive Codex CLI interface.
+            # `codex exec` accepts either:
+            # - `-` to read the prompt from stdin
+            # - a positional prompt argument
             attempts: list[tuple[list[str], Optional[str], str]] = [
-                (args + ["-q", "-"], combined, "q-stdin"),
-                (args + ["-q", combined], None, "q-inline"),
-                (args + [combined], None, "positional-prompt"),
-                (args, combined, "stdin-no-flag"),
+                (args + ["-"], combined, "exec-stdin"),
+                (args + [combined], None, "exec-inline"),
+                (args, combined, "exec-implicit-stdin"),
             ]
 
             errors: list[str] = []
@@ -1983,6 +2050,12 @@ class CoachEngine:
             match_tag = f" [Match #{match_num} id={short_id}]"
         lines.append(f"=== NEW GAME ==={match_tag}" if turn_num <= 1 and match_tag else f"=== GAME ==={match_tag}")
         lines.append(f"Legal: {valid_moves_str}")
+        raw_legal_actions = game_state.get("legal_actions_raw") or []
+        if raw_legal_actions:
+            lines.append(
+                "LegalGRE: "
+                + _format_legal_actions_raw_for_prompt(raw_legal_actions)
+            )
 
         # POST-LAND PLANNING: When land drop is available, show what spells
         # become castable after playing each land. This lets the LLM give
@@ -4331,6 +4404,36 @@ class CoachEngine:
         # Clean up double spaces
         advice = re.sub(r"\s+", " ", advice).strip()
 
+        def _augment_legal_actions_from_decision_context(
+            actions: list[str],
+        ) -> list[str]:
+            """Add high-signal combat actions from decision context when missing.
+
+            RulesEngine legal actions can lag behind GRE decision context during
+            declare-attack/block windows. In those states, prefer the concrete
+            attacker/blocker sets from decision_context over generic activate/cast
+            options so fallback advice remains action-appropriate.
+            """
+            augmented = list(actions)
+            decision_context = game_state.get("decision_context") or {}
+            dec_type = str(decision_context.get("type", "") or "").lower()
+
+            if dec_type == "declare_attackers":
+                legal_attackers = decision_context.get("legal_attackers") or []
+                if legal_attackers:
+                    attack_action = f"Declare Attackers: {', '.join(legal_attackers)}"
+                    if all(a.lower() != attack_action.lower() for a in augmented):
+                        augmented.append(attack_action)
+
+            if dec_type == "declare_blockers":
+                legal_blockers = decision_context.get("legal_blockers") or []
+                if legal_blockers:
+                    block_action = f"Block with: {', '.join(legal_blockers)}"
+                    if all(a.lower() != block_action.lower() for a in augmented):
+                        augmented.append(block_action)
+
+            return augmented
+
         # 5. Enforce Legal actions only (hard filter)
         # MULLIGAN OVERRIDE: During mulligan, RulesEngine returns "Wait (Opponent
         # has priority)" because priority_player != local_seat. Override here just
@@ -4346,6 +4449,7 @@ class CoachEngine:
                 from arenamcp.rules_engine import RulesEngine
 
                 legal_actions = RulesEngine.get_legal_actions(game_state) or []
+                legal_actions = _augment_legal_actions_from_decision_context(legal_actions)
             except Exception as e:
                 logger.warning(f"RulesEngine error in postprocess: {e}")
                 legal_actions = []
@@ -4375,6 +4479,8 @@ class CoachEngine:
                     and "declareattack" in step
                 ):
                     score += 90
+                if "declare attackers" in act and "declare attackers" in pending_decision:
+                    score += 120
                 if "block with" in act and "combat" in phase and "declareblock" in step:
                     score += 120
                 if "block with" in act and "declare blockers" in pending_decision:

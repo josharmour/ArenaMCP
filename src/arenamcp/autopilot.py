@@ -28,6 +28,20 @@ from typing import Union
 logger = logging.getLogger(__name__)
 
 
+class ExecutionPath:
+    """Tracks which execution path was used for an action.
+
+    gre-aware: Action has a GRE action reference (direct GRE command).
+    deterministic-geometry: Coordinates resolved via deterministic math
+        (arc-based hand layout, permanent heuristic, or fixed button coords).
+    vision-fallback: Coordinates resolved via VLM screenshot analysis
+        (used only when deterministic lookup fails).
+    """
+    GRE_AWARE = "gre-aware"
+    DETERMINISTIC_GEOMETRY = "deterministic-geometry"
+    VISION_FALLBACK = "vision-fallback"
+
+
 class AutopilotState(Enum):
     """Current state of the autopilot engine."""
     IDLE = "idle"
@@ -53,6 +67,7 @@ class AutopilotConfig:
     post_action_delay: float = 1.5  # Delay after action to allow GRE to update
     planning_timeout: float = 15.0
     enable_vision_fallback: bool = True
+    prefer_deterministic: bool = True  # When True, skip VLM for actions that have deterministic coordinates
     enable_tts_preview: bool = True
     dry_run: bool = False
     afk_mode: bool = False  # When True, auto-pass everything without LLM
@@ -118,6 +133,9 @@ class AutopilotEngine:
 
         # Vision scan: track if mapper supports layout scanning
         self._has_vision_scan = hasattr(self._mapper, 'scan_layout')
+
+        # Execution path tracking
+        self._path_stats: dict[str, int] = {}
 
     @property
     def afk_mode(self) -> bool:
@@ -209,6 +227,16 @@ class AutopilotEngine:
             "skipped": self._actions_skipped,
             "plans": self._plans_completed,
         }
+
+    @property
+    def path_stats(self) -> dict[str, int]:
+        """Execution path usage statistics."""
+        return dict(self._path_stats)
+
+    def _log_execution_path(self, path: str, action_desc: str) -> None:
+        """Log which execution path was used for an action."""
+        logger.info(f"[{path}] {action_desc}")
+        self._path_stats[path] = self._path_stats.get(path, 0) + 1
 
     def on_spacebar(self) -> None:
         """Handle spacebar press (confirm current action/plan)."""
@@ -950,6 +978,14 @@ class AutopilotEngine:
         Returns:
             ClickResult from the execution.
         """
+        # Check for GRE action reference (Phase 1 adds gre_action_ref to GameAction)
+        gre_ref = getattr(action, 'gre_action_ref', None)
+        if gre_ref is not None:
+            self._log_execution_path(
+                ExecutionPath.GRE_AWARE,
+                f"{action.action_type.value}: {action.card_name or action} (gre_ref={gre_ref})"
+            )
+
         handlers = {
             ActionType.PASS_PRIORITY: self._exec_pass_priority,
             ActionType.RESOLVE: self._exec_resolve,
@@ -1003,15 +1039,18 @@ class AutopilotEngine:
 
     def _exec_pass_priority(self) -> ClickResult:
         """Click the pass/resolve button."""
+        self._log_execution_path(ExecutionPath.DETERMINISTIC_GEOMETRY, "pass_priority: fixed button")
         return self._click_fixed("pass")
 
     def _exec_resolve(self) -> ClickResult:
         """Click the resolve button."""
+        self._log_execution_path(ExecutionPath.DETERMINISTIC_GEOMETRY, "resolve: fixed button")
         return self._click_fixed("resolve")
 
     def _exec_click_button(self, action: GameAction) -> ClickResult:
         """Click a named button."""
         button_name = action.card_name.lower().replace(" ", "_")
+        self._log_execution_path(ExecutionPath.DETERMINISTIC_GEOMETRY, f"click_button: {button_name} (fixed coords)")
         # Fallback for common MTGA action buttons that might be named differently by the LLM
         if button_name in ("next", "attack", "all_attack", "done", "no_attacks", "no_blocks"):
             return self._click_fixed("pass") # They all share the same spot
@@ -1025,6 +1064,10 @@ class AutopilotEngine:
         Lands are dragged from hand to the battlefield land row (y ≈ 0.75)
         because MTGA requires a drag gesture to play them. Spells are
         clicked normally (MTGA auto-casts on click).
+
+        Coordinate resolution priority:
+        1. Deterministic arc-based hand geometry
+        2. Vision fallback (only if deterministic fails and vision is enabled)
         """
         hand = game_state.get("hand", [])
         hand_names = [c.get("name", "???") for c in hand]
@@ -1034,11 +1077,23 @@ class AutopilotEngine:
         )
         coord = self._mapper.get_card_in_hand_coord(action.card_name, hand, game_state)
 
-        if not coord:
-            # Vision fallback
-            if self._config.enable_vision_fallback:
+        if coord:
+            self._log_execution_path(
+                ExecutionPath.DETERMINISTIC_GEOMETRY,
+                f"play_card: '{action.card_name}' found via arc-based hand lookup"
+            )
+        else:
+            # Vision fallback — only if deterministic fails
+            if self._config.enable_vision_fallback and not (
+                self._config.prefer_deterministic and getattr(action, 'gre_action_ref', None) is not None
+            ):
                 logger.info(f"Trying vision fallback for '{action.card_name}'")
                 coord = self._get_vision_coord(action.card_name, zone="hand")
+                if coord:
+                    self._log_execution_path(
+                        ExecutionPath.VISION_FALLBACK,
+                        f"play_card: '{action.card_name}' found via vision"
+                    )
 
             if not coord:
                 return ClickResult(False, 0, 0, action.card_name, "Card not found in hand (Heuristic & Vision failed)")
@@ -1067,7 +1122,12 @@ class AutopilotEngine:
     def _exec_activate_ability(
         self, action: GameAction, game_state: dict[str, Any]
     ) -> ClickResult:
-        """Click a permanent on the battlefield to activate its ability."""
+        """Click a permanent on the battlefield to activate its ability.
+
+        Coordinate resolution priority:
+        1. Deterministic heuristic (permanent grid position)
+        2. Vision fallback (only if deterministic fails and vision is enabled)
+        """
         battlefield = game_state.get("battlefield", [])
         local_seat = None
         for p in game_state.get("players", []):
@@ -1077,15 +1137,29 @@ class AutopilotEngine:
         if not local_seat:
             return ClickResult(False, 0, 0, action.card_name, "Local seat not found")
 
+        # Try instance_id lookup if available from GRE context
+        instance_id = self._find_instance_id(action.card_name, battlefield, local_seat)
         coord = self._mapper.get_permanent_coord(
-            action.card_name, None, battlefield, local_seat, local_seat
+            action.card_name, instance_id, battlefield, local_seat, local_seat
         )
 
-        if not coord:
-            # Vision fallback
-            if self._config.enable_vision_fallback:
+        if coord:
+            self._log_execution_path(
+                ExecutionPath.DETERMINISTIC_GEOMETRY,
+                f"activate_ability: '{action.card_name}' found via heuristic lookup"
+            )
+        else:
+            # Vision fallback — only if deterministic fails
+            if self._config.enable_vision_fallback and not (
+                self._config.prefer_deterministic and getattr(action, 'gre_action_ref', None) is not None
+            ):
                 logger.info(f"Trying vision fallback for board permanent '{action.card_name}'")
                 coord = self._get_vision_coord(action.card_name, zone="battlefield_yours")
+                if coord:
+                    self._log_execution_path(
+                        ExecutionPath.VISION_FALLBACK,
+                        f"activate_ability: '{action.card_name}' found via vision"
+                    )
 
             if not coord:
                 return ClickResult(False, 0, 0, action.card_name, "Permanent not found on battlefield (Heuristic & Vision failed)")
@@ -1102,7 +1176,16 @@ class AutopilotEngine:
     def _exec_declare_attackers(
         self, action: GameAction, game_state: dict[str, Any]
     ) -> ClickResult:
-        """Click each attacking creature, then click Done."""
+        """Click each attacking creature, then click Done.
+
+        When instance_ids are available from the decision context, uses them
+        for more reliable coordinate lookup.
+        """
+        # Log GRE action reference if present
+        gre_ref = getattr(action, 'gre_action_ref', None)
+        if gre_ref is not None:
+            logger.info(f"declare_attackers: GRE action ref type={type(gre_ref).__name__}, value={gre_ref}")
+
         battlefield = game_state.get("battlefield", [])
         local_seat = None
         for p in game_state.get("players", []):
@@ -1118,13 +1201,26 @@ class AutopilotEngine:
         if not window_rect:
             return ClickResult(False, 0, 0, "attackers", "MTGA window not found")
 
+        # Build name -> instance_id mapping from decision context if available
+        attacker_id_map = self._build_attacker_id_map(game_state)
+
         last_result = ClickResult(True, 0, 0, "attackers")
 
         for attacker_name in action.attacker_names:
+            # Prefer instance_id lookup from decision context
+            instance_id = attacker_id_map.get(attacker_name)
+            if instance_id is None:
+                # Fallback: search battlefield for matching name
+                instance_id = self._find_instance_id(attacker_name, battlefield, local_seat)
+
             coord = self._mapper.get_permanent_coord(
-                attacker_name, None, battlefield, local_seat, local_seat
+                attacker_name, instance_id, battlefield, local_seat, local_seat
             )
             if coord:
+                self._log_execution_path(
+                    ExecutionPath.DETERMINISTIC_GEOMETRY,
+                    f"declare_attackers: '{attacker_name}' (instance_id={instance_id})"
+                )
                 abs_x, abs_y = coord.to_absolute(window_rect)
                 result = self._controller.click(
                     abs_x, abs_y, f"Attack: {attacker_name}", window_rect
@@ -1132,7 +1228,25 @@ class AutopilotEngine:
                 if not result.success:
                     logger.warning(f"Failed to click attacker {attacker_name}")
                 last_result = result
-                self._controller.wait(self._config.action_delay, "between attacker clicks")
+            else:
+                # Vision fallback for attackers
+                if self._config.enable_vision_fallback:
+                    coord = self._get_vision_coord(attacker_name, zone="battlefield_yours")
+                    if coord:
+                        self._log_execution_path(
+                            ExecutionPath.VISION_FALLBACK,
+                            f"declare_attackers: '{attacker_name}' found via vision"
+                        )
+                        abs_x, abs_y = coord.to_absolute(window_rect)
+                        result = self._controller.click(
+                            abs_x, abs_y, f"Attack: {attacker_name}", window_rect
+                        )
+                        last_result = result
+                    else:
+                        logger.warning(f"Failed to find attacker {attacker_name} (heuristic & vision)")
+                else:
+                    logger.warning(f"Failed to find attacker {attacker_name} (heuristic only, vision disabled)")
+            self._controller.wait(self._config.action_delay, "between attacker clicks")
 
         # Click Done
         self._controller.wait(0.3, "before Done")
@@ -1142,7 +1256,16 @@ class AutopilotEngine:
     def _exec_declare_blockers(
         self, action: GameAction, game_state: dict[str, Any]
     ) -> ClickResult:
-        """Click blocker, then click attacker it should block, then Done."""
+        """Click blocker, then click attacker it should block, then Done.
+
+        When instance_ids are available from the decision context, uses them
+        for more reliable coordinate lookup.
+        """
+        # Log GRE action reference if present
+        gre_ref = getattr(action, 'gre_action_ref', None)
+        if gre_ref is not None:
+            logger.info(f"declare_blockers: GRE action ref type={type(gre_ref).__name__}, value={gre_ref}")
+
         battlefield = game_state.get("battlefield", [])
         local_seat = None
         opp_seat = None
@@ -1161,29 +1284,67 @@ class AutopilotEngine:
         if not window_rect:
             return ClickResult(False, 0, 0, "blockers", "MTGA window not found")
 
+        # Build name -> instance_id mapping from decision context if available
+        blocker_id_map = self._build_blocker_id_map(game_state)
+
         last_result = ClickResult(True, 0, 0, "blockers")
 
         for blocker_name, attacker_name in action.blocker_assignments.items():
-            # Click the blocker (our creature)
+            # Click the blocker (our creature) — prefer instance_id lookup
+            blocker_instance_id = blocker_id_map.get(blocker_name)
+            if blocker_instance_id is None:
+                blocker_instance_id = self._find_instance_id(blocker_name, battlefield, local_seat)
+
             blocker_coord = self._mapper.get_permanent_coord(
-                blocker_name, None, battlefield, local_seat, local_seat
+                blocker_name, blocker_instance_id, battlefield, local_seat, local_seat
             )
             if blocker_coord:
+                self._log_execution_path(
+                    ExecutionPath.DETERMINISTIC_GEOMETRY,
+                    f"declare_blockers: blocker '{blocker_name}' (instance_id={blocker_instance_id})"
+                )
                 bx, by = blocker_coord.to_absolute(window_rect)
                 self._controller.click(bx, by, f"Blocker: {blocker_name}", window_rect)
                 self._controller.wait(0.2, "blocker selected")
+            elif self._config.enable_vision_fallback:
+                coord = self._get_vision_coord(blocker_name, zone="battlefield_yours")
+                if coord:
+                    self._log_execution_path(
+                        ExecutionPath.VISION_FALLBACK,
+                        f"declare_blockers: blocker '{blocker_name}' found via vision"
+                    )
+                    bx, by = coord.to_absolute(window_rect)
+                    self._controller.click(bx, by, f"Blocker: {blocker_name}", window_rect)
+                    self._controller.wait(0.2, "blocker selected")
 
-            # Click the attacker (opponent's creature)
+            # Click the attacker (opponent's creature) — use instance_id if available
+            attacker_instance_id = self._find_instance_id(attacker_name, battlefield, opp_seat)
             attacker_coord = self._mapper.get_permanent_coord(
-                attacker_name, None, battlefield, opp_seat, local_seat
+                attacker_name, attacker_instance_id, battlefield, opp_seat, local_seat
             )
             if attacker_coord:
+                self._log_execution_path(
+                    ExecutionPath.DETERMINISTIC_GEOMETRY,
+                    f"declare_blockers: attacker '{attacker_name}' (instance_id={attacker_instance_id})"
+                )
                 ax, ay = attacker_coord.to_absolute(window_rect)
                 result = self._controller.click(
                     ax, ay, f"Block {attacker_name} with {blocker_name}", window_rect
                 )
                 last_result = result
-                self._controller.wait(self._config.action_delay, "between block assignments")
+            elif self._config.enable_vision_fallback:
+                coord = self._get_vision_coord(attacker_name, zone="battlefield_opponent")
+                if coord:
+                    self._log_execution_path(
+                        ExecutionPath.VISION_FALLBACK,
+                        f"declare_blockers: attacker '{attacker_name}' found via vision"
+                    )
+                    ax, ay = coord.to_absolute(window_rect)
+                    result = self._controller.click(
+                        ax, ay, f"Block {attacker_name} with {blocker_name}", window_rect
+                    )
+                    last_result = result
+            self._controller.wait(self._config.action_delay, "between block assignments")
 
         # Click Done
         self._controller.wait(0.3, "before Done")
@@ -1193,9 +1354,20 @@ class AutopilotEngine:
     def _exec_select_target(
         self, action: GameAction, game_state: dict[str, Any]
     ) -> ClickResult:
-        """Click on a target permanent or player."""
+        """Click on a target permanent or player.
+
+        Coordinate resolution priority:
+        1. Instance_id-based deterministic lookup (if available from GRE context)
+        2. Name-based deterministic heuristic lookup
+        3. Vision fallback (if both above fail)
+        """
         if not action.target_names:
             return ClickResult(False, 0, 0, "target", "No target specified")
+
+        # Log GRE action reference if present
+        gre_ref = getattr(action, 'gre_action_ref', None)
+        if gre_ref is not None:
+            logger.info(f"select_target: GRE action ref type={type(gre_ref).__name__}, value={gre_ref}")
 
         target_name = action.target_names[0]
         battlefield = game_state.get("battlefield", [])
@@ -1215,14 +1387,32 @@ class AutopilotEngine:
         if not window_rect:
             return ClickResult(False, 0, 0, target_name, "MTGA window not found")
 
-        # Search both sides of the battlefield
+        # Search both sides of the battlefield, using instance_id when available
         for owner in [opp_seat, local_seat]:
             if owner is None:
                 continue
+            instance_id = self._find_instance_id(target_name, battlefield, owner)
             coord = self._mapper.get_permanent_coord(
-                target_name, None, battlefield, owner, local_seat
+                target_name, instance_id, battlefield, owner, local_seat
             )
             if coord:
+                self._log_execution_path(
+                    ExecutionPath.DETERMINISTIC_GEOMETRY,
+                    f"select_target: '{target_name}' (owner={owner}, instance_id={instance_id})"
+                )
+                abs_x, abs_y = coord.to_absolute(window_rect)
+                return self._controller.click(
+                    abs_x, abs_y, f"Target: {target_name}", window_rect
+                )
+
+        # Vision fallback for targets
+        if self._config.enable_vision_fallback:
+            coord = self._get_vision_coord(target_name, zone="battlefield")
+            if coord:
+                self._log_execution_path(
+                    ExecutionPath.VISION_FALLBACK,
+                    f"select_target: '{target_name}' found via vision"
+                )
                 abs_x, abs_y = coord.to_absolute(window_rect)
                 return self._controller.click(
                     abs_x, abs_y, f"Target: {target_name}", window_rect
@@ -1292,7 +1482,9 @@ class AutopilotEngine:
 
     def _exec_mulligan(self, keep: bool) -> ClickResult:
         """Click Keep or Mulligan button."""
-        return self._click_fixed("keep" if keep else "mulligan")
+        choice = "keep" if keep else "mulligan"
+        self._log_execution_path(ExecutionPath.DETERMINISTIC_GEOMETRY, f"mulligan: {choice} (fixed coords)")
+        return self._click_fixed(choice)
 
     def _exec_draft_pick(
         self, action: GameAction, game_state: dict[str, Any]
@@ -1340,6 +1532,7 @@ class AutopilotEngine:
 
     def _exec_done_action(self, decision_name: str) -> ClickResult:
         """Generic handler for decisions that just need a Done click after MTGA auto-selects."""
+        self._log_execution_path(ExecutionPath.DETERMINISTIC_GEOMETRY, f"done_action: {decision_name} (fixed coords)")
         logger.info(f"{decision_name}: accepting default / clicking Done")
         result = self._click_fixed("done")
         if not result.success:
@@ -1375,6 +1568,74 @@ class AutopilotEngine:
                 return self._controller.click(abs_x, abs_y, "Choose: Play", window_rect)
         # Last fallback
         return self._click_fixed("pass")
+
+    # --- Instance ID Helpers ---
+
+    def _find_instance_id(
+        self, card_name: str, battlefield: list[dict[str, Any]], owner_seat: int
+    ) -> Optional[int]:
+        """Find the instance_id of a card on the battlefield by name and owner.
+
+        Searches battlefield entries for a card matching the given name and
+        owner seat, returning its instance_id for more reliable coordinate
+        lookup.
+
+        Args:
+            card_name: Card name to search for.
+            battlefield: List of battlefield card dicts.
+            owner_seat: Owner seat_id to filter by.
+
+        Returns:
+            instance_id if found, None otherwise.
+        """
+        card_lower = card_name.lower()
+        for card in battlefield:
+            if card.get("owner_seat_id") != owner_seat:
+                continue
+            name = card.get("name", "")
+            if name.lower() == card_lower:
+                return card.get("instance_id")
+        return None
+
+    def _build_attacker_id_map(self, game_state: dict[str, Any]) -> dict[str, int]:
+        """Build a name -> instance_id map from the attacker decision context.
+
+        Uses legal_attacker_ids from the decision context (if available) paired
+        with legal_attackers names to create a reliable mapping.
+
+        Returns:
+            Dict mapping card name -> instance_id.
+        """
+        decision = game_state.get("decision_context") or {}
+        if decision.get("type") != "declare_attackers":
+            return {}
+
+        names = decision.get("legal_attackers", [])
+        ids = decision.get("legal_attacker_ids", [])
+        if len(names) != len(ids) or not ids:
+            return {}
+
+        return dict(zip(names, ids))
+
+    def _build_blocker_id_map(self, game_state: dict[str, Any]) -> dict[str, int]:
+        """Build a name -> instance_id map from the blocker decision context.
+
+        Uses legal_blocker_ids from the decision context (if available) paired
+        with legal_blockers names to create a reliable mapping.
+
+        Returns:
+            Dict mapping card name -> instance_id.
+        """
+        decision = game_state.get("decision_context") or {}
+        if decision.get("type") != "declare_blockers":
+            return {}
+
+        names = decision.get("legal_blockers", [])
+        ids = decision.get("legal_blocker_ids", [])
+        if len(names) != len(ids) or not ids:
+            return {}
+
+        return dict(zip(names, ids))
 
     # --- State Verification ---
 

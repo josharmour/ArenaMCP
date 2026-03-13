@@ -1,4 +1,7 @@
 import subprocess
+from types import SimpleNamespace
+
+import pytest
 
 import arenamcp.standalone as standalone
 from arenamcp.standalone import StandaloneCoach
@@ -186,3 +189,65 @@ def test_init_mcp_starts_background_cache_warmup(monkeypatch):
     assert isinstance(coach._mcp, _FakeMCPClient)
     assert thread_events[0] == ("init", coach._warm_local_card_caches, True, "card-cache-warm")
     assert thread_events[1] == ("start", coach._warm_local_card_caches)
+
+
+def test_has_explicit_game_end_evidence_true_for_persistent_result(monkeypatch):
+    fake_gs = SimpleNamespace(
+        game_ended_event=SimpleNamespace(is_set=lambda: False),
+        last_game_result="win",
+        _pre_reset_snapshot=None,
+    )
+    fake_server = SimpleNamespace(game_state=fake_gs)
+    monkeypatch.setattr(standalone.importlib, "import_module", lambda name: fake_server)
+
+    coach = StandaloneCoach.__new__(StandaloneCoach)
+
+    assert coach._has_explicit_game_end_evidence() is True
+
+
+def test_has_explicit_game_end_evidence_false_without_signal(monkeypatch):
+    fake_gs = SimpleNamespace(
+        game_ended_event=SimpleNamespace(is_set=lambda: False),
+        last_game_result=None,
+        _pre_reset_snapshot=None,
+    )
+    fake_server = SimpleNamespace(game_state=fake_gs)
+    monkeypatch.setattr(standalone.importlib, "import_module", lambda name: fake_server)
+
+    coach = StandaloneCoach.__new__(StandaloneCoach)
+
+    assert coach._has_explicit_game_end_evidence() is False
+
+
+def test_tui_adapter_safe_call_noops_when_app_not_running():
+    tui_mod = pytest.importorskip("arenamcp.tui")
+
+    class _FakeApp:
+        is_running = False
+        _thread_id = 0
+
+        def call_from_thread(self, method, *args, **kwargs):
+            raise AssertionError("call_from_thread should not be used when app is stopped")
+
+    adapter = tui_mod.TUIAdapter(_FakeApp())
+
+    adapter.log("hello")
+    adapter.status("ANALYSIS", "done")
+
+
+def test_tui_adapter_safe_call_swallows_app_not_running_runtimeerror():
+    tui_mod = pytest.importorskip("arenamcp.tui")
+
+    class _FakeApp:
+        is_running = True
+        _thread_id = 0
+
+        def call_from_thread(self, method, *args, **kwargs):
+            raise RuntimeError("App is not running")
+
+        def write_log(self, message):
+            raise AssertionError("write_log should not be called directly in this test")
+
+    adapter = tui_mod.TUIAdapter(_FakeApp())
+
+    adapter.log("hello")

@@ -208,11 +208,31 @@ class OllamaVLM:
                 data = json.loads(resp.read())
                 models = [m.get("name", "") for m in data.get("models", [])]
                 # Check if our model (or a prefix of it) is available
-                self._available = any(
-                    self.model in m or m.startswith(self.model.split(":")[0])
-                    for m in models
-                )
-                if not self._available:
+                prefix = self.model.split(":")[0]
+                matched = None
+                for m in models:
+                    if self.model in m or m.startswith(prefix):
+                        matched = m
+                        break
+                # Fuzzy: strip hyphens to handle naming variants
+                # e.g. "qwen2.5-vl:3b" matches "qwen2.5vl:3b"
+                if matched is None:
+                    norm = self.model.replace("-", "")
+                    norm_prefix = prefix.replace("-", "")
+                    for m in models:
+                        mn = m.replace("-", "")
+                        if norm in mn or mn.startswith(norm_prefix):
+                            matched = m
+                            break
+                if matched:
+                    if matched != self.model:
+                        logger.info(
+                            f"Ollama model '{self.model}' resolved to '{matched}'"
+                        )
+                        self.model = matched
+                    self._available = True
+                else:
+                    self._available = False
                     logger.warning(
                         f"Ollama model '{self.model}' not found. "
                         f"Available: {models}. Run: ollama pull {self.model}"

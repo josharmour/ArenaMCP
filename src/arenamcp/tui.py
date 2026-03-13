@@ -147,8 +147,16 @@ class TextualLogHandler(logging.Handler):
             msg = self.format(record)
             # We must schedule the write on the main thread
             # .write() on RichLog is thread-safe in Textual (mostly), but better explicit
-            if hasattr(self.widget, 'app') and self.widget.app:
+            if (
+                hasattr(self.widget, 'app')
+                and self.widget.app
+                and getattr(self.widget.app, "is_running", False)
+            ):
                 self.widget.app.call_from_thread(self.widget.write, msg)
+        except RuntimeError as e:
+            if "App is not running" in str(e):
+                return
+            self.handleError(record)
         except Exception:
             self.handleError(record)
 
@@ -157,20 +165,36 @@ class TUIAdapter(UIAdapter):
     def __init__(self, app: "ArenaApp"):
         self.app = app
 
+    @staticmethod
+    def _is_app_not_running_error(exc: Exception) -> bool:
+        return isinstance(exc, RuntimeError) and "App is not running" in str(exc)
+
     def _safe_call(self, method, *args, **kwargs):
-        """Invoke method on main thread, safely handling if we are already there."""
+        """Invoke method on main thread, skipping calls after app shutdown."""
         # Textual apps primarily run on the main thread (usually)
         # We can check if we are in the same thread as the app loop
         try:
-             # accessing private _thread_id is risky but standard in Textual hacking
-             # better to just try/except or check threading
-             if threading.get_ident() == self.app._thread_id:
-                 method(*args, **kwargs)
-             else:
-                 self.app.call_from_thread(method, *args, **kwargs)
-        except Exception:
-             # Fallback if _thread_id missing or other error
-             self.app.call_from_thread(method, *args, **kwargs)
+            # If Textual is already torn down, background workers should noop.
+            if not getattr(self.app, "is_running", False):
+                return
+
+            # accessing private _thread_id is risky but standard in Textual hacking
+            # better to just try/except or check threading
+            if threading.get_ident() == self.app._thread_id:
+                method(*args, **kwargs)
+            else:
+                self.app.call_from_thread(method, *args, **kwargs)
+        except Exception as e:
+            if self._is_app_not_running_error(e):
+                return
+            try:
+                if not getattr(self.app, "is_running", False):
+                    return
+                self.app.call_from_thread(method, *args, **kwargs)
+            except Exception as inner:
+                if self._is_app_not_running_error(inner):
+                    return
+                raise
 
     def log(self, message: str) -> None:
         self._safe_call(self.app.write_log, message)

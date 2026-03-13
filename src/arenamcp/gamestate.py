@@ -202,7 +202,8 @@ class GameState:
         self.decision_context: Optional[dict] = None  # Rich context: source_card, options, etc.
         self.decision_timestamp: float = 0  # Track when decision was set
         self.last_cleared_decision: Optional[str] = None  # For watchdog validation
-        self.legal_actions: list[str] = [] # List of exact legal actions from GRE
+        self.legal_actions: list[str] = [] # Human-readable legal actions from GRE
+        self.legal_actions_raw: list[dict[str, Any]] = []  # Raw GRE ActionsAvailableReq action payloads
 
         # Match tracking (to avoid stale state across matches)
         self.match_id: Optional[str] = None
@@ -269,6 +270,7 @@ class GameState:
         self.decision_context = None
         self.decision_timestamp = 0
         self.legal_actions = []
+        self.legal_actions_raw = []
         self.deck_cards = []
         self.recent_events = []
         self.damage_taken = {}
@@ -539,6 +541,7 @@ class GameState:
             "decision_context": self.decision_context,
             "last_cleared_decision": self.last_cleared_decision,
             "legal_actions": list(self.legal_actions),
+            "legal_actions_raw": copy.deepcopy(self.legal_actions_raw),
             "pending_combat_steps": self._pending_combat_steps.copy(),
             "recent_events": self.recent_events[-10:],
             "damage_taken": dict(self.damage_taken),
@@ -1892,6 +1895,7 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                 # This is the "Ground Truth" for the autopilot.
                 req = msg.get("actionsAvailableReq", {})
                 raw_actions = req.get("actions", [])
+                game_state.legal_actions_raw = copy.deepcopy(raw_actions) if raw_actions else []
                 
                 legal_list = []
                 for action in raw_actions:
@@ -1943,17 +1947,20 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                 req = msg.get("declareAttackersReq", {})
                 legal_attackers = req.get("attackers", req.get("qualifiedAttackers", []))
                 attacker_names = []
+                attacker_ids = []
                 for atk in legal_attackers:
                     obj_id = atk if isinstance(atk, int) else atk.get("instanceId", atk.get("attackerInstanceId", 0))
                     obj = game_state.game_objects.get(obj_id)
                     if obj:
                         attacker_names.append(game_state._resolve_card_name(obj.grp_id))
+                        attacker_ids.append(obj_id)
                 logger.info(f"Captured Decision: Declare Attackers ({len(attacker_names)} legal)")
                 game_state.pending_decision = "Declare Attackers"
                 game_state.decision_timestamp = time.time()
                 game_state.decision_context = {
                     "type": "declare_attackers",
                     "legal_attackers": attacker_names,
+                    "legal_attacker_ids": attacker_ids,
                     "raw_attackers": legal_attackers,
                 }
 
@@ -1962,17 +1969,20 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                 req = msg.get("declareBlockersReq", {})
                 legal_blockers = req.get("blockers", req.get("qualifiedBlockers", []))
                 blocker_names = []
+                blocker_ids = []
                 for blk in legal_blockers:
                     obj_id = blk if isinstance(blk, int) else blk.get("instanceId", blk.get("blockerInstanceId", 0))
                     obj = game_state.game_objects.get(obj_id)
                     if obj:
                         blocker_names.append(game_state._resolve_card_name(obj.grp_id))
+                        blocker_ids.append(obj_id)
                 logger.info(f"Captured Decision: Declare Blockers ({len(blocker_names)} legal)")
                 game_state.pending_decision = "Declare Blockers"
                 game_state.decision_timestamp = time.time()
                 game_state.decision_context = {
                     "type": "declare_blockers",
                     "legal_blockers": blocker_names,
+                    "legal_blocker_ids": blocker_ids,
                     "raw_blockers": legal_blockers,
                 }
 

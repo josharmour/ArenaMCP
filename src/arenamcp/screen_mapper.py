@@ -9,6 +9,7 @@ converted to absolute pixel coordinates at click time.
 """
 
 import logging
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -151,6 +152,77 @@ class ScreenMapper:
         """
         return FixedCoordinates.get(name)
 
+    def _hand_arc_positions(self, hand_size: int) -> list[tuple[float, float]]:
+        """Compute normalized (x, y) positions for each card index using MTGA arc layout.
+
+        Based on decompiled CardLayout_Hand.cs constants:
+          Radius=45, FitAngle=30, MaxDeltaAngle=4.5, YOffset=-1.5
+
+        The MTGA hand places cards on a circular arc.  Middle cards sit at the
+        peak of the arc (highest on screen = lowest y value) while edge cards
+        droop slightly downward.
+
+        Returns:
+            List of (norm_x, norm_y) tuples, one per card index.
+        """
+        if hand_size == 0:
+            return []
+        if hand_size == 1:
+            return [(0.5, 0.95)]
+
+        RADIUS = 45.0
+        FIT_ANGLE = 30.0
+        MAX_DELTA = 4.5
+        Y_OFFSET = -1.5
+
+        delta_angle = min(MAX_DELTA, FIT_ANGLE / (hand_size - 1))
+
+        # Leftmost angle for arc base Y calculation
+        leftmost_angle_deg = 90.0 + FIT_ANGLE * 0.5
+        arc_base_y = math.sin(math.radians(leftmost_angle_deg)) * RADIUS
+
+        # Starting angle for this hand size
+        start_angle_deg = 90.0 + delta_angle * (hand_size - 1) * 0.5
+
+        positions: list[tuple[float, float]] = []
+        for i in range(hand_size):
+            angle_deg = start_angle_deg - delta_angle * i
+            angle_rad = math.radians(angle_deg)
+
+            world_x = math.cos(angle_rad) * RADIUS
+            world_y = math.sin(angle_rad) * RADIUS - arc_base_y + Y_OFFSET
+
+            positions.append((world_x, world_y))
+
+        # Convert world coords to normalized screen coords.
+        # Determine x range from the full arc extent.
+        full_left_x = math.cos(math.radians(90.0 + FIT_ANGLE * 0.5)) * RADIUS
+        full_right_x = math.cos(math.radians(90.0 - FIT_ANGLE * 0.5)) * RADIUS
+        x_range = full_right_x - full_left_x  # positive range
+
+        # Screen mapping bounds
+        SCREEN_HAND_LEFT = 0.20
+        SCREEN_HAND_RIGHT = 0.80
+        SCREEN_HAND_Y_CENTER = 0.95
+        SCREEN_Y_SCALE = 0.003  # small y variation for arc droop
+
+        normalized: list[tuple[float, float]] = []
+        for wx, wy in positions:
+            # Map world X to screen X
+            norm_x = SCREEN_HAND_LEFT + (wx - full_left_x) / x_range * (
+                SCREEN_HAND_RIGHT - SCREEN_HAND_LEFT
+            )
+            # Map world Y to screen Y (inverted: higher world y -> lower screen y)
+            norm_y = SCREEN_HAND_Y_CENTER - wy * SCREEN_Y_SCALE
+
+            # Clamp to safe screen region
+            norm_x = max(0.15, min(0.85, norm_x))
+            norm_y = max(0.88, min(0.98, norm_y))
+
+            normalized.append((norm_x, norm_y))
+
+        return normalized
+
     def get_card_in_hand_coord(
         self,
         card_name: str,
@@ -159,8 +231,8 @@ class ScreenMapper:
     ) -> Optional[ScreenCoord]:
         """Calculate the screen position of a card in hand.
 
-        Uses positional heuristic based on hand size and card index.
-        MTGA spreads cards evenly across the bottom of the screen.
+        Uses arc-based positioning derived from decompiled MTGA
+        CardLayout_Hand.cs to match the game's actual circular fan layout.
 
         Args:
             card_name: Name of the card to find.
@@ -182,22 +254,14 @@ class ScreenMapper:
             )
             return None
 
-        hand_size = len(hand_cards)
+        positions = self._hand_arc_positions(len(hand_cards))
+        x, y = positions[card_index]
 
-        # Hand spans roughly x=0.30 to x=0.70, y=0.95
-        # Cards are evenly distributed
-        hand_left = 0.30
-        hand_right = 0.70
-        hand_y = 0.95
-
-        if hand_size == 1:
-            x = 0.50
-        else:
-            spacing = (hand_right - hand_left) / (hand_size - 1)
-            x = hand_left + card_index * spacing
-
-        logger.info(f"Calc: card_idx={card_index}, size={hand_size}, x_norm={x:.3f}, y_norm={hand_y:.3f}")
-        return ScreenCoord(x, hand_y, f"Hand card: {card_name}")
+        logger.info(
+            f"Arc calc: card_idx={card_index}, size={len(hand_cards)}, "
+            f"x_norm={x:.3f}, y_norm={y:.3f}"
+        )
+        return ScreenCoord(x, y, f"Hand card: {card_name}")
 
     @staticmethod
     def _normalize_name(name: str) -> str:

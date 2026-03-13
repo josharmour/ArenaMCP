@@ -33,6 +33,7 @@ def _load_dotenv():
 _load_dotenv()
 
 import argparse
+import importlib
 import json
 import logging
 import os
@@ -1185,8 +1186,15 @@ class StandaloneCoach:
                     self._match_number += 1
                     logger.info(f"New game detected in coaching loop (turn {last_advice_turn} -> {turn_num}), match #{self._match_number}, resetting advice tracking")
 
-                    # Fallback: trigger analysis if game_end detection above missed it
-                    if self._advice_history and not self._saved_advice_history:
+                    # Only launch fallback post-match analysis when we have
+                    # explicit end-of-game evidence. A turn drop can also happen
+                    # after relaunch or mid-game resync, and using it alone
+                    # causes false "post-match analysis" loops.
+                    if (
+                        self._advice_history
+                        and not self._saved_advice_history
+                        and self._has_explicit_game_end_evidence()
+                    ):
                         self._saved_advice_history = list(self._advice_history)
                         self._saved_missed_decisions = list(self._missed_decisions)
                         self._last_match_result = self._detect_match_result()
@@ -1195,6 +1203,11 @@ class StandaloneCoach:
                             target=self._post_match_analysis_worker,
                             daemon=True,
                         ).start()
+                    elif self._advice_history and not self._saved_advice_history:
+                        logger.info(
+                            "Skipping fallback post-match analysis on turn-drop: "
+                            "no explicit game-end evidence"
+                        )
 
                     prev_state = {}
                     last_advice_turn = 0
@@ -2598,6 +2611,23 @@ class StandaloneCoach:
         except Exception as e:
             logger.debug(f"Could not detect match result: {e}")
         return "unknown"
+
+    def _has_explicit_game_end_evidence(self) -> bool:
+        """Return True only when GameState has explicit match-end evidence."""
+        try:
+            server_mod = importlib.import_module("arenamcp.server")
+            gs = getattr(server_mod, "game_state", None)
+            if gs is None:
+                return False
+            if gs.game_ended_event.is_set():
+                return True
+            if getattr(gs, "last_game_result", None):
+                return True
+            if getattr(gs, "_pre_reset_snapshot", None):
+                return True
+        except Exception as e:
+            logger.debug(f"Could not inspect game-end evidence: {e}")
+        return False
 
     def _post_match_analysis_worker(self) -> None:
         """Background worker: generate post-match strategic analysis.

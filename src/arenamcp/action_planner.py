@@ -62,6 +62,7 @@ class GameAction:
     play_or_draw: str = ""  # "play" or "draw"
     reasoning: str = ""
     confidence: float = 1.0
+    gre_action_ref: Optional[Any] = None  # GREActionRef from gre_action_matcher
 
     def __str__(self) -> str:
         parts = [self.action_type.value]
@@ -158,6 +159,7 @@ class ActionPlanner:
         trigger: str,
         legal_actions: Optional[list[str]] = None,
         decision_context: Optional[dict[str, Any]] = None,
+        legal_actions_raw: Optional[list[dict]] = None,
     ) -> ActionPlan:
         """Plan actions for the current game state.
 
@@ -166,6 +168,7 @@ class ActionPlanner:
             trigger: The trigger that caused this planning (e.g. "new_turn").
             legal_actions: Optional pre-computed legal actions list.
             decision_context: Optional decision context from game state.
+            legal_actions_raw: Optional raw GRE action dicts for GRE matching.
 
         Returns:
             ActionPlan with structured actions to execute.
@@ -199,8 +202,53 @@ class ActionPlanner:
             if fallback.actions:
                 plan = fallback
 
+        # Attach GRE action refs if raw actions are available
+        raw = legal_actions_raw or game_state.get("legal_actions_raw")
+        if raw and plan.actions:
+            self._attach_gre_refs(plan, raw, game_state)
+
         logger.info(f"Planned {len(plan.actions)} actions: {plan.overall_strategy}")
         return plan
+
+    def _attach_gre_refs(
+        self,
+        plan: ActionPlan,
+        raw_actions: list[dict],
+        game_state: dict[str, Any],
+    ) -> None:
+        """Attempt to match each action in the plan to a raw GRE action."""
+        try:
+            from arenamcp.gre_action_matcher import match_action_to_gre
+        except ImportError:
+            logger.debug("gre_action_matcher not available, skipping GRE ref attachment")
+            return
+
+        # Build game_objects lookup: instance_id -> object dict
+        game_objects: dict[int, dict] = {}
+        zones = game_state.get("zones", {})
+        for zone_key in ("battlefield", "my_hand", "stack", "graveyard", "exile", "command"):
+            for obj in zones.get(zone_key, []):
+                if isinstance(obj, dict):
+                    iid = obj.get("instance_id", 0)
+                    if iid:
+                        game_objects[iid] = obj
+
+        # Build a scryfall lookup helper
+        def scryfall_lookup(grp_id: int) -> Optional[str]:
+            try:
+                from arenamcp import server
+                info = server.get_card_info(grp_id)
+                return info.get("name")
+            except Exception:
+                return None
+
+        for action in plan.actions:
+            ref = match_action_to_gre(action, raw_actions, game_objects, scryfall_lookup)
+            if ref:
+                action.gre_action_ref = ref
+                logger.debug(f"Attached GRE ref to {action.action_type.value}: {ref.to_dict()}")
+            else:
+                logger.debug(f"No GRE ref found for {action.action_type.value} ({action.card_name})")
 
     def _build_action_prompt(
         self,
