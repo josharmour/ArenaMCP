@@ -585,6 +585,7 @@ class GameState:
                     card_info = server.get_card_info(grp_id)
                     enriched["name"] = card_info.get("name", f"Unknown ({grp_id})")
                     enriched["type_line"] = card_info.get("type_line", "")
+                    enriched["mana_cost"] = card_info.get("mana_cost", "")
                 except Exception:
                     enriched["name"] = f"Unknown ({grp_id})"
                     enriched["type_line"] = ""

@@ -251,3 +251,46 @@ def test_tui_adapter_safe_call_swallows_app_not_running_runtimeerror():
     adapter = tui_mod.TUIAdapter(_FakeApp())
 
     adapter.log("hello")
+
+
+def test_take_screenshot_analysis_reentry_guard_logs_and_returns():
+    class _UI:
+        def __init__(self):
+            self.log_calls = []
+
+        def log(self, message):
+            self.log_calls.append(message)
+
+        def subtask(self, status):
+            pass
+
+    coach = StandaloneCoach.__new__(StandaloneCoach)
+    coach.ui = _UI()
+    coach._screenshot_analysis_in_progress = True
+
+    coach.take_screenshot_analysis()
+
+    assert coach.ui.log_calls[-1] == "[yellow]Screenshot analysis already in progress...[/]"
+
+
+def test_take_screenshot_analysis_clears_flag_when_no_backend():
+    class _UI:
+        def __init__(self):
+            self.log_calls = []
+
+        def log(self, message):
+            self.log_calls.append(message)
+
+        def subtask(self, status):
+            pass
+
+    coach = StandaloneCoach.__new__(StandaloneCoach)
+    coach.ui = _UI()
+    coach._screenshot_analysis_in_progress = False
+    coach._vision_mapper = None
+    coach._backend_name = "codex-cli"
+
+    coach.take_screenshot_analysis()
+
+    assert coach._screenshot_analysis_in_progress is False
+    assert coach.ui.log_calls[-1] == "[red]No vision backend available. Need Ollama VLM or a cloud backend.[/]"

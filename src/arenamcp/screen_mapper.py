@@ -223,6 +223,48 @@ class ScreenMapper:
 
         return normalized
 
+    @staticmethod
+    def _mtga_hand_sort_key(card: dict[str, Any]) -> tuple:
+        """Sort key matching MTGA's hand card visual ordering.
+
+        Derived from decompiled MulliganWorkflow.SortCards():
+        1. Lands first (before non-lands)
+        2. By first frame color (WUBRG order: W=1, U=2, B=3, R=4, G=5)
+        3. By CMC ascending
+        4. By card name alphabetically
+        """
+        # 1. Lands first (sort key 0) vs non-lands (sort key 1)
+        card_types = card.get("card_types", [])
+        type_line = card.get("type_line", "")
+        is_land = any("Land" in ct for ct in card_types) or "Land" in type_line
+        land_key = 0 if is_land else 1
+
+        # 2. First frame color in WUBRG order
+        # Parse from mana_cost string like "{2}{G}{G}" or "{1}{W}{U}"
+        mana_cost = card.get("mana_cost", "")
+        # CardColor enum: Colorless=0, W=1, U=2, B=3, R=4, G=5
+        color_order = {"W": 1, "U": 2, "B": 3, "R": 4, "G": 5}
+        first_color = 0  # Colorless default
+        for ch in mana_cost:
+            if ch in color_order:
+                first_color = color_order[ch]
+                break
+
+        # 3. CMC — sum up mana cost components
+        cmc = 0
+        for part in re.findall(r'\{([^}]+)\}', mana_cost):
+            if part.isdigit():
+                cmc += int(part)
+            elif part in color_order or part == "C":
+                cmc += 1
+            elif part == "X":
+                pass  # X doesn't count toward CMC for sorting
+
+        # 4. Card name
+        name = card.get("name", "").lower()
+
+        return (land_key, first_color, cmc, name)
+
     def get_card_in_hand_coord(
         self,
         card_name: str,
@@ -233,6 +275,10 @@ class ScreenMapper:
 
         Uses arc-based positioning derived from decompiled MTGA
         CardLayout_Hand.cs to match the game's actual circular fan layout.
+
+        Cards are sorted by MTGA's visual ordering (lands first, then by
+        color/CMC/name) before computing arc positions, since the game
+        state zone order differs from the on-screen display order.
 
         Args:
             card_name: Name of the card to find.
@@ -245,21 +291,30 @@ class ScreenMapper:
         if not hand_cards:
             return None
 
-        card_index = self._find_card_index(card_name, hand_cards)
+        # Sort hand to match MTGA's visual order (derived from RE of
+        # MulliganWorkflow.SortCards: lands first, then color/CMC/name)
+        sorted_hand = sorted(hand_cards, key=self._mtga_hand_sort_key)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            gs_names = [c.get("name", "???") for c in hand_cards]
+            vis_names = [c.get("name", "???") for c in sorted_hand]
+            logger.debug(f"Hand sort: GS={gs_names} -> Visual={vis_names}")
+
+        card_index = self._find_card_index(card_name, sorted_hand)
 
         if card_index is None:
-            hand_names = [c.get("name", "???") for c in hand_cards]
+            hand_names = [c.get("name", "???") for c in sorted_hand]
             logger.warning(
                 f"Card '{card_name}' not found in hand: {hand_names}"
             )
             return None
 
-        positions = self._hand_arc_positions(len(hand_cards))
+        positions = self._hand_arc_positions(len(sorted_hand))
         x, y = positions[card_index]
 
         logger.info(
-            f"Arc calc: card_idx={card_index}, size={len(hand_cards)}, "
-            f"x_norm={x:.3f}, y_norm={y:.3f}"
+            f"Arc calc: card_idx={card_index}, size={len(sorted_hand)}, "
+            f"x_norm={x:.3f}, y_norm={y:.3f} (visual sort order)"
         )
         return ScreenCoord(x, y, f"Hand card: {card_name}")
 
