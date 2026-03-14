@@ -4473,8 +4473,8 @@ class CoachEngine:
                 score = 0
                 act = action.lower()
                 turn = game_state.get("turn", {})
-                phase = turn.get("phase", "")
-                step = turn.get("step", "")
+                phase = turn.get("phase", "").lower()
+                step = turn.get("step", "").lower()
                 pending_decision = str(game_state.get("pending_decision", "") or "").lower()
                 players = game_state.get("players", [])
                 local_player = next((p for p in players if p.get("is_local")), None)
@@ -4513,6 +4513,15 @@ class CoachEngine:
                 # Penalize "wait/pass" actions if anything else exists
                 if "wait" in act or "pass priority" in act:
                     score -= 50
+
+                # During combat, "Pass" (the Next button) is usually correct
+                # when no cast/play/declare actions are available
+                if act == "pass" and "combat" in phase:
+                    score += 10
+
+                # Penalize mana-only actions (not real decisions)
+                if act.startswith("action: "):
+                    score -= 10
 
                 # If we can detect a legal "Play Land" and lands available, boost it
                 if "play land" in act and local_seat is not None:

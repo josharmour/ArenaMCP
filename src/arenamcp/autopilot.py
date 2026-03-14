@@ -458,7 +458,29 @@ class AutopilotEngine:
             if not has_decision:
                 # Get legal actions once to check if we can actually do anything
                 legal = self._get_legal_actions(game_state)
-                can_do_anything = legal and legal != ["Pass"] and not all("Wait" in a for a in legal)
+                # Filter out mana/utility actions that don't represent real decisions.
+                # During combat, "Activate Ability" + mana taps are optional and
+                # shouldn't prevent auto-pass (the "Next" button in MTGA).
+                _PASSTHROUGH = {"pass", "action: activate_mana", "action: floatmana"}
+                meaningful = [a for a in legal if a.lower() not in _PASSTHROUGH]
+
+                # During combat, optional ability activations aren't worth calling
+                # the LLM for — treat as passthrough (click "Next").
+                phase = turn.get("phase", "")
+                if "Combat" in phase and meaningful:
+                    # Only cast/play/declare actions are meaningful during combat
+                    combat_meaningful = [
+                        a for a in meaningful
+                        if not a.lower().startswith("activate ")
+                    ]
+                    if not combat_meaningful:
+                        logger.info(
+                            f"Autopilot: combat auto-pass (only optional activations: "
+                            f"{[a for a in meaningful]})"
+                        )
+                        meaningful = []
+
+                can_do_anything = bool(meaningful) and not all("Wait" in a for a in meaningful)
 
                 if self._config.auto_pass_priority and trigger == "priority_gained":
                     if not can_do_anything:
