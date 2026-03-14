@@ -241,7 +241,17 @@ class ClaudeCodeBackend:
         self._stderr_thread.start()
 
         if not self._init_event.wait(timeout=5.0):
-            logger.warning("Claude Code CLI did not emit init event in time")
+            rc = self._proc.poll() if self._proc else None
+            if rc is not None:
+                logger.warning(
+                    f"Claude Code CLI exited during init (code {rc}). "
+                    "Check 'claude --version' and auth status."
+                )
+            else:
+                logger.warning(
+                    "Claude Code CLI did not emit init event in 5s "
+                    "(process still running — may be doing first-time setup)"
+                )
 
     def _reader_loop(self, stream, is_stderr: bool) -> None:
         if stream is None:
@@ -254,7 +264,7 @@ class ClaudeCodeBackend:
                 data = json.loads(line)
             except json.JSONDecodeError:
                 if is_stderr:
-                    logger.debug(f"[CLAUDE-CLI][stderr] {line}")
+                    logger.warning(f"[CLAUDE-CLI][stderr] {line}")
                 else:
                     logger.debug(f"[CLAUDE-CLI] Non-JSON line: {line}")
                 continue
@@ -262,6 +272,10 @@ class ClaudeCodeBackend:
             if data.get("type") == "system" and data.get("subtype") == "init":
                 self._session_id = data.get("session_id")
                 self._init_event.set()
+
+            # Log error events so they appear in bug reports
+            if data.get("type") == "error":
+                logger.warning(f"[CLAUDE-CLI] Error event: {data}")
 
             self._queue.put(data)
 
@@ -333,6 +347,12 @@ class ClaudeCodeBackend:
                 self.progress_callback("Thinking...")
 
             while time.time() < deadline:
+                # Check if process died
+                if self._proc and self._proc.poll() is not None:
+                    rc = self._proc.returncode
+                    logger.warning(f"[CLAUDE-CLI] Process exited with code {rc} during response wait")
+                    return f"Error: Claude Code CLI exited (code {rc})"
+
                 try:
                     data = self._queue.get(timeout=0.25)
                 except queue.Empty:
