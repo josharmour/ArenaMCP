@@ -147,7 +147,7 @@ class ClaudeCodeBackend:
     ) -> None:
         self.model = model
         self.command = command or os.environ.get("CLAUDE_CODE_CMD", "claude")
-        self.max_turns = int(os.environ.get("CLAUDE_CODE_MAX_TURNS", max_turns or 40))
+        self.max_turns = int(os.environ.get("CLAUDE_CODE_MAX_TURNS", max_turns or 200))
         self.timeout_s = float(
             os.environ.get("CLAUDE_CODE_TIMEOUT_S", timeout_s or 12.0)
         )
@@ -299,7 +299,7 @@ class ClaudeCodeBackend:
 
     def complete(self, system_prompt: str, user_message: str) -> str:
         """Get completion via Claude Code CLI."""
-        if not self._lock.acquire(timeout=3.0):
+        if not self._lock.acquire(timeout=self.timeout_s + 1):
             logger.warning(
                 "[CLAUDE-CLI] Lock busy (another call in progress), skipping"
             )
@@ -354,7 +354,7 @@ class ClaudeCodeBackend:
                     return f"Error: Claude Code CLI exited (code {rc})"
 
                 try:
-                    data = self._queue.get(timeout=0.25)
+                    data = self._queue.get(timeout=0.05)
                 except queue.Empty:
                     continue
 
@@ -425,12 +425,15 @@ class GeminiCliBackend:
     ) -> None:
         self.model = model
         self.command = command or os.environ.get("GEMINI_CLI_CMD", "gemini")
+        # Default to non-persistent: Gemini CLI rejects --prompt-interactive
+        # when stdin is a pipe (not a TTY), which is always the case when
+        # spawned as a subprocess.  One-shot mode (-p) works reliably.
         self.persistent = bool(
-            int(os.environ.get("GEMINI_CLI_PERSISTENT", "1"))
+            int(os.environ.get("GEMINI_CLI_PERSISTENT", "0"))
             if persistent is None
             else persistent
         )
-        self.max_turns = int(os.environ.get("GEMINI_CLI_MAX_TURNS", max_turns or 40))
+        self.max_turns = int(os.environ.get("GEMINI_CLI_MAX_TURNS", max_turns or 200))
         self.timeout_s = float(
             os.environ.get("GEMINI_CLI_TIMEOUT_S", timeout_s or 20.0)
         )
@@ -551,7 +554,7 @@ class GeminiCliBackend:
 
         fallback_to_one_shot = False
 
-        if not self._lock.acquire(timeout=3.0):
+        if not self._lock.acquire(timeout=self.timeout_s + 1):
             logger.warning(
                 "[GEMINI-CLI] Lock busy (previous call still in progress), skipping"
             )
@@ -614,7 +617,7 @@ class GeminiCliBackend:
 
                 while time.time() < deadline:
                     try:
-                        chunk = self._queue.get(timeout=0.25)
+                        chunk = self._queue.get(timeout=0.05)
                     except queue.Empty:
                         # Update elapsed time in progress
                         if self.progress_callback:
@@ -634,8 +637,18 @@ class GeminiCliBackend:
                 if marker in text:
                     text = text.split(marker, 1)[0]
                 text = text.strip()
-                if not text:
+                # Detect Gemini CLI errors that get returned as "responses"
+                # (e.g., --prompt-interactive rejected when stdin is a pipe)
+                is_cli_error = (
+                    not text
+                    or text.startswith("Error:")
+                    or "--prompt-interactive" in text
+                    or "cannot be used when input is piped" in text
+                )
+                if is_cli_error:
                     # Fallback to one-shot if persistent didn't yield output
+                    if text:
+                        logger.warning(f"[GEMINI-CLI] Persistent mode returned error: {text[:200]}")
                     self._persistent_failed = True
                     fallback_to_one_shot = True
                 else:
@@ -722,7 +735,16 @@ class GeminiCliBackend:
 
 
 class CodexCliBackend:
-    """LLM backend using Codex CLI (one-shot subprocess, similar to Gemini one-shot)."""
+    """LLM backend using Codex's Azure OpenAI Responses API directly.
+
+    Instead of spawning ``codex exec`` (which runs a full agent loop and
+    takes 20-30s), this backend reads the Azure endpoint and API key from
+    ``~/.codex/config.toml`` and calls the Responses API directly for
+    sub-3-second latency.
+
+    Falls back to the ``codex exec`` subprocess if Azure credentials are
+    not available.
+    """
 
     def __init__(
         self,
@@ -734,9 +756,228 @@ class CodexCliBackend:
         self.model = model
         self.command = command or os.environ.get("CODEX_CLI_CMD", "codex")
         self.timeout_s = float(
-            os.environ.get("CODEX_CLI_TIMEOUT_S", timeout_s or 30.0)
+            os.environ.get("CODEX_CLI_TIMEOUT_S", timeout_s or 5.0)
         )
         self.progress_callback = progress_callback
+
+        # Try to load Azure credentials (env var first, then codex config)
+        self._azure_base_url: Optional[str] = None
+        self._azure_api_key: Optional[str] = None
+        self._azure_api_version: str = "2025-04-01-preview"
+        self._use_direct_api = False
+        self._load_azure_config()
+
+        # Direct env var override (simpler than codex config parsing)
+        if not self._use_direct_api:
+            api_key = os.environ.get("AZURE_OPENAI_API_KEY")
+            base_url = os.environ.get(
+                "AZURE_OPENAI_BASE_URL",
+                "https://bmfllm-resource.cognitiveservices.azure.com/openai",
+            )
+            if api_key:
+                self._azure_api_key = api_key
+                self._azure_base_url = base_url
+                self._use_direct_api = True
+                if not self.model:
+                    self.model = "gpt-5.4"
+                logger.info(
+                    f"CodexCliBackend: using Azure API via env var "
+                    f"({base_url}, model={self.model})"
+                )
+
+    def _load_azure_config(self) -> None:
+        """Load Azure OpenAI credentials from ~/.codex/config.toml."""
+        try:
+            config_path = os.path.join(os.path.expanduser("~"), ".codex", "config.toml")
+            if not os.path.exists(config_path):
+                return
+
+            # Simple TOML parsing for the fields we need
+            with open(config_path, "r") as f:
+                text = f.read()
+            import re
+
+            # Get model if not set
+            if not self.model:
+                m = re.search(r'^model\s*=\s*"([^"]+)"', text, re.MULTILINE)
+                if m:
+                    self.model = m.group(1)
+
+            # Get Azure base_url
+            m = re.search(r'base_url\s*=\s*"([^"]+)"', text)
+            if m:
+                self._azure_base_url = m.group(1)
+
+            # Get api-version from query_params
+            m = re.search(r'"api-version"\s*=\s*"([^"]+)"', text)
+            if m:
+                self._azure_api_version = m.group(1)
+
+            # Get env key name for API key
+            m = re.search(r'env_key\s*=\s*"([^"]+)"', text)
+            if m:
+                env_key = m.group(1)
+                self._azure_api_key = os.environ.get(env_key)
+
+            if self._azure_base_url and self._azure_api_key:
+                self._use_direct_api = True
+                logger.info(
+                    f"CodexCliBackend: using direct Azure API "
+                    f"({self._azure_base_url}, model={self.model})"
+                )
+            else:
+                logger.info("CodexCliBackend: Azure credentials not found, using codex exec fallback")
+        except Exception as e:
+            logger.debug(f"Failed to load codex Azure config: {e}")
+
+        # Fire a warmup request in background to avoid cold-start timeout
+        if self._use_direct_api:
+            self._warmup_azure()
+
+    def _warmup_azure(self) -> None:
+        """Send a minimal request to warm up the Azure deployment."""
+        def _do_warmup():
+            try:
+                import urllib.request
+                url = (
+                    f"{self._azure_base_url}/responses"
+                    f"?api-version={self._azure_api_version}"
+                )
+                body = json.dumps({
+                    "model": self.model or "gpt-5.4",
+                    "input": "hi",
+                    "max_output_tokens": 16,
+                    "reasoning": {"effort": "low"},
+                }).encode()
+                req = urllib.request.Request(url, data=body, headers={
+                    "Content-Type": "application/json",
+                    "api-key": self._azure_api_key,
+                })
+                urllib.request.urlopen(req, timeout=10)
+                logger.info("CodexCliBackend: Azure warmup complete")
+            except Exception as e:
+                logger.debug(f"CodexCliBackend: Azure warmup failed (non-fatal): {e}")
+
+        threading.Thread(target=_do_warmup, daemon=True).start()
+
+    def complete(self, system_prompt: str, user_message: str) -> str:
+        """Get completion via Azure Responses API (or codex exec fallback)."""
+        if self._use_direct_api:
+            return self._complete_azure(system_prompt, user_message)
+        return self._complete_cli(system_prompt, user_message)
+
+    def _complete_azure(self, system_prompt: str, user_message: str) -> str:
+        """Call Azure OpenAI Responses API directly (~2-3s latency)."""
+        import urllib.request
+
+        url = (
+            f"{self._azure_base_url}/responses"
+            f"?api-version={self._azure_api_version}"
+        )
+
+        body = json.dumps({
+            "model": self.model or "gpt-5.4",
+            "input": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            "max_output_tokens": 400,
+            "reasoning": {"effort": "low"},
+        }).encode()
+
+        req = urllib.request.Request(url, data=body, headers={
+            "Content-Type": "application/json",
+            "api-key": self._azure_api_key,
+        })
+
+        if self.progress_callback:
+            self.progress_callback("Thinking (codex)...")
+
+        try:
+            start = time.perf_counter()
+            resp = urllib.request.urlopen(req, timeout=self.timeout_s)
+            data = json.loads(resp.read())
+            elapsed = (time.perf_counter() - start) * 1000
+            logger.info(f"Azure Responses API call took {elapsed:.0f}ms")
+
+            # Extract text from Responses API format
+            text = ""
+            for item in data.get("output", []):
+                if item.get("type") == "message":
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            text += c["text"]
+
+            if self.progress_callback:
+                self.progress_callback("")
+            return text.strip() or "Error: Empty response from Azure API"
+        except urllib.error.HTTPError as e:
+            err_body = ""
+            try:
+                err_body = e.read().decode()[:200]
+            except Exception:
+                pass
+            logger.error(f"Azure API error {e.code}: {err_body}")
+            if self.progress_callback:
+                self.progress_callback("")
+            return f"Error: Azure API {e.code}: {err_body}"
+        except Exception as e:
+            logger.error(f"Azure API call failed: {e}")
+            if self.progress_callback:
+                self.progress_callback("")
+            return f"Error: Azure API failed: {e}"
+
+    def _complete_cli(self, system_prompt: str, user_message: str) -> str:
+        """Fallback: Get completion via codex exec subprocess."""
+        combined = (
+            f"SYSTEM INSTRUCTIONS:\n{system_prompt}\n\nUSER MESSAGE:\n{user_message}"
+        )
+        args = self._build_args() + ["exec"]
+        if self.model:
+            args += ["--model", self.model]
+
+        if self.progress_callback:
+            self.progress_callback("Thinking (codex)...")
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("OPENAI_API_KEY",)}
+
+        try:
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = subprocess.CREATE_NO_WINDOW
+
+            result = subprocess.run(
+                args + ["-", "--ephemeral", "--skip-git-repo-check"],
+                input=combined,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=self.timeout_s,
+                creationflags=creationflags,
+                env=env,
+            )
+        except FileNotFoundError:
+            if self.progress_callback:
+                self.progress_callback("")
+            return "Error: Codex CLI not found."
+        except subprocess.TimeoutExpired:
+            if self.progress_callback:
+                self.progress_callback("")
+            return f"Error: Codex CLI timed out after {self.timeout_s}s"
+        except Exception as e:
+            if self.progress_callback:
+                self.progress_callback("")
+            return f"Error running Codex CLI: {e}"
+
+        if self.progress_callback:
+            self.progress_callback("")
+
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            return f"Error: Codex CLI failed: {err}"
+
+        return (result.stdout or "").strip()
 
     def _build_args(self) -> list[str]:
         import shutil
@@ -765,100 +1006,6 @@ class CodexCliBackend:
             ]
 
         return [resolved or cmd]
-
-    def complete(self, system_prompt: str, user_message: str) -> str:
-        """Get completion via Codex CLI (one-shot)."""
-        combined = (
-            f"SYSTEM INSTRUCTIONS:\n{system_prompt}\n\nUSER MESSAGE:\n{user_message}"
-        )
-        args = self._build_args() + ["exec"]
-        if self.model:
-            args += ["--model", self.model]
-
-        if self.progress_callback:
-            self.progress_callback("Thinking (codex)...")
-
-        # Strip API-key env vars so the CLI uses subscription auth.
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("OPENAI_API_KEY",)}
-
-        def _run(run_args: list[str], input_text: Optional[str]) -> subprocess.CompletedProcess[str]:
-            return subprocess.run(
-                run_args,
-                input=input_text,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=self.timeout_s,
-                creationflags=creationflags,
-                env=env,
-            )
-
-        try:
-            creationflags = 0
-            if os.name == "nt":
-                creationflags = subprocess.CREATE_NO_WINDOW
-
-            # Use the supported non-interactive Codex CLI interface.
-            # `codex exec` accepts either:
-            # - `-` to read the prompt from stdin
-            # - a positional prompt argument
-            attempts: list[tuple[list[str], Optional[str], str]] = [
-                (args + ["-"], combined, "exec-stdin"),
-                (args + [combined], None, "exec-inline"),
-                (args, combined, "exec-implicit-stdin"),
-            ]
-
-            errors: list[str] = []
-            result: Optional[subprocess.CompletedProcess[str]] = None
-
-            for run_args, input_text, label in attempts:
-                # Skip gigantic inline/positional variants on Windows.
-                if os.name == "nt" and input_text is None and len(combined) > 7000:
-                    continue
-                try:
-                    result = _run(run_args, input_text)
-                except subprocess.TimeoutExpired:
-                    errors.append(f"{label}: timed out")
-                    continue
-
-                out = (result.stdout or "").strip()
-                err = (result.stderr or "").strip()
-                if result.returncode == 0 and out:
-                    break
-
-                msg = (err or out or f"exit code {result.returncode}").strip()
-                errors.append(f"{label}: {msg}")
-                result = None
-
-            if result is None:
-                detail = " | ".join(errors[-3:]) if errors else "unknown invocation failure"
-                return f"Error: Codex CLI failed: {detail}"
-        except FileNotFoundError:
-            if self.progress_callback:
-                self.progress_callback("")
-            return (
-                "Error: Codex CLI not found. "
-                "Install it or set CODEX_CLI_CMD to the full path."
-            )
-        except subprocess.TimeoutExpired:
-            if self.progress_callback:
-                self.progress_callback("")
-            return "Error: Codex CLI request timed out"
-        except Exception as e:
-            if self.progress_callback:
-                self.progress_callback("")
-            return f"Error running Codex CLI: {e}"
-
-        if self.progress_callback:
-            self.progress_callback("")
-
-        if result.returncode != 0:
-            err = (result.stderr or result.stdout or "").strip()
-            return f"Error: Codex CLI failed: {err}"
-
-        return (result.stdout or "").strip()
-
 
     def list_models(self) -> list[str]:
         return []
@@ -898,6 +1045,9 @@ class ProxyBackend:
         self._api_key = api_key
         self._client = None
 
+        # Fire-and-forget warmup for Ollama to pre-load the model
+        self._ollama_warmup(base_url, api_key)
+
     def _get_client(self):
         """Lazy init of OpenAI client pointed at proxy."""
         if self._client is None:
@@ -932,6 +1082,44 @@ class ProxyBackend:
             except ImportError:
                 raise ImportError("openai package required: pip install openai")
         return self._client
+
+    def _ollama_warmup(self, base_url: Optional[str], api_key: Optional[str]) -> None:
+        """Send a minimal warmup request to Ollama in a background thread to pre-load the model."""
+        # Determine the effective URL/key to check if this is an Ollama endpoint
+        url = base_url or os.environ.get("PROXY_BASE_URL", "")
+        key = api_key or os.environ.get("PROXY_API_KEY", "")
+        if not url:
+            try:
+                from arenamcp.settings import get_settings
+                url = get_settings().get("proxy_url") or ""
+            except Exception:
+                pass
+        if not key:
+            try:
+                from arenamcp.settings import get_settings
+                key = get_settings().get("proxy_api_key") or ""
+            except Exception:
+                pass
+
+        is_ollama = ("localhost:11434" in url or "127.0.0.1:11434" in url or
+                     key == "ollama")
+        if not is_ollama:
+            return
+
+        def _warmup():
+            try:
+                client = self._get_client()
+                client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=1,
+                )
+                logger.info(f"[PROXY] Ollama warmup complete for model {self.model}")
+            except Exception as e:
+                logger.debug(f"[PROXY] Ollama warmup failed (non-fatal): {e}")
+
+        t = threading.Thread(target=_warmup, daemon=True)
+        t.start()
 
     def complete(self, system_prompt: str, user_message: str, max_tokens: int = 400) -> str:
         """Get completion from proxy."""
@@ -972,6 +1160,25 @@ class ProxyBackend:
             if extra:
                 params["extra_body"] = extra
 
+            request_start = time.perf_counter()
+
+            # Try streaming first for lower perceived latency
+            try:
+                stream = client.chat.completions.create(**params, stream=True)
+                chunks: list[str] = []
+                for chunk in stream:
+                    if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                        chunks.append(chunk.choices[0].delta.content)
+                content = "".join(chunks)
+                request_time = (time.perf_counter() - request_start) * 1000
+                logger.info(
+                    f"[PROXY] API (streamed): {request_time:.0f}ms, model: {self.model}"
+                )
+                return content
+            except Exception as stream_err:
+                logger.debug(f"[PROXY] Streaming failed, falling back to non-streaming: {stream_err}")
+
+            # Fallback: non-streaming request
             request_start = time.perf_counter()
             response = client.chat.completions.create(**params)
             request_time = (time.perf_counter() - request_start) * 1000

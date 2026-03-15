@@ -143,7 +143,7 @@ JSON SCHEMA:
 class ActionPlanner:
     """Converts game state + trigger into structured JSON action commands via LLM."""
 
-    def __init__(self, backend: Any, timeout: float = 15.0):
+    def __init__(self, backend: Any, timeout: float = 5.0):
         """Initialize the action planner.
 
         Args:
@@ -181,11 +181,18 @@ class ActionPlanner:
             game_state, trigger, legal_actions, decision_context
         )
 
-        # Call LLM
+        # Call LLM with enforced timeout
+        import concurrent.futures
         try:
-            response = self._backend.complete(system_prompt, user_message)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(self._backend.complete, system_prompt, user_message)
+                response = future.result(timeout=self._timeout)
             elapsed = (time.perf_counter() - start) * 1000
             logger.info(f"Action planning took {elapsed:.0f}ms")
+        except concurrent.futures.TimeoutError:
+            elapsed = (time.perf_counter() - start) * 1000
+            logger.error(f"Action planning timed out after {elapsed:.0f}ms (limit {self._timeout}s)")
+            return ActionPlan(trigger=trigger)
         except Exception as e:
             logger.error(f"Action planning LLM call failed: {e}")
             return ActionPlan(trigger=trigger)

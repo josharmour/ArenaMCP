@@ -58,14 +58,14 @@ class AutopilotConfig:
     """Configuration for autopilot behavior."""
     confirm_each_action: bool = False  # Per-action confirmation (legacy, slow)
     confirm_plan: bool = False  # Plan-level confirmation (legacy, slow)
-    auto_execute_delay: float = 1.0  # Seconds before auto-executing (F1/F4 cancels)
+    auto_execute_delay: float = 0.3  # Seconds before auto-executing (F1/F4 cancels)
     auto_pass_priority: bool = True
     auto_resolve: bool = True
     verify_after_action: bool = True
-    verification_timeout: float = 4.0
-    action_delay: float = 1.0
-    post_action_delay: float = 1.5  # Delay after action to allow GRE to update
-    planning_timeout: float = 15.0
+    verification_timeout: float = 1.5
+    action_delay: float = 0.25
+    post_action_delay: float = 0.4  # Delay after action to allow GRE to update
+    planning_timeout: float = 5.0
     enable_vision_fallback: bool = True
     prefer_deterministic: bool = True  # When True, skip VLM for actions that have deterministic coordinates
     enable_tts_preview: bool = True
@@ -466,7 +466,7 @@ class AutopilotEngine:
                 logger.info("Autopilot: auto-passing (pass-only priority)")
                 if not self._config.dry_run:
                     self._controller.focus_mtga_window()
-                    time.sleep(0.15)
+                    time.sleep(0.06)
                 self._exec_pass_priority()
                 return True
 
@@ -503,7 +503,7 @@ class AutopilotEngine:
                         logger.info("Autopilot: auto-passing priority (no actions)")
                         if not self._config.dry_run:
                             self._controller.focus_mtga_window()
-                            time.sleep(0.15)
+                            time.sleep(0.06)
                         self._exec_pass_priority()
                         return True
 
@@ -512,7 +512,7 @@ class AutopilotEngine:
                         logger.info("Autopilot: auto-resolving (opponent's spell, no responses)")
                         if not self._config.dry_run:
                             self._controller.focus_mtga_window()
-                            time.sleep(0.15)
+                            time.sleep(0.06)
                         self._exec_resolve()
                         return True
 
@@ -522,7 +522,7 @@ class AutopilotEngine:
                         logger.info(f"Autopilot: auto-passing {trigger} (no instant responses)")
                         if not self._config.dry_run:
                             self._controller.focus_mtga_window()
-                            time.sleep(0.15)
+                            time.sleep(0.06)
                         self._exec_pass_priority()
                         return True
 
@@ -531,6 +531,32 @@ class AutopilotEngine:
                     if not can_do_anything:
                         logger.info("Autopilot: auto-passing opponent turn (no responses)")
                         return True  # Just skip, don't click anything
+
+            # --- COMBAT STEP GUARD ---
+            # During DeclareBlock/DeclareAttack, the LLM often fails to parse
+            # and the fallback picks "Pass" which is wrong.  If the game is in
+            # a combat step that needs creature selection, handle it directly:
+            # click Done (submit with current selection — "no blocks" or
+            # "no attacks" if nothing was selected by the planner).
+            step = turn.get("step", "")
+            if step in ("Step_DeclareBlock", "Step_DeclareAttack"):
+                decision_ctx = game_state.get("decision_context") or {}
+                dec_type = decision_ctx.get("type", "")
+                if dec_type in ("declare_blockers", "declare_attackers"):
+                    # Let the LLM plan — but if it fails, don't fall back to Pass.
+                    # Instead fall through to the planning section which will call
+                    # the LLM.  We'll fix the fallback below.
+                    pass
+                elif trigger in ("combat_blockers", "combat_attackers"):
+                    # We got a combat trigger but no decision_context — the
+                    # DeclareBlockersReq/DeclareAttackersReq was already handled
+                    # or the legal_actions are stale.  Click Done to submit.
+                    logger.info(f"Autopilot: combat step {step} without decision context — clicking Done")
+                    if not self._config.dry_run:
+                        self._controller.focus_mtga_window()
+                        time.sleep(0.06)
+                    self._click_fixed("done")
+                    return True
 
             # --- 1. PLANNING ---
             self._state = AutopilotState.PLANNING
@@ -658,7 +684,7 @@ class AutopilotEngine:
             # Focus MTGA now — no more user input expected
             if not self._config.dry_run:
                 self._controller.focus_mtga_window()
-                time.sleep(0.15)
+                time.sleep(0.06)
 
             for i, action in enumerate(plan.actions):
                 if self._abort_event.is_set():
@@ -745,6 +771,27 @@ class AutopilotEngine:
             self._state = AutopilotState.IDLE
             self._plans_completed += 1
             self._notify("AUTOPILOT", f"Plan complete ({len(plan.actions)} actions)")
+
+            # --- POST-PLAN: handle any follow-up decision (ETB choices, etc.) ---
+            # After executing a plan, an ETB trigger or follow-up decision may
+            # have appeared (e.g. shock land "Pay 2 life?", scry, etc.).
+            # Re-poll immediately and handle it rather than waiting for the next
+            # coaching loop iteration.
+            try:
+                post_plan_state = self._get_game_state()
+                post_pending = post_plan_state.get("pending_decision")
+                if post_pending:
+                    logger.info(f"Post-plan follow-up decision detected: '{post_pending}'")
+                    # Release lock temporarily so process_trigger can re-acquire
+                    self._lock.release()
+                    try:
+                        self.process_trigger(post_plan_state, "decision_required")
+                    finally:
+                        # Re-acquire for the outer finally block
+                        self._lock.acquire()
+            except Exception as e:
+                logger.warning(f"Post-plan follow-up handling failed: {e}")
+
             return True
         finally:
             self._lock.release()
@@ -772,14 +819,14 @@ class AutopilotEngine:
                 logger.info("AFK: keeping hand (mulligan)")
                 if not self._config.dry_run:
                     self._controller.focus_mtga_window()
-                    time.sleep(0.15)
+                    time.sleep(0.06)
                 return self._click_fixed("keep").success
 
             if "scry" in pending_lower:
                 logger.info("AFK: scry to bottom")
                 if not self._config.dry_run:
                     self._controller.focus_mtga_window()
-                    time.sleep(0.15)
+                    time.sleep(0.06)
                 return self._click_fixed("scry_bottom").success
 
             # New decision types from expanded GRE handling
@@ -787,21 +834,21 @@ class AutopilotEngine:
                 logger.info("AFK: skipping attackers (click Done)")
                 if not self._config.dry_run:
                     self._controller.focus_mtga_window()
-                    time.sleep(0.15)
+                    time.sleep(0.06)
                 return self._click_fixed("done").success
 
             if dec_type == "declare_blockers":
                 logger.info("AFK: skipping blockers (click Done)")
                 if not self._config.dry_run:
                     self._controller.focus_mtga_window()
-                    time.sleep(0.15)
+                    time.sleep(0.06)
                 return self._click_fixed("done").success
 
             if dec_type == "choose_starting_player":
                 logger.info("AFK: choosing to play")
                 if not self._config.dry_run:
                     self._controller.focus_mtga_window()
-                    time.sleep(0.15)
+                    time.sleep(0.06)
                 # "Play" is typically the first option
                 return self._click_fixed("pass").success
 
@@ -816,7 +863,7 @@ class AutopilotEngine:
                 logger.info(f"AFK: auto-accepting decision '{dec_type}' (click Done)")
                 if not self._config.dry_run:
                     self._controller.focus_mtga_window()
-                    time.sleep(0.15)
+                    time.sleep(0.06)
                 result = self._click_fixed("done")
                 if result.success:
                     return True
@@ -829,7 +876,7 @@ class AutopilotEngine:
                 logger.warning(f"AFK: unknown decision '{pending}' - trying Done button")
                 if not self._config.dry_run:
                     self._controller.focus_mtga_window()
-                    time.sleep(0.15)
+                    time.sleep(0.06)
                 result = self._click_fixed("done")
                 if result.success:
                     return True
@@ -841,7 +888,7 @@ class AutopilotEngine:
         logger.info(f"AFK: passing ({trigger})")
         if not self._config.dry_run:
             self._controller.focus_mtga_window()
-            time.sleep(0.15)
+            time.sleep(0.06)
         return self._exec_pass_priority().success
 
     def _handle_land_drop(self, game_state: dict[str, Any], trigger: str) -> bool:
@@ -896,7 +943,7 @@ class AutopilotEngine:
                     if window_rect:
                         if not self._config.dry_run:
                             self._controller.focus_mtga_window()
-                            time.sleep(0.15)
+                            time.sleep(0.06)
 
                         from_x, from_y = coord.to_absolute(window_rect)
                         # Drag to center of battlefield (y ≈ 0.50)
@@ -927,13 +974,13 @@ class AutopilotEngine:
                 logger.info("LAND DROP: keeping hand (mulligan)")
                 if not self._config.dry_run:
                     self._controller.focus_mtga_window()
-                    time.sleep(0.15)
+                    time.sleep(0.06)
                 return self._click_fixed("keep").success
             if "scry" in pending_lower:
                 logger.info("LAND DROP: scry to bottom")
                 if not self._config.dry_run:
                     self._controller.focus_mtga_window()
-                    time.sleep(0.15)
+                    time.sleep(0.06)
                 return self._click_fixed("scry_bottom").success
 
             # New decision types: auto-pass combat, auto-accept others
@@ -941,14 +988,14 @@ class AutopilotEngine:
                 logger.info(f"LAND DROP: skipping {dec_type} (click Done)")
                 if not self._config.dry_run:
                     self._controller.focus_mtga_window()
-                    time.sleep(0.15)
+                    time.sleep(0.06)
                 return self._click_fixed("done").success
 
             if dec_type == "choose_starting_player":
                 logger.info("LAND DROP: choosing to play")
                 if not self._config.dry_run:
                     self._controller.focus_mtga_window()
-                    time.sleep(0.15)
+                    time.sleep(0.06)
                 return self._click_fixed("pass").success
 
             if dec_type in (
@@ -962,7 +1009,7 @@ class AutopilotEngine:
                 logger.info(f"LAND DROP: auto-accepting decision '{dec_type}' (click Done)")
                 if not self._config.dry_run:
                     self._controller.focus_mtga_window()
-                    time.sleep(0.15)
+                    time.sleep(0.06)
                 result = self._click_fixed("done")
                 if result.success:
                     return True
@@ -974,7 +1021,7 @@ class AutopilotEngine:
                 logger.warning(f"LAND DROP: unknown decision '{pending}' - trying Done button")
                 if not self._config.dry_run:
                     self._controller.focus_mtga_window()
-                    time.sleep(0.15)
+                    time.sleep(0.06)
                 result = self._click_fixed("done")
                 if result.success:
                     return True
@@ -984,7 +1031,7 @@ class AutopilotEngine:
         logger.info(f"LAND DROP: passing ({trigger})")
         if not self._config.dry_run:
             self._controller.focus_mtga_window()
-            time.sleep(0.15)
+            time.sleep(0.06)
         return self._exec_pass_priority().success
 
     def _get_legal_actions(self, game_state: dict[str, Any]) -> list[str]:
@@ -1066,11 +1113,11 @@ class AutopilotEngine:
         except Exception as e:
             logger.error(f"Stuck recovery re-plan failed: {e}")
 
-        # 2. Try common dismissal keys
-        logger.warning("Stuck recovery: sending Escape and Spacebar")
+        # 2. Try common dismissal actions (NOT Escape — it opens MTGA menu)
+        logger.warning("Stuck recovery: clicking Done button and pressing Spacebar")
         self._controller.focus_mtga_window()
         time.sleep(0.2)
-        self._controller.press_key("escape", "Dismissing dialog")
+        self._click_fixed("done")  # Done/Submit button
         time.sleep(0.5)
         self._controller.press_key("space", "Confirming priority")
 
@@ -1777,13 +1824,23 @@ class AutopilotEngine:
         time.sleep(self._config.post_action_delay)
 
         deadline = time.time() + self._config.verification_timeout
-        poll_interval = 0.3
+        poll_interval = 0.15
 
         card_name = action.card_name.lower() if action.card_name else ""
+
+        pre_pending = pre_state.get("pending_decision")
 
         while time.time() < deadline:
             try:
                 post_state = self._get_game_state()
+
+                # 0. New pending decision appeared (ETB choices, mana payments, etc.)
+                # This means the action was processed and MTGA is waiting for a
+                # follow-up choice (e.g. shock land "Pay 2 life?", scry, etc.)
+                post_pending = post_state.get("pending_decision")
+                if post_pending and post_pending != pre_pending:
+                    logger.info(f"Action verified: new pending decision '{post_pending}' (follow-up choice)")
+                    return True
 
                 # 1. Global state changes (Turn, Phase, Priority)
                 pre_turn = pre_state.get("turn", {})

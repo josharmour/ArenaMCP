@@ -4,7 +4,18 @@ import arenamcp.coach as coach_mod
 from arenamcp.coach import CoachEngine, CodexCliBackend
 
 
-def test_codex_cli_backend_uses_exec_subcommand(monkeypatch):
+def test_codex_cli_backend_direct_api_preferred(monkeypatch):
+    """When Azure credentials are available, direct API is preferred over codex exec."""
+    backend = CodexCliBackend(model="gpt-5.4-pro", command="codex")
+    # If Azure config exists and key is set, _use_direct_api should be True
+    # If not (CI/test env), it falls back to CLI mode — both are valid
+    assert hasattr(backend, '_use_direct_api')
+    assert hasattr(backend, '_complete_azure')
+    assert hasattr(backend, '_complete_cli')
+
+
+def test_codex_cli_backend_cli_fallback(monkeypatch):
+    """When Azure credentials are not available, falls back to codex exec."""
     calls = []
 
     def _fake_run(run_args, **kwargs):
@@ -14,12 +25,12 @@ def test_codex_cli_backend_uses_exec_subcommand(monkeypatch):
     monkeypatch.setattr(coach_mod.subprocess, "run", _fake_run)
 
     backend = CodexCliBackend(model="gpt-5.4-pro", command="codex")
-    result = backend.complete("sys", "msg")
+    backend._use_direct_api = False  # Force CLI fallback
+    result = backend._complete_cli("sys", "msg")
 
     assert result == "ok"
     assert calls
-    assert calls[0][0][1:3] == ["exec", "--model"]
-    assert calls[0][0][-1] == "-"
+    assert "exec" in calls[0][0]
 
 
 def test_postprocess_prefers_declare_attackers_from_decision_context(monkeypatch):

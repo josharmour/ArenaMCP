@@ -1943,6 +1943,31 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                     game_state.legal_actions = legal_list
                     logger.info(f"Captured {len(legal_list)} legal actions from GRE: {legal_list}")
 
+                # GRE sent us actions — we have priority.  Correct priority_player
+                # and active_player if they are stale (common during log backfill
+                # or when turnInfo diffs arrive out-of-order).
+                if raw_actions and game_state.local_seat_id is not None:
+                    local = game_state.local_seat_id
+                    action_types = {a.get("actionType", "") for a in raw_actions}
+                    has_sorcery_speed = (
+                        "ActionType_Cast" in action_types
+                        or "ActionType_Play" in action_types
+                    )
+                    # If we have Cast/Play actions and the stack is empty,
+                    # it MUST be our main phase — correct active_player.
+                    stack_empty = not game_state.get_objects_in_zone(ZoneType.STACK)
+                    if has_sorcery_speed and stack_empty:
+                        if game_state.turn_info.active_player != local:
+                            logger.warning(
+                                f"Active player correction: GRE gave us sorcery-speed "
+                                f"actions but active_player={game_state.turn_info.active_player} "
+                                f"(local={local}). Correcting to {local}."
+                            )
+                            game_state.turn_info.active_player = local
+                    # We always have priority when GRE sends ActionsAvailableReq
+                    if game_state.turn_info.priority_player != local:
+                        game_state.turn_info.priority_player = local
+
                 # Set pending_decision: the GRE is waiting for the player to act.
                 # Only set if we have actual actions (not an empty req).
                 if raw_actions:
