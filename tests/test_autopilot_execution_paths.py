@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 from dataclasses import dataclass, field
 
 from arenamcp.autopilot import AutopilotConfig, AutopilotEngine, ExecutionPath
-from arenamcp.action_planner import ActionType, GameAction
+from arenamcp.action_planner import ActionPlan, ActionType, GameAction
 from arenamcp.input_controller import ClickResult
 
 
@@ -126,6 +126,52 @@ class TestAutopilotConfigPreferDeterministic:
     def test_can_set_false(self):
         config = AutopilotConfig(prefer_deterministic=False)
         assert config.prefer_deterministic is False
+
+
+class TestVisionPrefetch:
+    """Vision prefetch should stay off the hot path in deterministic mode."""
+
+    def test_process_trigger_skips_prefetch_when_deterministic(self, engine, mock_planner):
+        engine._scan_layout_if_needed = MagicMock()
+        mock_planner.plan_actions.return_value = ActionPlan(actions=[])
+
+        game_state = {
+            "turn": {"turn_number": 3, "phase": "Phase_Main1", "active_player": 1},
+            "players": [{"is_local": True, "seat_id": 1}],
+            "pending_decision": "Choose Action",
+            "legal_actions": ["Pass"],
+        }
+
+        engine.process_trigger(game_state, "decision_required")
+
+        engine._scan_layout_if_needed.assert_not_called()
+
+    def test_process_trigger_prefetches_when_vision_heavy_mode(self, mock_planner, mock_mapper, mock_controller):
+        config = AutopilotConfig(
+            enable_vision_fallback=True,
+            prefer_deterministic=False,
+            dry_run=True,
+        )
+        engine = AutopilotEngine(
+            planner=mock_planner,
+            mapper=mock_mapper,
+            controller=mock_controller,
+            get_game_state=lambda: {},
+            config=config,
+        )
+        engine._scan_layout_if_needed = MagicMock()
+        mock_planner.plan_actions.return_value = ActionPlan(actions=[])
+
+        game_state = {
+            "turn": {"turn_number": 3, "phase": "Phase_Main1", "active_player": 1},
+            "players": [{"is_local": True, "seat_id": 1}],
+            "pending_decision": "Choose Action",
+            "legal_actions": ["Pass"],
+        }
+
+        engine.process_trigger(game_state, "decision_required")
+
+        engine._scan_layout_if_needed.assert_called_once_with(game_state)
 
 
 # ---- Button clicks use deterministic geometry ----

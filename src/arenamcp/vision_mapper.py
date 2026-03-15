@@ -115,7 +115,7 @@ Output ONLY a JSON object with this structure:
 {
   "elements": [
     {"name": "Card Name or Button Label", "zone": "hand", "x": 0.35, "y": 0.92, "confidence": 0.95},
-    {"name": "Done", "zone": "button", "x": 0.78, "y": 0.85, "confidence": 0.99}
+    {"name": "Done", "zone": "button", "x": 0.92, "y": 0.88, "confidence": 0.99}
   ],
   "phase_hint": "main_phase|combat|mulligan|draft|unknown"
 }

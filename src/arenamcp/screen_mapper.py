@@ -1,8 +1,17 @@
 """Hybrid UI Detection for Autopilot Mode.
 
-Maps game actions to screen coordinates using fixed normalized coordinates
-for known buttons, positional heuristics for cards, and vision/LLM fallback
-for dynamic elements.
+Maps game actions to screen coordinates using resolution-aware proportional
+positioning for buttons, arc-based geometry for hand cards, and vision/LLM
+fallback for dynamic elements.
+
+Button positions are derived from reverse-engineered MTGA UI layout logic:
+- Primary/Secondary prompt buttons use a RectTransform-anchored layout in
+  the bottom-right quadrant (see ``BattleFieldStaticElementsLayout`` and
+  ``UIManager.SpawnButtons`` in decompiled ``Core.dll``).
+- Mulligan Keep/Mulligan buttons live inside a centred browser overlay
+  (``MulliganBrowser``).
+- Aspect-ratio adjustments compensate for the pillar-boxing that MTGA
+  applies on non-16:9 displays.
 
 All coordinates are normalized to the MTGA window (0.0-1.0 range) and
 converted to absolute pixel coordinates at click time.
@@ -43,52 +52,180 @@ class ScreenCoord:
         return (abs_x, abs_y)
 
 
-class FixedCoordinates:
-    """Known fixed button positions in MTGA (normalized 0.0-1.0).
+class ButtonCoordinates:
+    """Resolution-aware button positions derived from MTGA RE analysis.
 
-    These are calibrated for standard 16:9 MTGA resolution.
-    May need adjustment via tools/calibrate_screen.py.
+    Positions are computed proportionally rather than hardcoded, with
+    aspect-ratio compensation for non-16:9 displays.
+
+    Architecture (from decompiled ``Core.dll``):
+
+    * **Prompt buttons** (Pass / Resolve / Done / Submit Attackers etc.)
+      live in a ``_buttonsLayout`` container anchored to
+      ``_promptButtonsAnchorPoint`` in the bottom-right quadrant.
+      ``UIManager.SpawnButtons`` creates a *primary* button (main action)
+      and a *secondary* button (cancel / Resolve-All).  Both are children
+      of the same layout, so they share a Y position and are separated
+      horizontally.
+
+    * **Mulligan buttons** (Keep / Mulligan) are embedded in a centred
+      ``MulliganBrowser`` overlay, not in the prompt-button layout.
+
+    * **Browser buttons** (Scry Top/Bottom, etc.) appear in centred
+      browser overlays at roughly mid-screen height.
+
+    When the window is not 16:9, MTGA pillar-boxes (adds black bars on the
+    sides for wider ratios) or letter-boxes (bars top/bottom for taller
+    ratios).  We compute the playable viewport inset and map coordinates
+    inside it.
     """
 
-    # Bottom-right action buttons (Pass/Resolve/Done all share same position)
-    PASS_TURN = ScreenCoord(0.78, 0.85, "Pass Turn button")
-    RESOLVE = ScreenCoord(0.78, 0.85, "Resolve button")
-    DONE = ScreenCoord(0.78, 0.85, "Done button")
+    # ---- reference aspect ratio (MTGA's native layout target) ----------
+    _REF_ASPECT = 16.0 / 9.0  # 1.7778
 
-    # Mulligan buttons
-    KEEP = ScreenCoord(0.58, 0.68, "Keep button")
-    MULLIGAN = ScreenCoord(0.42, 0.68, "Mulligan button")
+    # ---- 16:9 baseline positions (normalised to the playable viewport) --
+    # Primary prompt button: bottom-right area
+    # From RE: _primaryButton is to the right of _secondaryButton in
+    # _buttonsLayout, anchored via _promptButtonsAnchorPoint.
+    _PRIMARY_X_16_9 = 0.78
+    _PRIMARY_Y_16_9 = 0.85
 
-    # Scry options
-    SCRY_TOP = ScreenCoord(0.56, 0.55, "Scry to Top")
-    SCRY_BOTTOM = ScreenCoord(0.44, 0.55, "Scry to Bottom")
+    # Secondary prompt button: slightly left of primary
+    _SECONDARY_X_16_9 = 0.68
+    _SECONDARY_Y_16_9 = 0.85
 
-    # Zone centers (approximate)
-    HAND_CENTER = ScreenCoord(0.50, 0.92, "Hand zone center")
-    BATTLEFIELD_YOUR = ScreenCoord(0.50, 0.65, "Your battlefield center")
-    BATTLEFIELD_OPP = ScreenCoord(0.50, 0.35, "Opponent battlefield center")
+    # Mulligan browser buttons (centred overlay)
+    _KEEP_X_16_9 = 0.58
+    _KEEP_Y_16_9 = 0.68
+    _MULL_X_16_9 = 0.42
+    _MULL_Y_16_9 = 0.68
 
-    # Button name -> coordinate lookup
-    _BUTTONS = {
-        "pass": PASS_TURN,
-        "pass_turn": PASS_TURN,
-        "resolve": RESOLVE,
-        "done": DONE,
-        "next": PASS_TURN,
-        "attack": PASS_TURN,
-        "block": PASS_TURN,
-        "no_attacks": PASS_TURN,
-        "no_blocks": PASS_TURN,
-        "keep": KEEP,
-        "mulligan": MULLIGAN,
-        "scry_top": SCRY_TOP,
-        "scry_bottom": SCRY_BOTTOM,
-    }
+    # Scry/Surveil browser buttons (centred overlay)
+    _SCRY_TOP_X_16_9 = 0.56
+    _SCRY_TOP_Y_16_9 = 0.55
+    _SCRY_BOT_X_16_9 = 0.44
+    _SCRY_BOT_Y_16_9 = 0.55
+
+    # Zone centres
+    _HAND_CENTER_X = 0.50
+    _HAND_CENTER_Y = 0.92
+    _BF_YOUR_Y = 0.65
+    _BF_OPP_Y = 0.35
+
+    @staticmethod
+    def _viewport_inset(aspect: float) -> tuple[float, float, float, float]:
+        """Return (left, top, width, height) of the 16:9 playable viewport.
+
+        All values are normalised 0-1 fractions of the full window.
+
+        MTGA enforces a 16:9 playable area.  On wider monitors it
+        pillar-boxes (black bars left+right); on taller monitors it
+        letter-boxes (bars top+bottom).  The UI elements are laid out
+        inside this inner viewport.
+
+        Returns the identity (0, 0, 1, 1) for exactly 16:9.
+        """
+        ref = ButtonCoordinates._REF_ASPECT
+        if abs(aspect - ref) < 0.02:
+            # Close enough to 16:9 — no adjustment needed
+            return (0.0, 0.0, 1.0, 1.0)
+
+        if aspect > ref:
+            # Wider than 16:9 (e.g. 21:9) — pillar-box
+            vp_width = ref / aspect           # fraction of window used
+            bar = (1.0 - vp_width) / 2.0
+            return (bar, 0.0, vp_width, 1.0)
+        else:
+            # Taller than 16:9 (e.g. 16:10, 4:3) — letter-box
+            vp_height = aspect / ref          # fraction of window used
+            bar = (1.0 - vp_height) / 2.0
+            return (0.0, bar, 1.0, vp_height)
 
     @classmethod
-    def get(cls, name: str) -> Optional[ScreenCoord]:
-        """Look up a fixed coordinate by button name."""
-        return cls._BUTTONS.get(name.lower())
+    def _to_window_coord(
+        cls,
+        vp_x: float,
+        vp_y: float,
+        aspect: float,
+    ) -> tuple[float, float]:
+        """Convert a viewport-relative coord to a window-relative coord.
+
+        ``vp_x``, ``vp_y`` are in [0, 1] relative to the 16:9 playable
+        viewport.  Returns (win_x, win_y) in [0, 1] relative to the full
+        window, accounting for pillar-/letter-boxing.
+        """
+        left, top, w, h = cls._viewport_inset(aspect)
+        return (left + vp_x * w, top + vp_y * h)
+
+    @classmethod
+    def get(
+        cls,
+        name: str,
+        aspect: Optional[float] = None,
+    ) -> Optional[ScreenCoord]:
+        """Look up a button coordinate by name, adjusted for aspect ratio.
+
+        Args:
+            name: Button name (e.g. ``"pass"``, ``"keep"``).
+            aspect: Window width/height ratio.  Defaults to 16:9 if None.
+
+        Returns:
+            Resolution-compensated ``ScreenCoord``, or None.
+        """
+        if aspect is None:
+            aspect = cls._REF_ASPECT
+
+        key = name.lower()
+
+        # Map name aliases to canonical (vp_x, vp_y, description)
+        entry = cls._resolve_button(key)
+        if entry is None:
+            return None
+
+        vp_x, vp_y, desc = entry
+        win_x, win_y = cls._to_window_coord(vp_x, vp_y, aspect)
+
+        logger.debug(
+            f"ButtonCoord '{key}': vp({vp_x:.3f},{vp_y:.3f}) "
+            f"-> win({win_x:.3f},{win_y:.3f}) [aspect={aspect:.3f}]"
+        )
+        return ScreenCoord(win_x, win_y, desc)
+
+    @classmethod
+    def _resolve_button(
+        cls, key: str
+    ) -> Optional[tuple[float, float, str]]:
+        """Resolve a button name to viewport-relative (x, y, description).
+
+        The primary prompt button (Pass/Done/Submit/Resolve/etc.) all
+        occupy the same ``_primaryButton`` position in the
+        ``_buttonsLayout``.  The secondary button (Resolve-All, Cancel)
+        sits to its left.
+        """
+        # Primary prompt button aliases
+        if key in (
+            "pass", "pass_turn", "resolve", "done",
+            "next", "attack", "block", "no_attacks", "no_blocks",
+        ):
+            return (cls._PRIMARY_X_16_9, cls._PRIMARY_Y_16_9, f"{key.replace('_', ' ').title()} button")
+
+        # Mulligan browser buttons
+        if key == "keep":
+            return (cls._KEEP_X_16_9, cls._KEEP_Y_16_9, "Keep button")
+        if key == "mulligan":
+            return (cls._MULL_X_16_9, cls._MULL_Y_16_9, "Mulligan button")
+
+        # Scry browser buttons
+        if key == "scry_top":
+            return (cls._SCRY_TOP_X_16_9, cls._SCRY_TOP_Y_16_9, "Scry to Top")
+        if key == "scry_bottom":
+            return (cls._SCRY_BOT_X_16_9, cls._SCRY_BOT_Y_16_9, "Scry to Bottom")
+
+        return None
+
+
+# Backwards-compatible alias so existing imports keep working.
+FixedCoordinates = ButtonCoordinates
 
 
 class ScreenMapper:
@@ -141,8 +278,21 @@ class ScreenMapper:
         self._window_rect = None
         return self.get_mtga_window()
 
+    def _current_aspect(self) -> float:
+        """Return the current window aspect ratio, or 16:9 as default."""
+        rect = self._window_rect
+        if rect:
+            _, _, w, h = rect
+            if h > 0:
+                return w / h
+        return 16.0 / 9.0
+
     def get_button_coord(self, name: str) -> Optional[ScreenCoord]:
         """Get the screen coordinate for a known button.
+
+        Coordinates are adjusted for the current window aspect ratio so
+        that pillar-boxing (ultra-wide) and letter-boxing (4:3) are
+        accounted for automatically.
 
         Args:
             name: Button name (e.g., "pass", "keep", "resolve").
@@ -150,7 +300,7 @@ class ScreenMapper:
         Returns:
             ScreenCoord or None if button not found.
         """
-        return FixedCoordinates.get(name)
+        return ButtonCoordinates.get(name, aspect=self._current_aspect())
 
     def _hand_arc_positions(self, hand_size: int) -> list[tuple[float, float]]:
         """Compute normalized (x, y) positions for each card index using MTGA arc layout.
@@ -379,14 +529,17 @@ class ScreenMapper:
 
         return None
 
+    # -- Card type classification --
+    # Derived from BattlefieldLayout_MP.GenerateData() region-assignment
+    # logic in decompiled Core.dll.  MTGA classifies permanents into four
+    # region types per player side.
+
     @staticmethod
     def _is_creature(card: dict[str, Any]) -> bool:
         """Check if a battlefield card is a creature."""
-        # Check card_types list first (from game state)
         card_types = card.get("card_types", [])
         if card_types:
             return any("Creature" in ct for ct in card_types)
-        # Fallback: check type_line string
         type_line = card.get("type_line", "")
         return "creature" in type_line.lower()
 
@@ -400,10 +553,163 @@ class ScreenMapper:
         return "land" in type_line.lower()
 
     @staticmethod
-    def _is_aura(card: dict[str, Any]) -> bool:
-        """Check if a card is an Aura."""
+    def _is_planeswalker_row(card: dict[str, Any]) -> bool:
+        """Check if a card belongs in the planeswalker/saga row.
+
+        From BattlefieldLayout_MP.GenerateData(): Planeswalkers, Sagas,
+        Classes, Cases, and Rooms all go to the planeswalker region.
+        """
+        card_types = card.get("card_types", [])
+        subtypes = card.get("subtypes", [])
+        type_line = card.get("type_line", "").lower()
+
+        # CardType checks
+        if any("Planeswalker" in ct for ct in card_types):
+            return True
+        if any("Battle" in ct for ct in card_types):
+            return True
+
+        # SubType checks (Saga, Class, Case, Room)
+        pw_subtypes = {"Saga", "Class", "Case", "Room"}
+        if any(st in pw_subtypes for st in subtypes):
+            return True
+
+        # Fallback: check type_line string
+        for keyword in ("planeswalker", "battle", "saga", "class", "case", "room"):
+            if keyword in type_line:
+                return True
+
+        return False
+
+    @staticmethod
+    def _is_attached(card: dict[str, Any]) -> bool:
+        """Check if a card is attached to another permanent (aura/equipment).
+
+        Attached cards do not occupy their own position in the battlefield
+        row -- they are rendered on top of their parent permanent.
+        """
+        # parent_instance_id in our game state maps to GRE's parentId,
+        # which is set for attached auras, equipment, and abilities.
+        parent_id = card.get("parent_instance_id")
+        if parent_id and parent_id > 0:
+            return True
+        # Fallback: check type_line for Aura (catches cases where
+        # parent_instance_id might not yet be populated in a diff)
         type_line = card.get("type_line", "").lower()
         return "aura" in type_line
+
+    @staticmethod
+    def _classify_region(card: dict[str, Any]) -> str:
+        """Classify a card into its battlefield region.
+
+        Region assignment order mirrors BattlefieldLayout_MP.GenerateData()
+        from decompiled Core.dll:
+          1. Creature  -> creature region
+          2. Planeswalker / Battle / Saga / Class / Case / Room
+                       -> planeswalker region
+          3. Land      -> land region
+          4. Everything else (artifacts, enchantments) -> artifact region
+
+        Returns one of: "creature", "planeswalker", "land", "artifact".
+        """
+        if ScreenMapper._is_creature(card):
+            return "creature"
+        if ScreenMapper._is_planeswalker_row(card):
+            return "planeswalker"
+        if ScreenMapper._is_land(card):
+            return "land"
+        return "artifact"
+
+    # -- Battlefield row Y coordinates --
+    # Derived from MTGA's viewport-space region anchors observed in the
+    # UniversalBattlefieldRegion BoundsDefinition (AnchorMin/AnchorMax).
+    #
+    # MTGA layout from top to bottom (opponent then local player):
+    #   Opponent lands         y ~ 0.14
+    #   Opponent artifacts     y ~ 0.22
+    #   Opponent planeswalkers y ~ 0.28
+    #   Opponent creatures     y ~ 0.38
+    #   --- center line ~0.48 ---
+    #   Local creatures        y ~ 0.58
+    #   Local planeswalkers    y ~ 0.66
+    #   Local artifacts        y ~ 0.72
+    #   Local lands            y ~ 0.78
+    #
+    # When a row is empty its space is not strictly reclaimed, but the
+    # primary rows (creatures, lands) remain fixed.  The secondary rows
+    # (planeswalker, artifact) sit between them.
+
+    _ROW_Y: dict[tuple[bool, str], float] = {
+        # (is_yours, region) -> normalized y
+        (True,  "creature"):     0.58,
+        (True,  "planeswalker"): 0.66,
+        (True,  "artifact"):     0.72,
+        (True,  "land"):         0.78,
+        (False, "creature"):     0.38,
+        (False, "planeswalker"): 0.28,
+        (False, "artifact"):     0.22,
+        (False, "land"):         0.14,
+    }
+
+    @staticmethod
+    def _sort_by_age(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Sort cards by instance_id ascending (oldest first).
+
+        MTGA's StackBlockerAndAgeComparer sorts battlefield stacks by age
+        so that identical permanents group with oldest leftmost.  Instance
+        IDs increase monotonically, so they serve as a reliable age proxy.
+        """
+        return sorted(cards, key=lambda c: c.get("instance_id", 0))
+
+    def _battlefield_row_positions(
+        self, num_in_row: int
+    ) -> list[float]:
+        """Compute center-aligned X positions for permanents in one row.
+
+        Derived from UniversalBattlefieldGroup.GenerateLayoutInternal()
+        and LayoutDataGenerator.GetRowStartingPosition() which center-align
+        stacks within a region bounded by [0.10 .. 0.90] viewport X.
+
+        The algorithm:
+        - Each card occupies a *slot* whose width shrinks as the row grows.
+        - For small counts, a fixed comfortable spacing is used.
+        - For large counts, cards compress to fit the available width,
+          mimicking how MTGA overlaps cards.
+
+        Returns:
+            List of normalized X positions, one per card.
+        """
+        if num_in_row == 0:
+            return []
+        if num_in_row == 1:
+            return [0.50]
+
+        # MTGA uses a bounded region (roughly 80% of screen width).
+        # Cards are center-aligned with configurable inter-card gutter.
+        BF_LEFT = 0.10
+        BF_RIGHT = 0.90
+        BF_WIDTH = BF_RIGHT - BF_LEFT
+
+        # Card width in normalized coords (empirical: ~0.065 of screen).
+        CARD_W = 0.065
+        # Comfortable gutter between cards.
+        GUTTER = 0.020
+
+        # Total width the row would ideally occupy.
+        ideal_width = num_in_row * CARD_W + (num_in_row - 1) * GUTTER
+
+        if ideal_width <= BF_WIDTH:
+            # Fits comfortably -- center the group.
+            start_x = 0.50 - ideal_width / 2.0 + CARD_W / 2.0
+            step = CARD_W + GUTTER
+        else:
+            # Compress: distribute card centers evenly across the region.
+            # This mirrors MTGA's overlapping behaviour.
+            start_x = BF_LEFT + CARD_W / 2.0
+            usable = BF_WIDTH - CARD_W
+            step = usable / (num_in_row - 1) if num_in_row > 1 else 0.0
+
+        return [start_x + i * step for i in range(num_in_row)]
 
     def get_permanent_coord(
         self,
@@ -413,129 +719,140 @@ class ScreenMapper:
         owner_seat: int,
         local_seat: int,
     ) -> Optional[ScreenCoord]:
-        """Calculate the screen position of a permanent on the battlefield."""
+        """Calculate the screen position of a permanent on the battlefield.
+
+        Uses a four-region layout per player side derived from decompiled
+        BattlefieldLayout_MP.GenerateData() in Core.dll:
+
+        Region assignment (checked in order):
+          1. Creatures  -> creature row (closest to center line)
+          2. Planeswalkers / Battles / Sagas / Classes / Cases / Rooms
+                        -> planeswalker row
+          3. Lands      -> land row (furthest from center line)
+          4. Everything else (artifacts, enchantments) -> artifact row
+
+        Cards attached to other permanents (auras, equipment with
+        parentId set) are excluded from independent row positioning and
+        are treated as overlaying their parent.
+
+        Within each row, cards are sorted by instance_id (oldest first /
+        leftmost), matching StackBlockerAndAgeComparer from the game.
+        """
         is_yours = owner_seat == local_seat
 
-        # Filter battlefield to the right owner
+        # Filter to the controller's permanents on the battlefield.
         owner_cards = [c for c in battlefield if c.get("owner_seat_id") == owner_seat]
 
-        # Split into creatures vs non-creatures (lands/enchantments/artifacts)
-        # CRITICAL: Auras do not take up space in the row!
-        creatures = [c for c in owner_cards if self._is_creature(c)]
-        non_creatures = [c for c in owner_cards if not self._is_creature(c) and not self._is_aura(c)]
+        # Separate attached cards (auras / equipment) -- they overlay
+        # their parent and do not take up row space.
+        free_cards = [c for c in owner_cards if not self._is_attached(c)]
+        attached_cards = [c for c in owner_cards if self._is_attached(c)]
 
-        # Reverse lists to match MTGA's Left-to-Right layout (usually Oldest -> Newest)
-        creatures.reverse()
-        non_creatures.reverse()
+        # Classify into the four MTGA regions.
+        rows: dict[str, list[dict[str, Any]]] = {
+            "creature": [],
+            "planeswalker": [],
+            "land": [],
+            "artifact": [],
+        }
+        for card in free_cards:
+            region = self._classify_region(card)
+            rows[region].append(card)
 
-        logger.info(f"Row 'creature' contents: {[c.get('name') for c in creatures]}")
-        logger.info(f"Row 'non_creature' contents: {[c.get('name') for c in non_creatures]}")
+        # Sort each row by age (oldest first = leftmost).
+        for region in rows:
+            rows[region] = self._sort_by_age(rows[region])
 
-        # Find the specific card and determine which row it's in
+        if logger.isEnabledFor(logging.DEBUG):
+            for region, cards in rows.items():
+                names = [c.get("name", "?") for c in cards]
+                if names:
+                    logger.debug(f"Row '{region}' ({'yours' if is_yours else 'opp'}): {names}")
+
+        # Locate the target card in the rows (or among attached cards).
         target_card = None
-        card_row = None  # "creature" or "non_creature"
-        card_idx_in_row = None
+        card_region: Optional[str] = None
+        card_idx_in_row: Optional[int] = None
 
-        # Search by instance_id first (exact match)
-        if instance_id:
-            for i, card in enumerate(creatures):
-                if card.get("instance_id") == instance_id:
-                    target_card = card
-                    card_row = "creature"
-                    card_idx_in_row = i
-                    break
-            if target_card is None:
-                for i, card in enumerate(non_creatures):
-                    if card.get("instance_id") == instance_id:
+        # Build a flat search list: all rows + attached cards.
+        all_regions = list(rows.keys())
+
+        def _search_rows(predicate):
+            """Search rows with a predicate returning (card, region, idx) or None."""
+            nonlocal target_card, card_region, card_idx_in_row
+            for reg in all_regions:
+                for i, card in enumerate(rows[reg]):
+                    if predicate(card):
                         target_card = card
-                        card_row = "non_creature"
+                        card_region = reg
                         card_idx_in_row = i
-                        break
+                        return True
+            # Also check attached cards -- they get positioned at their
+            # parent's location.
+            for card in attached_cards:
+                if predicate(card):
+                    target_card = card
+                    card_region = None  # signals "attached"
+                    card_idx_in_row = None
+                    return True
+            return False
 
-        # Search by exact name match
+        # 1) Exact instance_id match.
+        if instance_id and not _search_rows(
+            lambda c: c.get("instance_id") == instance_id
+        ):
+            pass  # fall through
+
+        # 2) Exact name match (case-insensitive).
         if target_card is None:
-            for i, card in enumerate(creatures):
-                if card.get("name", "").lower() == card_name.lower():
-                    target_card = card
-                    card_row = "creature"
-                    card_idx_in_row = i
-                    break
-            if target_card is None:
-                for i, card in enumerate(non_creatures):
-                    if card.get("name", "").lower() == card_name.lower():
-                        target_card = card
-                        card_row = "non_creature"
-                        card_idx_in_row = i
-                        break
+            _search_rows(
+                lambda c: c.get("name", "").lower() == card_name.lower()
+            )
 
-        # Partial name match fallback
+        # 3) Partial / substring name match.
         if target_card is None:
-            for i, card in enumerate(creatures):
-                if card_name.lower() in card.get("name", "").lower():
-                    target_card = card
-                    card_row = "creature"
-                    card_idx_in_row = i
-                    break
-            if target_card is None:
-                for i, card in enumerate(non_creatures):
-                    if card_name.lower() in card.get("name", "").lower():
-                        target_card = card
-                        card_row = "non_creature"
-                        card_idx_in_row = i
-                        break
+            _search_rows(
+                lambda c: card_name.lower() in c.get("name", "").lower()
+            )
 
         if target_card is None:
             logger.warning(f"Permanent '{card_name}' not found on battlefield")
             return None
 
-        # Determine Y coordinate based on owner and card type
-        # MTGA layout (16:9):
-        #   Opp non-creatures (lands):  y ≈ 0.22
-        #   Opp creatures:              y ≈ 0.38
-        #   --- center line ---
-        #   Your creatures:             y ≈ 0.58
-        #   Your non-creatures (lands): y ≈ 0.75
-        
-        # ADJUSTMENT: If you have many non-creatures (artifacts/enchantments), 
-        # MTGA might shift the creature row up slightly.
-        if is_yours:
-            if card_row == "creature":
-                # If there are a lot of non-creatures, the creature row is higher
-                y = 0.58 if len(non_creatures) <= 4 else 0.52
-            else:
-                y = 0.75 if len(creatures) <= 4 else 0.82
-        else:
-            if card_row == "creature":
-                y = 0.38 if len(non_creatures) <= 4 else 0.42
-            else:
-                y = 0.22 if len(creatures) <= 4 else 0.15
+        # Handle attached cards: position at their parent's location.
+        if card_region is None:
+            parent_id = target_card.get("parent_instance_id")
+            if parent_id:
+                # Recurse: find the parent permanent's position.
+                parent_name = None
+                for c in battlefield:
+                    if c.get("instance_id") == parent_id:
+                        parent_name = c.get("name", card_name)
+                        break
+                if parent_name:
+                    logger.info(
+                        f"'{card_name}' is attached to '{parent_name}' "
+                        f"(id={parent_id}), using parent position"
+                    )
+                    return self.get_permanent_coord(
+                        parent_name, parent_id, battlefield,
+                        owner_seat, local_seat
+                    )
+            # Fallback: if parent not found, place at creature row center.
+            y = self._ROW_Y.get((is_yours, "creature"), 0.58 if is_yours else 0.38)
+            return ScreenCoord(0.50, y, f"Permanent (attached): {card_name}")
 
-        # Determine X coordinate — centered, evenly spaced in the row
-        row_cards = creatures if card_row == "creature" else non_creatures
-        num_in_row = len(row_cards)
+        # Look up the Y coordinate for this region/side.
+        y = self._ROW_Y[(is_yours, card_region)]
 
-        # Spacing logic: MTGA cards overlap as the row grows.
-        # Max width is roughly 0.60 (from 0.20 to 0.80)
-        # But if there are few cards, they stay closer to the center.
-        if num_in_row == 1:
-            x = 0.50
-        elif num_in_row <= 4:
-            # Small group: keep them centered and comfortably spaced
-            total_width = 0.12 * num_in_row
-            left_bound = 0.50 - (total_width / 2)
-            spacing = total_width / (num_in_row)
-            x = left_bound + (spacing / 2) + card_idx_in_row * spacing
-        else:
-            # Large group: spread across the full available area
-            bf_left = 0.15
-            bf_right = 0.85
-            total_width = bf_right - bf_left
-            spacing = total_width / num_in_row
-            x = bf_left + (spacing / 2) + card_idx_in_row * spacing
+        # Compute X positions for the row.
+        row_cards = rows[card_region]
+        xs = self._battlefield_row_positions(len(row_cards))
+        x = xs[card_idx_in_row]
 
         logger.info(
-            f"Mapped '{card_name}' -> ({x:.2f}, {y:.2f}) "
-            f"[{card_row}, idx={card_idx_in_row}/{num_in_row}, "
+            f"Mapped '{card_name}' -> ({x:.3f}, {y:.3f}) "
+            f"[{card_region}, idx={card_idx_in_row}/{len(row_cards)}, "
             f"{'yours' if is_yours else 'opponent'}]"
         )
 

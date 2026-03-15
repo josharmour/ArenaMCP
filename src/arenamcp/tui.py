@@ -486,6 +486,7 @@ class Sidebar(Vertical):
             yield Static("Style: CONCISE", id="status-style", classes="status-line")
             yield Static("Voice: Initializing...", id="status-voice", classes="status-line")
             yield Static("Backend: Starting...", id="status-backend", classes="status-line")
+            yield Static("", id="status-log-health", classes="status-line")
 
         with Vertical(id="actions-panel"):
             yield Button("Provider: detecting...", id="btn-provider", variant="primary")
@@ -951,6 +952,12 @@ class ArenaApp(App):
             self.query_one("#status-seat", Static).update(f"Seat: {value}")
         elif key == "BACKEND":
             self.query_one("#status-backend", Static).update(f"Backend: {value}")
+        elif key == "LOG":
+            widget = self.query_one("#status-log-health", Static)
+            if value:
+                widget.update(f"[bold yellow]Log: {value}[/]")
+            else:
+                widget.update("")
         elif key == "WIN-PLAN":
             btn = self.query_one("#btn-win-plan", Button)
             if value:

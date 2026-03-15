@@ -145,13 +145,16 @@ def test_arc_is_symmetric(mapper, hand_size):
 def test_get_card_in_hand_coord_uses_arc(mapper):
     """The public method should return arc-based coordinates."""
     hand = [
-        {"name": "Lightning Bolt"},
-        {"name": "Counterspell"},
-        {"name": "Dark Ritual"},
+        {"name": "Lightning Bolt", "mana_cost": "{R}", "card_types": ["CardType_Instant"], "type_line": "Instant"},
+        {"name": "Counterspell", "mana_cost": "{U}{U}", "card_types": ["CardType_Instant"], "type_line": "Instant"},
+        {"name": "Dark Ritual", "mana_cost": "{B}", "card_types": ["CardType_Instant"], "type_line": "Instant"},
     ]
-    coord = mapper.get_card_in_hand_coord("Counterspell", hand, {})
+    # MTGA sort: by first frame color (R=4, U=2, B=3), then CMC, then name
+    # Sorted order: Counterspell (U=2, cmc=2), Dark Ritual (B=3, cmc=1), Lightning Bolt (R=4, cmc=1)
+    # Counterspell is index 0 (leftmost), Dark Ritual index 1 (middle), Lightning Bolt index 2
+    coord = mapper.get_card_in_hand_coord("Dark Ritual", hand, {})
     assert coord is not None
-    # Counterspell is index 1 of 3 -> middle card, should be near x=0.5
+    # Dark Ritual is index 1 of 3 -> middle card, should be near x=0.5
     assert coord.x == pytest.approx(0.5, abs=0.01)
     assert 0.88 <= coord.y <= 0.98
 

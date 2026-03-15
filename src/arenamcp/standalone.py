@@ -47,6 +47,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from arenamcp.divergence_tracker import DivergenceTracker
+from arenamcp.action_detector import ActionDetector
 from arenamcp.settings import get_settings
 
 # Configure logging
@@ -216,6 +218,17 @@ class MCPClient:
     def poll_log(self) -> None:
         """Manually poll for new log content (backup for missed watchdog events)."""
         self._server.poll_log()
+
+    def check_log_health(self) -> Optional[str]:
+        """Check if the MTGA log file is healthy (growing as expected).
+
+        Returns:
+            Warning message string if an issue is detected, else None.
+        """
+        w = self._server.watcher
+        if w is not None:
+            return w.check_log_health()
+        return None
 
     def get_draft_pack(self) -> dict[str, Any]:
         """Call get_draft_pack MCP tool."""
@@ -485,6 +498,11 @@ class StandaloneCoach:
         self._recent_gre_log: list[str] = []  # Ring buffer of recent GRE/decision log lines
         self._recent_gre_log_max = 30
 
+        # Divergence tracking: detect when player deviates from advice
+        self._divergence_tracker = DivergenceTracker(output_dir=LOG_DIR / "divergence_reports")
+        self._action_detector = ActionDetector()
+        self._last_pending_decision: Optional[str] = None  # Track decision clearing for action inference
+
         # Backend health status (deduped to avoid noisy UI writes)
         self._last_backend_status: str = ""
         self._last_backend_error: str = ""
@@ -493,6 +511,7 @@ class StandaloneCoach:
         # causes missed trigger edges after an executed action.
         self._last_forced_decision_sig: Optional[str] = None
         self._last_forced_decision_ts: float = 0.0
+        self._autopilot_needs_kick: bool = False
 
     def _set_backend_status(self, status: str) -> None:
         """Update backend status in UI only when the value actually changes."""
@@ -864,7 +883,11 @@ class StandaloneCoach:
                 self._autopilot_afk = False
                 self._init_autopilot()
             if self._autopilot:
+                self._autopilot._clear_events()  # Reset abort from previous OFF toggle
+                from arenamcp.autopilot import AutopilotState
+                self._autopilot._state = AutopilotState.IDLE
                 self._autopilot_enabled = True
+                self._autopilot_needs_kick = True  # Force trigger on next poll
                 logger.info("Autopilot toggled ON")
                 return True
             else:
@@ -992,10 +1015,25 @@ class StandaloneCoach:
         last_draft_pick = 0
         last_inactive_log = 0
 
+        # Log health check — run every 30s, not every tick
+        last_health_check = 0.0
+        _HEALTH_CHECK_INTERVAL = 30.0
+
         while self._running:
             try:
                 # Poll for new log content (watchdog backup - Windows often misses events)
                 self._mcp.poll_log()
+
+                # Periodic log-health check (every 30s)
+                now = time.time()
+                if now - last_health_check >= _HEALTH_CHECK_INTERVAL:
+                    last_health_check = now
+                    health_warning = self._mcp.check_log_health()
+                    if health_warning:
+                        self.ui.status("LOG", health_warning)
+                    else:
+                        # Clear any previous warning
+                        self.ui.status("LOG", "")
 
                 # Check for active draft/sealed first
                 draft_pack = self._mcp.get_draft_pack()
@@ -1153,6 +1191,17 @@ class StandaloneCoach:
                             target=self._post_match_analysis_worker,
                             daemon=True,
                         ).start()
+                        # End divergence tracking for this match (primary path)
+                        try:
+                            div_report = self._divergence_tracker.end_match()
+                            if div_report.get("total_divergences", 0) > 0:
+                                self.ui.log(
+                                    f"[DIVERGENCE] Match ended: {div_report['total_divergences']} divergence(s) "
+                                    f"({div_report.get('user_flagged', 0)} flagged). "
+                                    f"Press Ctrl+D to review."
+                                )
+                        except Exception as div_e:
+                            logger.debug(f"Divergence end_match error (primary): {div_e}")
                 except Exception as e:
                     msg = str(e)
                     if msg != self._last_game_end_check_error:
@@ -1167,6 +1216,18 @@ class StandaloneCoach:
                 if match_id_changed and last_match_id is not None:
                     self._match_number += 1
                     logger.info(f"Match boundary detected ({last_match_id} -> {curr_match_id}), match #{self._match_number}, resetting coaching state")
+
+                    # End divergence tracking for the previous match
+                    try:
+                        div_report = self._divergence_tracker.end_match()
+                        if div_report.get("total_divergences", 0) > 0:
+                            self.ui.log(
+                                f"[DIVERGENCE] Match ended: {div_report['total_divergences']} divergence(s) "
+                                f"({div_report.get('user_flagged', 0)} flagged). "
+                                f"Press Ctrl+D to review."
+                            )
+                    except Exception as e:
+                        logger.debug(f"Divergence end_match error: {e}")
 
                     # Trigger analysis if game_end detection above missed it
                     if self._advice_history and not self._saved_advice_history:
@@ -1191,9 +1252,18 @@ class StandaloneCoach:
                     self._recent_gre_log.clear()
                     self._vlm_card_cache.clear()
                     self._vlm_card_failures.clear()
+                    self._last_pending_decision = None
                     if self._coach:
                         self._coach.clear_deck_strategy()
+
+                    # Start divergence tracking for the new match (if one is starting)
+                    if curr_match_id:
+                        self._divergence_tracker.start_match(curr_match_id)
+
                 if match_id_changed:
+                    # Start divergence tracking for the first match detected
+                    if last_match_id is None and curr_match_id:
+                        self._divergence_tracker.start_match(curr_match_id)
                     last_match_id = curr_match_id
 
                 # Debug: Log if turn_num is 0 (every 30 seconds)
@@ -1232,6 +1302,22 @@ class StandaloneCoach:
                             "no explicit game-end evidence"
                         )
 
+                    # End divergence tracking for the previous match (tertiary path)
+                    try:
+                        div_report = self._divergence_tracker.end_match()
+                        if div_report.get("total_divergences", 0) > 0:
+                            self.ui.log(
+                                f"[DIVERGENCE] Match ended: {div_report['total_divergences']} divergence(s) "
+                                f"({div_report.get('user_flagged', 0)} flagged). "
+                                f"Press Ctrl+D to review."
+                            )
+                    except Exception as e:
+                        logger.debug(f"Divergence end_match error (tertiary): {e}")
+
+                    # Start tracking the new match
+                    new_match_id = curr_match_id or f"match_{self._match_number}"
+                    self._divergence_tracker.start_match(new_match_id)
+
                     prev_state = {}
                     last_advice_turn = 0
                     last_advice_phase = ""
@@ -1245,6 +1331,7 @@ class StandaloneCoach:
                     self._recent_gre_log.clear()
                     self._vlm_card_cache.clear()
                     self._vlm_card_failures.clear()
+                    self._last_pending_decision = None
                     if self._coach:
                         self._coach.clear_deck_strategy()
                     logger.info("Cleared advice history for new match")
@@ -1329,6 +1416,25 @@ class StandaloneCoach:
 
                     triggers = self._trigger.check_triggers(prev_state, curr_state)
 
+                    # DIVERGENCE: Detect player action when a pending decision clears.
+                    # If the tracker has recorded advice and the decision just resolved,
+                    # infer what the player did from the game state change.
+                    _pending_now = curr_state.get("pending_decision")
+                    if self._last_pending_decision and not _pending_now:
+                        # Decision cleared — player acted
+                        action_desc = self._infer_action_from_state_change(
+                            prev_state, curr_state, self._last_pending_decision
+                        )
+                        if action_desc:
+                            divergence = self._divergence_tracker.check_action(action_desc)
+                            if divergence:
+                                self.ui.log(
+                                    f"[DIVERGENCE] Detected: advised '{divergence.advice_given[:60]}...' "
+                                    f"but player '{divergence.action_taken}'"
+                                )
+                                self.ui.status("DIVERGE", f"{len(self._divergence_tracker._divergences)} divergence(s)")
+                    self._last_pending_decision = _pending_now
+
                     # BACKSTOP: If a pending decision exists but trigger detection
                     # missed it (e.g. malformed GRE chunks), force a
                     # decision_required trigger so autopilot can continue after
@@ -1353,6 +1459,18 @@ class StandaloneCoach:
                                 )
                     else:
                         self._last_forced_decision_sig = None
+
+                    # KICK: When autopilot was just toggled on mid-game, force
+                    # a decision_required trigger so it doesn't sit idle waiting
+                    # for a state change that may never come.
+                    if getattr(self, '_autopilot_needs_kick', False):
+                        self._autopilot_needs_kick = False
+                        legal = curr_state.get("legal_actions", []) or []
+                        meaningful = [a for a in legal if a.lower() not in
+                                      {"pass", "action: activate_mana", "action: floatmana"}]
+                        if meaningful and "decision_required" not in triggers:
+                            triggers.append("decision_required")
+                            logger.info(f"Autopilot kick: forced decision_required ({len(meaningful)} meaningful actions)")
 
                     # Debug: Log trigger results
                     if triggers:
@@ -2140,6 +2258,169 @@ class StandaloneCoach:
         if bug_path:
             self.ui.log("[BUG] Path copied to clipboard. Paste it anywhere.")
 
+    def _on_divergence_summary_hotkey(self) -> None:
+        """Ctrl+D - Show divergence summary and export report."""
+        tracker = self._divergence_tracker
+        divergences = tracker._divergences
+        match_id = tracker._current_match_id
+
+        if not divergences and not match_id:
+            self.ui.log("\n[DIVERGENCE] No divergences recorded (no active or recent match).\n")
+            return
+
+        # Show summary in TUI
+        total = len(divergences)
+        flagged = sum(1 for d in divergences if d.flagged_by_user)
+        auto = sum(1 for d in divergences if d.auto_detected and not d.flagged_by_user)
+
+        self.ui.log(f"\n{'='*50}")
+        self.ui.log(f"DIVERGENCE SUMMARY (match: {match_id or 'unknown'})")
+        self.ui.log(f"{'='*50}")
+        self.ui.log(f"Total: {total} | Auto-detected: {auto} | User-flagged: {flagged}")
+
+        if divergences:
+            self.ui.log(f"{'-'*50}")
+            for i, d in enumerate(divergences[-10:], 1):  # Show last 10
+                flag = " [FLAGGED]" if d.flagged_by_user else ""
+                self.ui.log(
+                    f"  {i}. [{d.trigger}]{flag}\n"
+                    f"     Advice: {d.advice_given[:80]}{'...' if len(d.advice_given) > 80 else ''}\n"
+                    f"     Action: {d.action_taken}"
+                )
+            if total > 10:
+                self.ui.log(f"  ... and {total - 10} more")
+
+        # Export current divergences to file
+        if divergences:
+            report_dir = LOG_DIR / "divergence_reports"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_path = report_dir / f"divergence_snapshot_{timestamp}.json"
+            try:
+                report = {
+                    "match_id": match_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "total_divergences": total,
+                    "user_flagged": flagged,
+                    "auto_detected": auto,
+                    "divergences": [
+                        {
+                            "frame": d.frame_number,
+                            "trigger": d.trigger,
+                            "advice_given": d.advice_given,
+                            "action_taken": d.action_taken,
+                            "flagged_by_user": d.flagged_by_user,
+                            "timestamp": d.timestamp.isoformat(),
+                        }
+                        for d in divergences
+                    ],
+                }
+                with open(report_path, "w") as f:
+                    json.dump(report, f, indent=2)
+                self.ui.log(f"\n[DIVERGENCE] Report saved: {report_path}")
+                copy_to_clipboard(str(report_path))
+                self.ui.log("[DIVERGENCE] Path copied to clipboard.\n")
+            except Exception as e:
+                self.ui.log(f"\n[DIVERGENCE] Failed to save report: {e}\n")
+        else:
+            self.ui.log(f"\nNo divergences to export.\n")
+        self.ui.log(f"{'='*50}\n")
+
+    def _on_flag_divergence_hotkey(self) -> None:
+        """Ctrl+F - Flag current decision for divergence review."""
+        if self._divergence_tracker.flag_current_decision():
+            count = len(self._divergence_tracker._divergences)
+            self.ui.log(f"[DIVERGENCE] Decision flagged for review (total: {count})")
+            self.ui.status("DIVERGE", f"{count} divergence(s)")
+        else:
+            self.ui.log("[DIVERGENCE] No recent advice to flag.")
+
+    def _infer_action_from_state_change(
+        self, prev_state: dict, curr_state: dict, cleared_decision: str
+    ) -> Optional[str]:
+        """Infer what the player did from game state changes when a decision clears.
+
+        Uses heuristics based on the decision type and observable state diffs
+        (hand size changes, new permanents, graveyard additions, etc.).
+
+        Args:
+            prev_state: Game state before the action
+            curr_state: Game state after the action
+            cleared_decision: The decision type that just resolved
+
+        Returns:
+            Human-readable action description, or None if unknown
+        """
+        if not prev_state:
+            return None
+
+        prev_hand = prev_state.get("hand", [])
+        curr_hand = curr_state.get("hand", [])
+        prev_bf = prev_state.get("battlefield", [])
+        curr_bf = curr_state.get("battlefield", [])
+        prev_gy = prev_state.get("graveyard", [])
+        curr_gy = curr_state.get("graveyard", [])
+
+        # Cards that left hand
+        prev_hand_names = {c.get("name", "Unknown") for c in prev_hand}
+        curr_hand_names = {c.get("name", "Unknown") for c in curr_hand}
+        left_hand = prev_hand_names - curr_hand_names
+
+        # New permanents on battlefield
+        prev_bf_ids = {c.get("instance_id") for c in prev_bf}
+        new_perms = [c for c in curr_bf if c.get("instance_id") not in prev_bf_ids]
+        new_perm_names = [c.get("name", "Unknown") for c in new_perms]
+
+        # New cards in graveyard
+        prev_gy_ids = {c.get("instance_id") for c in prev_gy}
+        new_gy = [c for c in curr_gy if c.get("instance_id") not in prev_gy_ids]
+        new_gy_names = [c.get("name", "Unknown") for c in new_gy]
+
+        decision_lower = cleared_decision.lower()
+
+        if "mulligan" in decision_lower:
+            if len(curr_hand) < len(prev_hand):
+                return f"Mulliganed (hand {len(prev_hand)} -> {len(curr_hand)})"
+            else:
+                return "Kept hand"
+
+        if "discard" in decision_lower:
+            if new_gy_names:
+                return f"Discarded: {', '.join(new_gy_names)}"
+            elif left_hand:
+                return f"Discarded: {', '.join(left_hand)}"
+
+        if "scry" in decision_lower or "surveil" in decision_lower:
+            return f"Scried/Surveiled (hand now {len(curr_hand)})"
+
+        if "target" in decision_lower:
+            if new_gy_names:
+                return f"Targeted (went to graveyard): {', '.join(new_gy_names)}"
+            return "Made target selection"
+
+        if "attack" in decision_lower:
+            tapped_creatures = [
+                c.get("name", "Unknown") for c in curr_bf
+                if c.get("is_tapped") and c.get("instance_id") in prev_bf_ids
+                and not any(p.get("instance_id") == c.get("instance_id") and p.get("is_tapped") for p in prev_bf)
+            ]
+            if tapped_creatures:
+                return f"Attacked with: {', '.join(tapped_creatures)}"
+            return "Declared attackers"
+
+        if "block" in decision_lower:
+            return "Declared blockers"
+
+        # Generic: infer from what changed
+        if new_perm_names:
+            return f"Played: {', '.join(new_perm_names)}"
+        if left_hand:
+            return f"Used: {', '.join(left_hand)}"
+        if new_gy_names:
+            return f"Cards to graveyard: {', '.join(new_gy_names)}"
+
+        return f"Resolved: {cleared_decision}"
+
     def take_screenshot_analysis(self) -> None:
         """Capture screen and request visual analysis (e.g. Mulligan).
 
@@ -2583,10 +2864,21 @@ class StandaloneCoach:
         }
         self._advice_history.append(entry)
 
+        # Feed advice to divergence tracker (skip stale/error advice)
+        if not advice.startswith("[STALE") and not advice.startswith("Error"):
+            try:
+                self._divergence_tracker.record_advice(
+                    trigger=trigger,
+                    game_state=game_snapshot or {},
+                    advice=advice,
+                )
+            except Exception as e:
+                logger.debug(f"Divergence record_advice error: {e}")
+
         # Keep only last 50 entries (enough for post-match analysis)
         if len(self._advice_history) > 50:
             self._advice_history = self._advice_history[-50:]
-        
+
         # Also record to match recording for post-match analysis
         try:
             from arenamcp.match_validator import get_current_recording
@@ -3634,6 +3926,8 @@ class StandaloneCoach:
             keyboard.on_press_key("f11", lambda _: self._on_provider_cycle_hotkey(), suppress=False)
             keyboard.on_press_key("f12", lambda _: self._on_model_cycle_hotkey(), suppress=False)
             keyboard.add_hotkey("ctrl+0", lambda: self._on_read_win_plan(), suppress=False)
+            keyboard.add_hotkey("ctrl+d", lambda: self._on_divergence_summary_hotkey(), suppress=False)
+            keyboard.add_hotkey("ctrl+f", lambda: self._on_flag_divergence_hotkey(), suppress=False)
             logger.info("Hotkeys registered")
         except Exception as e:
             logger.warning(f"Hotkey registration failed: {e}")
@@ -3717,6 +4011,7 @@ class StandaloneCoach:
             self.ui.status("VOICE", f"PTT (F4) + Kokoro")
         self.ui.log("-"*50)
         self.ui.log("F5=mute F6=voice F7=bug F8=seat F9=restart F10=speed F12=model Num1=land")
+        self.ui.log("Ctrl+D=divergences Ctrl+F=flag divergence")
         self.ui.log("="*50)
         self.ui.log("\nWaiting for MTGA...")
         self.ui.log("F8=swap seat if wrong | F9=restart coach\n")

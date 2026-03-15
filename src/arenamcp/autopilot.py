@@ -209,6 +209,21 @@ class AutopilotEngine:
         except Exception as e:
             logger.error(f"Vision scan failed (non-fatal): {e}")
 
+    def _should_prefetch_vision(self, game_state: dict[str, Any], trigger: str) -> bool:
+        """Whether to run a blocking layout scan before planning.
+
+        GRE + deterministic geometry should stay on the critical path. Vision
+        prefetch is only useful in vision-heavy mode; otherwise it just adds a
+        large delay before the staleness snapshot and causes plans to be
+        discarded in fast games.
+        """
+        del game_state, trigger
+        return (
+            self._has_vision_scan
+            and self._config.enable_vision_fallback
+            and not self._config.prefer_deterministic
+        )
+
     @property
     def state(self) -> AutopilotState:
         """Current autopilot state."""
@@ -418,8 +433,9 @@ class AutopilotEngine:
 
             self._clear_events()
 
-            # --- VISION SCAN: refresh layout cache if game state changed ---
-            self._scan_layout_if_needed(game_state)
+            # --- VISION PREFETCH: only in vision-heavy mode ---
+            if self._should_prefetch_vision(game_state, trigger):
+                self._scan_layout_if_needed(game_state)
 
             # --- AFK MODE: auto-pass everything without LLM ---
             if self._config.afk_mode:
