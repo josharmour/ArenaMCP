@@ -1,6 +1,7 @@
 import subprocess
 
 import arenamcp.coach as coach_mod
+import arenamcp.backends.codex as codex_mod
 from arenamcp.coach import CoachEngine, CodexCliBackend
 
 
@@ -22,7 +23,7 @@ def test_codex_cli_backend_cli_fallback(monkeypatch):
         calls.append((run_args, kwargs.get("input")))
         return subprocess.CompletedProcess(run_args, 0, stdout="ok", stderr="")
 
-    monkeypatch.setattr(coach_mod.subprocess, "run", _fake_run)
+    monkeypatch.setattr(codex_mod.subprocess, "run", _fake_run)
 
     backend = CodexCliBackend(model="gpt-5.4-pro", command="codex")
     backend._use_direct_api = False  # Force CLI fallback
