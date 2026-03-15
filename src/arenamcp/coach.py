@@ -847,7 +847,7 @@ class CodexCliBackend:
                     "model": self.model or "gpt-5.4",
                     "input": "hi",
                     "max_output_tokens": 16,
-                    "reasoning": {"effort": "low"},
+                    "reasoning": {"effort": "medium"},
                 }).encode()
                 req = urllib.request.Request(url, data=body, headers={
                     "Content-Type": "application/json",
@@ -882,7 +882,7 @@ class CodexCliBackend:
                 {"role": "user", "content": user_message},
             ],
             "max_output_tokens": 400,
-            "reasoning": {"effort": "low"},
+            "reasoning": {"effort": "medium"},
         }).encode()
 
         req = urllib.request.Request(url, data=body, headers={
