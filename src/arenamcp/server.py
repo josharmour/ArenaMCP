@@ -17,8 +17,8 @@ from mcp.server.fastmcp import FastMCP
 from arenamcp.coach import CoachEngine, GameStateTrigger, create_backend
 
 from arenamcp.gamestate import (
-    GameState, GameObjectKind, ZoneType, create_game_state_handler,
-    save_match_state, load_match_state, mark_match_ended,
+    GameState, create_game_state_handler,
+    save_match_state, load_match_state,
     validate_log_identity,
 )
 from arenamcp.parser import LogParser
@@ -28,7 +28,11 @@ from arenamcp.draftstate import DraftState, create_draft_handler
 from arenamcp.draft_eval import evaluate_pack, format_pick_recommendation
 from arenamcp.sealed_eval import analyze_sealed_pool, format_sealed_recommendation, format_sealed_detailed
 from arenamcp.mtgadb import MTGADatabase
-from arenamcp.mtgjson import MTGJSONDatabase, get_mtgjson
+from arenamcp.card_db import (
+    FallbackCardDatabase,
+    get_card_database,
+    ScryfallAdapter,
+)
 from arenamcp.watcher import MTGALogWatcher
 # Defer voice/audio imports — sounddevice initializes PortAudio on import
 # which can hang if an audio device/driver is misbehaving.
@@ -47,21 +51,8 @@ parser: LogParser = LogParser()
 watcher: Optional[MTGALogWatcher] = None
 
 
-class _NullScryfallCache:
-    """No-op Scryfall cache used when initialization fails."""
-
-    def get_card_by_arena_id(self, arena_id: int):  # noqa: ARG002
-        return None
-
-    def get_card_by_name(self, name: str):  # noqa: ARG002
-        return None
-
 # Lazy-loaded caches (avoid blocking startup with bulk downloads)
-_scryfall: Optional[ScryfallCache | _NullScryfallCache] = None
-_scryfall_failed: bool = False
-_scryfall_lock = threading.Lock()
 _draft_stats: Optional[DraftStatsCache] = None
-_mtgadb: Optional[MTGADatabase] = None
 
 # Lazy-loaded voice components
 _voice_input: Optional[VoiceInput] = None
@@ -90,28 +81,34 @@ _draft_helper_last_pack: int = 0
 _draft_helper_last_pick: int = 0
 
 
-def _get_scryfall() -> ScryfallCache | _NullScryfallCache:
-    """Get or initialize the Scryfall cache (lazy loading)."""
-    global _scryfall, _scryfall_failed
-    if _scryfall is not None:
-        return _scryfall
+def _get_card_db() -> FallbackCardDatabase:
+    """Get the unified card database (lazy loading, thread-safe)."""
+    return get_card_database()
 
-    with _scryfall_lock:
-        if _scryfall is not None:
-            return _scryfall
-        if _scryfall_failed:
-            _scryfall = _NullScryfallCache()
-            return _scryfall
 
-        logger.info("Initializing Scryfall cache...")
-        try:
-            _scryfall = ScryfallCache()
-        except Exception as e:
-            # Disable Scryfall for this process and degrade gracefully.
-            _scryfall_failed = True
-            logger.error(f"Scryfall init failed; disabling Scryfall fallback for this session: {e}")
-            _scryfall = _NullScryfallCache()
-        return _scryfall
+def _get_scryfall() -> ScryfallCache:
+    """Get or initialize the Scryfall cache (lazy loading).
+
+    Deprecated: prefer _get_card_db() for card lookups. This accessor
+    is retained for call sites that need the raw ScryfallCache (e.g.
+    draft_eval.evaluate_pack which type-hints ScryfallCache).
+    """
+    db = _get_card_db()
+    for src in db.sources:
+        if isinstance(src, ScryfallAdapter):
+            return src._cache  # type: ignore[return-value]
+    # Fallback: create a NullCardDatabase-backed stub that quacks like ScryfallCache
+    return _NullScryfallCompat()
+
+
+class _NullScryfallCompat:
+    """Minimal ScryfallCache-compatible stub for when Scryfall is unavailable."""
+
+    def get_card_by_arena_id(self, arena_id: int):  # noqa: ARG002
+        return None
+
+    def get_card_by_name(self, name: str):  # noqa: ARG002
+        return None
 
 
 def _get_draft_stats() -> DraftStatsCache:
@@ -124,12 +121,18 @@ def _get_draft_stats() -> DraftStatsCache:
 
 
 def _get_mtgadb() -> MTGADatabase:
-    """Get or initialize the MTGA local database (lazy loading)."""
-    global _mtgadb
-    if _mtgadb is None:
-        logger.info("Initializing MTGA local database...")
-        _mtgadb = MTGADatabase()
-    return _mtgadb
+    """Get or initialize the MTGA local database (lazy loading).
+
+    Deprecated: prefer _get_card_db() for card lookups. This accessor
+    is retained for call sites that need the raw MTGADatabase (e.g.
+    draft_eval.evaluate_pack which type-hints MTGADatabase).
+    """
+    db = _get_card_db()
+    raw = db.get_raw_mtgadb()
+    if raw is not None:
+        return raw
+    # Not available -- return a fresh (non-connected) instance
+    return MTGADatabase()
 
 
 def _get_voice_input(mode: Literal["ptt", "vox"] = "ptt") -> VoiceInput:
@@ -663,10 +666,13 @@ def get_enrichment_failures() -> list[dict[str, Any]]:
 def enrich_with_oracle_text(grp_id: int) -> dict[str, Any]:
     """Look up card data and return enriched dict.
 
-    Uses multiple sources with fallback chain:
-    1. MTGJSON by arena_id (if available)
-    2. MTGA local DB for name -> MTGJSON by name (for new sets without arena_id mapping)
-    3. Scryfall as last resort
+    Delegates to the unified FallbackCardDatabase which tries sources in order:
+    1. MTGJSON by arena_id (most complete, updated daily)
+    2. MTGA local DB (has newest cards, tokens, digital-only)
+    3. Scryfall (API fallback)
+
+    The FallbackCardDatabase also performs cross-source enrichment: if a source
+    returns a card without oracle_text, it checks remaining sources by name.
 
     Args:
         grp_id: MTGA arena_id for the card
@@ -678,105 +684,44 @@ def enrich_with_oracle_text(grp_id: int) -> dict[str, Any]:
     if grp_id == 0:
         return {"grp_id": 0, "name": "Unknown", "oracle_text": "", "type_line": "", "mana_cost": ""}
 
-    mtgjson = get_mtgjson()
+    card_db = _get_card_db()
+    card = card_db.get_card_by_arena_id(grp_id)
 
-    # Try MTGJSON by arena_id first (most complete, updated daily)
-    if mtgjson.available:
-        mtgjson_card = mtgjson.get_card(grp_id)
-        if mtgjson_card:
-            return {
-                "grp_id": grp_id,
-                "name": mtgjson_card.name or f"Unknown ({grp_id})",
-                "oracle_text": mtgjson_card.oracle_text or "",
-                "type_line": mtgjson_card.type_line or "",
-                "mana_cost": mtgjson_card.mana_cost or "",
-            }
-
-    # Try MTGA local DB for name, then look up oracle text by name from MTGJSON
-    mtgadb = _get_mtgadb()
-    if mtgadb.available:
-        mtga_card = mtgadb.get_card(grp_id)
-        if mtga_card:
-            # Got simple card data from MTGA DB.
-            # Ideally we enrich it with Scryfall/MTGJSON for formatted mana costs and clean text.
-
-            # Try MTGJSON by name
-            if mtgjson.available:
-                mtgjson_card = mtgjson.get_card_by_name(mtga_card.name)
-                if mtgjson_card:
-                    return {
-                        "grp_id": grp_id,
-                        "name": mtga_card.name or f"Unknown ({grp_id})",
-                        "oracle_text": mtgjson_card.oracle_text or "",
-                        "type_line": mtgjson_card.type_line or "",
-                        "mana_cost": mtgjson_card.mana_cost or "",
-                    }
-
-            # Try Scryfall for oracle text - first by arena_id, then by name
-            scryfall = _get_scryfall()
-            scryfall_card = scryfall.get_card_by_arena_id(grp_id)
-
-            # If arena_id lookup fails (new sets), try by name
-            if scryfall_card is None:
-                scryfall_card = scryfall.get_card_by_name(mtga_card.name)
-
-            if scryfall_card:
-                return {
-                    "grp_id": grp_id,
-                    "name": mtga_card.name or f"Unknown ({grp_id})",
-                    "oracle_text": scryfall_card.oracle_text or "",
-                    "type_line": scryfall_card.type_line or "",
-                    "mana_cost": scryfall_card.mana_cost or "",
-                }
-            else:
-                # MTGA DB Fallback: Use the text we resolved from AbilityIds
-                # This handles digital-only cards (Alchemy) or new sets not yet in Scryfall
-                return {
-                    "grp_id": grp_id,
-                    "name": mtga_card.name or f"Unknown ({grp_id})",
-                    "oracle_text": mtga_card.oracle_text or "",
-                    "type_line": mtga_card.types or "",
-                    "mana_cost": "", # TODO: Parse OldSchoolManaText if needed
-                }
-        
-        # If not found as a card, check if it's an ABILITY (e.g. on stack)
-        ability_text = mtgadb.get_ability_text(grp_id)
-        if ability_text:
-            return {
-                "grp_id": grp_id,
-                "name": f"Ability (ID: {grp_id})",
-                "oracle_text": ability_text,
-                "type_line": "Ability",
-                "mana_cost": "",
-            }
-
-    # Last resort: Scryfall only (legacy path)
-    scryfall = _get_scryfall()
-    card = scryfall.get_card_by_arena_id(grp_id)
-
-    if card is None:
-        from datetime import datetime
-        _enrichment_failures.append({
-            "timestamp": datetime.now().isoformat(),
-            "grp_id": grp_id,
-            "source": "all_lookups_failed",
-        })
-        if len(_enrichment_failures) > 100:
-            _enrichment_failures[:] = _enrichment_failures[-50:]
+    if card is not None:
         return {
             "grp_id": grp_id,
-            "name": f"Unknown (ID: {grp_id})",
-            "oracle_text": "",
-            "type_line": "",
+            "name": card.name or f"Unknown ({grp_id})",
+            "oracle_text": card.oracle_text or "",
+            "type_line": card.type_line or "",
+            "mana_cost": card.mana_cost or "",
+        }
+
+    # Check if it's an ABILITY (e.g. on stack) via MTGA database
+    ability_text = card_db.get_ability_text(grp_id)
+    if ability_text:
+        return {
+            "grp_id": grp_id,
+            "name": f"Ability (ID: {grp_id})",
+            "oracle_text": ability_text,
+            "type_line": "Ability",
             "mana_cost": "",
         }
 
+    # All lookups failed -- record for diagnostics
+    from datetime import datetime
+    _enrichment_failures.append({
+        "timestamp": datetime.now().isoformat(),
+        "grp_id": grp_id,
+        "source": "all_lookups_failed",
+    })
+    if len(_enrichment_failures) > 100:
+        _enrichment_failures[:] = _enrichment_failures[-50:]
     return {
         "grp_id": grp_id,
-        "name": card.name or f"Unknown ({grp_id})",
-        "oracle_text": card.oracle_text or "",
-        "type_line": card.type_line or "",
-        "mana_cost": card.mana_cost or "",
+        "name": f"Unknown (ID: {grp_id})",
+        "oracle_text": "",
+        "type_line": "",
+        "mana_cost": "",
     }
 
 
@@ -949,8 +894,9 @@ def get_card_info(arena_id: int) -> dict[str, Any]:
 
     Use this to get oracle text, mana cost, and other card details
     when you need to understand what a specific card does.
-    
-    Tries MTGA's local database first (for newest cards), then Scryfall.
+
+    Uses the unified FallbackCardDatabase which tries MTGJSON, MTGA local DB,
+    and Scryfall in order, enriching results across sources as needed.
 
     Args:
         arena_id: The MTGA arena ID (grp_id) of the card
@@ -959,24 +905,8 @@ def get_card_info(arena_id: int) -> dict[str, Any]:
         Dict with name, oracle_text, type_line, mana_cost, cmc, colors, scryfall_uri
         or {"error": "Card not found"} if the card isn't in any database.
     """
-    # Try MTGA local database first (has newest cards like Final Fantasy crossover)
-    mtgadb = _get_mtgadb()
-    if mtgadb.available:
-        mtga_card = mtgadb.get_card(arena_id)
-        if mtga_card:
-            return {
-                "name": mtga_card.name,
-                "oracle_text": mtga_card.oracle_text or "",
-                "type_line": mtga_card.types or "",
-                "mana_cost": "",  # MTGA DB doesn't store mana cost
-                "cmc": 0,
-                "colors": mtga_card.colors.split(",") if mtga_card.colors else [],
-                "scryfall_uri": None,
-            }
-    
-    # Fall back to Scryfall
-    scryfall = _get_scryfall()
-    card = scryfall.get_card_by_arena_id(arena_id)
+    card_db = _get_card_db()
+    card = card_db.get_card_by_arena_id(arena_id)
 
     if card is None:
         return {"error": f"Card not found for arena_id {arena_id}"}
@@ -988,7 +918,7 @@ def get_card_info(arena_id: int) -> dict[str, Any]:
         "mana_cost": card.mana_cost or "",
         "cmc": card.cmc or 0,
         "colors": card.colors or [],
-        "scryfall_uri": card.scryfall_uri,
+        "scryfall_uri": card.scryfall_uri or None,
     }
 
 
@@ -1163,13 +1093,17 @@ def evaluate_draft_pack_for_standalone() -> dict[str, Any]:
     if not draft_state.cards_in_pack:
         return {"is_active": True, "cards": []}
 
+    _scryfall = _get_scryfall()
+    _draft_stats = _get_draft_stats()
+    _mtga = _get_mtgadb()
+
     evaluations = evaluate_pack(
         cards_in_pack=draft_state.cards_in_pack,
         picked_cards=draft_state.picked_cards,
         set_code=draft_state.set_code,
-        scryfall=scryfall,
-        draft_stats=draft_stats_cache,
-        mtgadb=mtgadb,
+        scryfall=_scryfall,
+        draft_stats=_draft_stats,
+        mtgadb=_mtga,
     )
 
     advice = format_pick_recommendation(
@@ -1772,4 +1706,7 @@ def get_commander_info(commander_name: str) -> dict[str, Any]:
 
 # Entry point for running as module
 if __name__ == "__main__":
+    from arenamcp.logging_config import configure_logging
+
+    configure_logging(console=False)
     mcp.run()

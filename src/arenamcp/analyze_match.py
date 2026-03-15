@@ -66,7 +66,6 @@ def format_state_summary(parsed_snapshot: dict) -> str:
     # Life totals
     life_parts = []
     for p in players:
-        seat = p.get("seat_id")
         life = p.get("life_total", 20)
         label = "You" if p.get("is_local") else "Opp"
         life_parts.append(f"{label}:{life}")
@@ -173,12 +172,6 @@ def generate_analysis_report(recording_path: Path, bug_report_path: Optional[Pat
     if bug_report_path and bug_report_path.exists():
         advice_history = load_advice_history(bug_report_path)
     
-    # Initialize coach if regenerating
-    coach = None
-    if regenerate:
-        from arenamcp.coach import create_coach
-        coach = create_coach(backend="claude-code", model="sonnet")
-    
     # Build report
     lines = [
         "=" * 60,
@@ -197,7 +190,6 @@ def generate_analysis_report(recording_path: Path, bug_report_path: Optional[Pat
     lines.append("")
     
     # Analyze frames where advice was given
-    advice_frames = []
     for advice in advice_history:
         timestamp = advice.get("timestamp", "")
         trigger = advice.get("trigger", "")

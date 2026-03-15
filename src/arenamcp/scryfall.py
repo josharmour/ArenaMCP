@@ -5,12 +5,13 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, Optional
 
 import requests
+
+from arenamcp.cache_utils import FileCache
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,9 @@ class ScryfallCache:
             cache_dir: Directory for cache files. Defaults to ~/.arenamcp/cache/scryfall/
         """
         self._cache_dir = cache_dir or CACHE_DIR
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._file_cache = FileCache(
+            self._cache_dir, ttl_seconds=CACHE_MAX_AGE_HOURS * 3600
+        )
 
         self._arena_index: dict[int, dict[str, Any]] = {}
         self._last_api_call: float = 0.0
@@ -65,12 +68,7 @@ class ScryfallCache:
     def _is_cache_stale(self) -> bool:
         """Check if the cache file is older than CACHE_MAX_AGE_HOURS."""
         bulk_path = self._get_bulk_data_path()
-        if not bulk_path.exists():
-            return True
-
-        mtime = datetime.fromtimestamp(bulk_path.stat().st_mtime)
-        age = datetime.now() - mtime
-        return age > timedelta(hours=CACHE_MAX_AGE_HOURS)
+        return not self._file_cache.is_cache_valid(bulk_path)
 
     def _download_bulk_data(self) -> None:
         """Download bulk data from Scryfall API."""

@@ -7,8 +7,8 @@ allowing for post-game review and prompt optimization.
 import json
 import logging
 from pathlib import Path
-from typing import Any, Optional
-from dataclasses import dataclass, field
+from typing import Optional
+from dataclasses import dataclass
 from datetime import datetime
 
 logger = logging.getLogger(__name__)

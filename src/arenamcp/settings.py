@@ -1,6 +1,21 @@
 """Persistent settings for ArenaMCP standalone coach.
 
-Settings are stored in ~/.arenamcp/settings.json and persist between sessions.
+Settings are stored in ``~/.arenamcp/settings.json`` and persist between
+sessions.
+
+Configuration precedence (highest to lowest):
+    1. **Environment variables** -- checked first for settings that support
+       them (e.g. ``MTGA_LOG_PATH``, ``MTGA_PLAYER_ID``, ``PROXY_BASE_URL``,
+       ``PROXY_API_KEY``, ``ARENAMCP_LOG_LEVEL``).  Individual modules are
+       responsible for reading their own env vars before falling through
+       to the Settings object.
+    2. **~/.arenamcp/settings.json** -- persistent user preferences written
+       by the TUI / ``Settings.set()`` calls.
+    3. **DEFAULTS dict below** -- compiled-in defaults used when neither an
+       env var nor a settings.json entry is present.
+
+Modules should use ``get_settings().get(key)`` and let the Settings class
+merge with DEFAULTS automatically.
 """
 
 import json

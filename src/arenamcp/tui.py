@@ -1,20 +1,17 @@
 
 from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
-from textual.widgets import Header, Footer, Log, RichLog, Input, Button, Static
+from textual.containers import Vertical
+from textual.widgets import Header, Footer, RichLog, Input, Button, Static
 from textual.selection import Selection
 
-from textual.message import Message
 from textual import events
 
 import threading
-import time
-import os
 import sys
 import logging
 
 # Import core logic
-from arenamcp.standalone import StandaloneCoach, UIAdapter, LOG_FILE, LOG_DIR
+from arenamcp.standalone import StandaloneCoach, UIAdapter, LOG_DIR
 from arenamcp.match_validator import start_recording, get_current_recording
 
 logger = logging.getLogger(__name__)
@@ -274,7 +271,6 @@ class GameStateDisplay(Static):
             pending_decision = self._last_state.get("pending_decision")
             decision_context = self._last_state.get("decision_context")
             recent_events = self._last_state.get("recent_events", [])
-            damage_taken = self._last_state.get("damage_taken", {})
 
             # Turn and Phase
             turn_num = turn_info.get("turn_number", "?")
@@ -300,7 +296,6 @@ class GameStateDisplay(Static):
             if players:
                 life_parts = []
                 for p in players:
-                    seat = p.get("seat_id")
                     life = p.get("life_total", 20)
                     is_you = p.get("is_local", False)
                     label = f"[bold green]YOU[/]" if is_you else f"[yellow]OPP[/]"
@@ -935,7 +930,7 @@ class ArenaApp(App):
             if self.log_widget:
                 self.log_widget.write("[dim]Match recording started automatically[/]")
 
-        except Exception as e:
+        except Exception:
             pass  # Don't fail advice delivery if auto-record fails
 
     def update_status(self, key: str, value: str) -> None:
@@ -1303,7 +1298,6 @@ class ArenaApp(App):
                           Used in the issue title and body when provided.
         """
         import shutil
-        from pathlib import Path
 
         bug_dir = LOG_DIR / "bug_reports"
         if not bug_dir.exists():
@@ -1747,7 +1741,6 @@ def _set_console_icon():
 
         IMAGE_ICON = 1
         LR_LOADFROMFILE = 0x0010
-        LR_DEFAULTSIZE = 0x0040
 
         # Big icon (32x32 for alt-tab / taskbar)
         icon_big = user32.LoadImageW(
@@ -1797,7 +1790,6 @@ def run_tui(args):
                 sys.exit(42)
             else:
                 # Restart by re-execing the process for a clean slate
-                import subprocess
                 python = sys.executable
                 os.execv(python, [python, "-m", "arenamcp.standalone"] + sys.argv[1:])
                 # execv replaces the process, so this line is never reached

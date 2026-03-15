@@ -12,12 +12,9 @@ import importlib
 import json
 import os
 import platform
-import shutil
 import struct
-import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
 
 
 # ── Formatting helpers ───────────────────────────────────────────────

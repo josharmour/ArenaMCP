@@ -13,17 +13,14 @@ import logging
 import threading
 import time
 import io
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional
 from PIL import ImageGrab
 
 from arenamcp.action_planner import ActionPlan, ActionPlanner, ActionType, GameAction
 from arenamcp.input_controller import ClickResult, InputController
-from arenamcp.screen_mapper import FixedCoordinates, ScreenCoord, ScreenMapper
-
-# Type alias: mapper can be ScreenMapper or VisionMapper (duck-typed)
-from typing import Union
+from arenamcp.screen_mapper import ScreenCoord, ScreenMapper
 
 logger = logging.getLogger(__name__)
 
@@ -304,14 +301,16 @@ class AutopilotEngine:
                 "window_rect": self._mapper.window_rect,
                 "cache_size": getattr(self._mapper, 'cache_size', 0),
             }
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Could not read screen_mapper state: {e}")
             info["screen_mapper"] = {"error": "unavailable"}
 
         # Planner backend info
         try:
             backend = self._planner._backend
             info["planner_backend"] = type(backend).__name__
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Could not read planner backend info: {e}")
             info["planner_backend"] = "unknown"
 
         return info
@@ -725,8 +724,8 @@ class AutopilotEngine:
                             self._state = AutopilotState.IDLE
                             return False
                         game_state = step_state
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Mid-execution staleness check failed (non-fatal): {e}")
 
                 # Legacy per-action confirmation (only if explicitly enabled)
                 if self._config.confirm_each_action:
@@ -1063,8 +1062,8 @@ class AutopilotEngine:
         if self._ui_advice_fn:
             try:
                 self._ui_advice_fn(text, label)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"UI notification callback failed: {e}")
 
     def _get_vision_coord(self, card_name: str, zone: Optional[str] = None) -> Optional[ScreenCoord]:
         """Capture screenshot and use vision to find a card.

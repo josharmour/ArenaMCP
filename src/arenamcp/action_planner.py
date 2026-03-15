@@ -246,7 +246,8 @@ class ActionPlanner:
                 from arenamcp import server
                 info = server.get_card_info(grp_id)
                 return info.get("name")
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Scryfall lookup failed for grp_id={grp_id}: {e}")
                 return None
 
         for action in plan.actions:

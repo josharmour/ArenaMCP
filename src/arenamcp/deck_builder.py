@@ -7,8 +7,8 @@ Adapted from Voice Assistant's DeckBuilderV2 to use ArenaMCP data sources.
 
 import logging
 from collections import Counter
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 

@@ -48,42 +48,15 @@ from pathlib import Path
 from typing import Any, Optional
 
 from arenamcp.settings import get_settings
+from arenamcp.logging_config import configure_logging, LOG_DIR, LOG_FILE
 
-# Configure logging
-LOG_DIR = Path.home() / ".arenamcp"
-LOG_DIR.mkdir(exist_ok=True)
-LOG_FILE = LOG_DIR / "standalone.log"
+# Configure logging (shared with server.py via logging_config)
+# Console handler disabled -- TUI handles user-facing output.
+configure_logging(console=False)
+
 WATCHDOG_SCREENSHOT_DIR = LOG_DIR / "watchdog_screenshots"
 WATCHDOG_SCREENSHOT_DIR.mkdir(exist_ok=True)
 WATCHDOG_SCREENSHOT_MAX = 20  # Keep last N screenshots (pruned at match end)
-
-LOG_LEVEL_NAME = os.getenv("ARENAMCP_LOG_LEVEL", "INFO").upper()
-LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.INFO)
-
-file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
-file_handler.setLevel(LOG_LEVEL)
-file_handler.setFormatter(logging.Formatter(
-    '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-))
-
-root_logger = logging.getLogger()
-root_logger.setLevel(LOG_LEVEL)
-for h in root_logger.handlers[:]:
-    root_logger.removeHandler(h)
-root_logger.addHandler(file_handler)
-
-# Suppress noisy third-party loggers
-logging.getLogger("google").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-# Console handler disabled when using TUI to prevent log bleed-through
-# Logs still go to file (standalone.log)
-# console_handler = logging.StreamHandler()
-# console_handler.setLevel(logging.INFO)
-# console_handler.setFormatter(logging.Formatter('%(message)s'))
-# root_logger.addHandler(console_handler)
 
 logger = logging.getLogger(__name__)
 
@@ -148,8 +121,8 @@ def copy_to_clipboard(text: str) -> bool:
     except subprocess.TimeoutExpired:
         try:
             process.kill()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to kill timed-out clip process: {e}")
         logger.debug("clip command timed out")
         return False
     except Exception as e:
@@ -502,8 +475,8 @@ class StandaloneCoach:
         self._last_backend_status = status
         try:
             self.ui.status("BACKEND", status)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"UI status update failed: {e}")
 
     def _report_backend_failure(self, detail: str) -> None:
         """Surface backend failures in UI/logs with deduping."""
@@ -513,8 +486,8 @@ class StandaloneCoach:
             self._last_backend_error = short
             try:
                 self.ui.log(f"\n[BACKEND] {short}\n")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"UI log update failed: {e}")
 
     def _mark_backend_healthy(self) -> None:
         """Clear backend failure status after successful responses."""
@@ -627,11 +600,9 @@ class StandaloneCoach:
         """Warm local card data sources without blocking startup."""
         logger.info("Warming local card databases in background...")
         try:
-            from arenamcp.mtgjson import get_mtgjson
-            from arenamcp.server import _get_mtgadb
+            from arenamcp.card_db import get_card_database
 
-            get_mtgjson()
-            _get_mtgadb()
+            get_card_database()
             logger.info("Local card database warmup complete")
         except Exception as e:
             logger.warning(f"Failed to warm local card databases: {e}")
@@ -785,18 +756,18 @@ class StandaloneCoach:
 
     @staticmethod
     def _enrich_vlm_resolved_card(card: dict, name: str) -> None:
-        """Try to fill oracle_text from Scryfall using the VLM-resolved name."""
+        """Try to fill oracle_text using the unified card database."""
         try:
-            from arenamcp.server import _get_scryfall
-            scryfall = _get_scryfall()
-            sc = scryfall.get_card_by_name(name)
-            if sc:
-                card["oracle_text"] = sc.oracle_text or card.get("oracle_text", "")
-                card["type_line"] = sc.type_line or card.get("type_line", "")
-                card["mana_cost"] = sc.mana_cost or card.get("mana_cost", "")
-                card["name"] = f"{sc.name} (vision)"  # Use Scryfall's canonical name
-        except Exception:
-            pass  # Best effort
+            from arenamcp.card_db import get_card_database
+            card_db = get_card_database()
+            result = card_db.get_card_by_name(name)
+            if result:
+                card["oracle_text"] = result.oracle_text or card.get("oracle_text", "")
+                card["type_line"] = result.type_line or card.get("type_line", "")
+                card["mana_cost"] = result.mana_cost or card.get("mana_cost", "")
+                card["name"] = f"{result.name} (vision)"  # Use canonical name
+        except Exception as e:
+            logger.debug(f"Card enrichment failed for '{name}' (best effort): {e}")
 
     def _init_autopilot(self) -> None:
         """Initialize autopilot components (requires LLM backend + MCP)."""
@@ -1136,7 +1107,6 @@ class StandaloneCoach:
                             logger.error(f"Post-draft deck analysis failed: {e}")
 
                 curr_state = self._mcp.get_game_state()
-                curr_state_ts = time.time()  # Timestamp for cache freshness
                 turn = curr_state.get("turn", {})
                 turn_num = turn.get("turn_number", 0)
                 phase = turn.get("phase", "")
@@ -1295,7 +1265,8 @@ class StandaloneCoach:
                                         card_type = info.get("type_line", "")
                                         oracle = info.get("oracle_text", "")
                                         enriched.append((name, card_type, oracle))
-                                    except Exception:
+                                    except Exception as e:
+                                        logger.debug(f"Card enrichment failed for grp_id={grp_id}: {e}")
                                         enriched.append((f"Unknown({grp_id})", "", ""))
 
                                 # Use a SEPARATE backend instance so deck analysis
@@ -1646,8 +1617,8 @@ class StandaloneCoach:
                             # Force a log poll to ensure we have latest updates
                             try:
                                 self._mcp.poll_log()
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug(f"poll_log failed after new_turn delay: {e}")
                             # Re-fetch game state to get updated hand
                             try:
                                 curr_state = self._mcp.get_game_state()
@@ -1676,8 +1647,8 @@ class StandaloneCoach:
                             time.sleep(0.5)  # 500ms to allow hand zone update
                             try:
                                 self._mcp.poll_log()
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug(f"poll_log failed after mulligan delay: {e}")
                             try:
                                 curr_state = self._mcp.get_game_state()
                             except Exception as e:
@@ -1690,8 +1661,8 @@ class StandaloneCoach:
                             time.sleep(0.4)  # 400ms to allow ETB triggers to resolve
                             try:
                                 self._mcp.poll_log()
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug(f"poll_log failed after spell_resolved delay: {e}")
                             try:
                                 curr_state = self._mcp.get_game_state()
                             except Exception as e:
@@ -1822,9 +1793,7 @@ class StandaloneCoach:
                         if self._coach:
                             # Snapshot turn state BEFORE the (slow) LLM call
                             pre_advice_turn = turn_num
-                            pre_advice_active = active_seat
                             pre_advice_phase = phase
-                            pre_advice_step = turn.get("step", "")
 
                             # Inject library targets when a tutor spell is in hand
                             self._inject_library_summary_if_needed(curr_state)
@@ -2092,8 +2061,8 @@ class StandaloneCoach:
             self.ui.status("VOICE", f"Changed to: {desc} (saved)")
             try:
                 self._voice_output.speak("Voice changed.", blocking=False)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"TTS voice confirmation failed: {e}")
         else:
             self.ui.status("VOICE", "TTS not enabled")
 
@@ -2105,8 +2074,8 @@ class StandaloneCoach:
             self.ui.status("SPEED", f"{speed}x")
             try:
                 self._voice_output.speak("Speed changed.", blocking=False)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"TTS speed confirmation failed: {e}")
         else:
             self.ui.status("SPEED", "TTS not enabled")
 
@@ -2212,7 +2181,8 @@ class StandaloneCoach:
             # Context
             try:
                 game_state = self.get_game_state()
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Could not get game state for screenshot analysis: {e}")
                 game_state = {}
 
             ctx = ""
@@ -2338,7 +2308,6 @@ class StandaloneCoach:
             self.ui.log("[red]Missing 'Pillow' library. Install with: pip install Pillow[/]")
         except Exception as e:
             self.ui.log(f"[red]Screenshot error: {e}[/]")
-            import traceback
             print(f"Screenshot Error: {e}")
         finally:
             self.ui.subtask("")
@@ -2493,7 +2462,8 @@ class StandaloneCoach:
                 from arenamcp.server import get_opponent_played_cards
                 opp = get_opponent_played_cards()
                 ctx["opponent_played_cards"] = opp if opp else []
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Could not get opponent played cards for bug report: {e}")
                 ctx["opponent_played_cards"] = []
             # Recent game events
             snapshot = game_state.get_snapshot() if hasattr(game_state, "get_snapshot") else {}
@@ -2538,7 +2508,8 @@ class StandaloneCoach:
         try:
             from arenamcp.server import get_enrichment_failures
             return get_enrichment_failures()
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Could not get enrichment failures: {e}")
             return []
 
     def _get_recent_logs(self, num_lines: int = 100) -> list:
@@ -2574,8 +2545,8 @@ class StandaloneCoach:
                     game_state = self._mcp.get_game_state()
                 if game_state and hasattr(self._coach, '_format_game_context'):
                     game_context = self._coach._format_game_context(game_state)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Could not format game context for advice record: {e}")
 
         # Extract key game state fields for bug reports (turn, life, board snapshot)
         game_snapshot = None
@@ -2594,8 +2565,8 @@ class StandaloneCoach:
                     "battlefield_count": len(game_state.get("battlefield", [])),
                     "hand_count": len(game_state.get("hand", [])),
                 }
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Could not extract game snapshot for advice record: {e}")
 
         entry = {
             "timestamp": datetime.now().isoformat(),
@@ -2626,8 +2597,8 @@ class StandaloneCoach:
                     parsed_turn=parsed_turn,
                     parsed_phase=parsed_phase
                 )
-        except Exception:
-            pass  # Don't fail if recording isn't active
+        except Exception as e:
+            logger.debug(f"Advice recording failed (non-fatal): {e}")
 
     def _record_error(self, error: str, context: str = None) -> None:
         """Record error for debug history."""
@@ -2971,7 +2942,8 @@ class StandaloneCoach:
         try:
             game_state = self._mcp.get_game_state()
             self._last_match_final_state = game_state
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Could not capture final game state for post-match: {e}")
             self._last_match_final_state = None
 
         threading.Thread(
@@ -3045,7 +3017,8 @@ class StandaloneCoach:
             if grp_id not in card_info_cache:
                 try:
                     card_info_cache[grp_id] = self._mcp.get_card_info(grp_id)
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Card info lookup failed for grp_id={grp_id} (remaining): {e}")
                     card_info_cache[grp_id] = {"name": f"Unknown({grp_id})"}
             name = card_info_cache[grp_id].get("name", f"Unknown({grp_id})")
             name_counts[name] = name_counts.get(name, 0) + 1
@@ -3140,7 +3113,8 @@ class StandaloneCoach:
             if grp_id not in card_info_cache:
                 try:
                     card_info_cache[grp_id] = self._mcp.get_card_info(grp_id)
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Card info lookup failed for grp_id={grp_id} (library): {e}")
                     card_info_cache[grp_id] = {"name": f"Unknown({grp_id})"}
 
         # Group non-land cards by CMC
@@ -3333,8 +3307,8 @@ class StandaloneCoach:
                 try:
                     current_state = self._mcp.get_game_state()
                     current_turn = current_state.get("turn", {}).get("turn_number", 0)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Could not check current turn for win plan staleness: {e}")
                 if current_turn and current_turn - turn_num > 2:
                     logger.info(f"Win plan stale (started turn {turn_num}, now {current_turn})")
                     break
@@ -3438,7 +3412,6 @@ class StandaloneCoach:
         except Exception as e:
             self.ui.error(f"Failed to set provider {provider}: {e}")
             logger.error(f"Set provider error: {e}")
-            import traceback
             logger.debug(traceback.format_exc())
 
     def fallback_to_ollama(self, reason: str = "") -> bool:
@@ -3763,8 +3736,8 @@ class StandaloneCoach:
         if self._autopilot:
             try:
                 self._autopilot.on_abort()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Autopilot abort during cleanup failed: {e}")
 
         # 1. Unregister hotkeys first to prevent new events
         self._unregister_hotkeys()

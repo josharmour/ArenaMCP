@@ -14,13 +14,12 @@ Usage:
 import json
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from arenamcp.match_validator import MatchRecording, MatchFrame
 from arenamcp.coach import CoachEngine, create_backend
-from arenamcp.arena_replay import ArenaReplay
 from arenamcp.replay_converter import ReplayConverter
 
 logger = logging.getLogger(__name__)
@@ -322,7 +321,6 @@ def analyze_arena_replay(replay_path: Path, output_dir: Optional[Path] = None) -
 
 
 if __name__ == "__main__":
-    import sys
     import argparse
     
     parser = argparse.ArgumentParser(description="Analyze advisor performance and suggest improvements")

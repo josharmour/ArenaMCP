@@ -60,8 +60,8 @@ def detect_backends_quick() -> dict[str, bool]:
             req = urllib.request.Request("http://localhost:11434/", method="GET")
             with urllib.request.urlopen(req, timeout=2):
                 ollama_http = True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Ollama HTTP check failed: {e}")
     results["ollama"] = ollama_bin or ollama_http
 
     # CLI-based backends (try Windows shim variants too)
@@ -108,7 +108,8 @@ def _validate_ollama() -> tuple[bool, str]:
             if models:
                 return True, ""
             return False, "Ollama is running but has no models. Run: ollama pull llama3.2"
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Ollama API check failed: {e}")
         # Try binary
         if shutil.which("ollama"):
             return False, "Ollama binary found but server not running. Run: ollama serve"
@@ -187,14 +188,16 @@ def _validate_proxy() -> tuple[bool, str]:
         from arenamcp.settings import get_settings
         s = get_settings()
         url = s.get("proxy_url") or "http://127.0.0.1:8080/v1"
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Could not load proxy settings for validation: {e}")
         url = "http://127.0.0.1:8080/v1"
 
     try:
         req = urllib.request.Request(f"{url}/models", method="GET")
         with urllib.request.urlopen(req, timeout=3):
             return True, ""
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Proxy validation failed at {url}: {e}")
         return False, "cli-api-proxy not reachable (requires custom endpoint config)"
 
 

@@ -6,9 +6,8 @@ related to drafts (Premier, Traditional, Quick Draft, and Sealed).
 
 import json
 import logging
-import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 

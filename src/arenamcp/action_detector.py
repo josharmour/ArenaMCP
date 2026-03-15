@@ -5,7 +5,7 @@ allowing comparison with advisor suggestions.
 """
 
 import logging
-from typing import Any, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +152,6 @@ class ActionDetector:
     
     def _handle_mulligan(self, msg: dict, game_state: dict) -> Optional[str]:
         """Handle mulligan decision response."""
-        resp = msg.get("submitDeckResp", {})
         # In Arena, mulligan choice is implicit from deck size
         # If you kept, deck stays same size
         # If you mulled, you drew fewer cards

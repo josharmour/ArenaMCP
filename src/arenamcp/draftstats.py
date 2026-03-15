@@ -3,11 +3,12 @@
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
 import requests
+
+from arenamcp.cache_utils import FileCache
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,9 @@ class DraftStatsCache:
             cache_dir: Directory for cache files. Defaults to ~/.arenamcp/cache/17lands/
         """
         self._cache_dir = cache_dir or CACHE_DIR
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._file_cache = FileCache(
+            self._cache_dir, ttl_seconds=CACHE_MAX_AGE_HOURS * 3600
+        )
 
         # In-memory cache: {set_code: {card_name_lower: DraftStats}}
         self._stats_cache: dict[str, dict[str, DraftStats]] = {}
@@ -55,12 +58,7 @@ class DraftStatsCache:
     def _is_cache_stale(self, set_code: str) -> bool:
         """Check if the cache file is older than CACHE_MAX_AGE_HOURS."""
         cache_path = self._get_cache_path(set_code)
-        if not cache_path.exists():
-            return True
-
-        mtime = datetime.fromtimestamp(cache_path.stat().st_mtime)
-        age = datetime.now() - mtime
-        return age > timedelta(hours=CACHE_MAX_AGE_HOURS)
+        return not self._file_cache.is_cache_valid(cache_path)
 
     def _download_set_data(self, set_code: str) -> list[dict[str, Any]]:
         """Download card ratings JSON from 17lands.

@@ -7,7 +7,6 @@ card data including oracle text, updated daily for new sets.
 import gzip
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,8 +81,7 @@ class MTGJSONDatabase:
         Returns:
             True if download succeeded, False otherwise.
         """
-        logger.info("Downloading MTGJSON AtomicCards...")
-        print("[MTGJSON] Downloading card database (one-time, ~30MB)...")
+        logger.info("Downloading MTGJSON AtomicCards (one-time, ~30MB)...")
 
         try:
             response = requests.get(ATOMIC_CARDS_URL, timeout=120, stream=True)
@@ -101,9 +99,9 @@ class MTGJSONDatabase:
                     if total_size > 0:
                         pct = int(100 * downloaded / total_size)
                         if downloaded % (1024 * 1024) < 8192:  # Every ~1MB
-                            print(f"[MTGJSON] Downloading... {pct}%", end='\r')
+                            logger.info("MTGJSON download progress: %d%%", pct)
 
-            print(f"[MTGJSON] Download complete, decompressing...")
+            logger.info("MTGJSON download complete, decompressing...")
 
             # Decompress
             with gzip.open(temp_file, 'rt', encoding='utf-8') as gz:
@@ -121,7 +119,6 @@ class MTGJSONDatabase:
 
         except requests.RequestException as e:
             logger.error(f"Failed to download MTGJSON: {e}")
-            print(f"[MTGJSON] Download failed: {e}")
             return False
         except Exception as e:
             logger.error(f"Error processing MTGJSON data: {e}")
@@ -325,7 +322,11 @@ class MTGJSONDatabase:
 
             self._loaded = True
             self._available = True
-            print(f"[MTGJSON] Loaded {len(self._name_index)} cards ({len(self._arena_index)} with arena_id)")
+            logger.info(
+                "MTGJSON loaded %d cards (%d with arena_id)",
+                len(self._name_index),
+                len(self._arena_index),
+            )
             return True
 
         except Exception as e:

@@ -73,8 +73,13 @@ def _default_log_path() -> str:
             "Player.log",
         )
 
-    # Last-resort fallback (legacy behavior)
-    return r"C:\Users\joshu\AppData\LocalLow\Wizards Of The Coast\MTGA\Player.log"
+    # Last-resort fallback: construct from platform-appropriate home directory.
+    # On Windows (or WSL without env vars) this resolves to the standard MTGA
+    # log location under the current user's profile.
+    home = Path.home()
+    return str(
+        home / "AppData" / "LocalLow" / "Wizards Of The Coast" / "MTGA" / "Player.log"
+    )
 
 
 def _normalize_log_path(path: str) -> Path:

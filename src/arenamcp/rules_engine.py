@@ -83,7 +83,6 @@ class RulesEngine:
         if mana_pool["total"] < cmc:
             return False
         # Check each color requirement
-        reqs = {}
         for color in "WUBRGC":
             count = len(re.findall(rf"\{{{color}\}}", mana_cost))
             if count > 0:
@@ -432,11 +431,6 @@ class RulesEngine:
         if not dec_type:
             return []
 
-        players = game_state.get("players", [])
-        local_player = next((p for p in players if p.get("is_local")), None)
-        local_seat = local_player.get("seat_id") if local_player else None
-        battlefield = game_state.get("battlefield", [])
-
         if dec_type == "declare_attackers":
             legal = decision_context.get("legal_attackers", [])
             actions = []
@@ -538,7 +532,6 @@ class RulesEngine:
 
         # Calculate available mana (with color breakdown)
         mana_pool = RulesEngine._get_mana_pool(game_state, local_seat)
-        available_mana = mana_pool["total"]
 
         # 1. LAND DROPS
         # Legal if: Main Phase, Stack Empty, Lands Played < 1, Active Player

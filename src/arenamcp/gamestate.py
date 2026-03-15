@@ -162,73 +162,103 @@ class GameState:
 
     This class tracks zones, game objects, players, and turn information
     as they are updated via GameStateMessage events from the log parser.
+
+    Snapshot architecture
+    ---------------------
+    There is a single canonical snapshot pipeline:
+
+    1. **_published_snapshot** -- An immutable ``dict`` rebuilt (under
+       ``_state_lock``) every time mutable state changes.  All readers
+       go through ``get_published_snapshot()`` which returns either a
+       deep-copy or a read-only reference.
+
+    2. **get_snapshot()** -- A convenience layer on top of (1) that
+       enriches game-object dicts with card names (for the TUI).
+
+    3. **_game_end_data** -- When a game ends, ``prepare_for_game_end()``
+       atomically captures the result and a copy of ``_published_snapshot``
+       into this single dict, then sets ``game_ended_event``.  The coaching
+       loop calls ``consume_game_end()`` to retrieve and clear it in one
+       step.
     """
+
+    # Fields that are reset when a new match starts.  Grouped here so that
+    # ``__init__`` and ``reset()`` stay in sync automatically.
+    # Entries whose value is a *type* (``dict``, ``list``, ``set``) get a
+    # fresh instance; everything else is used as a literal default.
+    _RESETTABLE_DEFAULTS: dict[str, Any] = {
+        # Core game data
+        "zones": dict,
+        "game_objects": dict,
+        "players": dict,
+        # Local player tracking
+        "local_seat_id": None,
+        "_seat_source": 0,
+        # Opponent card history
+        "played_cards": dict,
+        "_seen_instances": set,
+        # Combat step tracking
+        "_pending_combat_steps": list,
+        "_last_combat_step_time": 0,
+        # Stack update tracking
+        "_last_stack_update_time": 0,
+        # Untap prevention
+        "_untap_prevention": set,
+        "_in_untap_step": False,
+        # Decision tracking
+        "pending_decision": None,
+        "decision_seat_id": None,
+        "decision_context": None,
+        "decision_timestamp": 0,
+        "last_cleared_decision": None,
+        "legal_actions": list,
+        "legal_actions_raw": list,
+        # Match tracking
+        "match_id": None,
+        # Deck list
+        "deck_cards": list,
+        # Annotation-derived event tracking
+        "recent_events": list,
+        "damage_taken": dict,
+        "revealed_cards": dict,
+    }
+
+    def _apply_field_defaults(self) -> None:
+        """Set every resettable field to its default value.
+
+        For entries whose value is a *type* (``dict``, ``list``, ``set``),
+        a fresh instance is created.  For everything else the value is
+        used directly.
+        """
+        for attr, default in self._RESETTABLE_DEFAULTS.items():
+            if isinstance(default, type):
+                setattr(self, attr, default())
+            else:
+                setattr(self, attr, default)
 
     def __init__(self) -> None:
         """Initialize empty game state."""
-        # Core state dictionaries
-        self.zones: dict[int, Zone] = {}
-        self.game_objects: dict[int, GameObject] = {}
-        self.players: dict[int, Player] = {}
+        # Apply all resettable field defaults
+        self._apply_field_defaults()
+
+        # Non-resettable fields (survive across matches)
         self.turn_info: TurnInfo = TurnInfo()
-
-        # Local player tracking
-        self.local_seat_id: Optional[int] = None
-        # Source of the seat ID: 0=None, 1=Inferred, 2=System (MatchCreated), 3=User (F8)
-        self._seat_source: int = 0
-        
-        # Opponent card history tracking
-        self.played_cards: dict[int, list[int]] = {}  # seat_id -> list of grp_ids
-        self._seen_instances: set[int] = set()  # Track instances to avoid double-counting
-
-        # Combat step tracking - captures steps that happen between polls
-        # This ensures fast combat phases aren't missed
-        self._pending_combat_steps: list[str] = []
-        self._last_combat_step_time: float = 0  # When last combat step was queued
-
-        # Stack update tracking for delay-tolerant clearing
-        self._last_stack_update_time: float = 0  # When stack was last modified
-
-        # Untap prevention tracking: instance_ids that MTGA explicitly kept tapped
-        # during the untap step (e.g., creatures with Blossombind "can't become untapped").
-        # These are skipped during blanket untap on subsequent turns.
-        self._untap_prevention: set[int] = set()
-        self._in_untap_step: bool = False  # True during first message of a turn change
-
-        # Decision tracking (for Mulligan advice, etc.)
-        self.pending_decision: Optional[str] = None  # e.g. "Mulligan"
-        self.decision_seat_id: Optional[int] = None
-        # PHASE 1: Enhanced decision context
-        self.decision_context: Optional[dict] = None  # Rich context: source_card, options, etc.
-        self.decision_timestamp: float = 0  # Track when decision was set
-        self.last_cleared_decision: Optional[str] = None  # For watchdog validation
-        self.legal_actions: list[str] = [] # Human-readable legal actions from GRE
-        self.legal_actions_raw: list[dict[str, Any]] = []  # Raw GRE ActionsAvailableReq action payloads
-
-        # Match tracking (to avoid stale state across matches)
-        self.match_id: Optional[str] = None
-
-        # Deck list captured from ConnectResp
-        self.deck_cards: list[int] = []
-
-        # --- Annotation-derived event tracking ---
-        # Recent game events from GRE annotations (ring buffer, max 50)
-        self.recent_events: list[dict] = []
         self._max_recent_events: int = 50
-        # Persists across reset() so the coaching loop can read it after match ends
+
+        # Persists across reset() so the coaching loop can read it after
+        # match ends.  Cleared only by consume_game_end().
         self.last_game_result: Optional[str] = None  # "win", "loss", or None
-        # Cumulative damage tracking per player this game: {seat_id: total_damage_taken}
-        self.damage_taken: dict[int, int] = {}
-        # Cards revealed to us by opponent (from CardRevealed/InstanceRevealedToOpponent)
-        self.revealed_cards: dict[int, set[int]] = {}  # seat_id -> set of grp_ids
 
         # ── Cross-thread game-end signaling ──
-        # The parser thread sets this event when the game ends (IntermissionReq).
-        # The coaching loop checks it to detect game end immediately, even if
-        # blocked on an LLM call or in between polls.
+        # The parser thread calls prepare_for_game_end() which atomically
+        # stores result + final snapshot into _game_end_data and sets
+        # game_ended_event.  The coaching loop calls consume_game_end()
+        # to retrieve and clear it.
         self.game_ended_event: threading.Event = threading.Event()
-        # Snapshot of the full game state captured BEFORE reset(), so the
-        # post-match analysis has the final board state even after reset clears it.
+        self._game_end_data: Optional[dict[str, Any]] = None
+
+        # Backward-compatible alias -- standalone.py and server.py read
+        # _pre_reset_snapshot directly in a few places.
         self._pre_reset_snapshot: Optional[dict] = None
 
         # Published immutable snapshot for lock-safe readers
@@ -237,99 +267,85 @@ class GameState:
         self.publish_snapshot()
 
     def reset(self) -> None:
-        """Reset the game state to essentially empty (for new match)."""
+        """Reset the game state for a new match.
+
+        Clears all per-game fields via ``_apply_field_defaults()``.
+        Fields that must survive across matches (``last_game_result``,
+        ``game_ended_event``, ``_game_end_data``, ``_pre_reset_snapshot``)
+        are intentionally preserved -- they are consumed by the coaching
+        loop after the reset.
+        """
         logger.info("Resetting GameState for new match")
-        self.zones.clear()
-        self.game_objects.clear()
-        self.players.clear()
+        self._apply_field_defaults()
         self.turn_info = TurnInfo()
-        
-        # Reset local player seat logic (but keep User/System if we want persistence?)
-        # Actually for a NEW match, System seat ID will change, so we should clear it.
-        # But User override (F8) might be intended to persist? 
-        # Usually seat ID changes every match, so User override might be wrong for next match.
-        # Better to reset seat source to 0 or keep it if it's 3?
-        # Let's trust reset_local_player(force=False) logic which keeps User/System.
-        # But wait, if System ID is from OLD match, it's invalid.
-        # So for a full match reset, we probably want to clear System source too.
-        # Always reset seat ID for a new match. 
-        # Even if user manually set it (Source 3) in previous match, 
-        # it is likely invalid for the new match.
-        self.local_seat_id = None
-        self._seat_source = 0
-            
-        self.played_cards.clear()
-        self._seen_instances.clear()
-        self._pending_combat_steps.clear()
-        self._last_combat_step_time = 0
-        self._last_stack_update_time = 0
-        self._untap_prevention.clear()
-        self._in_untap_step = False
-        self.pending_decision = None
-        self.decision_seat_id = None
-        self.decision_context = None
-        self.decision_timestamp = 0
-        self.legal_actions = []
-        self.legal_actions_raw = []
-        self.deck_cards = []
-        self.recent_events = []
-        self.damage_taken = {}
-        self.revealed_cards = {}
         self.publish_snapshot()
-        # NOTE: last_game_result is intentionally NOT cleared here.
-        # The coaching loop reads it after reset() to detect the match outcome.
-        # It is cleared by the coaching loop once consumed.
-        # NOTE: game_ended_event and _pre_reset_snapshot are NOT cleared here.
-        # They are cleared by the coaching loop once consumed.
 
     def prepare_for_game_end(self) -> None:
         """Capture final state and infer result BEFORE reset().
 
         Called by the IntermissionReq handler (parser thread) right before
-        ``reset()`` wipes the board.  This ensures:
-        1. ``last_game_result`` is set even if no WinTheGame/LossOfGame annotation fired
-        2. ``_pre_reset_snapshot`` preserves the final board state for analysis
-        3. ``game_ended_event`` is set so the coaching loop detects it immediately
+        ``reset()`` wipes the board.  Atomically stores the result and a
+        copy of the current published snapshot into ``_game_end_data``,
+        then sets ``game_ended_event`` so the coaching loop detects it
+        immediately.
         """
-        # 1. Infer game result from life totals if not already set
-        if not self.last_game_result and self.local_seat_id is not None:
-            for seat_id, player in self.players.items():
-                if player.life_total <= 0:
-                    if seat_id == self.local_seat_id:
-                        self.last_game_result = "loss"
-                        logger.info(f"Inferred game result from life totals: loss (seat {seat_id} life={player.life_total})")
-                    else:
-                        self.last_game_result = "win"
-                        logger.info(f"Inferred game result from life totals: win (opponent seat {seat_id} life={player.life_total})")
-                    break  # First player at ≤0 life determines result
+        with self._state_lock:
+            # 1. Infer game result from life totals if not already set
+            if not self.last_game_result and self.local_seat_id is not None:
+                for seat_id, player in self.players.items():
+                    if player.life_total <= 0:
+                        if seat_id == self.local_seat_id:
+                            self.last_game_result = "loss"
+                            logger.info(f"Inferred game result from life totals: loss (seat {seat_id} life={player.life_total})")
+                        else:
+                            self.last_game_result = "win"
+                            logger.info(f"Inferred game result from life totals: win (opponent seat {seat_id} life={player.life_total})")
+                        break  # First player at 0 or less determines result
 
-        # 2. Save a snapshot of the full state before reset wipes it
-        try:
-            self._pre_reset_snapshot = self.get_snapshot()
-        except Exception as e:
-            logger.warning(f"Failed to capture pre-reset snapshot: {e}")
-            self._pre_reset_snapshot = None
+            # 2. Capture the published snapshot (already built, no enrichment
+            #    overhead).  Deep-copy so it is immune to the upcoming reset().
+            final_snapshot = copy.deepcopy(self._published_snapshot)
 
-        # 3. Signal the coaching loop
+            # 3. Bundle result + snapshot atomically
+            self._game_end_data = {
+                "result": self.last_game_result,
+                "snapshot": final_snapshot,
+            }
+            # Keep backward-compatible alias for external readers
+            self._pre_reset_snapshot = final_snapshot
+
+        # 4. Signal the coaching loop (Event.set is thread-safe on its own)
         self.game_ended_event.set()
-        logger.info(f"Game-end prepared: result={self.last_game_result}, snapshot={'yes' if self._pre_reset_snapshot else 'no'}")
+        logger.info(f"Game-end prepared: result={self.last_game_result}, snapshot={'yes' if final_snapshot else 'no'}")
 
     def consume_game_end(self) -> tuple[Optional[str], Optional[dict]]:
         """Consume the game-end signal and return (result, snapshot).
 
         Called by the coaching loop after detecting ``game_ended_event``.
-        Clears the event and persistent fields so they don't re-trigger.
+        Clears the event and all persistent game-end fields atomically so
+        they don't re-trigger.
 
         Returns:
-            Tuple of (result, pre_reset_snapshot) where result is "win",
-            "loss", or None, and snapshot is the full game state dict
+            Tuple of (result, final_snapshot) where result is "win",
+            "loss", or None, and final_snapshot is the board state dict
             captured before reset().
         """
-        result = self.last_game_result
-        snapshot = self._pre_reset_snapshot
-        # Clear consumed data
-        self.last_game_result = None
-        self._pre_reset_snapshot = None
+        with self._state_lock:
+            data = self._game_end_data
+            if data is not None:
+                result = data.get("result")
+                snapshot = data.get("snapshot")
+            else:
+                # Fallback: read legacy fields for callers that set them
+                # individually (e.g. finalMatchResult in server.py).
+                result = self.last_game_result
+                snapshot = self._pre_reset_snapshot
+
+            # Clear all game-end state
+            self._game_end_data = None
+            self._pre_reset_snapshot = None
+            self.last_game_result = None
+
         self.game_ended_event.clear()
         return result, snapshot
 
@@ -586,7 +602,8 @@ class GameState:
                     enriched["name"] = card_info.get("name", f"Unknown ({grp_id})")
                     enriched["type_line"] = card_info.get("type_line", "")
                     enriched["mana_cost"] = card_info.get("mana_cost", "")
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Card info lookup failed for grp_id={grp_id}: {e}")
                     enriched["name"] = f"Unknown ({grp_id})"
                     enriched["type_line"] = ""
             else:
@@ -1174,7 +1191,8 @@ class GameState:
             from arenamcp import server
             info = server.get_card_info(grp_id)
             return info.get("name", f"Card#{grp_id}")
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Card name resolution failed for grp_id={grp_id}: {e}")
             return f"Card#{grp_id}"
 
     def _process_annotations(self, annotations: list[dict]) -> None:
@@ -1572,6 +1590,547 @@ class GameState:
         logger.debug(f"Updated turn info: turn {self.turn_info.turn_number}, phase {self.turn_info.phase}, step {self.turn_info.step}")
 
 
+def _auto_clear_stale_decision(game_state: GameState) -> bool:
+    """Auto-clear stale decisions whose source is no longer on the stack.
+
+    Returns True if the decision was cleared (snapshot_dirty should be set).
+    """
+    MIN_DECISION_HOLD_S = 5
+    _decision_type = (game_state.decision_context or {}).get("type", "")
+    _skip_auto_clear = _decision_type in ("actions_available", "pay_costs")
+    if not (game_state.pending_decision
+            and game_state.pending_decision != "Mulligan"
+            and game_state.decision_context
+            and not _skip_auto_clear):
+        return False
+
+    import time as _time
+    decision_age = (
+        _time.time() - game_state.decision_timestamp
+        if game_state.decision_timestamp else 999
+    )
+    source_id = game_state.decision_context.get("source_id")
+    should_clear = False
+    if source_id is not None:
+        still_on_stack = any(
+            obj.instance_id == source_id for obj in game_state.stack
+        )
+        if not still_on_stack:
+            if decision_age >= MIN_DECISION_HOLD_S:
+                should_clear = True
+                logger.info(
+                    f"Auto-clearing stale decision '{game_state.pending_decision}' "
+                    f"(source {source_id} no longer on stack, age={decision_age:.1f}s)"
+                )
+            else:
+                logger.debug(
+                    f"Decision '{game_state.pending_decision}' source left stack "
+                    f"but holding ({decision_age:.1f}s < {MIN_DECISION_HOLD_S}s)"
+                )
+    elif game_state.decision_timestamp:
+        is_busy = (
+            "Combat" in game_state.turn_info.phase
+            or len(game_state.stack) > 0
+        )
+        no_source_timeout = 25 if is_busy else 15
+        if decision_age > no_source_timeout:
+            should_clear = True
+            logger.info(
+                f"Auto-clearing stale decision '{game_state.pending_decision}' "
+                f"(no source_id, age={decision_age:.0f}s, "
+                f"timeout={no_source_timeout}s)"
+            )
+    if should_clear:
+        game_state.pending_decision = None
+        game_state.decision_seat_id = None
+        game_state.decision_context = None
+        game_state.decision_timestamp = 0
+        return True
+    return False
+
+
+def _set_simple_decision(game_state: GameState, label: str, dec_type: str,
+                         raw: Optional[dict] = None) -> None:
+    """Set a simple pending decision with optional raw data."""
+    import time as _time
+    logger.info(f"Captured Decision: {label}")
+    game_state.pending_decision = label
+    game_state.decision_timestamp = _time.time()
+    ctx: dict[str, Any] = {"type": dec_type}
+    if raw is not None:
+        ctx["raw"] = raw
+    game_state.decision_context = ctx
+
+
+def _handle_decision_message(game_state: GameState, msg_type: str,
+                             msg: dict) -> bool:
+    """Handle a GRE decision message. Returns True if snapshot_dirty should be set."""
+    import time as _time
+
+    if msg_type in ("GREMessageType_MulliganReq", "GREMessageType_SubmitDeckReq"):
+        logger.info(f"Captured Decision: Mulligan Check ({msg_type})")
+        if game_state.turn_info.turn_number > 1:
+            logger.info(f"Mulligan Request detected at Turn {game_state.turn_info.turn_number} -> Resetting Ghost State.")
+            game_state.reset()
+        game_state.pending_decision = "Mulligan"
+        game_state.decision_seat_id = game_state.local_seat_id
+        game_state.decision_timestamp = _time.time()
+        game_state.decision_context = {"type": "mulligan"}
+        return False
+
+    elif msg_type == "GREMessageType_IntermissionReq":
+        logger.info(f"IntermissionReq received (turn {game_state.turn_info.turn_number}) - game over/transition")
+        game_state.prepare_for_game_end()
+        game_state.reset()
+        game_state.pending_decision = None
+        game_state.decision_seat_id = None
+        game_state.decision_context = None
+        game_state.decision_timestamp = 0
+        return False
+
+    elif msg_type == "GREMessageType_PromptReq":
+        prompt_text = msg.get("promptReq", {}).get("prompt", {}).get("text", "Action Required")
+        logger.info(f"Captured Decision: Prompt ({prompt_text})")
+        if game_state.pending_decision == "Mulligan":
+            logger.info("Skipping PromptReq — Mulligan decision already active")
+        else:
+            game_state.pending_decision = prompt_text
+            game_state.decision_timestamp = _time.time()
+            game_state.decision_context = {"type": "prompt", "text": prompt_text}
+        return False
+
+    elif msg_type == "GREMessageType_SelectTargetsReq":
+        req = msg.get("selectTargetsReq", {})
+        source_id = req.get("sourceId")
+        source_card = None
+        if source_id:
+            for obj in game_state.stack:
+                if obj.instance_id == source_id:
+                    try:
+                        from arenamcp import server
+                        card_info = server.get_card_info(obj.grp_id)
+                        source_card = card_info.get("name", f"Unknown ({obj.grp_id})")
+                    except Exception:
+                        source_card = f"Unknown ({obj.grp_id})"
+                    break
+        logger.info(f"Captured Decision: Select Targets (source: {source_card or 'unknown'})")
+        game_state.pending_decision = "Select Targets"
+        game_state.decision_timestamp = _time.time()
+        game_state.decision_context = {
+            "type": "target_selection",
+            "source_card": source_card,
+            "source_id": source_id,
+        }
+        return False
+
+    elif msg_type == "GREMessageType_SelectNReq":
+        return _handle_select_n_req(game_state, msg)
+
+    elif msg_type == "GREMessageType_GroupReq":
+        req = msg.get("groupReq", {})
+        if game_state.turn_info.turn_number < 1:
+            logger.info(f"Captured Decision: Mulligan Bottom Cards ({msg_type})")
+            game_state.pending_decision = "Mulligan Bottom"
+            game_state.decision_seat_id = game_state.local_seat_id
+            game_state.decision_timestamp = _time.time()
+            game_state.decision_context = {"type": "mulligan_bottom", "raw": dict(req)}
+        else:
+            _set_simple_decision(game_state, "Group Selection", "group_selection", dict(req))
+        return False
+
+    elif msg_type == "GREMessageType_GroupOptionReq":
+        req = msg.get("groupOptionReq", {})
+        options = req.get("options", [])
+        logger.info(f"Captured Decision: Choose Mode ({len(options)} options)")
+        game_state.pending_decision = "Choose Mode"
+        game_state.decision_timestamp = _time.time()
+        game_state.decision_context = {"type": "modal_choice", "num_options": len(options), "options": options}
+        return False
+
+    elif msg_type == "GREMessageType_ActionsAvailableReq":
+        return _handle_actions_available(game_state, msg)
+
+    elif msg_type == "GREMessageType_ConnectResp":
+        connect_resp = msg.get("connectResp", {})
+        deck_cards = connect_resp.get("deckMessage", {}).get("deckCards", [])
+        if deck_cards:
+            game_state.deck_cards = deck_cards
+            logger.info(f"Captured deck list from ConnectResp: {len(deck_cards)} cards")
+        return False
+
+    elif msg_type == "GREMessageType_DeclareAttackersReq":
+        req = msg.get("declareAttackersReq", {})
+        legal_attackers = req.get("attackers", req.get("qualifiedAttackers", []))
+        attacker_names, attacker_ids = [], []
+        for atk in legal_attackers:
+            obj_id = atk if isinstance(atk, int) else atk.get("instanceId", atk.get("attackerInstanceId", 0))
+            obj = game_state.game_objects.get(obj_id)
+            if obj:
+                attacker_names.append(game_state._resolve_card_name(obj.grp_id))
+                attacker_ids.append(obj_id)
+        logger.info(f"Captured Decision: Declare Attackers ({len(attacker_names)} legal)")
+        game_state.pending_decision = "Declare Attackers"
+        game_state.decision_timestamp = _time.time()
+        game_state.decision_context = {
+            "type": "declare_attackers", "legal_attackers": attacker_names,
+            "legal_attacker_ids": attacker_ids, "raw_attackers": legal_attackers,
+        }
+        return False
+
+    elif msg_type == "GREMessageType_DeclareBlockersReq":
+        req = msg.get("declareBlockersReq", {})
+        legal_blockers = req.get("blockers", req.get("qualifiedBlockers", []))
+        blocker_names, blocker_ids = [], []
+        for blk in legal_blockers:
+            obj_id = blk if isinstance(blk, int) else blk.get("instanceId", blk.get("blockerInstanceId", 0))
+            obj = game_state.game_objects.get(obj_id)
+            if obj:
+                blocker_names.append(game_state._resolve_card_name(obj.grp_id))
+                blocker_ids.append(obj_id)
+        logger.info(f"Captured Decision: Declare Blockers ({len(blocker_names)} legal)")
+        game_state.pending_decision = "Declare Blockers"
+        game_state.decision_timestamp = _time.time()
+        game_state.decision_context = {
+            "type": "declare_blockers", "legal_blockers": blocker_names,
+            "legal_blocker_ids": blocker_ids, "raw_blockers": legal_blockers,
+        }
+        return False
+
+    elif msg_type == "GREMessageType_AssignDamageReq":
+        _set_simple_decision(game_state, "Assign Damage", "assign_damage",
+                             dict(msg.get("assignDamageReq", {})))
+        return False
+
+    elif msg_type == "GREMessageType_OrderCombatDamageReq":
+        req = msg.get("orderCombatDamageReq", msg.get("orderDamageReq", {}))
+        _set_simple_decision(game_state, "Order Combat Damage", "order_combat_damage", dict(req))
+        return False
+
+    elif msg_type == "GREMessageType_PayCostsReq":
+        return _handle_pay_costs(game_state, msg)
+
+    elif msg_type == "GREMessageType_SearchReq":
+        req = msg.get("searchReq", {})
+        logger.info(f"Captured Decision: Search (zone {req.get('zoneId', 0)})")
+        game_state.pending_decision = "Search Library"
+        game_state.decision_timestamp = _time.time()
+        game_state.decision_context = {"type": "search", "zone_id": req.get("zoneId", 0), "raw": dict(req)}
+        return False
+
+    elif msg_type == "GREMessageType_DistributionReq":
+        req = msg.get("distributionReq", {})
+        total = req.get("amount", req.get("total", 0))
+        source_id = req.get("sourceId", 0)
+        source_obj = game_state.game_objects.get(source_id)
+        source_name = game_state._resolve_card_name(source_obj.grp_id) if source_obj else "Unknown"
+        logger.info(f"Captured Decision: Distribute {total} (source: {source_name})")
+        game_state.pending_decision = "Distribute"
+        game_state.decision_timestamp = _time.time()
+        game_state.decision_context = {
+            "type": "distribution", "source_card": source_name,
+            "source_id": source_id, "total": total, "raw": dict(req),
+        }
+        return False
+
+    elif msg_type == "GREMessageType_NumericInputReq":
+        req = msg.get("numericInputReq", {})
+        source_id = req.get("sourceId", 0)
+        source_obj = game_state.game_objects.get(source_id)
+        source_name = game_state._resolve_card_name(source_obj.grp_id) if source_obj else "Unknown"
+        logger.info(f"Captured Decision: Numeric Input for {source_name} ({req.get('min', 0)}-{req.get('max', 0)})")
+        game_state.pending_decision = "Choose Number"
+        game_state.decision_timestamp = _time.time()
+        game_state.decision_context = {
+            "type": "numeric_input", "source_card": source_name,
+            "source_id": source_id, "min": req.get("min", 0), "max": req.get("max", 0),
+        }
+        return False
+
+    elif msg_type == "GREMessageType_ChooseStartingPlayerReq":
+        _set_simple_decision(game_state, "Choose Play/Draw", "choose_starting_player")
+        return False
+
+    elif msg_type == "GREMessageType_SelectReplacementReq":
+        _set_simple_decision(game_state, "Select Replacement", "select_replacement",
+                             dict(msg.get("selectReplacementReq", {})))
+        return False
+
+    elif msg_type == "GREMessageType_SelectNGroupReq":
+        _set_simple_decision(game_state, "Select from Group", "select_n_group",
+                             dict(msg.get("selectNGroupReq", {})))
+        return False
+
+    elif msg_type == "GREMessageType_SelectFromGroupsReq":
+        _set_simple_decision(game_state, "Select from Groups", "select_from_groups",
+                             dict(msg.get("selectFromGroupsReq", {})))
+        return False
+
+    elif msg_type == "GREMessageType_SearchFromGroupsReq":
+        _set_simple_decision(game_state, "Search from Groups", "search_from_groups",
+                             dict(msg.get("searchFromGroupsReq", {})))
+        return False
+
+    elif msg_type == "GREMessageType_CastingTimeOptionsReq":
+        _set_simple_decision(game_state, "Choose Casting Option", "casting_time_options",
+                             dict(msg.get("castingTimeOptionsReq", {})))
+        return False
+
+    elif msg_type == "GREMessageType_SelectCountersReq":
+        _set_simple_decision(game_state, "Select Counters", "select_counters",
+                             dict(msg.get("selectCountersReq", {})))
+        return False
+
+    elif msg_type == "GREMessageType_RevealHandReq":
+        req = msg.get("revealHandReq", {})
+        logger.info(f"Hand reveal for seats: {req.get('systemSeatIds', [])}")
+        return False
+
+    elif msg_type == "GREMessageType_OrderReq":
+        _set_simple_decision(game_state, "Order Triggers", "order_triggers",
+                             dict(msg.get("orderReq", {})))
+        return False
+
+    elif msg_type == "GREMessageType_GatherReq":
+        _set_simple_decision(game_state, "Gather", "gather",
+                             dict(msg.get("gatherReq", {})))
+        return False
+
+    elif msg_type == "GREMessageType_OptionalActionMessage":
+        opt = msg.get("optionalActionMessage", msg.get("prompt", {}))
+        prompt_text = ""
+        if isinstance(opt, dict):
+            prompt_text = (
+                opt.get("prompt", {}).get("text", "")
+                if isinstance(opt.get("prompt"), dict)
+                else str(opt.get("prompt", ""))
+            )
+        logger.info(f"Captured Decision: Optional Action ({prompt_text[:60]})")
+        game_state.pending_decision = "Optional Action"
+        game_state.decision_timestamp = _time.time()
+        game_state.decision_context = {
+            "type": "optional_action", "prompt": prompt_text,
+            "raw": {k: v for k, v in msg.items() if k != "type"},
+        }
+        return False
+
+    return False  # Unhandled message type
+
+
+def _handle_select_n_req(game_state: GameState, msg: dict) -> bool:
+    """Handle SelectNReq messages (scry, discard, choose creature, etc.)."""
+    import time as _time
+    req = msg.get("selectNReq", {})
+    context_data = req.get("context", {})
+    num_to_select = req.get("count", 1)
+    min_select = req.get("minCount", num_to_select)
+    max_select = req.get("maxCount", num_to_select)
+    option_ids = req.get("ids", [])
+
+    context_str = str(context_data).lower()
+    prior_prompt = ""
+    if (game_state.pending_decision
+            and game_state.decision_context
+            and game_state.decision_context.get("type") == "prompt"):
+        prior_prompt = game_state.decision_context.get("text", "").lower()
+        context_str = f"{context_str} {prior_prompt}"
+
+    # Determine selection type
+    _type_map = [
+        ("discard", "discard", "Discard"), ("sacrifice", "sacrifice", "Sacrifice"),
+        ("exile", "exile", "Exile"), ("destroy", "destroy", "Destroy"),
+        ("return", "return", "Return"), ("scry", "scry", "Scry"),
+        ("surveil", "surveil", "Surveil"), ("mill", "mill", "Mill"),
+        ("explore", "explore", "Explore"), ("creature", "choose_creature", "Choose Creature"),
+        ("land", "choose_land", "Choose Land"), ("enchantment", "choose_enchantment", "Choose Enchantment"),
+        ("artifact", "choose_artifact", "Choose Artifact"), ("permanent", "choose_permanent", "Choose Permanent"),
+        ("choose", "choose", "Choose"),
+    ]
+    selection_type = "select_n"
+    decision_text = "Select Items"
+    for keyword, sel_type, dec_text in _type_map:
+        if keyword in context_str:
+            selection_type = sel_type
+            decision_text = dec_text
+            break
+    else:
+        if prior_prompt:
+            decision_text = game_state.decision_context.get("text", "Select Items")
+
+    # Resolve option IDs to card names
+    option_cards: list[str] = []
+    for oid in option_ids[:20]:
+        obj = game_state.game_objects.get(oid)
+        if obj and obj.grp_id:
+            try:
+                from arenamcp import server
+                info = server.get_card_info(obj.grp_id)
+                option_cards.append(info.get("name", f"Card#{obj.grp_id}"))
+            except Exception:
+                option_cards.append(f"Card#{obj.grp_id}")
+
+    logger.info(f"Captured Decision: {decision_text} ({num_to_select} items, type={selection_type}, options={option_cards or option_ids[:5]})")
+    game_state.pending_decision = decision_text
+    game_state.decision_timestamp = _time.time()
+    game_state.decision_context = {
+        "type": selection_type, "count": num_to_select,
+        "min": min_select, "max": max_select,
+        "context_raw": context_data, "prior_prompt": prior_prompt or None,
+        "option_cards": option_cards or None,
+    }
+    return False
+
+
+def _handle_actions_available(game_state: GameState, msg: dict) -> bool:
+    """Handle ActionsAvailableReq messages. Returns True if snapshot_dirty."""
+    import time as _time
+    req = msg.get("actionsAvailableReq", {})
+    raw_actions = req.get("actions", [])
+    game_state.legal_actions_raw = copy.deepcopy(raw_actions) if raw_actions else []
+
+    legal_list = []
+    for action in raw_actions:
+        atype = action.get("actionType", "")
+        if atype == "ActionType_Pass":
+            legal_list.append("Pass")
+        elif atype == "ActionType_Play":
+            name = "Land"
+            if action.get("grpId"):
+                try:
+                    from arenamcp import server
+                    info = server.get_card_info(action["grpId"])
+                    name = info.get("name", "Land")
+                except Exception: pass
+            legal_list.append(f"Play Land: {name}")
+        elif atype == "ActionType_Cast":
+            name = "Spell"
+            if action.get("grpId"):
+                try:
+                    from arenamcp import server
+                    info = server.get_card_info(action["grpId"])
+                    name = info.get("name", "Spell")
+                except Exception: pass
+            legal_list.append(f"Cast {name}")
+        elif atype == "ActionType_Activate":
+            legal_list.append("Activate Ability")
+        else:
+            legal_list.append(f"Action: {atype.replace('ActionType_', '')}")
+
+    if legal_list:
+        game_state.legal_actions = legal_list
+        logger.info(f"Captured {len(legal_list)} legal actions from GRE: {legal_list}")
+
+    # Correct priority/active player
+    if raw_actions and game_state.local_seat_id is not None:
+        local = game_state.local_seat_id
+        action_types = {a.get("actionType", "") for a in raw_actions}
+        has_sorcery_speed = "ActionType_Cast" in action_types or "ActionType_Play" in action_types
+        stack_empty = not game_state.get_objects_in_zone(ZoneType.STACK)
+        if has_sorcery_speed and stack_empty:
+            if game_state.turn_info.active_player != local:
+                logger.warning(
+                    f"Active player correction: GRE gave us sorcery-speed "
+                    f"actions but active_player={game_state.turn_info.active_player} "
+                    f"(local={local}). Correcting to {local}."
+                )
+                game_state.turn_info.active_player = local
+        if game_state.turn_info.priority_player != local:
+            game_state.turn_info.priority_player = local
+
+    if raw_actions:
+        action_types = {a.get("actionType", "") for a in raw_actions}
+        if action_types == {"ActionType_Pass"}:
+            decision_label = "Priority (Pass Only)"
+        elif "ActionType_Cast" in action_types or "ActionType_Play" in action_types:
+            decision_label = "Priority"
+        elif "ActionType_AttackWithGroup" in action_types or "ActionType_Attack" in action_types:
+            decision_label = "Declare Attackers"
+        elif "ActionType_BlockWithGroup" in action_types or "ActionType_Block" in action_types:
+            decision_label = "Declare Blockers"
+        else:
+            decision_label = "Choose Action"
+        game_state.pending_decision = decision_label
+        game_state.decision_timestamp = _time.time()
+        game_state.decision_context = {
+            "type": "actions_available",
+            "num_actions": len(raw_actions),
+            "action_types": sorted(action_types),
+        }
+        return True
+    return False
+
+
+def _handle_pay_costs(game_state: GameState, msg: dict) -> bool:
+    """Handle PayCostsReq messages."""
+    import time as _time
+    req = msg.get("payCostsReq", {})
+    mana_cost = req.get("manaCost", [])
+    source_id = 0
+    for mc in mana_cost:
+        oid = mc.get("objectId", 0)
+        if oid:
+            source_id = oid
+            break
+    source_obj = game_state.game_objects.get(source_id) if source_id else None
+    source_name = game_state._resolve_card_name(source_obj.grp_id) if source_obj else "Unknown"
+
+    _MANA_ABBREV = {
+        "ManaColor_White": "W", "ManaColor_Blue": "U",
+        "ManaColor_Black": "B", "ManaColor_Red": "R",
+        "ManaColor_Green": "G", "ManaColor_Colorless": "C",
+        "ManaColor_Any": "Any",
+    }
+    mana_parts = []
+    for mc in mana_cost:
+        colors = mc.get("color", [])
+        count = mc.get("count", 1)
+        if colors:
+            symbols = [_MANA_ABBREV.get(c, c) for c in colors]
+            mana_parts.append(f"{count}x{''.join(symbols)}")
+        else:
+            mana_parts.append(f"{count}")
+    mana_str = ", ".join(mana_parts) if mana_parts else "unknown"
+
+    has_autotap = bool(req.get("autoTapActionsReq", {}).get("autoTapSolutions"))
+    logger.info(f"Captured Decision: Pay Costs (source: {source_name}, mana: {mana_str}, autotap={has_autotap})")
+    game_state.pending_decision = "Pay Costs"
+    game_state.decision_timestamp = _time.time()
+    game_state.decision_context = {
+        "type": "pay_costs", "source_card": source_name,
+        "source_id": source_id if source_id else None,
+        "mana_cost": mana_str, "has_autotap": has_autotap,
+    }
+    return False
+
+
+# Known decision Req types handled by _handle_decision_message
+_KNOWN_REQ_TYPES = frozenset([
+    "GREMessageType_MulliganReq", "GREMessageType_SubmitDeckReq",
+    "GREMessageType_IntermissionReq", "GREMessageType_PromptReq",
+    "GREMessageType_SelectTargetsReq", "GREMessageType_SelectNReq",
+    "GREMessageType_GroupReq", "GREMessageType_GroupOptionReq",
+    "GREMessageType_ActionsAvailableReq",
+    "GREMessageType_DeclareAttackersReq", "GREMessageType_DeclareBlockersReq",
+    "GREMessageType_AssignDamageReq", "GREMessageType_OrderCombatDamageReq",
+    "GREMessageType_PayCostsReq", "GREMessageType_SearchReq",
+    "GREMessageType_DistributionReq", "GREMessageType_NumericInputReq",
+    "GREMessageType_ChooseStartingPlayerReq", "GREMessageType_SelectReplacementReq",
+    "GREMessageType_SelectNGroupReq", "GREMessageType_SelectFromGroupsReq",
+    "GREMessageType_SearchFromGroupsReq", "GREMessageType_CastingTimeOptionsReq",
+    "GREMessageType_SelectCountersReq", "GREMessageType_RevealHandReq",
+    "GREMessageType_OrderReq", "GREMessageType_GatherReq",
+    "GREMessageType_ConnectResp", "GREMessageType_OptionalActionMessage",
+])
+
+_DECISION_RESPONSE_TYPES = frozenset([
+    "GREMessageType_SelectTargetsResp", "GREMessageType_SubmitTargetsResp",
+    "GREMessageType_SelectNResp", "GREMessageType_GroupOptionResp",
+    "GREMessageType_GroupResp", "GREMessageType_OptionalActionResp",
+    "GREMessageType_SubmitDeckResp", "GREMessageType_PromptResp",
+    "GREMessageType_SubmitAttackersResp", "GREMessageType_SubmitBlockersResp",
+    "GREMessageType_AssignDamageConfirmation", "GREMessageType_OrderDamageConfirmation",
+])
+
+
 def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
     """Create an event handler that updates a GameState from GreToClientEvent.
 
@@ -1601,7 +2160,6 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
             game_state.update_from_message(msg_payload)
             snapshot_dirty = False
 
-        # Process each message in the array
         for msg in messages:
             msg_type = msg.get("type", "")
             if (
@@ -1616,720 +2174,31 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                 game_state_msg = msg.get("gameStateMessage")
                 if game_state_msg:
                     apply_game_state_update(game_state_msg)
-                    # Auto-clear stale decisions whose source is no longer on the stack.
-                    # Client→server responses (SelectTargetsResp etc.) never reach this
-                    # handler, so we detect resolution by checking if the source left the stack.
-                    #
-                    # IMPORTANT: Enforce a minimum hold time before auto-clearing.
-                    # ETB triggers (e.g. Mockingbird clone) cause a SelectTargetsReq
-                    # whose source immediately leaves the stack (it resolved onto the
-                    # battlefield). Without a hold window, the decision is cleared
-                    # before the coaching loop (1.5s poll) ever sees it.
-                    MIN_DECISION_HOLD_S = 5  # seconds — must survive at least 2 poll cycles
-                    # Never auto-clear decisions set by ActionsAvailableReq or PayCostsReq
-                    # from GameStateMessage — they should only be replaced by the next *Req.
-                    _decision_type = (game_state.decision_context or {}).get("type", "")
-                    _skip_auto_clear = _decision_type in ("actions_available", "pay_costs")
-                    if (game_state.pending_decision
-                            and game_state.pending_decision != "Mulligan"
-                            and game_state.decision_context
-                            and not _skip_auto_clear):
-                        import time
-                        decision_age = (
-                            time.time() - game_state.decision_timestamp
-                            if game_state.decision_timestamp else 999
-                        )
-                        source_id = game_state.decision_context.get("source_id")
-                        should_clear = False
-                        if source_id is not None:
-                            still_on_stack = any(
-                                obj.instance_id == source_id for obj in game_state.stack
-                            )
-                            if not still_on_stack:
-                                if decision_age >= MIN_DECISION_HOLD_S:
-                                    should_clear = True
-                                    logger.info(
-                                        f"Auto-clearing stale decision '{game_state.pending_decision}' "
-                                        f"(source {source_id} no longer on stack, age={decision_age:.1f}s)"
-                                    )
-                                else:
-                                    logger.debug(
-                                        f"Decision '{game_state.pending_decision}' source left stack "
-                                        f"but holding ({decision_age:.1f}s < {MIN_DECISION_HOLD_S}s)"
-                                    )
-                        elif game_state.decision_timestamp:
-                            # Decisions without source_id (prompt, scry, etc.):
-                            # Use longer timeout during combat (complex blocking
-                            # decisions) or when the stack is non-empty (resolving
-                            # triggers may re-prompt). Default: 15s; combat: 25s.
-                            is_busy = (
-                                "Combat" in game_state.turn_info.phase
-                                or len(game_state.stack) > 0
-                            )
-                            no_source_timeout = 25 if is_busy else 15
-                            if decision_age > no_source_timeout:
-                                should_clear = True
-                                logger.info(
-                                    f"Auto-clearing stale decision '{game_state.pending_decision}' "
-                                    f"(no source_id, age={decision_age:.0f}s, "
-                                    f"timeout={no_source_timeout}s)"
-                                )
-                        if should_clear:
-                            game_state.pending_decision = None
-                            game_state.decision_seat_id = None
-                            game_state.decision_context = None
-                            game_state.decision_timestamp = 0
-                            snapshot_dirty = True
+                    if _auto_clear_stale_decision(game_state):
+                        snapshot_dirty = True
             
-            # Handle Mulligan (MulliganReq or legacy SubmitDeckReq)
-            elif msg_type in ("GREMessageType_MulliganReq", "GREMessageType_SubmitDeckReq"):
-                # MulliganReq = MTGA asking a player to keep/mulligan.
-                # Even if systemSeatIds targets the opponent, both players decide
-                # simultaneously — so always set the mulligan decision.
-                logger.info(f"Captured Decision: Mulligan Check ({msg_type})")
-
-                # If we get a Mulligan request while deeply into a game (Turn > 1),
-                # it implies a restart/rematch that happened before the 'Turn 1' update arrived.
-                if game_state.turn_info.turn_number > 1:
-                     logger.info(f"Mulligan Request detected at Turn {game_state.turn_info.turn_number} -> Resetting Ghost State.")
-                     game_state.reset()
-
-                game_state.pending_decision = "Mulligan"
-                game_state.decision_seat_id = game_state.local_seat_id
-                import time
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {"type": "mulligan"}
-
-            # Handle IntermissionReq (end-of-game / sideboard transition)
-            elif msg_type == "GREMessageType_IntermissionReq":
-                # IntermissionReq = game over / BO3 sideboard. Reset state but do NOT
-                # set a Mulligan decision — the actual mulligan SubmitDeckReq will come
-                # later if a new game starts.
-                logger.info(f"IntermissionReq received (turn {game_state.turn_info.turn_number}) - game over/transition")
-                # Capture final state and infer result BEFORE reset wipes the board
-                game_state.prepare_for_game_end()
-                game_state.reset()
-                # Clear any stale decision from the finished game
-                game_state.pending_decision = None
-                game_state.decision_seat_id = None
-                game_state.decision_context = None
-                game_state.decision_timestamp = 0
-                
-            elif msg_type == "GREMessageType_PromptReq":
-                import time
-                prompt_text = msg.get("promptReq", {}).get("prompt", {}).get("text", "Action Required")
-                logger.info(f"Captured Decision: Prompt ({prompt_text})")
-                # Don't overwrite Mulligan with a generic PromptReq — the
-                # mulligan prompt often arrives as a PromptReq right after the
-                # MulliganReq and would clobber the specific "Mulligan" state
-                # that the coach relies on for keep/mull advice.
-                if game_state.pending_decision == "Mulligan":
-                    logger.info("Skipping PromptReq — Mulligan decision already active")
-                else:
-                    game_state.pending_decision = prompt_text
-                    game_state.decision_timestamp = time.time()
-                    game_state.decision_context = {"type": "prompt", "text": prompt_text}
-                
-            elif msg_type == "GREMessageType_SelectTargetsReq":
-                # PHASE 1: Capture rich context for target selection
-                import time
-                req = msg.get("selectTargetsReq", {})
-                source_id = req.get("sourceId")
-                source_card = None
-                if source_id:
-                    # Try to find the source card on the stack
-                    for obj in game_state.stack:
-                        if obj.instance_id == source_id:
-                            try:
-                                from arenamcp import server
-                                card_info = server.get_card_info(obj.grp_id)
-                                source_card = card_info.get("name", f"Unknown ({obj.grp_id})")
-                            except Exception:
-                                source_card = f"Unknown ({obj.grp_id})"
-                            break
-                
-                logger.info(f"Captured Decision: Select Targets (source: {source_card or 'unknown'})")
-                game_state.pending_decision = "Select Targets"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "target_selection",
-                    "source_card": source_card,
-                    "source_id": source_id,
-                }
-                
-            elif msg_type == "GREMessageType_SelectNReq":
-                # Capture rich context for N-selection decisions.
-                # MTGA sends PromptReq (e.g. "Choose a creature") right before
-                # SelectNReq.  We merge both to get the most descriptive text.
-                import time
-                req = msg.get("selectNReq", {})
-                context_data = req.get("context", {})
-                num_to_select = req.get("count", 1)
-                min_select = req.get("minCount", num_to_select)
-                max_select = req.get("maxCount", num_to_select)
-                option_ids = req.get("ids", [])
-
-                # Build combined context from selectNReq AND any preceding PromptReq
-                context_str = str(context_data).lower()
-                prior_prompt = ""
-                if (game_state.pending_decision
-                        and game_state.decision_context
-                        and game_state.decision_context.get("type") == "prompt"):
-                    prior_prompt = game_state.decision_context.get("text", "").lower()
-                    context_str = f"{context_str} {prior_prompt}"
-
-                # Determine selection type — more specific keywords first
-                if "discard" in context_str:
-                    selection_type = "discard"
-                    decision_text = "Discard"
-                elif "sacrifice" in context_str:
-                    selection_type = "sacrifice"
-                    decision_text = "Sacrifice"
-                elif "exile" in context_str:
-                    selection_type = "exile"
-                    decision_text = "Exile"
-                elif "destroy" in context_str:
-                    selection_type = "destroy"
-                    decision_text = "Destroy"
-                elif "return" in context_str:
-                    selection_type = "return"
-                    decision_text = "Return"
-                elif "scry" in context_str:
-                    selection_type = "scry"
-                    decision_text = "Scry"
-                elif "surveil" in context_str:
-                    selection_type = "surveil"
-                    decision_text = "Surveil"
-                elif "mill" in context_str:
-                    selection_type = "mill"
-                    decision_text = "Mill"
-                elif "explore" in context_str:
-                    selection_type = "explore"
-                    decision_text = "Explore"
-                elif "creature" in context_str:
-                    selection_type = "choose_creature"
-                    decision_text = "Choose Creature"
-                elif "land" in context_str:
-                    selection_type = "choose_land"
-                    decision_text = "Choose Land"
-                elif "enchantment" in context_str:
-                    selection_type = "choose_enchantment"
-                    decision_text = "Choose Enchantment"
-                elif "artifact" in context_str:
-                    selection_type = "choose_artifact"
-                    decision_text = "Choose Artifact"
-                elif "permanent" in context_str:
-                    selection_type = "choose_permanent"
-                    decision_text = "Choose Permanent"
-                elif "choose" in context_str:
-                    selection_type = "choose"
-                    decision_text = "Choose"
-                elif prior_prompt:
-                    # Fall back to the PromptReq text directly
-                    selection_type = "select_n"
-                    decision_text = game_state.decision_context.get("text", "Select Items")
-                else:
-                    selection_type = "select_n"
-                    decision_text = "Select Items"
-
-                # Resolve selectable instance IDs to card names for coaching
-                option_cards: list[str] = []
-                for oid in option_ids[:20]:  # cap to avoid perf issues
-                    obj = game_state.game_objects.get(oid)
-                    if obj and obj.grp_id:
-                        try:
-                            from arenamcp import server
-                            info = server.get_card_info(obj.grp_id)
-                            option_cards.append(info.get("name", f"Card#{obj.grp_id}"))
-                        except Exception:
-                            option_cards.append(f"Card#{obj.grp_id}")
-
-                logger.info(f"Captured Decision: {decision_text} ({num_to_select} items, type={selection_type}, options={option_cards or option_ids[:5]})")
-                game_state.pending_decision = decision_text
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": selection_type,
-                    "count": num_to_select,
-                    "min": min_select,
-                    "max": max_select,
-                    "context_raw": context_data,
-                    "prior_prompt": prior_prompt or None,
-                    "option_cards": option_cards or None,
-                }
-                
-            elif msg_type == "GREMessageType_GroupReq":
-                # London Mulligan "choose cards to put on bottom" step,
-                # or other group selection during the game.
-                import time
-                req = msg.get("groupReq", {})
-                if game_state.turn_info.turn_number < 1:
-                    # During mulligan phase, this is "select cards to bottom"
-                    logger.info(f"Captured Decision: Mulligan Bottom Cards ({msg_type})")
-                    game_state.pending_decision = "Mulligan Bottom"
-                    game_state.decision_seat_id = game_state.local_seat_id
-                    game_state.decision_timestamp = time.time()
-                    game_state.decision_context = {
-                        "type": "mulligan_bottom",
-                        "raw": {k: v for k, v in req.items()},
-                    }
-                else:
-                    logger.info(f"Captured Decision: Group Selection ({msg_type})")
-                    game_state.pending_decision = "Group Selection"
-                    game_state.decision_timestamp = time.time()
-                    game_state.decision_context = {
-                        "type": "group_selection",
-                        "raw": {k: v for k, v in req.items()},
-                    }
-
-            elif msg_type == "GREMessageType_GroupOptionReq":
-                # PHASE 1: Capture modal spell options
-                import time
-                req = msg.get("groupOptionReq", {})
-                options = req.get("options", [])
-
-                logger.info(f"Captured Decision: Choose Mode ({len(options)} options)")
-                game_state.pending_decision = "Choose Mode"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "modal_choice",
-                    "num_options": len(options),
-                    "options": options,
-                }
-
-            elif msg_type == "GREMessageType_ActionsAvailableReq":
-                # PHASE 1: Capture the exact list of actions Arena says are legal right now.
-                # This is the "Ground Truth" for the autopilot.
-                # RE insight: ActionsAvailableReq IS a decision — the GRE is waiting
-                # for the player to choose an action.  Setting pending_decision here
-                # ensures the coach/autopilot knows the game needs input.
-                import time as _time
-                req = msg.get("actionsAvailableReq", {})
-                raw_actions = req.get("actions", [])
-                game_state.legal_actions_raw = copy.deepcopy(raw_actions) if raw_actions else []
-
-                legal_list = []
-                for action in raw_actions:
-                    atype = action.get("actionType", "")
-                    # Human-friendly mapping
-                    if atype == "ActionType_Pass":
-                        legal_list.append("Pass")
-                    elif atype == "ActionType_Play":
-                        # Try to resolve card name if grpId is present
-                        name = "Land"
-                        if action.get("grpId"):
-                            try:
-                                from arenamcp import server
-                                info = server.get_card_info(action["grpId"])
-                                name = info.get("name", "Land")
-                            except: pass
-                        legal_list.append(f"Play Land: {name}")
-                    elif atype == "ActionType_Cast":
-                        name = "Spell"
-                        if action.get("grpId"):
-                            try:
-                                from arenamcp import server
-                                info = server.get_card_info(action["grpId"])
-                                name = info.get("name", "Spell")
-                            except: pass
-                        legal_list.append(f"Cast {name}")
-                    elif atype == "ActionType_Activate":
-                        legal_list.append(f"Activate Ability")
-                    else:
-                        # Fallback for other types
-                        clean_type = atype.replace("ActionType_", "")
-                        legal_list.append(f"Action: {clean_type}")
-
-                if legal_list:
-                    game_state.legal_actions = legal_list
-                    logger.info(f"Captured {len(legal_list)} legal actions from GRE: {legal_list}")
-
-                # GRE sent us actions — we have priority.  Correct priority_player
-                # and active_player if they are stale (common during log backfill
-                # or when turnInfo diffs arrive out-of-order).
-                if raw_actions and game_state.local_seat_id is not None:
-                    local = game_state.local_seat_id
-                    action_types = {a.get("actionType", "") for a in raw_actions}
-                    has_sorcery_speed = (
-                        "ActionType_Cast" in action_types
-                        or "ActionType_Play" in action_types
-                    )
-                    # If we have Cast/Play actions and the stack is empty,
-                    # it MUST be our main phase — correct active_player.
-                    stack_empty = not game_state.get_objects_in_zone(ZoneType.STACK)
-                    if has_sorcery_speed and stack_empty:
-                        if game_state.turn_info.active_player != local:
-                            logger.warning(
-                                f"Active player correction: GRE gave us sorcery-speed "
-                                f"actions but active_player={game_state.turn_info.active_player} "
-                                f"(local={local}). Correcting to {local}."
-                            )
-                            game_state.turn_info.active_player = local
-                    # We always have priority when GRE sends ActionsAvailableReq
-                    if game_state.turn_info.priority_player != local:
-                        game_state.turn_info.priority_player = local
-
-                # Set pending_decision: the GRE is waiting for the player to act.
-                # Only set if we have actual actions (not an empty req).
-                if raw_actions:
-                    # Determine a descriptive decision name from available actions
-                    action_types = {a.get("actionType", "") for a in raw_actions}
-                    if action_types == {"ActionType_Pass"}:
-                        decision_label = "Priority (Pass Only)"
-                    elif "ActionType_Cast" in action_types or "ActionType_Play" in action_types:
-                        decision_label = "Priority"
-                    elif "ActionType_AttackWithGroup" in action_types or "ActionType_Attack" in action_types:
-                        decision_label = "Declare Attackers"
-                    elif "ActionType_BlockWithGroup" in action_types or "ActionType_Block" in action_types:
-                        decision_label = "Declare Blockers"
-                    else:
-                        decision_label = "Choose Action"
-                    game_state.pending_decision = decision_label
-                    game_state.decision_timestamp = _time.time()
-                    game_state.decision_context = {
-                        "type": "actions_available",
-                        "num_actions": len(raw_actions),
-                        "action_types": sorted(action_types),
-                    }
+            # Dispatch known decision/action message types to helpers
+            elif msg_type in _KNOWN_REQ_TYPES:
+                if _handle_decision_message(game_state, msg_type, msg):
                     snapshot_dirty = True
 
-            elif msg_type == "GREMessageType_ConnectResp":
-                connect_resp = msg.get("connectResp", {})
-                deck_cards = connect_resp.get("deckMessage", {}).get("deckCards", [])
-                if deck_cards:
-                    game_state.deck_cards = deck_cards
-                    logger.info(f"Captured deck list from ConnectResp: {len(deck_cards)} cards")
-
-            # --- Combat Decision Messages ---
-
-            elif msg_type == "GREMessageType_DeclareAttackersReq":
-                import time
-                req = msg.get("declareAttackersReq", {})
-                legal_attackers = req.get("attackers", req.get("qualifiedAttackers", []))
-                attacker_names = []
-                attacker_ids = []
-                for atk in legal_attackers:
-                    obj_id = atk if isinstance(atk, int) else atk.get("instanceId", atk.get("attackerInstanceId", 0))
-                    obj = game_state.game_objects.get(obj_id)
-                    if obj:
-                        attacker_names.append(game_state._resolve_card_name(obj.grp_id))
-                        attacker_ids.append(obj_id)
-                logger.info(f"Captured Decision: Declare Attackers ({len(attacker_names)} legal)")
-                game_state.pending_decision = "Declare Attackers"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "declare_attackers",
-                    "legal_attackers": attacker_names,
-                    "legal_attacker_ids": attacker_ids,
-                    "raw_attackers": legal_attackers,
-                }
-
-            elif msg_type == "GREMessageType_DeclareBlockersReq":
-                import time
-                req = msg.get("declareBlockersReq", {})
-                legal_blockers = req.get("blockers", req.get("qualifiedBlockers", []))
-                blocker_names = []
-                blocker_ids = []
-                for blk in legal_blockers:
-                    obj_id = blk if isinstance(blk, int) else blk.get("instanceId", blk.get("blockerInstanceId", 0))
-                    obj = game_state.game_objects.get(obj_id)
-                    if obj:
-                        blocker_names.append(game_state._resolve_card_name(obj.grp_id))
-                        blocker_ids.append(obj_id)
-                logger.info(f"Captured Decision: Declare Blockers ({len(blocker_names)} legal)")
-                game_state.pending_decision = "Declare Blockers"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "declare_blockers",
-                    "legal_blockers": blocker_names,
-                    "legal_blocker_ids": blocker_ids,
-                    "raw_blockers": legal_blockers,
-                }
-
-            elif msg_type == "GREMessageType_AssignDamageReq":
-                import time
-                req = msg.get("assignDamageReq", {})
-                logger.info("Captured Decision: Assign Damage")
-                game_state.pending_decision = "Assign Damage"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "assign_damage",
-                    "raw": {k: v for k, v in req.items()},
-                }
-
-            elif msg_type == "GREMessageType_OrderCombatDamageReq":
-                import time
-                req = msg.get("orderCombatDamageReq", msg.get("orderDamageReq", {}))
-                logger.info("Captured Decision: Order Combat Damage")
-                game_state.pending_decision = "Order Combat Damage"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "order_combat_damage",
-                    "raw": {k: v for k, v in req.items()},
-                }
-
-            # --- Additional Decision Messages ---
-
-            elif msg_type == "GREMessageType_PayCostsReq":
-                # RE insight: PayCostsReq proto has NO sourceId field.
-                # The source is in manaCost[].objectId.  The proto fields are:
-                #   manaCost: RepeatedField<ManaRequirement>  (color, count, costId, objectId, abilityGrpId)
-                #   paymentActions: ActionsAvailableReq  (which lands/abilities can produce mana)
-                #   autoTapActionsReq: AutoTapActionsAvailableReq  (pre-computed tap solutions)
-                #   shouldCancel: bool
-                import time
-                req = msg.get("payCostsReq", {})
-
-                # Extract source from manaCost[0].objectId (the card being cast)
-                mana_cost = req.get("manaCost", [])
-                source_id = 0
-                for mc in mana_cost:
-                    oid = mc.get("objectId", 0)
-                    if oid:
-                        source_id = oid
-                        break
-
-                source_obj = game_state.game_objects.get(source_id) if source_id else None
-                source_name = game_state._resolve_card_name(source_obj.grp_id) if source_obj else "Unknown"
-
-                # Build human-readable mana cost string from requirements
-                _MANA_ABBREV = {
-                    "ManaColor_White": "W", "ManaColor_Blue": "U",
-                    "ManaColor_Black": "B", "ManaColor_Red": "R",
-                    "ManaColor_Green": "G", "ManaColor_Colorless": "C",
-                    "ManaColor_Any": "Any",
-                }
-                mana_parts = []
-                for mc in mana_cost:
-                    colors = mc.get("color", [])
-                    count = mc.get("count", 1)
-                    if colors:
-                        symbols = [_MANA_ABBREV.get(c, c) for c in colors]
-                        mana_parts.append(f"{count}x{''.join(symbols)}")
-                    else:
-                        mana_parts.append(f"{count}")
-                mana_str = ", ".join(mana_parts) if mana_parts else "unknown"
-
-                has_autotap = bool(req.get("autoTapActionsReq", {}).get("autoTapSolutions"))
-                logger.info(
-                    f"Captured Decision: Pay Costs (source: {source_name}, "
-                    f"mana: {mana_str}, autotap={has_autotap})"
-                )
-                game_state.pending_decision = "Pay Costs"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "pay_costs",
-                    "source_card": source_name,
-                    "source_id": source_id if source_id else None,  # None → uses longer timeout
-                    "mana_cost": mana_str,
-                    "has_autotap": has_autotap,
-                }
-
-            elif msg_type == "GREMessageType_SearchReq":
-                import time
-                req = msg.get("searchReq", {})
-                zone_id = req.get("zoneId", 0)
-                logger.info(f"Captured Decision: Search (zone {zone_id})")
-                game_state.pending_decision = "Search Library"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "search",
-                    "zone_id": zone_id,
-                    "raw": {k: v for k, v in req.items()},
-                }
-
-            elif msg_type == "GREMessageType_DistributionReq":
-                import time
-                req = msg.get("distributionReq", {})
-                total = req.get("amount", req.get("total", 0))
-                source_id = req.get("sourceId", 0)
-                source_obj = game_state.game_objects.get(source_id)
-                source_name = game_state._resolve_card_name(source_obj.grp_id) if source_obj else "Unknown"
-                logger.info(f"Captured Decision: Distribute {total} (source: {source_name})")
-                game_state.pending_decision = "Distribute"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "distribution",
-                    "source_card": source_name,
-                    "source_id": source_id,
-                    "total": total,
-                    "raw": {k: v for k, v in req.items()},
-                }
-
-            elif msg_type == "GREMessageType_NumericInputReq":
-                import time
-                req = msg.get("numericInputReq", {})
-                source_id = req.get("sourceId", 0)
-                source_obj = game_state.game_objects.get(source_id)
-                source_name = game_state._resolve_card_name(source_obj.grp_id) if source_obj else "Unknown"
-                min_val = req.get("min", 0)
-                max_val = req.get("max", 0)
-                logger.info(f"Captured Decision: Numeric Input for {source_name} ({min_val}-{max_val})")
-                game_state.pending_decision = "Choose Number"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "numeric_input",
-                    "source_card": source_name,
-                    "source_id": source_id,
-                    "min": min_val,
-                    "max": max_val,
-                }
-
-            elif msg_type == "GREMessageType_ChooseStartingPlayerReq":
-                import time
-                logger.info("Captured Decision: Choose Starting Player (Play or Draw)")
-                game_state.pending_decision = "Choose Play/Draw"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "choose_starting_player",
-                }
-
-            elif msg_type == "GREMessageType_SelectReplacementReq":
-                import time
-                req = msg.get("selectReplacementReq", {})
-                logger.info("Captured Decision: Select Replacement Effect")
-                game_state.pending_decision = "Select Replacement"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "select_replacement",
-                    "raw": {k: v for k, v in req.items()},
-                }
-
-            elif msg_type == "GREMessageType_SelectNGroupReq":
-                import time
-                req = msg.get("selectNGroupReq", {})
-                logger.info("Captured Decision: Select N from Group")
-                game_state.pending_decision = "Select from Group"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "select_n_group",
-                    "raw": {k: v for k, v in req.items()},
-                }
-
-            elif msg_type == "GREMessageType_SelectFromGroupsReq":
-                import time
-                req = msg.get("selectFromGroupsReq", {})
-                logger.info("Captured Decision: Select from Groups")
-                game_state.pending_decision = "Select from Groups"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "select_from_groups",
-                    "raw": {k: v for k, v in req.items()},
-                }
-
-            elif msg_type == "GREMessageType_SearchFromGroupsReq":
-                import time
-                req = msg.get("searchFromGroupsReq", {})
-                logger.info("Captured Decision: Search from Groups")
-                game_state.pending_decision = "Search from Groups"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "search_from_groups",
-                    "raw": {k: v for k, v in req.items()},
-                }
-
-            elif msg_type == "GREMessageType_CastingTimeOptionsReq":
-                import time
-                req = msg.get("castingTimeOptionsReq", {})
-                logger.info("Captured Decision: Casting Time Options (alternative cost)")
-                game_state.pending_decision = "Choose Casting Option"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "casting_time_options",
-                    "raw": {k: v for k, v in req.items()},
-                }
-
-            elif msg_type == "GREMessageType_SelectCountersReq":
-                import time
-                req = msg.get("selectCountersReq", {})
-                logger.info("Captured Decision: Select Counters")
-                game_state.pending_decision = "Select Counters"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "select_counters",
-                    "raw": {k: v for k, v in req.items()},
-                }
-
-            elif msg_type == "GREMessageType_RevealHandReq":
-                # Opponent's hand is being revealed - track for strategy
-                req = msg.get("revealHandReq", {})
-                seat_ids = req.get("systemSeatIds", [])
-                logger.info(f"Hand reveal for seats: {seat_ids}")
-                # The actual revealed cards arrive via GameStateMessage + CardRevealed annotations
-
-            elif msg_type == "GREMessageType_OrderReq":
-                import time
-                req = msg.get("orderReq", {})
-                logger.info("Captured Decision: Order (triggered ability ordering)")
-                game_state.pending_decision = "Order Triggers"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "order_triggers",
-                    "raw": {k: v for k, v in req.items()},
-                }
-
-            elif msg_type == "GREMessageType_GatherReq":
-                import time
-                req = msg.get("gatherReq", {})
-                logger.info("Captured Decision: Gather")
-                game_state.pending_decision = "Gather"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "gather",
-                    "raw": {k: v for k, v in req.items()},
-                }
-
-            elif msg_type == "GREMessageType_OptionalActionMessage":
-                # "May" abilities — optional triggered/activated abilities
-                import time
-                opt = msg.get("optionalActionMessage", msg.get("prompt", {}))
-                prompt_text = ""
-                if isinstance(opt, dict):
-                    prompt_text = (
-                        opt.get("prompt", {}).get("text", "")
-                        if isinstance(opt.get("prompt"), dict)
-                        else str(opt.get("prompt", ""))
-                    )
-                logger.info(f"Captured Decision: Optional Action ({prompt_text[:60]})")
-                game_state.pending_decision = "Optional Action"
-                game_state.decision_timestamp = time.time()
-                game_state.decision_context = {
-                    "type": "optional_action",
-                    "prompt": prompt_text,
-                    "raw": {k: v for k, v in msg.items() if k != "type"},
-                }
-
             elif msg_type == "GREMessageType_QueuedGameStateMessage":
-                # Queued state updates that arrive during animations/resolution
                 game_state_msg = msg.get("gameStateMessage")
                 if game_state_msg:
                     apply_game_state_update(game_state_msg)
 
             elif msg_type == "GREMessageType_UIMessage":
-                # Hover/highlight UI events — safe to ignore
+                pass  # Hover/highlight UI events
+
+            elif msg_type == "GREMessageType_TimerStateMessage":
                 pass
 
-            # --- Fallback for truly unknown Req types ---
-
-            elif msg_type.endswith("Req") and msg_type not in (
-                "GREMessageType_MulliganReq", "GREMessageType_SubmitDeckReq",
-                "GREMessageType_IntermissionReq", "GREMessageType_PromptReq",
-                "GREMessageType_SelectTargetsReq", "GREMessageType_SelectNReq",
-                "GREMessageType_GroupReq", "GREMessageType_GroupOptionReq",
-                "GREMessageType_ActionsAvailableReq",
-                "GREMessageType_DeclareAttackersReq", "GREMessageType_DeclareBlockersReq",
-                "GREMessageType_AssignDamageReq", "GREMessageType_OrderCombatDamageReq",
-                "GREMessageType_PayCostsReq", "GREMessageType_SearchReq",
-                "GREMessageType_DistributionReq", "GREMessageType_NumericInputReq",
-                "GREMessageType_ChooseStartingPlayerReq", "GREMessageType_SelectReplacementReq",
-                "GREMessageType_SelectNGroupReq", "GREMessageType_SelectFromGroupsReq",
-                "GREMessageType_SearchFromGroupsReq", "GREMessageType_CastingTimeOptionsReq",
-                "GREMessageType_SelectCountersReq", "GREMessageType_RevealHandReq",
-                "GREMessageType_OrderReq", "GREMessageType_GatherReq",
-            ):
-                import time
+            # Fallback for unknown Req types
+            elif msg_type.endswith("Req") and msg_type not in _KNOWN_REQ_TYPES:
+                import time as _time
                 logger.warning(f"Unknown GRE Req type: {msg_type} - treating as pending decision")
                 game_state.pending_decision = f"Unknown Decision ({msg_type})"
-                game_state.decision_timestamp = time.time()
+                game_state.decision_timestamp = _time.time()
                 game_state.decision_context = {
                     "type": "unknown_req",
                     "gre_type": msg_type,
@@ -2337,25 +2206,7 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                 }
 
             elif "Resp" in msg_type:
-                # PHASE 3: Only clear decisions on actual decision responses, not generic responses
-                # Only clear on explicit decision submission responses
-                decision_response_types = [
-                    "GREMessageType_SelectTargetsResp",
-                    "GREMessageType_SubmitTargetsResp",
-                    "GREMessageType_SelectNResp",
-                    "GREMessageType_GroupOptionResp",
-                    "GREMessageType_GroupResp",
-                    "GREMessageType_OptionalActionResp",
-                    "GREMessageType_SubmitDeckResp",  # Mulligan
-                    "GREMessageType_PromptResp",
-                    "GREMessageType_SubmitAttackersResp",
-                    "GREMessageType_SubmitBlockersResp",
-                    "GREMessageType_AssignDamageConfirmation",
-                    "GREMessageType_OrderDamageConfirmation",
-                ]
-                
-                if game_state.pending_decision and msg_type in decision_response_types:
-                    # Don't auto-clear Mulligan (handled separately)
+                if game_state.pending_decision and msg_type in _DECISION_RESPONSE_TYPES:
                     if game_state.pending_decision == "Mulligan" and msg_type != "GREMessageType_SubmitDeckResp":
                         pass
                     else:
@@ -2365,9 +2216,6 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
                         game_state.decision_seat_id = None
                         game_state.decision_context = None
                         game_state.decision_timestamp = 0
-
-            elif msg_type == "GREMessageType_TimerStateMessage":
-                pass
 
         # Also handle direct GameStateMessage events (legacy format)
         if "gameObjects" in payload or "zones" in payload or "players" in payload:

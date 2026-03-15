@@ -2210,17 +2210,824 @@ class CoachEngine:
         cmc += len(hybrid)
         return cmc
 
+    # ------------------------------------------------------------------
+    # Helpers extracted from _format_game_context
+    # ------------------------------------------------------------------
+
+    def _compute_combat_trade(self, atk: dict, blk: dict) -> Optional[str]:
+        """Compute the combat trade result between an attacker and a blocker.
+
+        Returns a human-readable result string, or None if the blocker
+        cannot legally block the attacker (e.g. flying vs no fly/reach).
+        """
+        atk_name = atk.get("name", "?")
+        atk_pow = atk.get("power") or 0
+        atk_tgh = atk.get("toughness") or 0
+        atk_oracle = self._remove_reminder_text(atk.get("oracle_text", "")).lower()
+        atk_has_fly = "flying" in atk_oracle
+        atk_has_dth = "deathtouch" in atk_oracle
+        atk_has_trample = "trample" in atk_oracle
+        atk_has_fs = "first strike" in atk_oracle or "double strike" in atk_oracle
+
+        blk_name = blk.get("name", "?")
+        blk_pow = blk.get("power") or 0
+        blk_tgh = blk.get("toughness") or 0
+        blk_oracle = self._remove_reminder_text(blk.get("oracle_text", "")).lower()
+        blk_has_fly = "flying" in blk_oracle
+        blk_has_reach = "reach" in blk_oracle
+        blk_has_dth = "deathtouch" in blk_oracle
+        blk_has_fs = "first strike" in blk_oracle or "double strike" in blk_oracle
+
+        if atk_has_fly and not blk_has_fly and not blk_has_reach:
+            return None
+
+        atk_dies = (blk_pow >= atk_tgh) or blk_has_dth
+        blk_dies = (atk_pow >= blk_tgh) or atk_has_dth
+        if atk_has_fs and not blk_has_fs:
+            if atk_pow >= blk_tgh or atk_has_dth:
+                atk_dies = False
+        elif blk_has_fs and not atk_has_fs:
+            if blk_pow >= atk_tgh or blk_has_dth:
+                blk_dies = False
+
+        if atk_dies and blk_dies:
+            return "TRADE (both die)"
+        elif atk_dies:
+            return f"{atk_name} dies, {blk_name} lives ({blk_tgh - atk_pow} left)"
+        elif blk_dies:
+            trample_note = ""
+            if atk_has_trample:
+                spillover = atk_pow - blk_tgh
+                if spillover > 0:
+                    trample_note = f", {spillover} trample through"
+            return f"{blk_name} dies, {atk_name} lives ({atk_tgh - blk_pow} left){trample_note}"
+        else:
+            return "both live"
+
+    def _compute_optimal_blocking_damage(self, attackers: list[dict],
+                                         blockers: list[dict]) -> int:
+        """Compute minimum damage through after optimal blocking assignment."""
+        available_blk = list(blockers)
+        damage_through = 0
+        sorted_atk = sorted(attackers, key=lambda c: c.get("power") or 0, reverse=True)
+        for atk in sorted_atk:
+            atk_pow = atk.get("power") or 0
+            atk_oracle = self._remove_reminder_text(atk.get("oracle_text", "")).lower()
+            atk_has_fly = "flying" in atk_oracle
+            atk_has_trample = "trample" in atk_oracle
+            valid = []
+            for i, blk in enumerate(available_blk):
+                blk_oracle = self._remove_reminder_text(blk.get("oracle_text", "")).lower()
+                if atk_has_fly and "flying" not in blk_oracle and "reach" not in blk_oracle:
+                    continue
+                valid.append((i, blk))
+            if valid:
+                if atk_has_trample:
+                    idx, blocker = max(valid, key=lambda x: x[1].get("toughness") or 0)
+                else:
+                    idx, blocker = min(valid, key=lambda x: x[1].get("toughness") or 0)
+                available_blk.pop(idx)
+                if atk_has_trample:
+                    spillover = max(0, atk_pow - (blocker.get("toughness") or 0))
+                    damage_through += spillover
+            else:
+                damage_through += atk_pow
+        return damage_through
+
+    def _format_legal_moves(self, game_state: dict[str, Any],
+                            local_seat: int) -> tuple[list[str], str]:
+        """Determine the legal moves and return (valid_moves, valid_moves_str)."""
+        pending = game_state.get("pending_decision")
+        if pending == "Mulligan":
+            return ["KEEP", "MULLIGAN"], "KEEP, MULLIGAN"
+        elif pending == "Mulligan Bottom":
+            hand_cards = game_state.get("hand", [])
+            card_names = [c.get("name", "Unknown") for c in hand_cards]
+            return [f"Bottom: {n}" for n in card_names], ", ".join(card_names)
+        else:
+            try:
+                from arenamcp.rules_engine import RulesEngine
+                valid_moves = RulesEngine.get_legal_actions(game_state)
+                if not valid_moves:
+                    return [], 'NONE \u2014 say "pass priority"'
+                else:
+                    return valid_moves, ", ".join(valid_moves)
+            except Exception as e:
+                logger.error(f"RulesEngine error: {e}")
+                return [], "Error"
+
+    def _format_post_land_planning(self, game_state: dict[str, Any],
+                                   local_seat: int, valid_moves: list[str],
+                                   is_my_turn: bool, phase: str) -> list[str]:
+        """Compute post-land-drop planning lines."""
+        import re as _re_plan
+        from arenamcp.rules_engine import RulesEngine
+
+        lines: list[str] = []
+        local_player = next(
+            (p for p in game_state.get("players", []) if p.get("is_local")), None
+        )
+        lands_played_count = local_player.get("lands_played", 0) if local_player else 0
+        _stack = game_state.get("stack", [])
+        has_land_drop = (
+            is_my_turn and "Main" in phase and len(_stack) == 0
+            and lands_played_count == 0
+        )
+        if not (has_land_drop and valid_moves):
+            return lines
+
+        hand_cards = game_state.get("hand", [])
+        bf = game_state.get("battlefield", [])
+        cur_mana = RulesEngine._count_available_mana(game_state, local_seat)
+
+        hand_lands: dict[str, dict] = {}
+        for c in hand_cards:
+            if "Land" in c.get("type_line", ""):
+                name = c.get("name", "")
+                if name not in hand_lands:
+                    hand_lands[name] = c
+
+        if not hand_lands:
+            return lines
+
+        post_land_parts = []
+        for land_name, land_card in hand_lands.items():
+            post_mana = cur_mana + 1
+            land_oracle = land_card.get("oracle_text", "")
+            land_colors: set[str] = set()
+            for color, basic in [("W", "Plains"), ("U", "Island"), ("B", "Swamp"),
+                                 ("R", "Mountain"), ("G", "Forest")]:
+                if basic in land_name or f"{{{color}}}" in land_oracle:
+                    land_colors.add(color)
+            if "any color" in land_oracle.lower():
+                land_colors = {"W", "U", "B", "R", "G"}
+
+            new_casts = []
+            for c in hand_cards:
+                if "Land" in c.get("type_line", ""):
+                    continue
+                cost = c.get("mana_cost", "")
+                cmc = RulesEngine._parse_cmc(cost)
+                if cur_mana < cmc <= post_mana:
+                    colored_pips = set(_re_plan.findall(r"\{([WUBRG])\}", cost))
+                    existing_colors: set[str] = set()
+                    for bf_card in bf:
+                        if bf_card.get("owner_seat_id") == local_seat and not bf_card.get("is_tapped"):
+                            bf_oracle = bf_card.get("oracle_text", "")
+                            bf_name = bf_card.get("name", "")
+                            for clr, bsc in [("W", "Plains"), ("U", "Island"), ("B", "Swamp"),
+                                             ("R", "Mountain"), ("G", "Forest")]:
+                                if bsc in bf_name or f"{{{clr}}}" in bf_oracle:
+                                    existing_colors.add(clr)
+                    available_colors = land_colors | existing_colors
+                    if not colored_pips or colored_pips & available_colors:
+                        new_casts.append(c.get("name", "?"))
+            if new_casts:
+                post_land_parts.append(f"Play {land_name} \u2192 Cast {', '.join(new_casts)}")
+        if post_land_parts:
+            lines.append(f"THEN: {'; '.join(post_land_parts)}")
+        return lines
+
+    def _format_decision_lines(self, game_state: dict[str, Any]) -> list[str]:
+        """Format decision context into display lines for the LLM prompt."""
+        lines: list[str] = []
+        pending_decision = game_state.get("pending_decision")
+        decision_context = game_state.get("decision_context")
+        if not pending_decision:
+            return lines
+
+        if decision_context:
+            dec_type = decision_context.get("type", "unknown")
+            _simple = {
+                "mulligan_bottom": lambda ctx: [
+                    f"!!! DECISION: MULLIGAN - PUT {max(1, 7 - len(game_state.get('hand', [])) + 1)} CARD(S) ON BOTTOM !!!",
+                    "Keep: lands + on-curve plays | Bottom: expensive/off-color/redundant"],
+                "assign_damage": lambda ctx: ["!!! DECISION: ASSIGN COMBAT DAMAGE !!!",
+                    "Order: kill most important blocker/attacker first"],
+                "order_combat_damage": lambda ctx: ["!!! DECISION: ORDER COMBAT DAMAGE !!!",
+                    "Order: prioritize killing the biggest threat"],
+                "search": lambda ctx: ["!!! DECISION: SEARCH LIBRARY !!!",
+                    "Choose: what you need most \u2014 land, removal, threat, or answer"],
+                "choose_starting_player": lambda ctx: ["!!! DECISION: PLAY OR DRAW !!!",
+                    "Aggro decks: PLAY (tempo). Control/limited: DRAW (card advantage)"],
+                "explore": lambda ctx: ["!!! DECISION: EXPLORE !!!",
+                    "Keep land on top if needed, otherwise bottom for a better draw"],
+                "select_replacement": lambda ctx: ["!!! DECISION: ORDER REPLACEMENT EFFECTS !!!",
+                    "Choose: apply the replacement that gives most advantage first"],
+                "casting_time_options": lambda ctx: ["!!! DECISION: CHOOSE CASTING OPTION !!!",
+                    "Evaluate: alternative cost vs normal cost (Foretell, Flashback, Escape)"],
+                "select_counters": lambda ctx: ["!!! DECISION: SELECT COUNTERS !!!",
+                    "Choose: remove least valuable counters, keep most impactful"],
+                "order_triggers": lambda ctx: ["!!! DECISION: ORDER TRIGGERED ABILITIES !!!",
+                    "Order: resolve most impactful trigger last (it resolves first)"],
+                "select_n_group": lambda ctx: ["!!! DECISION: SELECT FROM GROUP !!!"],
+                "select_from_groups": lambda ctx: ["!!! DECISION: SELECT FROM GROUPS !!!"],
+                "search_from_groups": lambda ctx: ["!!! DECISION: SEARCH FROM GROUPS !!!"],
+                "gather": lambda ctx: ["!!! DECISION: GATHER !!!"],
+            }
+            if dec_type in _simple:
+                lines.extend(_simple[dec_type](decision_context))
+            elif dec_type == "discard":
+                lines.append(f"!!! DECISION: DISCARD {decision_context.get('count', 1)} card(s) !!!")
+                lines.append("Choose: excess lands > high CMC uncastables > redundant copies")
+            elif dec_type == "scry":
+                lines.append(f"!!! DECISION: SCRY {decision_context.get('count', 1)} !!!")
+                lines.append("Keep: needed lands/threats | Bottom: dead cards")
+            elif dec_type == "surveil":
+                lines.append(f"!!! DECISION: SURVEIL {decision_context.get('count', 1)} !!!")
+                lines.append("Keep: want to draw | Graveyard: synergy or digging")
+            elif dec_type == "target_selection":
+                lines.append(f"!!! DECISION: TARGET for {decision_context.get('source_card', 'spell')} !!!")
+                lines.append("Choose: biggest threat or best value target")
+            elif dec_type == "modal_choice":
+                lines.append(f"!!! DECISION: CHOOSE MODE ({decision_context.get('num_options', '?')} options) !!!")
+                lines.append("Evaluate: which mode solves current problem best")
+            elif dec_type == "declare_attackers":
+                legal = decision_context.get("legal_attackers", [])
+                lines.append(f"!!! DECISION: DECLARE ATTACKERS ({len(legal)} legal) !!!")
+                if legal:
+                    lines.append(f"Can attack: {', '.join(legal[:8])}")
+                lines.append("Choose: maximize damage while keeping safe blockers back")
+            elif dec_type == "declare_blockers":
+                legal = decision_context.get("legal_blockers", [])
+                lines.append(f"!!! DECISION: DECLARE BLOCKERS ({len(legal)} legal) !!!")
+                if legal:
+                    lines.append(f"Can block: {', '.join(legal[:8])}")
+                lines.append("Choose: trade up, double-block threats, protect life total")
+            elif dec_type == "pay_costs":
+                source = decision_context.get("source_card", "spell")
+                mana_cost = decision_context.get("mana_cost", "")
+                cost_str = f" ({mana_cost})" if mana_cost else ""
+                lines.append(f"!!! DECISION: PAY COSTS for {source}{cost_str} !!!")
+                if decision_context.get("has_autotap", False):
+                    lines.append("Auto-tap available \u2014 confirm or tap manually for better mana efficiency")
+                else:
+                    lines.append("Choose: tap lands that leave best mana open for responses")
+            elif dec_type == "distribution":
+                lines.append(f"!!! DECISION: DISTRIBUTE {decision_context.get('total', '?')} from {decision_context.get('source_card', 'effect')} !!!")
+                lines.append("Distribute: maximize kills, finish off wounded targets first")
+            elif dec_type == "numeric_input":
+                source = decision_context.get("source_card", "effect")
+                lines.append(f"!!! DECISION: CHOOSE NUMBER for {source} ({decision_context.get('min', 0)}-{decision_context.get('max', '?')}) !!!")
+                lines.append("Choose: balance value vs. cost (life, mana, etc.)")
+            elif dec_type == "mill":
+                lines.append(f"!!! DECISION: MILL {decision_context.get('count', 1)} !!!")
+            elif dec_type in ("sacrifice", "exile", "destroy", "return"):
+                count = decision_context.get("count", 1)
+                opts = decision_context.get("option_cards")
+                lines.append(f"!!! DECISION: {dec_type.upper()} {count} !!!")
+                if opts:
+                    lines.append(f"Options: {', '.join(opts[:8])}")
+                _advice = {"sacrifice": "Choose: sacrifice least valuable permanent for the board state",
+                           "exile": "Choose: exile least impactful card",
+                           "destroy": "Choose: destroy biggest threat on the board",
+                           "return": "Choose: return least important permanent"}
+                lines.append(_advice[dec_type])
+            elif dec_type in ("choose_creature", "choose_land", "choose_enchantment",
+                              "choose_artifact", "choose_permanent", "choose"):
+                count = decision_context.get("count", 1)
+                label = dec_type.replace("choose_", "").upper() or "ITEM"
+                opts = decision_context.get("option_cards")
+                lines.append(f"!!! DECISION: CHOOSE {label} ({count}) !!!")
+                if opts:
+                    lines.append(f"Options: {', '.join(opts[:8])}")
+                lines.append("Choose: pick the option that best advances your game plan")
+            elif dec_type == "actions_available":
+                lines.append(f"!!! YOUR PRIORITY \u2014 {decision_context.get('num_actions', '?')} legal actions available !!!")
+            else:
+                lines.append(f"!!! DECISION: {pending_decision} !!!")
+        else:
+            lines.append(f"!!! DECISION: {pending_decision} !!!")
+
+        if pending_decision == "Mulligan":
+            lines.extend(self._format_mulligan_hand(game_state))
+        return lines
+
+    def _format_mulligan_hand(self, game_state: dict[str, Any]) -> list[str]:
+        """Format mulligan hand summary lines."""
+        import re as _re
+        lines: list[str] = []
+        my_hand = game_state.get("hand", [])
+        if not my_hand:
+            lines.append("Waiting for hand...")
+            return lines
+        lands = [c for c in my_hand if "land" in c.get("type_line", "").lower()]
+        creatures = [c for c in my_hand if "creature" in c.get("type_line", "").lower()]
+        spells = [c for c in my_hand if c not in lands and c not in creatures]
+        cmcs = []
+        for c in my_hand:
+            cost = c.get("mana_cost", "")
+            if cost:
+                generic = sum(int(g) for g in _re.findall(r"\{(\d+)\}", cost))
+                pips = len(_re.findall(r"\{[WUBRGC]\}", cost))
+                cmcs.append(generic + pips)
+            else:
+                cmcs.append(0)
+        avg_cmc = sum(cmcs) / len(cmcs) if cmcs else 0
+        land_names = [c.get("name", "?") for c in lands]
+        nonland_names = [f"{c.get('name', '?')} ({c.get('mana_cost', '')})" for c in my_hand if c not in lands]
+        lines.append(f"MULLIGAN HAND: {len(lands)} lands, {len(creatures)} creatures, {len(spells)} spells, avg CMC {avg_cmc:.1f}")
+        lines.append(f"  Lands: {', '.join(land_names) if land_names else 'NONE'}")
+        lines.append(f"  Nonland: {', '.join(nonland_names) if nonland_names else 'NONE'}")
+        lines.append("Decide: KEEP or MULLIGAN based on curve, colors, and land count")
+        return lines
+
+    def _format_mana_info(self, your_cards: list[dict], turn_num: int) -> tuple[list[str], int, dict[str, int]]:
+        """Compute mana pool info. Returns (lines, total_mana, mana_pool)."""
+        import re
+        lines: list[str] = []
+        mana_pool = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0, "C": 0, "Any": 0}
+        mana_sources: list[str] = []
+        total_mana = 0
+        creature_mana_source_count = 0
+
+        for card in your_cards:
+            type_line = card.get("type_line", "").lower()
+            oracle = card.get("oracle_text", "")
+            is_creature = "creature" in type_line
+            is_land = "land" in type_line
+            has_haste = "haste" in self._remove_reminder_text(oracle).lower()
+            is_summoning_sick = (is_creature and card.get("turn_entered_battlefield") == turn_num and not has_haste)
+            has_mana_ability = ("add {" in oracle.lower() or "add one mana" in oracle.lower())
+            if is_land and not has_mana_ability:
+                for basic in ("plains", "island", "swamp", "mountain", "forest"):
+                    if basic in type_line:
+                        has_mana_ability = True
+                        break
+            if not card.get("is_tapped"):
+                if is_land or (is_creature and has_mana_ability and not is_summoning_sick):
+                    total_mana += 1
+                    name = card.get("name", "")
+                    if is_creature and has_mana_ability and not is_summoning_sick:
+                        creature_mana_source_count += 1
+                    source_colors: list[str] = []
+                    if "Plains" in name or "plains" in type_line or "{W}" in oracle:
+                        mana_pool["W"] += 1; source_colors.append("W")
+                    if "Island" in name or "island" in type_line or "{U}" in oracle:
+                        mana_pool["U"] += 1; source_colors.append("U")
+                    if "Swamp" in name or "swamp" in type_line or "{B}" in oracle:
+                        mana_pool["B"] += 1; source_colors.append("B")
+                    if "Mountain" in name or "mountain" in type_line or "{R}" in oracle:
+                        mana_pool["R"] += 1; source_colors.append("R")
+                    if "Forest" in name or "forest" in type_line or "{G}" in oracle:
+                        mana_pool["G"] += 1; source_colors.append("G")
+                    if "{C}" in oracle:
+                        mana_pool["C"] += 1; source_colors.append("C")
+                    if "any color" in oracle.lower():
+                        mana_pool["Any"] += 1; source_colors.append("Any")
+                    if len(source_colors) > 1:
+                        mana_sources.append("/".join(source_colors))
+                    elif len(source_colors) == 1:
+                        mana_sources.append(source_colors[0])
+
+        mana_bonus_notes: list[str] = []
+        for card in your_cards:
+            oracle_lower = card.get("oracle_text", "").lower()
+            name = card.get("name", "")
+            bonus_match = re.search(r"whenever you tap a creature for mana,?\s*add an additional \{(\w)\}", oracle_lower)
+            if bonus_match and creature_mana_source_count > 0:
+                bonus_color = bonus_match.group(1).upper()
+                bonus_total = creature_mana_source_count
+                total_mana += bonus_total
+                if bonus_color in mana_pool:
+                    mana_pool[bonus_color] += bonus_total
+                for _ in range(bonus_total):
+                    mana_sources.append(f"+{bonus_color}")
+                logger.info(f"Mana bonus from {name}: +{bonus_total} {{{bonus_color}}} ({creature_mana_source_count} creature sources)")
+            if "untap" in oracle_lower and ("mana value" in oracle_lower or "converted mana cost" in oracle_lower):
+                untap_match = re.search(r"(?:mana value|converted mana cost)\s*(\d+)\s*or greater.*untap|cast.*(?:mana value|converted mana cost)\s*(\d+).*untap|untap.*(?:mana value|converted mana cost)\s*(\d+)", oracle_lower)
+                if untap_match:
+                    threshold = untap_match.group(1) or untap_match.group(2) or untap_match.group(3)
+                    mana_bonus_notes.append(f"{name} untaps on MV{threshold}+ cast \u2192 tap again for extra mana")
+
+        logger.info(f"Mana: {mana_pool} (Total: {total_mana})")
+        if mana_sources:
+            source_display = " ".join(f"{{{s}}}" if "/" in s else s for s in mana_sources)
+            lines.append(f"Mana: {total_mana} (sources: {source_display})")
+        else:
+            lines.append("Mana: 0")
+        for note in mana_bonus_notes:
+            lines.append(f"\u26a0\ufe0f {note}")
+        return lines, total_mana, mana_pool
+
+    def _format_board_card(self, card: dict, local_seat: int, turn_num: int,
+                           attachments: dict[int, list[dict]],
+                           name_counts: Counter, name_seen: dict[str, int],
+                           is_local: bool) -> list[str]:
+        """Format a single battlefield card into display lines."""
+        lines: list[str] = []
+        name = card.get("name", "Unknown")
+        type_line = card.get("type_line", "").lower()
+        is_creature = "creature" in type_line
+        is_land = "land" in type_line
+
+        if name_counts[name] > 1:
+            name_seen[name] = name_seen.get(name, 0) + 1
+            display_name = f"{name} #{name_seen[name]}"
+        else:
+            display_name = name
+
+        pt = (f" {card.get('power') or 0}/{card.get('toughness') or 0}"
+              if is_creature or card.get("power") is not None else "")
+
+        flags: list[str] = []
+        if not is_creature and not is_land:
+            if "equipment" in type_line: flags.append("EQUIPMENT")
+            elif "artifact" in type_line: flags.append("ARTIFACT")
+            if "enchantment" in type_line: flags.append("ENCHANT")
+            if "planeswalker" in type_line: flags.append("PW")
+        if card.get("is_tapped"): flags.append("T")
+
+        oracle_text = self._remove_reminder_text(card.get("oracle_text", "")).lower()
+        if "flying" in oracle_text: flags.append("FLY")
+        if "reach" in oracle_text: flags.append("RCH")
+        if is_local and "haste" in oracle_text: flags.append("HST")
+        if "vigilance" in oracle_text: flags.append("VIG")
+        if "trample" in oracle_text: flags.append("TRM")
+        if "first strike" in oracle_text: flags.append("FS")
+        if "deathtouch" in oracle_text: flags.append("DTH")
+        if is_creature and card.get("turn_entered_battlefield") == turn_num and "haste" not in oracle_text:
+            flags.append("SS")
+        if self._is_impending(card): flags.append("IMPENDING")
+        if card.get("is_attacking"): flags.append("ATK")
+        if card.get("is_blocking"): flags.append("BLK")
+
+        inst_id = card.get("instance_id")
+        attached = attachments.get(inst_id, [])
+        if any("doesn't untap" in (a.get("oracle_text") or "").lower() for a in attached):
+            flags.append("LOCKED")
+
+        obj_kind = card.get("object_kind", "")
+        if obj_kind == "TOKEN":
+            display_name = f"*{display_name}"
+        counters = card.get("counters", {})
+        counter_str = ""
+        if counters:
+            cparts = [f"{cc}{ct.replace('CounterType_', '')[:4]}" for ct, cc in counters.items()]
+            counter_str = f" ({','.join(cparts)})"
+
+        flag_str = f" [{','.join(flags)}]" if flags else ""
+        lines.append(f"  {display_name}{pt}{counter_str}{flag_str}")
+
+        raw_oracle = card.get("oracle_text", "")
+        if raw_oracle and not is_land:
+            stripped = self._remove_reminder_text(raw_oracle).strip()
+            keyword_only = all(
+                w in {"flying", "reach", "haste", "vigilance", "trample", "first", "strike",
+                      "double", "deathtouch", "lifelink", "menace", "ward", "hexproof",
+                      "indestructible", "defender"}
+                for w in stripped.lower().replace(",", " ").replace("\n", " ").split() if w
+            )
+            if not keyword_only and len(stripped) > 0:
+                lines.append(f"    {stripped}")
+
+        if attached:
+            for att in attached:
+                att_name = att.get("name", "Unknown")
+                att_oracle = self._remove_reminder_text(att.get("oracle_text", "")).strip()
+                if is_local:
+                    att_owner = "OPP" if att.get("owner_seat_id") != local_seat else "YOUR"
+                else:
+                    att_owner = "YOUR" if att.get("owner_seat_id") == local_seat else "OPP"
+                lines.append(f"    >> {att_owner} AURA: {att_name}")
+                if att_oracle:
+                    lines.append(f"       {att_oracle}")
+        return lines
+
+    def _format_attack_combat(self, your_cards: list[dict], opp_cards: list[dict],
+                              local_player: Optional[dict], opponent_player: Optional[dict],
+                              turn_num: int, valid_attackers: list[dict]) -> list[str]:
+        """Format the attack-side combat analysis (your turn attacking)."""
+        lines: list[str] = []
+        your_creatures = [c for c in your_cards if "creature" in c.get("type_line", "").lower() and not self._is_impending(c)]
+        opp_creatures = [c for c in opp_cards if "creature" in c.get("type_line", "").lower() and not self._is_impending(c)]
+        opp_blockers = [c for c in opp_creatures if not c.get("is_tapped")]
+        opp_block_count = len(opp_blockers)
+        opp_life = opponent_player.get("life_total", 20) if opponent_player else 20
+        your_attack_power = sum(c.get("power") or 0 for c in valid_attackers)
+
+        if valid_attackers:
+            lethal = "LETHAL" if (opp_block_count == 0 and your_attack_power >= opp_life) else f"{opp_block_count}blk"
+            attacker_names = [c.get("name", "?") for c in valid_attackers]
+            atk_name_counts = Counter(attacker_names)
+            atk_name_seen: dict[str, int] = {}
+            deduped_names = []
+            for n in attacker_names:
+                if atk_name_counts[n] > 1:
+                    atk_name_seen[n] = atk_name_seen.get(n, 0) + 1
+                    deduped_names.append(f"{n} #{atk_name_seen[n]}")
+                else:
+                    deduped_names.append(n)
+            lines.append(f"Atk: {len(valid_attackers)}cr/{your_attack_power}pwr vs {lethal} \u2014 can attack: {', '.join(deduped_names)}")
+            if valid_attackers and opp_blockers:
+                for atk in valid_attackers:
+                    for blk in opp_blockers:
+                        result = self._compute_combat_trade(atk, blk)
+                        if result is None:
+                            continue
+                        atk_name = atk.get("name", "?"); atk_pow = atk.get("power") or 0; atk_tgh = atk.get("toughness") or 0
+                        blk_name = blk.get("name", "?"); blk_pow = blk.get("power") or 0; blk_tgh = blk.get("toughness") or 0
+                        if "TRADE" in result or "both live" in result:
+                            display_result = result
+                        elif f"{atk_name} dies" in result:
+                            display_result = f"BAD \u2014 {result}"
+                        elif f"{blk_name} dies" in result:
+                            display_result = f"GOOD \u2014 {result}"
+                        else:
+                            display_result = result
+                        lines.append(f"  If {blk_name} {blk_pow}/{blk_tgh} blocks {atk_name} {atk_pow}/{atk_tgh}: {display_result}")
+        else:
+            lines.append("Atk: None (T/SS)")
+
+        opp_attack_power = sum(c.get("power") or 0 for c in opp_creatures)
+        your_life = local_player.get("life_total", 20) if local_player else 20
+        if opp_attack_power > 0:
+            non_attackers = [c for c in your_creatures if c not in valid_attackers]
+            allout_dmg = self._compute_optimal_blocking_damage(opp_creatures, non_attackers)
+            life_after_allout = your_life - allout_dmg
+            noatk_dmg = self._compute_optimal_blocking_damage(opp_creatures, your_creatures)
+            life_after_noatk = your_life - noatk_dmg
+            life_margin = your_life - opp_attack_power
+            if life_after_allout <= 0:
+                if life_after_noatk > 0:
+                    lines.append(f"\u26a0\ufe0f Crackback: opp {opp_attack_power}pwr \u2014 ALL-OUT lethal ({allout_dmg} through vs {your_life} life), but holding all {len(your_creatures)} blockers \u2192 only {noatk_dmg} through \u2192 SAFE at {life_after_noatk} life. Attack selectively!")
+                else:
+                    lines.append(f"\u26a0\ufe0f Crackback: opp {opp_attack_power}pwr \u2192 LETHAL even with all {len(your_creatures)} blockers ({noatk_dmg} through vs {your_life} life)! Must race or remove threats!")
+            elif life_margin <= 0:
+                if allout_dmg < opp_attack_power and len(non_attackers) > 0:
+                    lines.append(f"Crackback: opp {opp_attack_power}pwr, but your {len(non_attackers)} blocker(s) absorb {opp_attack_power - allout_dmg} \u2192 only {allout_dmg} through vs {your_life} life \u2014 {'safe' if life_after_allout > 3 else 'tight'}")
+                else:
+                    lines.append(f"Crackback: {opp_attack_power}pwr vs your {your_life} life \u2014 LETHAL if no blockers held!")
+            elif life_margin <= 3:
+                lines.append(f"Crackback: {opp_attack_power}pwr vs your {your_life} life \u2014 DANGER (only {life_margin} margin!)")
+            else:
+                lines.append(f"Crackback: {opp_attack_power}pwr vs your {your_life} life \u2014 safe")
+        return lines
+
+    def _format_block_combat(self, your_cards: list[dict], opp_cards: list[dict],
+                             local_player: Optional[dict], turn_num: int,
+                             phase: str, _inferred_atk_ids: set[int]) -> list[str]:
+        """Format the block-side combat analysis (opponent's turn)."""
+        lines: list[str] = []
+        attacking = [c for c in opp_cards if c.get("is_attacking")]
+        if not attacking and _inferred_atk_ids:
+            attacking = [c for c in opp_cards if c.get("instance_id") in _inferred_atk_ids]
+        flying_atk = [c for c in attacking if "flying" in self._remove_reminder_text(c.get("oracle_text", "")).lower()]
+        ground_atk = [c for c in attacking if c not in flying_atk]
+        your_creatures = [c for c in your_cards if "creature" in c.get("type_line", "").lower() and not c.get("is_tapped") and not self._is_impending(c)]
+        flyer_blockers = [c for c in your_creatures if any(kw in self._remove_reminder_text(c.get("oracle_text", "")).lower() for kw in ["flying", "reach"])]
+
+        if not attacking:
+            return lines
+
+        fly_dmg = sum(c.get("power") or 0 for c in flying_atk)
+        gnd_dmg = sum(c.get("power") or 0 for c in ground_atk)
+        total_incoming = fly_dmg + gnd_dmg
+        your_life = local_player.get("life_total", 20) if local_player else 20
+        lines.append(f"Blk: {fly_dmg}fly/{gnd_dmg}gnd dmg | {len(flyer_blockers)}FLY-blk avail")
+        life_after_no_blocks = your_life - total_incoming
+        if life_after_no_blocks <= 0:
+            lines.append(f"\u26a0\ufe0f No blocks \u2192 {total_incoming} dmg \u2192 DEAD (from {your_life} life)! Must block!")
+        else:
+            lines.append(f"No blocks \u2192 take {total_incoming} dmg \u2192 {life_after_no_blocks} life remaining")
+        if flying_atk and not flyer_blockers:
+            lines.append(f"\u26a0\ufe0f {fly_dmg} UNBLOCKABLE!")
+        dth_atk = [c for c in attacking if "deathtouch" in self._remove_reminder_text(c.get("oracle_text", "")).lower()]
+        if dth_atk:
+            lines.append(f"\u26a0\ufe0f DEATHTOUCH: {', '.join(c.get('name', '?') for c in dth_atk)} \u2014 any blocker DIES regardless of toughness!")
+
+        damage_through = self._compute_optimal_blocking_damage(attacking, your_creatures)
+        life_after_blocks = your_life - damage_through
+        if damage_through < total_incoming:
+            if life_after_blocks <= 0:
+                lines.append(f"\u26a0\ufe0f Best blocks \u2192 take {damage_through} dmg \u2192 DEAD (from {your_life} life)! Not enough blockers!")
+            else:
+                lines.append(f"Best blocks \u2192 take {damage_through} dmg \u2192 {life_after_blocks} life")
+        else:
+            life_after_blocks = life_after_no_blocks
+
+        if your_creatures and attacking:
+            for atk in attacking:
+                for blk in your_creatures:
+                    result = self._compute_combat_trade(atk, blk)
+                    if result is None:
+                        continue
+                    atk_name = atk.get("name", "?"); atk_pow = atk.get("power") or 0; atk_tgh = atk.get("toughness") or 0
+                    blk_name = blk.get("name", "?"); blk_pow = blk.get("power") or 0; blk_tgh = blk.get("toughness") or 0
+                    lines.append(f"  If {blk_name} {blk_pow}/{blk_tgh} blocks {atk_name} {atk_pow}/{atk_tgh}: {result}")
+
+        opp_non_attacking = [c for c in opp_cards if "creature" in c.get("type_line", "").lower() and c not in attacking and not self._is_impending(c)]
+        opp_next_turn_power = sum(c.get("power") or 0 for c in attacking) + sum(c.get("power") or 0 for c in opp_non_attacking)
+        if opp_next_turn_power > 0 and life_after_blocks > 0:
+            if opp_next_turn_power >= life_after_blocks:
+                lines.append(f"\u26a0\ufe0f Next turn: opp can attack for up to {opp_next_turn_power}pwr \u2014 LETHAL if you're at {life_after_blocks} life after this combat! Preserve blockers!")
+        return lines
+
+    def _check_castability(self, type_line: str, cost: str, cmc: int,
+                           reqs: dict[str, int], total_mana: int,
+                           mana_pool: dict[str, int], can_play_land: bool) -> str:
+        """Determine castability status string for a hand card."""
+        if "land" in type_line:
+            return "LAND" if can_play_land else "HOLD"
+        elif total_mana >= cmc:
+            color_ok = all(mana_pool.get(c, 0) + mana_pool.get("Any", 0) >= reqs[c] for c in "WUBRGC" if reqs[c] > 0)
+            if color_ok:
+                return "OK"
+            missing_pips = "".join(f"{{{c}}}" * max(0, reqs[c] - mana_pool.get(c, 0) - mana_pool.get("Any", 0)) for c in "WUBRGC" if reqs[c] > 0)
+            return f"NEED:{missing_pips}" if missing_pips else f"NEED:{max(1, cmc - total_mana)}"
+        else:
+            missing_pips = "".join(f"{{{c}}}" * max(0, reqs[c] - mana_pool.get(c, 0) - mana_pool.get("Any", 0)) for c in "WUBRGC" if reqs[c] > 0)
+            generic_short = cmc - total_mana
+            return f"NEED:{generic_short}+{missing_pips}" if missing_pips else f"NEED:{generic_short}"
+
+    def _analyze_removal(self, oracle_lower: str, opp_creatures: list[dict],
+                         opp_nonland: list[dict], all_creatures: list[dict],
+                         battlefield: list[dict], card_name: str,
+                         no_target_card_names: set[str]) -> str:
+        """Analyze removal capabilities of a card. Mutates no_target_card_names."""
+        import re
+        removal_info = ""
+        damage_match = re.search(r"deals?\s+(\d+)\s+damage", oracle_lower)
+        minus_match = re.search(r"gets?\s+(-\d+)/(-\d+)", oracle_lower)
+        is_destroy_creature = "destroy target creature" in oracle_lower
+        is_exile_creature = "exile target creature" in oracle_lower
+        is_destroy_permanent = "destroy target permanent" in oracle_lower or "destroy target nonland permanent" in oracle_lower
+        is_destroy_art_ench = "destroy target artifact" in oracle_lower or "destroy target enchantment" in oracle_lower or "naturalize" in oracle_lower
+        is_exile_permanent = "exile target permanent" in oracle_lower or "exile target nonland permanent" in oracle_lower or "exile target artifact" in oracle_lower or "exile target enchantment" in oracle_lower
+        is_bounce_creature = "return target creature" in oracle_lower or ("put target creature" in oracle_lower and "top" in oracle_lower)
+        is_bounce_permanent = "return target nonland permanent" in oracle_lower or "return target permanent" in oracle_lower
+
+        if not (damage_match or minus_match or is_destroy_creature or is_exile_creature or is_destroy_permanent or is_destroy_art_ench or is_exile_permanent or is_bounce_creature or is_bounce_permanent):
+            return removal_info
+
+        if is_bounce_creature or is_bounce_permanent: removal_info = " [RM:bounce]"
+        elif is_destroy_permanent or is_exile_permanent: removal_info = " [RM:perm]"
+        elif is_destroy_art_ench: removal_info = " [RM:art/ench]"
+        elif is_destroy_creature or is_exile_creature: removal_info = " [RM:creat]"
+        elif damage_match: removal_info = f" [RM:<={int(damage_match.group(1))}T]"
+        elif minus_match: removal_info = f" [RM:<={abs(int(minus_match.group(2)))}T]"
+
+        if is_bounce_creature: target_pool = all_creatures
+        elif is_bounce_permanent: target_pool = [c for c in battlefield if "land" not in c.get("type_line", "").lower()]
+        elif is_destroy_creature or is_exile_creature: target_pool = opp_creatures
+        elif "nonland" in oracle_lower or is_destroy_permanent or is_exile_permanent: target_pool = opp_nonland
+        elif is_destroy_art_ench: target_pool = [c for c in opp_nonland if any(t in c.get("type_line", "").lower() for t in ["artifact", "enchantment"])]
+        else: target_pool = opp_creatures
+
+        mv_match = re.search(r"mana value (\d+) or less", oracle_lower)
+        if mv_match and target_pool:
+            mv_limit = int(mv_match.group(1))
+            target_pool = [c for c in target_pool if self._get_cmc(c.get("mana_cost", "")) <= mv_limit]
+
+        if not target_pool:
+            removal_info += " [NO TARGETS]"
+            no_target_card_names.add(card_name)
+        return removal_info
+
+    def _format_hand_cards(self, game_state: dict[str, Any], local_seat: int,
+                           total_mana: int, mana_pool: dict[str, int],
+                           opp_cards: list[dict], battlefield: list[dict],
+                           is_my_turn: bool, phase: str, turn_num: int,
+                           valid_moves: list[str]) -> tuple[list[str], set[str]]:
+        """Format the hand section. Returns (lines, no_target_card_names)."""
+        import re
+        lines: list[str] = []
+        no_target_card_names: set[str] = set()
+        hand = game_state.get("hand", [])
+        lines.append("")
+        lines.append("HAND:")
+
+        opp_creatures = [c for c in opp_cards if "creature" in c.get("type_line", "").lower() and not self._is_impending(c)]
+        opp_nonland = [c for c in opp_cards if "land" not in c.get("type_line", "").lower()]
+        all_creatures = [c for c in battlefield if c.get("power") is not None and "land" not in c.get("type_line", "").lower()]
+
+        if not hand:
+            lines.append("  (empty)")
+            return lines, no_target_card_names
+
+        local_player = next((p for p in game_state.get("players", []) if p.get("is_local")), None)
+        lands_played = local_player.get("lands_played", 0) if local_player else 0
+        stack = game_state.get("stack", [])
+        can_play_land = (lands_played == 0) and is_my_turn and "Main" in phase and len(stack) == 0
+        hand_name_counts = Counter(c.get("name", "Unknown") for c in hand)
+        hand_name_seen: dict[str, int] = {}
+
+        for card in hand:
+            name = card.get("name", "Unknown")
+            cost = card.get("mana_cost", "")
+            type_line = card.get("type_line", "").lower()
+            oracle_text = card.get("oracle_text", "")
+            oracle_lower = oracle_text.lower()
+            is_instant = "instant" in type_line or "flash" in oracle_lower
+            timing = "I" if is_instant else "S"
+
+            cmc = 0
+            reqs = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0, "C": 0}
+            if cost:
+                generic = re.findall(r"\{(\d+)\}", cost)
+                cmc += sum(int(g) for g in generic)
+                for color in "WUBRGC":
+                    count = len(re.findall(rf"\{{{color}\}}", cost))
+                    reqs[color] += count
+                    cmc += count
+                hybrid = re.findall(r"\{[^}]+/[^}]+\}", cost)
+                cmc += len(hybrid)
+
+            castable = self._check_castability(type_line, cost, cmc, reqs, total_mana, mana_pool, can_play_land)
+            removal_info = self._analyze_removal(oracle_lower, opp_creatures, opp_nonland, all_creatures, battlefield, name, no_target_card_names)
+
+            is_basic_land = "land" in type_line and ("basic" in type_line or name in ["Plains", "Island", "Swamp", "Mountain", "Forest"])
+            oracle_stripped = self._remove_reminder_text(oracle_text) if oracle_text else ""
+            show_oracle = bool(oracle_text) and not is_basic_land
+
+            type_tag = ""
+            if "creature" not in type_line and "land" not in type_line:
+                if "enchantment" in type_line and "aura" in type_line: type_tag = " (AURA)"
+                elif "enchantment" in type_line: type_tag = " (ENCHANT)"
+                elif "equipment" in type_line: type_tag = " (EQUIP)"
+                elif "artifact" in type_line: type_tag = " (ART)"
+                elif "planeswalker" in type_line: type_tag = " (PW)"
+
+            if hand_name_counts[name] > 1:
+                hand_name_seen[name] = hand_name_seen.get(name, 0) + 1
+                display_name = f"{name} #{hand_name_seen[name]}"
+            else:
+                display_name = name
+
+            lines.append(f"  {display_name}{type_tag} {cost} [{timing},{castable}]{removal_info}")
+            if show_oracle:
+                lines.append(f"    {oracle_stripped}")
+        return lines, no_target_card_names
+
+    def _format_zones_and_events(self, game_state: dict[str, Any], local_seat: int, opp_seat: Optional[int]) -> list[str]:
+        """Format recent events, revealed cards, stack, graveyard, command zone, and library."""
+        lines: list[str] = []
+        recent_events = game_state.get("recent_events", [])
+        if recent_events:
+            event_strs = []
+            for evt in recent_events[-5:]:
+                etype = evt.get("type", "")
+                if etype == "damage_dealt": event_strs.append(f"{evt.get('source','?')} dealt {evt.get('amount',0)} to {evt.get('target','?')}")
+                elif etype == "zone_transfer": event_strs.append(f"{evt.get('card','?')} moved zones")
+                elif etype == "counter_added": event_strs.append(f"+{evt.get('amount',1)} counter on {evt.get('card','?')}")
+                elif etype == "counter_removed": event_strs.append(f"-{evt.get('amount',1)} counter from {evt.get('card','?')}")
+                elif etype == "token_created": event_strs.append(f"Token: {evt.get('card','?')}")
+                elif etype == "card_revealed": event_strs.append(f"Revealed: {evt.get('card','?')}")
+                elif etype == "controller_changed": event_strs.append(f"{evt.get('card','?')} changed controller")
+            if event_strs:
+                lines.append(f"Recent: {'; '.join(event_strs)}")
+
+        revealed = game_state.get("revealed_cards", {})
+        if revealed and opp_seat is not None:
+            opp_revealed = revealed.get(str(opp_seat), revealed.get(opp_seat, []))
+            if opp_revealed:
+                lines.append(f"Opp revealed {len(opp_revealed)} card(s) this game")
+
+        stack = game_state.get("stack", [])
+        if stack:
+            stack_items = [f"{'Y' if c.get('owner_seat_id') == local_seat else 'O'}:{c.get('name', 'Unknown')}" for c in stack]
+            lines.append(f"Stack: {' > '.join(stack_items)}")
+
+        graveyard = game_state.get("graveyard", [])
+        if graveyard:
+            your_gy = [c for c in graveyard if c.get("owner_seat_id") == local_seat]
+            opp_gy = [c for c in graveyard if c.get("owner_seat_id") != local_seat]
+            if your_gy or opp_gy:
+                gy_parts = []
+                if your_gy: gy_parts.append(f"Y={len(your_gy)} ({', '.join(c.get('name', '?') for c in your_gy[:8])})")
+                if opp_gy: gy_parts.append(f"O={len(opp_gy)} ({', '.join(c.get('name', '?') for c in opp_gy[:8])})")
+                lines.append(f"GY: {' '.join(gy_parts)}")
+
+        command = game_state.get("command", [])
+        if command:
+            your_cmds = [c for c in command if c.get("owner_seat_id") == local_seat]
+            opp_cmds = [c for c in command if c.get("owner_seat_id") != local_seat]
+            cmd_parts = []
+            for c in your_cmds:
+                cost_str = f" {c.get('mana_cost', '')}" if c.get("mana_cost") else ""
+                cmd_parts.append(f"  YOUR CMD: {c.get('name', 'Unknown')}{cost_str}")
+                oracle = (c.get("oracle_text", "") or "").replace("\n", " ").strip()
+                if oracle: cmd_parts.append(f"    {oracle}")
+            for c in opp_cmds:
+                cost_str = f" {c.get('mana_cost', '')}" if c.get("mana_cost") else ""
+                cmd_parts.append(f"  OPP CMD: {c.get('name', 'Unknown')}{cost_str}")
+                oracle = (c.get("oracle_text", "") or "").replace("\n", " ").strip()
+                if oracle: cmd_parts.append(f"    {oracle}")
+            lines.append("COMMAND ZONE:")
+            lines.extend(cmd_parts)
+
+        library_summary = game_state.get("library_summary", "")
+        if library_summary:
+            lines.append("")
+            lines.append(library_summary)
+        return lines
+
     def _format_game_context(
         self, game_state: dict[str, Any], question: str = ""
     ) -> str:
         """Format the game state into a COMPACT context for the LLM.
 
-        OPTIMIZATION: Heavily compressed to reduce token usage while maintaining accuracy.
-        - Uses symbols (T=tapped, FLY=flying, SS=summoning sick)
-        - Only shows oracle text for relevant cards (not basic lands)
-        - Terse removal analysis (kill range, not individual targets)
-        - Consolidated combat/blocking info
-        - Removed redundant rule explanations (LLM knows MTG rules)
+        Orchestrator that delegates to focused helper methods for each section.
         """
 
         # Determine local player seat and active turn
@@ -2238,37 +3045,10 @@ class CoachEngine:
         step = turn.get("step", "").replace("Step_", "")
         turn_num = turn.get("turn_number", 0)
 
-        # Get legal moves (still useful for complex decisions)
-        # MULLIGAN OVERRIDE: During mulligan, the player's only choices are
-        # KEEP or MULLIGAN — priority_player is irrelevant, so skip the rules
-        # engine which would say "Wait (Opponent has priority)".
-        pending = game_state.get("pending_decision")
-        if pending == "Mulligan":
-            valid_moves = ["KEEP", "MULLIGAN"]
-            valid_moves_str = "KEEP, MULLIGAN"
-        elif pending == "Mulligan Bottom":
-            # London Mulligan: player kept but must put N cards on bottom
-            hand_cards = game_state.get("hand", [])
-            card_names = [c.get("name", "Unknown") for c in hand_cards]
-            valid_moves = [f"Bottom: {n}" for n in card_names]
-            valid_moves_str = ", ".join(card_names)
-        else:
-            try:
-                from arenamcp.rules_engine import RulesEngine
-
-                valid_moves = RulesEngine.get_legal_actions(game_state)
-                if not valid_moves:
-                    valid_moves_str = 'NONE — say "pass priority"'
-                else:
-                    valid_moves_str = ", ".join(valid_moves)
-            except Exception as e:
-                logger.error(f"RulesEngine error: {e}")
-                valid_moves = []
-                valid_moves_str = "Error"
+        # Legal moves
+        valid_moves, valid_moves_str = self._format_legal_moves(game_state, local_seat)
 
         lines = []
-        # Match identifier helps persistent backends (claude-code) detect
-        # new games and avoid carrying stale board knowledge across matches.
         match_num = game_state.get("_match_number")
         match_id = game_state.get("match_id") or ""
         match_tag = ""
@@ -2279,98 +3059,10 @@ class CoachEngine:
         lines.append(f"Legal: {valid_moves_str}")
         raw_legal_actions = game_state.get("legal_actions_raw") or []
         if raw_legal_actions:
-            lines.append(
-                "LegalGRE: "
-                + _format_legal_actions_raw_for_prompt(raw_legal_actions)
-            )
+            lines.append("LegalGRE: " + _format_legal_actions_raw_for_prompt(raw_legal_actions))
 
-        # POST-LAND PLANNING: When land drop is available, show what spells
-        # become castable after playing each land. This lets the LLM give
-        # multi-step advice ("Play Forest, then cast Llanowar Elves") instead
-        # of just "Play land" followed by silence while the player acts.
-        lands_played_count = local_player.get("lands_played", 0) if local_player else 0
-        _stack = game_state.get("stack", [])
-        has_land_drop = (
-            is_my_turn
-            and "Main" in phase
-            and len(_stack) == 0
-            and lands_played_count == 0
-        )
-        if has_land_drop and valid_moves:
-            import re as _re_plan
-
-            hand_cards = game_state.get("hand", [])
-            bf = game_state.get("battlefield", [])
-
-            # Current mana sources
-            cur_mana = RulesEngine._count_available_mana(game_state, local_seat)
-
-            # Find distinct land types in hand
-            hand_lands = {}
-            for c in hand_cards:
-                if "Land" in c.get("type_line", ""):
-                    name = c.get("name", "")
-                    if name not in hand_lands:
-                        hand_lands[name] = c
-
-            # For each distinct land, compute what new spells become castable
-            # Also track what colors each land adds for basic color checking
-            if hand_lands:
-                post_land_parts = []
-                for land_name, land_card in hand_lands.items():
-                    post_mana = cur_mana + 1
-                    # Determine what color this land adds
-                    land_oracle = land_card.get("oracle_text", "")
-                    land_colors = set()
-                    for color, basic in [
-                        ("W", "Plains"),
-                        ("U", "Island"),
-                        ("B", "Swamp"),
-                        ("R", "Mountain"),
-                        ("G", "Forest"),
-                    ]:
-                        if basic in land_name or f"{{{color}}}" in land_oracle:
-                            land_colors.add(color)
-                    if "any color" in land_oracle.lower():
-                        land_colors = {"W", "U", "B", "R", "G"}
-
-                    new_casts = []
-                    for c in hand_cards:
-                        if "Land" in c.get("type_line", ""):
-                            continue
-                        cost = c.get("mana_cost", "")
-                        cmc = RulesEngine._parse_cmc(cost)
-                        # Currently not castable, but castable after land
-                        if cur_mana < cmc <= post_mana:
-                            # Basic color check: if spell has colored pips,
-                            # verify at least one matches the land's colors
-                            colored_pips = set(_re_plan.findall(r"\{([WUBRG])\}", cost))
-                            # Also consider existing mana pool colors
-                            existing_colors = set()
-                            for bf_card in bf:
-                                if bf_card.get(
-                                    "owner_seat_id"
-                                ) == local_seat and not bf_card.get("is_tapped"):
-                                    bf_oracle = bf_card.get("oracle_text", "")
-                                    bf_name = bf_card.get("name", "")
-                                    for clr, bsc in [
-                                        ("W", "Plains"),
-                                        ("U", "Island"),
-                                        ("B", "Swamp"),
-                                        ("R", "Mountain"),
-                                        ("G", "Forest"),
-                                    ]:
-                                        if bsc in bf_name or f"{{{clr}}}" in bf_oracle:
-                                            existing_colors.add(clr)
-                            available_colors = land_colors | existing_colors
-                            if not colored_pips or colored_pips & available_colors:
-                                new_casts.append(c.get("name", "?"))
-                    if new_casts:
-                        post_land_parts.append(
-                            f"Play {land_name} → Cast {', '.join(new_casts)}"
-                        )
-                if post_land_parts:
-                    lines.append(f"THEN: {'; '.join(post_land_parts)}")
+        # Post-land planning
+        lines.extend(self._format_post_land_planning(game_state, local_seat, valid_moves, is_my_turn, phase))
 
         # Get player info
         opponent_player = None
@@ -2378,271 +3070,30 @@ class CoachEngine:
             if not p.get("is_local"):
                 opponent_player = p
                 break
-
         opp_seat = opponent_player.get("seat_id") if opponent_player else None
 
-        # OPTIMIZATION: Compact turn info - one line
         active_label = "YOUR" if active_seat == local_seat else "OPP"
         priority_label = "You" if priority_seat == local_seat else "Opp"
-
-        # Timing context
         is_main_phase = "Main" in phase
         is_your_turn = active_seat == local_seat
         stack = game_state.get("stack", [])
         stack_empty = len(stack) == 0
-        can_cast_sorcery = (
-            is_your_turn and is_main_phase and stack_empty and has_priority
-        )
+        can_cast_sorcery = (is_your_turn and is_main_phase and stack_empty and has_priority)
         is_blocking = "DeclareBlock" in step and not is_your_turn
 
-        # Decision Check
+        # Decision context
         pending_decision = game_state.get("pending_decision")
-        decision_context = game_state.get("decision_context")
-
         if pending_decision:
-            # PHASE 1+2: Enhanced decision display with context
-            if decision_context:
-                dec_type = decision_context.get("type", "unknown")
+            lines.extend(self._format_decision_lines(game_state))
 
-                if dec_type == "mulligan_bottom":
-                    # London Mulligan: choose cards to put on bottom
-                    hand = game_state.get("hand", [])
-                    num_to_bottom = max(1, 7 - len(hand) + 1)  # estimate from hand size
-                    lines.append(f"!!! DECISION: MULLIGAN - PUT {num_to_bottom} CARD(S) ON BOTTOM !!!")
-                    lines.append("Keep: lands + on-curve plays | Bottom: expensive/off-color/redundant")
-
-                elif dec_type == "discard":
-                    count = decision_context.get("count", 1)
-                    lines.append(f"!!! DECISION: DISCARD {count} card(s) !!!")
-                    lines.append(
-                        "Choose: excess lands > high CMC uncastables > redundant copies"
-                    )
-
-                elif dec_type == "scry":
-                    count = decision_context.get("count", 1)
-                    lines.append(f"!!! DECISION: SCRY {count} !!!")
-                    lines.append("Keep: needed lands/threats | Bottom: dead cards")
-
-                elif dec_type == "surveil":
-                    count = decision_context.get("count", 1)
-                    lines.append(f"!!! DECISION: SURVEIL {count} !!!")
-                    lines.append("Keep: want to draw | Graveyard: synergy or digging")
-
-                elif dec_type == "target_selection":
-                    source = decision_context.get("source_card", "spell")
-                    lines.append(f"!!! DECISION: TARGET for {source} !!!")
-                    lines.append("Choose: biggest threat or best value target")
-
-                elif dec_type == "modal_choice":
-                    num_opts = decision_context.get("num_options", "?")
-                    lines.append(f"!!! DECISION: CHOOSE MODE ({num_opts} options) !!!")
-                    lines.append("Evaluate: which mode solves current problem best")
-
-                elif dec_type == "declare_attackers":
-                    legal = decision_context.get("legal_attackers", [])
-                    lines.append(f"!!! DECISION: DECLARE ATTACKERS ({len(legal)} legal) !!!")
-                    if legal:
-                        lines.append(f"Can attack: {', '.join(legal[:8])}")
-                    lines.append("Choose: maximize damage while keeping safe blockers back")
-
-                elif dec_type == "declare_blockers":
-                    legal = decision_context.get("legal_blockers", [])
-                    lines.append(f"!!! DECISION: DECLARE BLOCKERS ({len(legal)} legal) !!!")
-                    if legal:
-                        lines.append(f"Can block: {', '.join(legal[:8])}")
-                    lines.append("Choose: trade up, double-block threats, protect life total")
-
-                elif dec_type == "assign_damage":
-                    lines.append("!!! DECISION: ASSIGN COMBAT DAMAGE !!!")
-                    lines.append("Order: kill most important blocker/attacker first")
-
-                elif dec_type == "order_combat_damage":
-                    lines.append("!!! DECISION: ORDER COMBAT DAMAGE !!!")
-                    lines.append("Order: prioritize killing the biggest threat")
-
-                elif dec_type == "pay_costs":
-                    source = decision_context.get("source_card", "spell")
-                    mana_cost = decision_context.get("mana_cost", "")
-                    has_autotap = decision_context.get("has_autotap", False)
-                    cost_str = f" ({mana_cost})" if mana_cost else ""
-                    lines.append(f"!!! DECISION: PAY COSTS for {source}{cost_str} !!!")
-                    if has_autotap:
-                        lines.append("Auto-tap available — confirm or tap manually for better mana efficiency")
-                    else:
-                        lines.append("Choose: tap lands that leave best mana open for responses")
-
-                elif dec_type == "search":
-                    lines.append("!!! DECISION: SEARCH LIBRARY !!!")
-                    lines.append("Choose: what you need most — land, removal, threat, or answer")
-
-                elif dec_type == "distribution":
-                    source = decision_context.get("source_card", "effect")
-                    total = decision_context.get("total", "?")
-                    lines.append(f"!!! DECISION: DISTRIBUTE {total} from {source} !!!")
-                    lines.append("Distribute: maximize kills, finish off wounded targets first")
-
-                elif dec_type == "numeric_input":
-                    source = decision_context.get("source_card", "effect")
-                    min_v = decision_context.get("min", 0)
-                    max_v = decision_context.get("max", "?")
-                    lines.append(f"!!! DECISION: CHOOSE NUMBER for {source} ({min_v}-{max_v}) !!!")
-                    lines.append("Choose: balance value vs. cost (life, mana, etc.)")
-
-                elif dec_type == "choose_starting_player":
-                    lines.append("!!! DECISION: PLAY OR DRAW !!!")
-                    lines.append("Aggro decks: PLAY (tempo). Control/limited: DRAW (card advantage)")
-
-                elif dec_type == "sacrifice":
-                    count = decision_context.get("count", 1)
-                    opts = decision_context.get("option_cards")
-                    lines.append(f"!!! DECISION: SACRIFICE {count} !!!")
-                    if opts:
-                        lines.append(f"Options: {', '.join(opts[:8])}")
-                    lines.append("Choose: sacrifice least valuable permanent for the board state")
-
-                elif dec_type == "exile":
-                    count = decision_context.get("count", 1)
-                    opts = decision_context.get("option_cards")
-                    lines.append(f"!!! DECISION: EXILE {count} !!!")
-                    if opts:
-                        lines.append(f"Options: {', '.join(opts[:8])}")
-                    lines.append("Choose: exile least impactful card")
-
-                elif dec_type == "destroy":
-                    count = decision_context.get("count", 1)
-                    opts = decision_context.get("option_cards")
-                    lines.append(f"!!! DECISION: DESTROY {count} !!!")
-                    if opts:
-                        lines.append(f"Options: {', '.join(opts[:8])}")
-                    lines.append("Choose: destroy biggest threat on the board")
-
-                elif dec_type == "return":
-                    count = decision_context.get("count", 1)
-                    opts = decision_context.get("option_cards")
-                    lines.append(f"!!! DECISION: RETURN {count} !!!")
-                    if opts:
-                        lines.append(f"Options: {', '.join(opts[:8])}")
-                    lines.append("Choose: return least important permanent")
-
-                elif dec_type == "mill":
-                    count = decision_context.get("count", 1)
-                    lines.append(f"!!! DECISION: MILL {count} !!!")
-
-                elif dec_type == "explore":
-                    lines.append("!!! DECISION: EXPLORE !!!")
-                    lines.append("Keep land on top if needed, otherwise bottom for a better draw")
-
-                elif dec_type in ("choose_creature", "choose_land", "choose_enchantment",
-                                  "choose_artifact", "choose_permanent", "choose"):
-                    count = decision_context.get("count", 1)
-                    label = dec_type.replace("choose_", "").upper() or "ITEM"
-                    opts = decision_context.get("option_cards")
-                    lines.append(f"!!! DECISION: CHOOSE {label} ({count}) !!!")
-                    if opts:
-                        lines.append(f"Options: {', '.join(opts[:8])}")
-                    lines.append("Choose: pick the option that best advances your game plan")
-
-                elif dec_type == "select_replacement":
-                    lines.append("!!! DECISION: ORDER REPLACEMENT EFFECTS !!!")
-                    lines.append("Choose: apply the replacement that gives most advantage first")
-
-                elif dec_type == "casting_time_options":
-                    lines.append("!!! DECISION: CHOOSE CASTING OPTION !!!")
-                    lines.append("Evaluate: alternative cost vs normal cost (Foretell, Flashback, Escape)")
-
-                elif dec_type == "select_counters":
-                    lines.append("!!! DECISION: SELECT COUNTERS !!!")
-                    lines.append("Choose: remove least valuable counters, keep most impactful")
-
-                elif dec_type == "order_triggers":
-                    lines.append("!!! DECISION: ORDER TRIGGERED ABILITIES !!!")
-                    lines.append("Order: resolve most impactful trigger last (it resolves first)")
-
-                elif dec_type == "select_n_group":
-                    lines.append("!!! DECISION: SELECT FROM GROUP !!!")
-
-                elif dec_type == "select_from_groups":
-                    lines.append("!!! DECISION: SELECT FROM GROUPS !!!")
-
-                elif dec_type == "search_from_groups":
-                    lines.append("!!! DECISION: SEARCH FROM GROUPS !!!")
-
-                elif dec_type == "gather":
-                    lines.append("!!! DECISION: GATHER !!!")
-
-                elif dec_type == "actions_available":
-                    # ActionsAvailableReq — GRE is waiting for player to choose an action.
-                    # The legal actions are already shown separately, so keep this brief.
-                    n_actions = decision_context.get("num_actions", "?")
-                    lines.append(f"!!! YOUR PRIORITY — {n_actions} legal actions available !!!")
-
-                else:
-                    # Fallback for other decision types
-                    lines.append(f"!!! DECISION: {pending_decision} !!!")
-            else:
-                # No context available - generic display
-                lines.append(f"!!! DECISION: {pending_decision} !!!")
-
-            # Special handling for Mulligan - show hand summary for LLM
-            if pending_decision == "Mulligan":
-                my_hand = game_state.get("hand", [])
-                if not my_hand:
-                    lines.append("Waiting for hand...")
-                else:
-                    lands = [
-                        c for c in my_hand if "land" in c.get("type_line", "").lower()
-                    ]
-                    creatures = [
-                        c
-                        for c in my_hand
-                        if "creature" in c.get("type_line", "").lower()
-                    ]
-                    spells = [
-                        c for c in my_hand if c not in lands and c not in creatures
-                    ]
-                    cmcs = []
-                    for c in my_hand:
-                        cost = c.get("mana_cost", "")
-                        if cost:
-                            import re as _re
-
-                            generic = sum(
-                                int(g) for g in _re.findall(r"\{(\d+)\}", cost)
-                            )
-                            pips = len(_re.findall(r"\{[WUBRGC]\}", cost))
-                            cmcs.append(generic + pips)
-                        else:
-                            cmcs.append(0)
-                    avg_cmc = sum(cmcs) / len(cmcs) if cmcs else 0
-                    land_names = [c.get("name", "?") for c in lands]
-                    nonland_names = [
-                        f"{c.get('name', '?')} ({c.get('mana_cost', '')})"
-                        for c in my_hand
-                        if c not in lands
-                    ]
-                    lines.append(
-                        f"MULLIGAN HAND: {len(lands)} lands, {len(creatures)} creatures, {len(spells)} spells, avg CMC {avg_cmc:.1f}"
-                    )
-                    lines.append(
-                        f"  Lands: {', '.join(land_names) if land_names else 'NONE'}"
-                    )
-                    lines.append(
-                        f"  Nonland: {', '.join(nonland_names) if nonland_names else 'NONE'}"
-                    )
-                    lines.append(
-                        "Decide: KEEP or MULLIGAN based on curve, colors, and land count"
-                    )
-
-        # OPTIMIZATION: Single line for turn/phase/priority
-        # During mulligan, override the turn line to avoid "Pri:Opp" confusing the LLM
+        # Turn/phase/priority line
         if pending_decision in ("Mulligan", "Mulligan Bottom"):
             lines.append("YOUR MULLIGAN DECISION")
         else:
             phase_str = f"{phase}/{step}" if step else phase
             lines.append(f"T{turn_num} {active_label} | {phase_str} | Pri:{priority_label}")
 
-        # OPTIMIZATION: Compact timing rules - single line
-        # Skip timing info during mulligan - it's irrelevant and confusing
+        # Timing rules
         if pending_decision not in ("Mulligan", "Mulligan Bottom"):
             if can_cast_sorcery:
                 lines.append("Timing: ALL SPELLS")
@@ -2653,7 +3104,7 @@ class CoachEngine:
             else:
                 lines.append("Timing: INSTANTS ONLY")
 
-        # OPTIMIZATION: Compact life totals - single line with damage tracking
+        # Life totals
         your_life = local_player.get("life_total", "?") if local_player else "?"
         opp_life = opponent_player.get("life_total", "?") if opponent_player else "?"
         damage_taken = game_state.get("damage_taken", {})
@@ -2663,132 +3114,16 @@ class CoachEngine:
         opp_dmg_str = f" (taken {opp_dmg})" if opp_dmg else ""
         lines.append(f"Life: You={your_life}{your_dmg_str} Opp={opp_life}{opp_dmg_str}")
 
-        # Battlefield - grouped by owner
+        # Battlefield
         battlefield = game_state.get("battlefield", [])
         your_cards = [c for c in battlefield if c.get("owner_seat_id") == local_seat and c.get("type_line", "").lower() != "ability"]
         opp_cards = [c for c in battlefield if c.get("owner_seat_id") != local_seat and c.get("type_line", "").lower() != "ability"]
 
-        # OPTIMIZATION: Compact mana calculation
-        # Track mana sources individually to avoid misleading dual-land displays
-        mana_pool = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0, "C": 0, "Any": 0}
-        mana_sources = []  # Track individual sources for clearer display
-        total_mana = 0
-        creature_mana_source_count = 0  # For bonus-mana detection
+        # Mana info
+        mana_lines, total_mana, mana_pool = self._format_mana_info(your_cards, turn_num)
+        lines.extend(mana_lines)
 
-        for card in your_cards:
-            type_line = card.get("type_line", "").lower()
-            oracle = card.get("oracle_text", "")
-            is_creature = "creature" in type_line
-            is_land = "land" in type_line
-            # Check for casting sickness (unless it has haste)
-            has_haste = "haste" in self._remove_reminder_text(oracle).lower()
-            is_summoning_sick = (
-                is_creature
-                and card.get("turn_entered_battlefield") == turn_num
-                and not has_haste
-            )
-
-            # Count mana sources (Lands AND Creatures)
-            # Logic: Untapped AND (Land OR (Creature AND "add {" in oracle AND not summoning sick))
-            # Relaxed check: Just looking for "Add " or "{T}: Add" is surprisingly robust for dorks
-            has_mana_ability = (
-                "add {" in oracle.lower() or "add one mana" in oracle.lower()
-            )
-            # Some lands say "this land is the chosen type" (e.g. Multiversal Passage)
-            # — they produce mana of whatever basic type they are but don't have "add {" in oracle.
-            # Detect via basic land subtypes in the type_line.
-            if is_land and not has_mana_ability:
-                for basic in ("plains", "island", "swamp", "mountain", "forest"):
-                    if basic in type_line:
-                        has_mana_ability = True
-                        break
-
-            if not card.get("is_tapped"):
-                if is_land or (
-                    is_creature and has_mana_ability and not is_summoning_sick
-                ):
-                    total_mana += 1
-                    name = card.get("name", "")
-
-                    # Track creature mana sources for bonus-mana effects
-                    if is_creature and has_mana_ability and not is_summoning_sick:
-                        creature_mana_source_count += 1
-
-                    # Detect what colors this specific source can produce
-                    source_colors = []
-                    if "Plains" in name or "plains" in type_line or "{W}" in oracle:
-                        mana_pool["W"] += 1
-                        source_colors.append("W")
-                    if "Island" in name or "island" in type_line or "{U}" in oracle:
-                        mana_pool["U"] += 1
-                        source_colors.append("U")
-                    if "Swamp" in name or "swamp" in type_line or "{B}" in oracle:
-                        mana_pool["B"] += 1
-                        source_colors.append("B")
-                    if "Mountain" in name or "mountain" in type_line or "{R}" in oracle:
-                        mana_pool["R"] += 1
-                        source_colors.append("R")
-                    if "Forest" in name or "forest" in type_line or "{G}" in oracle:
-                        mana_pool["G"] += 1
-                        source_colors.append("G")
-                    if "{C}" in oracle:
-                        mana_pool["C"] += 1
-                        source_colors.append("C")
-                    if "any color" in oracle.lower():
-                        mana_pool["Any"] += 1
-                        source_colors.append("Any")
-
-                    # Track this source for clearer display
-                    if len(source_colors) > 1:
-                        # Multi-color source (dual land, etc.)
-                        mana_sources.append("/".join(source_colors))
-                    elif len(source_colors) == 1:
-                        mana_sources.append(source_colors[0])
-
-        # Detect bonus-mana effects: "whenever you tap a creature for mana, add"
-        # e.g. Badgermole Cub, Leyline of Abundance
-        mana_bonus_notes = []
-        import re
-        for card in your_cards:
-            oracle_lower = card.get("oracle_text", "").lower()
-            name = card.get("name", "")
-            # Pattern: "whenever you tap a creature for mana, add an additional {X}"
-            bonus_match = re.search(r"whenever you tap a creature for mana,?\s*add an additional \{(\w)\}", oracle_lower)
-            if bonus_match and creature_mana_source_count > 0:
-                bonus_color = bonus_match.group(1).upper()
-                bonus_total = creature_mana_source_count
-                total_mana += bonus_total
-                if bonus_color in mana_pool:
-                    mana_pool[bonus_color] += bonus_total
-                # Add bonus sources to display
-                for _ in range(bonus_total):
-                    mana_sources.append(f"+{bonus_color}")
-                logger.info(f"Mana bonus from {name}: +{bonus_total} {{{bonus_color}}} ({creature_mana_source_count} creature sources)")
-
-            # Detect untap-on-cast effects for annotation
-            if "untap" in oracle_lower and ("mana value" in oracle_lower or "converted mana cost" in oracle_lower):
-                untap_match = re.search(r"(?:mana value|converted mana cost)\s*(\d+)\s*or greater.*untap|cast.*(?:mana value|converted mana cost)\s*(\d+).*untap|untap.*(?:mana value|converted mana cost)\s*(\d+)", oracle_lower)
-                if untap_match:
-                    threshold = untap_match.group(1) or untap_match.group(2) or untap_match.group(3)
-                    mana_bonus_notes.append(f"{name} untaps on MV{threshold}+ cast → tap again for extra mana")
-
-        logger.info(f"Mana: {mana_pool} (Total: {total_mana})")
-
-        # IMPROVED: Show mana sources more clearly to avoid dual-land confusion
-        # Old: "Mana: 1 (U:1 G:1)" - misleading, looks like 2 mana!
-        # New: "Mana: 1 (sources: {U/G})" - clear that it's one source with options
-        if mana_sources:
-            # Group identical sources: ["W", "W", "U/G"] -> "W W {U/G}"
-            source_display = " ".join(
-                f"{{{s}}}" if "/" in s else s for s in mana_sources
-            )
-            lines.append(f"Mana: {total_mana} (sources: {source_display})")
-        else:
-            lines.append(f"Mana: 0")
-        for note in mana_bonus_notes:
-            lines.append(f"⚠️ {note}")
-
-        # OPTIMIZATION: Compact land drop status
+        # Land drop status
         lands_played = local_player.get("lands_played", 0) if local_player else 0
         if is_your_turn and lands_played == 0:
             lines.append("Land: AVAILABLE")
@@ -2797,1079 +3132,102 @@ class CoachEngine:
         else:
             lines.append("Land: N/A (opp turn)")
 
-        # Build attachment map: instance_id -> list of attached aura/equipment cards
-        # so we can show "doesn't untap" effects under the creature they're on.
+        # Build attachment map
         _attachments: dict[int, list[dict]] = {}
         for card in battlefield:
             parent_id = card.get("parent_instance_id")
             if parent_id is not None:
                 _attachments.setdefault(parent_id, []).append(card)
 
-        # OPTIMIZATION: Compact battlefield display with symbols
-        # T=tapped, FLY=flying, RCH=reach, SS=summoning sick, ATK=attacking, BLK=blocking
+        # Battlefield display
         if battlefield:
             lines.append("")
-            lines.append(f"YOUR BOARD:")
+            lines.append("YOUR BOARD:")
             if your_cards:
-                # Disambiguate duplicate names: "Gene Pollinator #1", "Gene Pollinator #2"
                 your_name_counts = Counter(c.get("name", "Unknown") for c in your_cards)
-                your_name_seen = {}
+                your_name_seen: dict[str, int] = {}
                 for card in your_cards:
-                    name = card.get("name", "Unknown")
-                    type_line = card.get("type_line", "").lower()
-
-                    # Disambiguate duplicate names
-                    if your_name_counts[name] > 1:
-                        your_name_seen[name] = your_name_seen.get(name, 0) + 1
-                        display_name = f"{name} #{your_name_seen[name]}"
-                    else:
-                        display_name = name
-
-                    # P/T for creatures (use type_line, handle null power)
-                    pt = (
-                        f" {card.get('power') or 0}/{card.get('toughness') or 0}"
-                        if "creature" in type_line or card.get("power") is not None
-                        else ""
-                    )
-
-                    # Status flags (compact symbols)
-                    flags = []
-
-                    # Type tags for non-creature non-land permanents
-                    is_creature = "creature" in type_line
-                    is_land = "land" in type_line
-                    if not is_creature and not is_land:
-                        if "equipment" in type_line:
-                            flags.append("EQUIPMENT")
-                        elif "artifact" in type_line:
-                            flags.append("ARTIFACT")
-                        if "enchantment" in type_line:
-                            flags.append("ENCHANT")
-                        if "planeswalker" in type_line:
-                            flags.append("PW")
-
-                    if card.get("is_tapped"):
-                        flags.append("T")
-
-                    oracle_text = self._remove_reminder_text(
-                        card.get("oracle_text", "")
-                    ).lower()
-                    is_creature = "creature" in type_line
-
-                    # Keywords that matter for combat
-                    if "flying" in oracle_text:
-                        flags.append("FLY")
-                    if "reach" in oracle_text:
-                        flags.append("RCH")
-                    if "haste" in oracle_text:
-                        flags.append("HST")
-                    if "vigilance" in oracle_text:
-                        flags.append("VIG")
-                    if "trample" in oracle_text:
-                        flags.append("TRM")
-                    if "first strike" in oracle_text:
-                        flags.append("FS")
-                    if "deathtouch" in oracle_text:
-                        flags.append("DTH")
-
-                    # Summoning sickness check
-                    if (
-                        is_creature
-                        and card.get("turn_entered_battlefield") == turn_num
-                        and "haste" not in oracle_text
-                    ):
-                        flags.append("SS")
-
-                    # Impending: enchantment with time counters, not a creature yet
-                    if self._is_impending(card):
-                        flags.append("IMPENDING")
-
-                    if card.get("is_attacking"):
-                        flags.append("ATK")
-                    if card.get("is_blocking"):
-                        flags.append("BLK")
-
-                    # Check for "doesn't untap" auras attached to this card
-                    inst_id = card.get("instance_id")
-                    attached = _attachments.get(inst_id, [])
-                    _locked = any(
-                        "doesn't untap" in (a.get("oracle_text") or "").lower()
-                        or "doesn't untap" in (a.get("oracle_text") or "").lower()
-                        for a in attached
-                    )
-                    if _locked:
-                        flags.append("LOCKED")
-
-                    # Token and counter annotations
-                    obj_kind = card.get("object_kind", "")
-                    if obj_kind == "TOKEN":
-                        display_name = f"*{display_name}"
-                    counters = card.get("counters", {})
-                    counter_str = ""
-                    if counters:
-                        cparts = []
-                        for ctype, ccount in counters.items():
-                            clean = ctype.replace("CounterType_", "")[:4]
-                            cparts.append(f"{ccount}{clean}")
-                        counter_str = f" ({','.join(cparts)})"
-
-                    flag_str = f" [{','.join(flags)}]" if flags else ""
-                    lines.append(f"  {display_name}{pt}{counter_str}{flag_str}")
-
-                    # Show compact oracle text for non-vanilla permanents so the
-                    # LLM doesn't hallucinate abilities.  Skip basic lands and
-                    # cards where the keywords already capture everything.
-                    raw_oracle = card.get("oracle_text", "")
-                    if raw_oracle and not is_land:
-                        stripped = self._remove_reminder_text(raw_oracle).strip()
-                        # Skip if the oracle text is ONLY keywords already captured by flags
-                        keyword_only = all(
-                            w in {"flying", "reach", "haste", "vigilance", "trample",
-                                  "first", "strike", "double", "deathtouch", "lifelink",
-                                  "menace", "ward", "hexproof", "indestructible", "defender"}
-                            for w in stripped.lower().replace(",", " ").replace("\n", " ").split()
-                            if w
-                        )
-                        if not keyword_only and len(stripped) > 0:
-                            lines.append(f"    {stripped}")
-
-                    # Show auras/equipment attached to this permanent
-                    if attached:
-                        for att in attached:
-                            att_name = att.get("name", "Unknown")
-                            att_oracle = self._remove_reminder_text(
-                                att.get("oracle_text", "")
-                            ).strip()
-                            att_owner = "OPP" if att.get("owner_seat_id") != local_seat else "YOUR"
-                            lines.append(f"    >> {att_owner} AURA: {att_name}")
-                            if att_oracle:
-                                lines.append(f"       {att_oracle}")
-
+                    lines.extend(self._format_board_card(
+                        card, local_seat, turn_num, _attachments,
+                        your_name_counts, your_name_seen, is_local=True
+                    ))
             else:
                 lines.append("  (empty)")
 
             # Pre-compute inferred attackers for DeclareBlock display
-            # MTGA doesn't always send isAttacking on game objects, so we infer
-            # from tapped non-SS creatures during opponent's combat
-            _inferred_atk_ids = set()
+            _inferred_atk_ids: set[int] = set()
             if "Combat" in phase and not is_your_turn and "DeclareBlock" in step:
                 has_explicit_atk = any(c.get("is_attacking") for c in opp_cards)
                 if not has_explicit_atk:
                     for c in opp_cards:
                         c_type = c.get("type_line", "").lower()
-                        c_oracle = self._remove_reminder_text(
-                            c.get("oracle_text", "")
-                        ).lower()
-                        is_ss = (
-                            c.get("turn_entered_battlefield") == turn_num
-                            and "haste" not in c_oracle
-                        )
-                        if (
-                            c.get("is_tapped")
-                            and "creature" in c_type
-                            and not is_ss
-                        ):
+                        c_oracle = self._remove_reminder_text(c.get("oracle_text", "")).lower()
+                        is_ss = (c.get("turn_entered_battlefield") == turn_num and "haste" not in c_oracle)
+                        if c.get("is_tapped") and "creature" in c_type and not is_ss:
                             _inferred_atk_ids.add(c.get("instance_id"))
 
-            lines.append(f"OPP BOARD:")
+            lines.append("OPP BOARD:")
             if opp_cards:
                 opp_name_counts = Counter(c.get("name", "Unknown") for c in opp_cards)
-                opp_name_seen = {}
+                opp_name_seen: dict[str, int] = {}
                 for card in opp_cards:
-                    name = card.get("name", "Unknown")
-                    type_line = card.get("type_line", "").lower()
-
-                    # Disambiguate duplicate names
-                    if opp_name_counts[name] > 1:
-                        opp_name_seen[name] = opp_name_seen.get(name, 0) + 1
-                        display_name = f"{name} #{opp_name_seen[name]}"
-                    else:
-                        display_name = name
-
-                    pt = (
-                        f" {card['power']}/{card['toughness']}"
-                        if card.get("power") is not None
-                        else ""
-                    )
-
-                    flags = []
-
-                    # Type tags for non-creature non-land permanents
-                    is_creature = "creature" in type_line
-                    is_land = "land" in type_line
-                    if not is_creature and not is_land:
-                        if "equipment" in type_line:
-                            flags.append("EQUIPMENT")
-                        elif "artifact" in type_line:
-                            flags.append("ARTIFACT")
-                        if "enchantment" in type_line:
-                            flags.append("ENCHANT")
-                        if "planeswalker" in type_line:
-                            flags.append("PW")
-
-                    if card.get("is_tapped"):
-                        flags.append("T")
-
-                    oracle_text = self._remove_reminder_text(
-                        card.get("oracle_text", "")
-                    ).lower()
-                    if "flying" in oracle_text:
-                        flags.append("FLY")
-                    if "reach" in oracle_text:
-                        flags.append("RCH")
-                    if "vigilance" in oracle_text:
-                        flags.append("VIG")
-                    if "trample" in oracle_text:
-                        flags.append("TRM")
-                    if "first strike" in oracle_text:
-                        flags.append("FS")
-                    if "deathtouch" in oracle_text:
-                        flags.append("DTH")
-
-                    # Summoning sickness check for opponent creatures
-                    if (
-                        is_creature
-                        and card.get("turn_entered_battlefield") == turn_num
-                        and "haste" not in oracle_text
-                    ):
-                        flags.append("SS")
-
-                    # Impending: enchantment with time counters, not a creature yet
-                    if self._is_impending(card):
-                        flags.append("IMPENDING")
-
-                    if (
-                        card.get("is_attacking")
-                        or card.get("instance_id") in _inferred_atk_ids
-                    ):
-                        flags.append("ATK")
-                    if card.get("is_blocking"):
-                        flags.append("BLK")
-
-                    # Check for "doesn't untap" auras on opponent creatures
-                    opp_inst_id = card.get("instance_id")
-                    opp_attached = _attachments.get(opp_inst_id, [])
-                    if any("doesn't untap" in (a.get("oracle_text") or "").lower() for a in opp_attached):
-                        flags.append("LOCKED")
-
-                    # Token and counter annotations (opponent)
-                    obj_kind = card.get("object_kind", "")
-                    if obj_kind == "TOKEN":
-                        display_name = f"*{display_name}"
-                    counters = card.get("counters", {})
-                    counter_str = ""
-                    if counters:
-                        cparts = []
-                        for ctype, ccount in counters.items():
-                            clean = ctype.replace("CounterType_", "")[:4]
-                            cparts.append(f"{ccount}{clean}")
-                        counter_str = f" ({','.join(cparts)})"
-
-                    flag_str = f" [{','.join(flags)}]" if flags else ""
-                    lines.append(f"  {display_name}{pt}{counter_str}{flag_str}")
-
-                    # Show compact oracle text for opponent permanents too
-                    raw_oracle = card.get("oracle_text", "")
-                    if raw_oracle and "land" not in type_line:
-                        stripped = self._remove_reminder_text(raw_oracle).strip()
-                        keyword_only = all(
-                            w in {"flying", "reach", "haste", "vigilance", "trample",
-                                  "first", "strike", "double", "deathtouch", "lifelink",
-                                  "menace", "ward", "hexproof", "indestructible", "defender"}
-                            for w in stripped.lower().replace(",", " ").replace("\n", " ").split()
-                            if w
-                        )
-                        if not keyword_only and len(stripped) > 0:
-                            lines.append(f"    {stripped}")
-
-                    # Show auras/equipment attached to opponent permanents
-                    if opp_attached:
-                        for att in opp_attached:
-                            att_name = att.get("name", "Unknown")
-                            att_oracle = self._remove_reminder_text(
-                                att.get("oracle_text", "")
-                            ).strip()
-                            att_owner = "YOUR" if att.get("owner_seat_id") == local_seat else "OPP"
-                            lines.append(f"    >> {att_owner} AURA: {att_name}")
-                            if att_oracle:
-                                lines.append(f"       {att_oracle}")
+                    # Add inferred ATK flag before formatting
+                    if card.get("instance_id") in _inferred_atk_ids and not card.get("is_attacking"):
+                        card = dict(card)
+                        card["is_attacking"] = True
+                    lines.extend(self._format_board_card(
+                        card, local_seat, turn_num, _attachments,
+                        opp_name_counts, opp_name_seen, is_local=False
+                    ))
             else:
                 lines.append("  (empty)")
 
-            # OPTIMIZATION: Compact combat analysis (was 70+ lines, now ~20)
+            # Combat analysis
             if ("Combat" in phase or "Main" in phase) and is_your_turn:
-                your_creatures = [
-                    c
-                    for c in your_cards
-                    if "creature" in c.get("type_line", "").lower()
-                    and not self._is_impending(c)
-                ]
-
+                your_creatures = [c for c in your_cards if "creature" in c.get("type_line", "").lower() and not self._is_impending(c)]
                 valid_attackers = [
-                    c
-                    for c in your_creatures
+                    c for c in your_creatures
                     if not c.get("is_tapped")
-                    and not (
-                        c.get("turn_entered_battlefield") == turn_num
-                        and "haste"
-                        not in self._remove_reminder_text(
-                            c.get("oracle_text", "")
-                        ).lower()
-                    )
+                    and not (c.get("turn_entered_battlefield") == turn_num
+                             and "haste" not in self._remove_reminder_text(c.get("oracle_text", "")).lower())
                 ]
-
-                your_attack_power = sum(c.get("power") or 0 for c in valid_attackers)
-
-                opp_creatures = [
-                    c
-                    for c in opp_cards
-                    if "creature" in c.get("type_line", "").lower()
-                    and not self._is_impending(c)
-                ]
-                opp_blockers = [c for c in opp_creatures if not c.get("is_tapped")]
-                opp_block_count = len(opp_blockers)
-                opp_life = (
-                    opponent_player.get("life_total", 20) if opponent_player else 20
-                )
-
-                # Single line combat summary
-                if valid_attackers:
-                    lethal = (
-                        "LETHAL"
-                        if (opp_block_count == 0 and your_attack_power >= opp_life)
-                        else f"{opp_block_count}blk"
-                    )
-                    attacker_names = [c.get("name", "?") for c in valid_attackers]
-                    # Disambiguate duplicate attacker names
-                    atk_name_counts = Counter(attacker_names)
-                    atk_name_seen: dict[str, int] = {}
-                    deduped_names = []
-                    for n in attacker_names:
-                        if atk_name_counts[n] > 1:
-                            atk_name_seen[n] = atk_name_seen.get(n, 0) + 1
-                            deduped_names.append(f"{n} #{atk_name_seen[n]}")
-                        else:
-                            deduped_names.append(n)
-                    attacker_list = ", ".join(deduped_names)
-                    lines.append(
-                        f"Atk: {len(valid_attackers)}cr/{your_attack_power}pwr vs {lethal} — can attack: {attacker_list}"
-                    )
-                    # Trade analysis for attacks: show what happens if each blocker blocks each attacker
-                    if valid_attackers and opp_blockers:
-                        for atk in valid_attackers:
-                            atk_name = atk.get("name", "?")
-                            atk_pow = atk.get("power") or 0
-                            atk_tgh = atk.get("toughness") or 0
-                            atk_oracle = self._remove_reminder_text(
-                                atk.get("oracle_text", "")
-                            ).lower()
-                            atk_has_fly = "flying" in atk_oracle
-                            atk_has_dth = "deathtouch" in atk_oracle
-                            atk_has_trample = "trample" in atk_oracle
-                            atk_has_fs = "first strike" in atk_oracle or "double strike" in atk_oracle
-                            for blk in opp_blockers:
-                                blk_name = blk.get("name", "?")
-                                blk_pow = blk.get("power") or 0
-                                blk_tgh = blk.get("toughness") or 0
-                                blk_oracle = self._remove_reminder_text(
-                                    blk.get("oracle_text", "")
-                                ).lower()
-                                blk_has_fly = "flying" in blk_oracle
-                                blk_has_reach = "reach" in blk_oracle
-                                blk_has_dth = "deathtouch" in blk_oracle
-                                blk_has_fs = "first strike" in blk_oracle or "double strike" in blk_oracle
-                                # Skip if blocker can't legally block (flying vs no fly/reach)
-                                if atk_has_fly and not blk_has_fly and not blk_has_reach:
-                                    continue
-                                # Determine outcomes
-                                atk_dies = (blk_pow >= atk_tgh) or blk_has_dth
-                                blk_dies = (atk_pow >= blk_tgh) or atk_has_dth
-                                if atk_has_fs and not blk_has_fs:
-                                    if atk_pow >= blk_tgh or atk_has_dth:
-                                        atk_dies = False
-                                elif blk_has_fs and not atk_has_fs:
-                                    if blk_pow >= atk_tgh or blk_has_dth:
-                                        blk_dies = False
-                                if atk_dies and blk_dies:
-                                    result = "TRADE (both die)"
-                                elif atk_dies:
-                                    result = f"BAD — {atk_name} dies, {blk_name} lives ({blk_tgh - atk_pow} left)"
-                                elif blk_dies:
-                                    trample_note = ""
-                                    if atk_has_trample:
-                                        spillover = atk_pow - blk_tgh
-                                        if spillover > 0:
-                                            trample_note = f", {spillover} trample through"
-                                    result = f"GOOD — {blk_name} dies, {atk_name} lives ({atk_tgh - blk_pow} left){trample_note}"
-                                else:
-                                    result = f"BAD — both live, {atk_name} just bounces off"
-                                lines.append(
-                                    f"  If {blk_name} {blk_pow}/{blk_tgh} blocks {atk_name} {atk_pow}/{atk_tgh}: {result}"
-                                )
-                else:
-                    lines.append(f"Atk: None (T/SS)")
-
-                # Crackback warning: opponent's potential attack power next turn
-                opp_attack_power = sum(
-                    c.get("power") or 0 for c in opp_creatures
-                )
-                your_life = (
-                    local_player.get("life_total", 20) if local_player else 20
-                )
-                if opp_attack_power > 0:
-                    # Helper: compute crackback damage through optimal blocking
-                    def _crackback_dmg(blockers_list):
-                        cb_avail = list(blockers_list)
-                        dmg = 0
-                        cb_sorted = sorted(
-                            opp_creatures, key=lambda c: c.get("power") or 0, reverse=True
-                        )
-                        for opp_c in cb_sorted:
-                            opp_pow = opp_c.get("power") or 0
-                            opp_oracle = self._remove_reminder_text(
-                                opp_c.get("oracle_text", "")
-                            ).lower()
-                            opp_has_fly = "flying" in opp_oracle
-                            opp_has_trample = "trample" in opp_oracle
-                            cb_valid = []
-                            for i, blk in enumerate(cb_avail):
-                                blk_oracle = self._remove_reminder_text(
-                                    blk.get("oracle_text", "")
-                                ).lower()
-                                if opp_has_fly and "flying" not in blk_oracle and "reach" not in blk_oracle:
-                                    continue
-                                cb_valid.append((i, blk))
-                            if cb_valid:
-                                if opp_has_trample:
-                                    idx, blocker = max(
-                                        cb_valid, key=lambda x: x[1].get("toughness") or 0
-                                    )
-                                else:
-                                    idx, blocker = min(
-                                        cb_valid, key=lambda x: x[1].get("toughness") or 0
-                                    )
-                                cb_avail.pop(idx)
-                                if opp_has_trample:
-                                    spillover = max(
-                                        0, opp_pow - (blocker.get("toughness") or 0)
-                                    )
-                                    dmg += spillover
-                            else:
-                                dmg += opp_pow
-                        return dmg
-
-                    # Scenario 1: All-out attack (only non-attackers can block)
-                    non_attackers = [
-                        c for c in your_creatures if c not in valid_attackers
-                    ]
-                    allout_dmg = _crackback_dmg(non_attackers)
-                    life_after_allout = your_life - allout_dmg
-
-                    # Scenario 2: No attack (all creatures available to block)
-                    noatk_dmg = _crackback_dmg(your_creatures)
-                    life_after_noatk = your_life - noatk_dmg
-
-                    life_margin = your_life - opp_attack_power
-                    if life_after_allout <= 0:
-                        if life_after_noatk > 0:
-                            # All-out is lethal but holding back is safe
-                            lines.append(
-                                f"⚠️ Crackback: opp {opp_attack_power}pwr — ALL-OUT lethal "
-                                f"({allout_dmg} through vs {your_life} life), but holding all "
-                                f"{len(your_creatures)} blockers → only {noatk_dmg} through → "
-                                f"SAFE at {life_after_noatk} life. Attack selectively!"
-                            )
-                        else:
-                            lines.append(
-                                f"⚠️ Crackback: opp {opp_attack_power}pwr → LETHAL even with "
-                                f"all {len(your_creatures)} blockers ({noatk_dmg} through vs "
-                                f"{your_life} life)! Must race or remove threats!"
-                            )
-                    elif life_margin <= 0:
-                        if allout_dmg < opp_attack_power and len(non_attackers) > 0:
-                            lines.append(
-                                f"Crackback: opp {opp_attack_power}pwr, but your {len(non_attackers)} blocker(s) absorb "
-                                f"{opp_attack_power - allout_dmg} → only {allout_dmg} through vs {your_life} life — "
-                                f"{'safe' if life_after_allout > 3 else 'tight'}"
-                            )
-                        else:
-                            lines.append(
-                                f"Crackback: {opp_attack_power}pwr vs your {your_life} life — LETHAL if no blockers held!"
-                            )
-                    elif life_margin <= 3:
-                        lines.append(
-                            f"Crackback: {opp_attack_power}pwr vs your {your_life} life — DANGER (only {life_margin} margin!)"
-                        )
-                    else:
-                        lines.append(
-                            f"Crackback: {opp_attack_power}pwr vs your {your_life} life — safe"
-                        )
-
-            # OPTIMIZATION: Compact blocking analysis (was 50+ lines, now ~10)
+                lines.extend(self._format_attack_combat(
+                    your_cards, opp_cards, local_player, opponent_player,
+                    turn_num, valid_attackers
+                ))
             elif "Combat" in phase and not is_your_turn:
-                attacking = [c for c in opp_cards if c.get("is_attacking")]
-                # Fallback: reuse pre-computed inferred attackers from display section
-                if not attacking and _inferred_atk_ids:
-                    attacking = [
-                        c
-                        for c in opp_cards
-                        if c.get("instance_id") in _inferred_atk_ids
-                    ]
-                flying_atk = [
-                    c
-                    for c in attacking
-                    if "flying"
-                    in self._remove_reminder_text(c.get("oracle_text", "")).lower()
-                ]
-                ground_atk = [c for c in attacking if c not in flying_atk]
-
-                your_creatures = [
-                    c
-                    for c in your_cards
-                    if "creature" in c.get("type_line", "").lower()
-                    and not c.get("is_tapped")
-                    and not self._is_impending(c)
-                ]
-
-                flyer_blockers = [
-                    c
-                    for c in your_creatures
-                    if any(
-                        kw
-                        in self._remove_reminder_text(c.get("oracle_text", "")).lower()
-                        for kw in ["flying", "reach"]
-                    )
-                ]
-
-                # Single line blocking summary
-                if attacking:
-                    fly_dmg = sum(c.get("power") or 0 for c in flying_atk)
-                    gnd_dmg = sum(c.get("power") or 0 for c in ground_atk)
-                    total_incoming = fly_dmg + gnd_dmg
-                    your_life = (
-                        local_player.get("life_total", 20) if local_player else 20
-                    )
-                    lines.append(
-                        f"Blk: {fly_dmg}fly/{gnd_dmg}gnd dmg | {len(flyer_blockers)}FLY-blk avail"
-                    )
-                    # Show total incoming damage and post-combat life if unblocked
-                    life_after_no_blocks = your_life - total_incoming
-                    if life_after_no_blocks <= 0:
-                        lines.append(
-                            f"⚠️ No blocks → {total_incoming} dmg → DEAD (from {your_life} life)! Must block!"
-                        )
-                    else:
-                        lines.append(
-                            f"No blocks → take {total_incoming} dmg → {life_after_no_blocks} life remaining"
-                        )
-                    if flying_atk and not flyer_blockers:
-                        lines.append(f"⚠️ {fly_dmg} UNBLOCKABLE!")
-                    # Deathtouch warning — critical for blocking decisions
-                    dth_atk = [
-                        c for c in attacking
-                        if "deathtouch" in self._remove_reminder_text(c.get("oracle_text", "")).lower()
-                    ]
-                    if dth_atk:
-                        dth_names = ", ".join(c.get("name", "?") for c in dth_atk)
-                        lines.append(f"⚠️ DEATHTOUCH: {dth_names} — any blocker DIES regardless of toughness!")
-
-                    # Compute minimum damage after optimal blocking
-                    available_blk = list(your_creatures)
-                    damage_through = 0
-                    # Sort attackers by power descending (block biggest threats first)
-                    sorted_atk = sorted(
-                        attacking, key=lambda c: c.get("power") or 0, reverse=True
-                    )
-                    for atk in sorted_atk:
-                        atk_pow = atk.get("power") or 0
-                        atk_oracle = self._remove_reminder_text(
-                            atk.get("oracle_text", "")
-                        ).lower()
-                        atk_has_fly = "flying" in atk_oracle
-                        atk_has_trample = "trample" in atk_oracle
-                        # Find valid blockers for this attacker
-                        valid = []
-                        for i, blk in enumerate(available_blk):
-                            blk_oracle = self._remove_reminder_text(
-                                blk.get("oracle_text", "")
-                            ).lower()
-                            if atk_has_fly and "flying" not in blk_oracle and "reach" not in blk_oracle:
-                                continue
-                            valid.append((i, blk))
-                        if valid:
-                            if atk_has_trample:
-                                # Use highest-toughness blocker to minimize trample spillover
-                                idx, blocker = max(
-                                    valid, key=lambda x: x[1].get("toughness") or 0
-                                )
-                            else:
-                                # Use smallest blocker to preserve bigger ones
-                                idx, blocker = min(
-                                    valid, key=lambda x: x[1].get("toughness") or 0
-                                )
-                            available_blk.pop(idx)
-                            if atk_has_trample:
-                                spillover = max(
-                                    0, atk_pow - (blocker.get("toughness") or 0)
-                                )
-                                damage_through += spillover
-                            # else: no damage through (blocked without trample)
-                        else:
-                            damage_through += atk_pow  # unblockable
-
-                    life_after_blocks = your_life - damage_through
-                    if damage_through < total_incoming:
-                        if life_after_blocks <= 0:
-                            lines.append(
-                                f"⚠️ Best blocks → take {damage_through} dmg → DEAD (from {your_life} life)! Not enough blockers!"
-                            )
-                        else:
-                            lines.append(
-                                f"Best blocks → take {damage_through} dmg → {life_after_blocks} life"
-                            )
-                    else:
-                        # All blockers used but no damage reduction (e.g. all trample)
-                        life_after_blocks = life_after_no_blocks
-
-                    # Trade analysis: show what happens for each block
-                    if your_creatures and attacking:
-                        for atk in attacking:
-                            atk_name = atk.get("name", "?")
-                            atk_pow = atk.get("power") or 0
-                            atk_tgh = atk.get("toughness") or 0
-                            atk_oracle = self._remove_reminder_text(
-                                atk.get("oracle_text", "")
-                            ).lower()
-                            atk_has_fly = "flying" in atk_oracle
-                            atk_has_dth = "deathtouch" in atk_oracle
-                            atk_has_trample = "trample" in atk_oracle
-                            atk_has_fs = "first strike" in atk_oracle or "double strike" in atk_oracle
-                            for blk in your_creatures:
-                                blk_name = blk.get("name", "?")
-                                blk_pow = blk.get("power") or 0
-                                blk_tgh = blk.get("toughness") or 0
-                                blk_oracle = self._remove_reminder_text(
-                                    blk.get("oracle_text", "")
-                                ).lower()
-                                blk_has_fly = "flying" in blk_oracle
-                                blk_has_reach = "reach" in blk_oracle
-                                blk_has_dth = "deathtouch" in blk_oracle
-                                blk_has_fs = "first strike" in blk_oracle or "double strike" in blk_oracle
-                                # Skip if blocker can't legally block (flying vs no fly/reach)
-                                if atk_has_fly and not blk_has_fly and not blk_has_reach:
-                                    continue
-                                # Determine outcomes
-                                atk_dies = (blk_pow >= atk_tgh) or blk_has_dth
-                                blk_dies = (atk_pow >= blk_tgh) or atk_has_dth
-                                # First strike advantage
-                                if atk_has_fs and not blk_has_fs:
-                                    if atk_pow >= blk_tgh or atk_has_dth:
-                                        atk_dies = False  # blocker dies before dealing damage
-                                elif blk_has_fs and not atk_has_fs:
-                                    if blk_pow >= atk_tgh or blk_has_dth:
-                                        blk_dies = False  # attacker dies before dealing damage
-                                if atk_dies and blk_dies:
-                                    result = "TRADE (both die)"
-                                elif atk_dies:
-                                    result = f"{atk_name} dies, {blk_name} lives ({blk_tgh - atk_pow} left)"
-                                elif blk_dies:
-                                    trample_dmg = ""
-                                    if atk_has_trample:
-                                        spillover = atk_pow - blk_tgh
-                                        if spillover > 0:
-                                            trample_dmg = f", {spillover} trample through"
-                                    result = f"{blk_name} dies, {atk_name} lives ({atk_tgh - blk_pow} left){trample_dmg}"
-                                else:
-                                    result = "both live"
-                                lines.append(
-                                    f"  If {blk_name} {blk_pow}/{blk_tgh} blocks {atk_name} {atk_pow}/{atk_tgh}: {result}"
-                                )
-
-                    # Next-turn danger: opponent's non-attacking creatures can
-                    # attack again next turn alongside any surviving attackers
-                    opp_non_attacking = [
-                        c for c in opp_cards
-                        if "creature" in c.get("type_line", "").lower()
-                        and c not in attacking
-                        and not self._is_impending(c)
-                    ]
-                    opp_next_turn_power = (
-                        sum(c.get("power") or 0 for c in attacking)
-                        + sum(c.get("power") or 0 for c in opp_non_attacking)
-                    )
-                    if opp_next_turn_power > 0 and life_after_blocks > 0:
-                        if opp_next_turn_power >= life_after_blocks:
-                            lines.append(
-                                f"⚠️ Next turn: opp can attack for up to {opp_next_turn_power}pwr — "
-                                f"LETHAL if you're at {life_after_blocks} life after this combat! Preserve blockers!"
-                            )
+                lines.extend(self._format_block_combat(
+                    your_cards, opp_cards, local_player, turn_num, phase, _inferred_atk_ids
+                ))
         else:
             lines.append("")
             lines.append("BOARD: Empty")
 
-        # Recent events (damage, zone transfers, reveals, etc.)
-        recent_events = game_state.get("recent_events", [])
-        if recent_events:
-            event_strs = []
-            for evt in recent_events[-5:]:
-                etype = evt.get("type", "")
-                if etype == "damage_dealt":
-                    event_strs.append(f"{evt.get('source','?')} dealt {evt.get('amount',0)} to {evt.get('target','?')}")
-                elif etype == "zone_transfer":
-                    event_strs.append(f"{evt.get('card','?')} moved zones")
-                elif etype == "counter_added":
-                    event_strs.append(f"+{evt.get('amount',1)} counter on {evt.get('card','?')}")
-                elif etype == "counter_removed":
-                    event_strs.append(f"-{evt.get('amount',1)} counter from {evt.get('card','?')}")
-                elif etype == "token_created":
-                    event_strs.append(f"Token: {evt.get('card','?')}")
-                elif etype == "card_revealed":
-                    event_strs.append(f"Revealed: {evt.get('card','?')}")
-                elif etype == "controller_changed":
-                    event_strs.append(f"{evt.get('card','?')} changed controller")
-            if event_strs:
-                lines.append(f"Recent: {'; '.join(event_strs)}")
+        # Recent events and revealed cards
+        lines.extend(self._format_zones_and_events(game_state, local_seat, opp_seat))
 
-        # Revealed cards from opponent
-        revealed = game_state.get("revealed_cards", {})
-        if revealed and opp_seat is not None:
-            opp_revealed = revealed.get(str(opp_seat), revealed.get(opp_seat, []))
-            if opp_revealed:
-                # opp_revealed is a list of grp_ids; try to resolve names from battlefield/graveyard
-                lines.append(f"Opp revealed {len(opp_revealed)} card(s) this game")
-
-        # OPTIMIZATION: Compact hand display
-        hand = game_state.get("hand", [])
-        lines.append("")
-        lines.append(f"HAND:")
-
-        # Pre-compute opponent battlefield subsets for removal target analysis
-        opp_creatures = [
-            c
-            for c in opp_cards
-            if "creature" in c.get("type_line", "").lower()
-            and not self._is_impending(c)
-        ]
-        opp_nonland = [
-            c for c in opp_cards
-            if "land" not in c.get("type_line", "").lower()
-        ]
-        # All creatures on board (both sides) — needed for bounce target checks
-        all_creatures = [
-            c for c in battlefield
-            if c.get("power") is not None
-            and "land" not in c.get("type_line", "").lower()
-        ]
-
-        no_target_card_names = set()
-
-        if hand:
-            import re
-
-            # OPTIMIZATION: Simplified mana checking - just need to know if castable
-            can_play_land = (
-                (lands_played == 0) and is_your_turn and is_main_phase and stack_empty
-            )
-
-            # Disambiguate duplicate card names in hand
-            hand_name_counts = Counter(c.get("name", "Unknown") for c in hand)
-            hand_name_seen = {}
-
-            for card in hand:
-                name = card.get("name", "Unknown")
-                cost = card.get("mana_cost", "")
-                type_line = card.get("type_line", "").lower()
-                oracle_text = card.get("oracle_text", "")
-                oracle_lower = oracle_text.lower()
-
-                # OPTIMIZATION: Simplified timing - just need instant vs sorcery
-                is_instant = "instant" in type_line or "flash" in oracle_lower
-                timing = "I" if is_instant else "S"
-
-                # OPTIMIZATION: Simplified CMC calculation
-                cmc = 0
-                reqs = {"W": 0, "U": 0, "B": 0, "R": 0, "G": 0, "C": 0}
-                if cost:
-                    generic = re.findall(r"\{(\d+)\}", cost)
-                    cmc += sum(int(g) for g in generic)
-                    for color in "WUBRGC":
-                        count = len(re.findall(rf"\{{{color}\}}", cost))
-                        reqs[color] += count
-                        cmc += count
-                    hybrid = re.findall(r"\{[^}]+/[^}]+\}", cost)
-                    cmc += len(hybrid)
-
-                # OPTIMIZATION: Simple castability check
-                # This logic is CORRECT: it checks total_mana (actual count) first, then colors.
-                # For dual lands: Temple of Mystery counts as 1 total_mana, but mana_pool shows
-                # both U:1 and G:1 since it CAN produce either. The color check ensures you can
-                # pay colored requirements, while total_mana >= cmc ensures you have enough sources.
-                castable = ""
-                if "land" in type_line:
-                    castable = "LAND" if can_play_land else "HOLD"
-                elif total_mana >= cmc:
-                    # Color check: verify we can meet colored requirements
-                    # Note: mana_pool[color] counts sources that CAN produce that color
-                    # For dual lands, this may overcount, but we check total_mana first to ensure
-                    # we have enough actual mana sources, then verify color requirements can be met.
-                    color_ok = all(
-                        mana_pool.get(c, 0) + mana_pool.get("Any", 0) >= reqs[c]
-                        for c in "WUBRGC"
-                        if reqs[c] > 0
-                    )
-                    if color_ok:
-                        castable = "OK"
-                    else:
-                        # Missing specific color — show which colors are needed
-                        missing_pips = ""
-                        for c in "WUBRGC":
-                            if reqs[c] > 0:
-                                shortfall = reqs[c] - mana_pool.get(c, 0) - mana_pool.get("Any", 0)
-                                if shortfall > 0:
-                                    missing_pips += f"{{{c}}}" * shortfall
-                        castable = f"NEED:{missing_pips}" if missing_pips else f"NEED:{max(1, cmc - total_mana)}"
-                else:
-                    # Not enough total mana — also show color requirements so
-                    # the LLM knows WHICH colors are needed (e.g. NEED:2+{G}{G}
-                    # means 2 more mana including 2 green specifically)
-                    missing_pips = ""
-                    for c in "WUBRGC":
-                        if reqs[c] > 0:
-                            shortfall = reqs[c] - mana_pool.get(c, 0) - mana_pool.get("Any", 0)
-                            if shortfall > 0:
-                                missing_pips += f"{{{c}}}" * shortfall
-                    generic_short = cmc - total_mana
-                    if missing_pips:
-                        castable = f"NEED:{generic_short}+{missing_pips}"
-                    else:
-                        castable = f"NEED:{generic_short}"
-
-                # OPTIMIZATION: Terse removal analysis - show kill RANGE, not every target
-                removal_info = ""
-                damage_match = re.search(r"deals?\s+(\d+)\s+damage", oracle_lower)
-                minus_match = re.search(r"gets?\s+(-\d+)/(-\d+)", oracle_lower)
-
-                is_destroy_creature = "destroy target creature" in oracle_lower
-                is_exile_creature = "exile target creature" in oracle_lower
-
-                # Enhanced removal detection (includes artifacts/enchantments/permanents)
-                is_destroy_permanent = (
-                    "destroy target permanent" in oracle_lower
-                    or "destroy target nonland permanent" in oracle_lower
-                )
-                is_destroy_art_ench = (
-                    "destroy target artifact" in oracle_lower
-                    or "destroy target enchantment" in oracle_lower
-                    or "naturalize" in oracle_lower
-                )
-                is_exile_permanent = (
-                    "exile target permanent" in oracle_lower
-                    or "exile target nonland permanent" in oracle_lower
-                    or "exile target artifact" in oracle_lower
-                    or "exile target enchantment" in oracle_lower
-                )
-                # Bounce effects (return to hand/top of library)
-                is_bounce_creature = (
-                    "return target creature" in oracle_lower
-                    or ("put target creature" in oracle_lower and "top" in oracle_lower)
-                )
-                is_bounce_permanent = (
-                    "return target nonland permanent" in oracle_lower
-                    or "return target permanent" in oracle_lower
-                )
-
-                if (
-                    damage_match
-                    or minus_match
-                    or is_destroy_creature
-                    or is_exile_creature
-                    or is_destroy_permanent
-                    or is_destroy_art_ench
-                    or is_exile_permanent
-                    or is_bounce_creature
-                    or is_bounce_permanent
-                ):
-                    if is_bounce_creature or is_bounce_permanent:
-                        removal_info = " [RM:bounce]"
-                    elif is_destroy_permanent or is_exile_permanent:
-                        removal_info = " [RM:perm]"
-                    elif is_destroy_art_ench:
-                        removal_info = " [RM:art/ench]"
-                    elif is_destroy_creature or is_exile_creature:
-                        removal_info = " [RM:creat]"
-                    elif damage_match:
-                        dmg = int(damage_match.group(1))
-                        removal_info = f" [RM:<={dmg}T]"
-                    elif minus_match:
-                        tough_reduction = abs(int(minus_match.group(2)))
-                        removal_info = f" [RM:<={tough_reduction}T]"
-
-                    # Target availability check: warn if no valid targets exist
-                    targets_nonland = "nonland" in oracle_lower
-                    targets_creature = is_destroy_creature or is_exile_creature
-                    targets_bounce_creature = is_bounce_creature
-                    targets_bounce_permanent = is_bounce_permanent
-                    targets_art_ench = is_destroy_art_ench
-                    # Check MV restriction (e.g., "mana value 2 or less")
-                    mv_match = re.search(r"mana value (\d+) or less", oracle_lower)
-                    mv_limit = int(mv_match.group(1)) if mv_match else None
-
-                    # Determine the valid target pool
-                    if targets_bounce_creature:
-                        target_pool = all_creatures  # bounce hits ANY creature (either side)
-                    elif targets_bounce_permanent:
-                        # Any nonland permanent on either side
-                        target_pool = [
-                            c for c in battlefield
-                            if "land" not in c.get("type_line", "").lower()
-                        ]
-                    elif targets_creature:
-                        target_pool = opp_creatures
-                    elif targets_nonland or is_destroy_permanent or is_exile_permanent:
-                        target_pool = opp_nonland
-                    elif targets_art_ench:
-                        target_pool = [
-                            c for c in opp_nonland
-                            if any(t in c.get("type_line", "").lower()
-                                   for t in ["artifact", "enchantment"])
-                        ]
-                    else:
-                        target_pool = opp_creatures  # damage/minus targets creatures
-
-                    # Apply MV filter if present
-                    if mv_limit is not None and target_pool:
-                        target_pool = [
-                            c for c in target_pool
-                            if self._get_cmc(c.get("mana_cost", "")) <= mv_limit
-                        ]
-
-                    if not target_pool:
-                        removal_info += " [NO TARGETS]"
-                        no_target_card_names.add(name)
-
-                # OPTIMIZATION: Only show oracle text for non-basic, non-land cards with relevant text
-                is_basic_land = "land" in type_line and (
-                    "basic" in type_line
-                    or name in ["Plains", "Island", "Swamp", "Mountain", "Forest"]
-                )
-                is_aura = "enchantment" in type_line and "aura" in type_line
-                # Always show oracle text for non-basic-land cards (truncated if long).
-                # Hiding oracle entirely causes the LLM to miss critical abilities
-                # (e.g. Mockingbird being a clone, X-cost tutor effects).
-                oracle_stripped = self._remove_reminder_text(oracle_text) if oracle_text else ""
-                show_oracle = bool(oracle_text) and not is_basic_land
-
-                # Type tag for non-creature, non-land cards so LLM knows what it is
-                type_tag = ""
-                if "creature" not in type_line and "land" not in type_line:
-                    if "enchantment" in type_line and "aura" in type_line:
-                        type_tag = " (AURA)"
-                    elif "enchantment" in type_line:
-                        type_tag = " (ENCHANT)"
-                    elif "equipment" in type_line:
-                        type_tag = " (EQUIP)"
-                    elif "artifact" in type_line:
-                        type_tag = " (ART)"
-                    elif "planeswalker" in type_line:
-                        type_tag = " (PW)"
-
-                # Disambiguate duplicate names in hand
-                if hand_name_counts[name] > 1:
-                    hand_name_seen[name] = hand_name_seen.get(name, 0) + 1
-                    display_name = f"{name} #{hand_name_seen[name]}"
-                else:
-                    display_name = name
-
-                # OPTIMIZATION: Compact card display
-                lines.append(
-                    f"  {display_name}{type_tag} {cost} [{timing},{castable}]{removal_info}"
-                )
-                if show_oracle:
-                    # Full oracle text (reminder text already removed above).
-                    # No truncation — game context is a few KB total, well within
-                    # any model's context window. Truncating hides critical abilities.
-                    lines.append(f"    {oracle_stripped}")
-        else:
-            lines.append("  (empty)")
+        # Hand cards
+        hand_lines, no_target_card_names = self._format_hand_cards(
+            game_state, local_seat, total_mana, mana_pool,
+            opp_cards, battlefield, is_my_turn, phase, turn_num, valid_moves
+        )
+        lines.extend(hand_lines)
 
         # Post-filter: Remove [NO TARGETS] cards from the Legal line
-        # so the LLM cannot suggest casting spells with no valid targets.
         if no_target_card_names and valid_moves:
-            filtered_moves = [
-                m for m in valid_moves
-                if not any(f"Cast {nt}" in m for nt in no_target_card_names)
-            ]
+            filtered_moves = [m for m in valid_moves if not any(f"Cast {nt}" in m for nt in no_target_card_names)]
             if filtered_moves != valid_moves:
                 if not filtered_moves:
-                    new_legal = 'NONE — say "pass priority"'
+                    new_legal = 'NONE \u2014 say "pass priority"'
                 else:
                     new_legal = ", ".join(filtered_moves[:8])
                     if len(filtered_moves) > 8:
                         new_legal += f"... (+{len(filtered_moves) - 8})"
                 lines[1] = f"Legal: {new_legal}"
 
-        # OPTIMIZATION: Compact stack display
-        stack = game_state.get("stack", [])
-        if stack:
-            stack_items = []
-            for card in stack:
-                name = card.get("name", "Unknown")
-                owner = "Y" if card.get("owner_seat_id") == local_seat else "O"
-                stack_items.append(f"{owner}:{name}")
-            lines.append(f"Stack: {' > '.join(stack_items)}")
-
-        # Graveyard: show counts AND card names so the LLM knows what died
-        # (prevents counting dead permanents as still on board)
-        graveyard = game_state.get("graveyard", [])
-        if graveyard:
-            your_gy = [c for c in graveyard if c.get("owner_seat_id") == local_seat]
-            opp_gy = [c for c in graveyard if c.get("owner_seat_id") != local_seat]
-            if your_gy or opp_gy:
-                your_names = ", ".join(c.get("name", "?") for c in your_gy[:8])
-                opp_names = ", ".join(c.get("name", "?") for c in opp_gy[:8])
-                gy_parts = []
-                if your_gy:
-                    gy_parts.append(f"Y={len(your_gy)} ({your_names})")
-                if opp_gy:
-                    gy_parts.append(f"O={len(opp_gy)} ({opp_names})")
-                lines.append(f"GY: {' '.join(gy_parts)}")
-
-        # Command zone (Commander/Brawl) — show full card details so
-        # the LLM knows what each commander does and costs to cast.
-        command = game_state.get("command", [])
-        if command:
-            your_cmds = [c for c in command if c.get("owner_seat_id") == local_seat]
-            opp_cmds = [c for c in command if c.get("owner_seat_id") != local_seat]
-            cmd_parts = []
-            for c in your_cmds:
-                name = c.get("name", "Unknown")
-                cost = c.get("mana_cost", "")
-                oracle = c.get("oracle_text", "")
-                oracle_stripped = oracle.replace("\n", " ").strip() if oracle else ""
-                cost_str = f" {cost}" if cost else ""
-                cmd_parts.append(f"  YOUR CMD: {name}{cost_str}")
-                if oracle_stripped:
-                    cmd_parts.append(f"    {oracle_stripped}")
-            for c in opp_cmds:
-                name = c.get("name", "Unknown")
-                cost = c.get("mana_cost", "")
-                oracle = c.get("oracle_text", "")
-                oracle_stripped = oracle.replace("\n", " ").strip() if oracle else ""
-                cost_str = f" {cost}" if cost else ""
-                cmd_parts.append(f"  OPP CMD: {name}{cost_str}")
-                if oracle_stripped:
-                    cmd_parts.append(f"    {oracle_stripped}")
-            lines.append("COMMAND ZONE:")
-            lines.extend(cmd_parts)
-
-        # Library search targets (injected when hand has tutor/search spells)
-        library_summary = game_state.get("library_summary", "")
-        if library_summary:
-            lines.append("")
-            lines.append(library_summary)
-
         return "\n".join(lines)
 
+    # Dead code removed — old _format_game_context body replaced by helper calls above.
     def _extract_card_name_words(self, game_state: dict[str, Any]) -> set[str]:
         """Extract all words from card names in the current game state.
 

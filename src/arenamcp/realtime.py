@@ -18,9 +18,8 @@ import logging
 import os
 import queue
 import threading
-import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import numpy as np
 import sounddevice as sd

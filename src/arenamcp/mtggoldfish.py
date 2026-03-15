@@ -4,7 +4,6 @@ Scrapes metagame breakdowns and deck lists from MTGGoldfish.
 Caches responses for 1 hour.
 """
 
-import json
 import logging
 import time
 from pathlib import Path
@@ -12,6 +11,8 @@ from typing import Any, Optional
 
 import requests
 from bs4 import BeautifulSoup
+
+from arenamcp.cache_utils import FileCache
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ class MTGGoldfishClient:
 
     def __init__(self) -> None:
         """Initialize the client."""
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        self._cache = FileCache(CACHE_DIR, CACHE_DURATION)
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -36,39 +37,13 @@ class MTGGoldfishClient:
             "Accept-Language": "en-US,en;q=0.9",
         }
 
-    def _get_cache_path(self, key: str) -> Path:
-        """Get cache file path for a given key."""
-        safe_key = "".join(
-            c if c.isalnum() or c in ("-", "_") else "_" for c in key
-        )
-        return CACHE_DIR / f"{safe_key}.json"
-
-    def _is_cache_valid(self, cache_path: Path) -> bool:
-        """Check if cached data is still valid."""
-        if not cache_path.exists():
-            return False
-        age = time.time() - cache_path.stat().st_mtime
-        return age < CACHE_DURATION
-
     def _read_cache(self, key: str) -> Optional[dict[str, Any]]:
         """Read data from cache if available and valid."""
-        cache_path = self._get_cache_path(key)
-        if self._is_cache_valid(cache_path):
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.warning(f"Failed to read cache for {key}: {e}")
-        return None
+        return self._cache.read(key)
 
     def _write_cache(self, key: str, data: dict[str, Any]) -> None:
         """Write data to cache."""
-        cache_path = self._get_cache_path(key)
-        try:
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            logger.warning(f"Failed to write cache for {key}: {e}")
+        self._cache.write(key, data)
 
     def get_metagame(
         self, format_name: str, force_refresh: bool = False

@@ -209,7 +209,7 @@ def match_action_to_gre(
     Returns:
         A ``GREActionRef`` if a match is found, otherwise ``None``.
     """
-    from arenamcp.action_planner import ActionType, GameAction  # local import to avoid circular
+    from arenamcp.action_planner import ActionType  # local import to avoid circular
 
     if not raw_actions:
         logger.debug("match_action_to_gre: no raw_actions available")

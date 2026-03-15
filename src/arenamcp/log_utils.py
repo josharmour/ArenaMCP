@@ -130,7 +130,8 @@ def get_seat_mapping():
                                         
                                         logger.info(f"Found Seat Mapping: {mapping}")
                                         return mapping
-                            except:
+                            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                                logger.debug("Failed to parse seat mapping line: %s", exc)
                                 continue
             
     except Exception as e:
