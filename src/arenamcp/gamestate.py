@@ -2023,13 +2023,20 @@ def _handle_actions_available(game_state: GameState, msg: dict) -> bool:
     if raw_actions and game_state.local_seat_id is not None:
         local = game_state.local_seat_id
         action_types = {a.get("actionType", "") for a in raw_actions}
-        has_sorcery_speed = "ActionType_Cast" in action_types or "ActionType_Play" in action_types
+        # Only correct active_player when GRE offers ActionType_Play (land drop).
+        # Land drops are strictly sorcery-speed and main-phase-only, so they
+        # reliably indicate it's our turn.  ActionType_Cast is NOT reliable
+        # because the GRE sends it for instants too (e.g. responding to an
+        # opponent's spell on THEIR turn).  Using Cast here caused bug #49:
+        # the system flipped active_player to local when we only had instant-
+        # speed responses, making the coach suggest sorceries on opp's turn.
+        has_land_play = "ActionType_Play" in action_types
         stack_empty = not game_state.get_objects_in_zone(ZoneType.STACK)
-        if has_sorcery_speed and stack_empty:
+        if has_land_play and stack_empty:
             if game_state.turn_info.active_player != local:
                 logger.warning(
-                    f"Active player correction: GRE gave us sorcery-speed "
-                    f"actions but active_player={game_state.turn_info.active_player} "
+                    f"Active player correction: GRE offered land play "
+                    f"but active_player={game_state.turn_info.active_player} "
                     f"(local={local}). Correcting to {local}."
                 )
                 game_state.turn_info.active_player = local
