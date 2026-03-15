@@ -9,6 +9,13 @@ from arenamcp.scryfall import ScryfallCache, ScryfallCard
 from arenamcp.draftstats import DraftStatsCache, DraftStats
 from arenamcp.draftstate import DraftState, create_draft_handler
 from arenamcp.mtgadb import MTGADatabase, MTGACard
+from arenamcp.card_db import (
+    CardInfo,
+    CardDatabase,
+    FallbackCardDatabase,
+    get_card_database,
+    create_card_database,
+)
 from arenamcp.draft_eval import evaluate_pack, format_pick_recommendation, CardEvaluation
 from arenamcp.server import mcp, start_watching, stop_watching
 # Voice/TTS imports deferred — sounddevice initializes PortAudio on import
@@ -57,7 +64,7 @@ except ImportError:
 
 from arenamcp.gamestate import save_match_state, load_match_state, mark_match_ended
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 
 def create_log_pipeline(
@@ -110,6 +117,11 @@ __all__ = [
     "create_draft_handler",
     "MTGADatabase",
     "MTGACard",
+    "CardInfo",
+    "CardDatabase",
+    "FallbackCardDatabase",
+    "get_card_database",
+    "create_card_database",
     "evaluate_pack",
     "format_pick_recommendation",
     "CardEvaluation",
