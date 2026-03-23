@@ -33,7 +33,7 @@ class EDHRECClient:
         self.edhrec_lib = EDHRec()
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "ArenaMCP/1.0 (Educational MTG AI Project)"
+            "User-Agent": "mtgacoach/1.0 (Educational MTG AI Project)"
         })
 
     def _read_cache(self, key: str) -> Optional[dict[str, Any]]:

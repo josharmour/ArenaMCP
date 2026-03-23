@@ -1,4 +1,4 @@
-"""ArenaMCP diagnostic checker.
+"""mtgacoach diagnostic checker.
 
 Runs a series of checks to verify the installation is healthy and
 reports issues with actionable fix instructions.
@@ -281,7 +281,7 @@ def check_ollama_models() -> bool:
 
 
 def check_log_health() -> bool:
-    """Check for MTGA logging mode issues that break ArenaMCP assumptions.
+    """Check for MTGA logging mode issues that break mtgacoach assumptions.
 
     Detects:
     - Log file not growing while MTGA may be running (nolog mode)
@@ -309,7 +309,7 @@ def check_log_health() -> bool:
                 )
                 _fix(
                     "If MTGA uses -logfile, set MTGA_LOG_PATH to match.\n"
-                    "If MTGA uses -nolog, ArenaMCP cannot track games.\n"
+                    "If MTGA uses -nolog, mtgacoach cannot track games.\n"
                     "If MTGA uses -appendlog, resume after restart may be less reliable."
                 )
         except (OSError, ValueError):
@@ -358,14 +358,14 @@ def check_log_health() -> bool:
 
 
 def check_log_file() -> bool:
-    """Check the ArenaMCP log file for recent errors."""
+    """Check the mtgacoach log file for recent errors."""
     log_file = Path.home() / ".arenamcp" / "standalone.log"
     if not log_file.exists():
-        _check("ArenaMCP log", INFO, "No log yet (first run?)")
+        _check("mtgacoach log", INFO, "No log yet (first run?)")
         return True
 
     size_mb = log_file.stat().st_size / (1024 * 1024)
-    _check(f"ArenaMCP log ({size_mb:.1f} MB)", PASS, str(log_file))
+    _check(f"mtgacoach log ({size_mb:.1f} MB)", PASS, str(log_file))
 
     # Scan last 50 lines for errors
     try:
@@ -400,7 +400,7 @@ def check_network() -> bool:
         req = urllib.request.Request(
             "https://api.scryfall.com/sets",
             headers={
-                "User-Agent": "ArenaMCP-Diagnostics/1.0",
+                "User-Agent": "mtgacoach-Diagnostics/1.0",
                 "Accept": "application/json",
             },
         )
@@ -448,7 +448,7 @@ def check_disk_space() -> bool:
 def run_diagnostics() -> int:
     """Run all diagnostic checks. Returns 0 if healthy, 1 if issues found."""
     print(f"{'═' * _W}")
-    print(f"  ArenaMCP Diagnostics")
+    print(f"  mtgacoach Diagnostics")
     print(f"  {platform.system()} {platform.release()} | Python {sys.version.split()[0]}")
     print(f"{'═' * _W}")
 
@@ -494,7 +494,7 @@ def run_diagnostics() -> int:
     # Summary
     print(f"\n{'═' * _W}")
     if issues == 0:
-        print("  RESULT: All checks passed! ArenaMCP should work correctly.")
+        print("  RESULT: All checks passed! mtgacoach should work correctly.")
     else:
         print(f"  RESULT: {issues} issue(s) found. See [FAIL] items above.")
     print(f"{'═' * _W}")

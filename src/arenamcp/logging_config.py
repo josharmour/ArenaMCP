@@ -1,4 +1,4 @@
-"""Centralized logging configuration for ArenaMCP.
+"""Centralized logging configuration for mtgacoach.
 
 All entry points (standalone.py, server.py, etc.) should call
 ``configure_logging()`` once at startup to ensure a consistent format

@@ -2,7 +2,7 @@
 
 Suggests deck configurations based on GIHWR (Games In Hand Win Rate)
 and archetype constraints (Aggro/Midrange/Control).
-Adapted from Voice Assistant's DeckBuilderV2 to use ArenaMCP data sources.
+Adapted from Voice Assistant's DeckBuilderV2 to use mtgacoach data sources.
 """
 
 import logging
@@ -44,7 +44,7 @@ class DeckSuggestion:
 class DeckBuilderV2:
     """Builds deck suggestions from a draft pool using 17lands data.
 
-    Uses ArenaMCP's DraftStatsCache for GIHWR and enrich_with_oracle_text
+    Uses mtgacoach's DraftStatsCache for GIHWR and enrich_with_oracle_text
     for card metadata, replacing the Voice Assistant's SQLite approach.
     """
 

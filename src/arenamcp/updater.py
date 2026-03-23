@@ -1,4 +1,4 @@
-"""Auto-update helpers for ArenaMCP.
+"""Auto-update helpers for mtgacoach.
 
 Uses git ls-remote + git pull so there is no GitHub API dependency and
 no authentication / rate-limit concern.

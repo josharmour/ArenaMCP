@@ -1,4 +1,4 @@
-"""Convert Arena replay files to ArenaMCP match recording format.
+"""Convert Arena replay files to mtgacoach match recording format.
 
 This allows us to use Arena's native .rply recordings as test data
 for advisor validation and tuning.
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class ReplayConverter:
-    """Converts Arena .rply files to ArenaMCP MatchRecording format."""
+    """Converts Arena .rply files to mtgacoach MatchRecording format."""
     
     def __init__(self, card_db=None):
         """Initialize converter.
@@ -163,7 +163,7 @@ class ReplayConverter:
 
 
 def convert_replay_file(replay_path: Path, output_dir: Optional[Path] = None) -> Optional[Path]:
-    """Convert an Arena replay file to ArenaMCP format.
+    """Convert an Arena replay file to mtgacoach format.
     
     Args:
         replay_path: Path to .rply file

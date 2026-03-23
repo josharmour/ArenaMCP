@@ -136,7 +136,7 @@ class SingleInstanceGuard:
 
 def notify_already_running(owner: str | None = None) -> None:
     """Show a visible warning when a second launcher is started."""
-    message = "ArenaMCP is already running."
+    message = "mtgacoach is already running."
     if owner:
         message += f"\n\nExisting launcher: {owner}"
     message += "\n\nClose the existing window first."
@@ -144,7 +144,7 @@ def notify_already_running(owner: str | None = None) -> None:
     print(message)
     if os.name == "nt":
         try:
-            ctypes.windll.user32.MessageBoxW(None, message, "ArenaMCP", 0x30)
+            ctypes.windll.user32.MessageBoxW(None, message, "mtgacoach", 0x30)
         except Exception:
             pass
 

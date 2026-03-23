@@ -642,8 +642,8 @@ class ArenaApp(App):
         self.game_state_widget = self.query_one("#game-state-display", GameStateDisplay)
 
         from arenamcp import __version__
-        self.title = f"ArenaMCP v{__version__}"
-        self.write_log(f"[bold]ArenaMCP v{__version__}[/]")
+        self.title = f"mtgacoach v{__version__}"
+        self.write_log(f"[bold]mtgacoach v{__version__}[/]")
 
         # Check for updates in background (non-blocking)
         threading.Thread(target=self._check_for_update, daemon=True).start()
@@ -1568,7 +1568,7 @@ class ArenaApp(App):
                 gist_url = None
                 gist_result = subprocess.run(
                     [gh_bin, "gist", "create", "--public", "--desc",
-                     f"ArenaMCP Bug Report {timestamp}", str(report_path)],
+                     f"mtgacoach Bug Report {timestamp}", str(report_path)],
                     capture_output=True, text=True, timeout=30,
                 )
                 if gist_result.returncode == 0:
@@ -1845,7 +1845,7 @@ def _set_console_icon():
         # --- 1. Set unique AppUserModelID to ungroup from terminal ---
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "ArenaMCP.Coach.TUI"
+                "mtgacoach.Coach.TUI"
             )
         except Exception:
             pass

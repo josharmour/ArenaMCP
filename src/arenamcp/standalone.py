@@ -2943,7 +2943,7 @@ class StandaloneCoach:
         lines.append("in the trigger/GRE message mapping.")
         lines.append("")
         lines.append("---")
-        lines.append("*Auto-filed by ArenaMCP vision watchdog*")
+        lines.append("*Auto-filed by mtgacoach vision watchdog*")
 
         body = "\n".join(lines)
 
@@ -3822,7 +3822,7 @@ class StandaloneCoach:
                 afk = " AFK" if self._autopilot_afk else ""
                 self.ui.log(f"MTGA AUTOPILOT ({mode}{afk})")
             else:
-                self.ui.log("MTGA STANDALONE COACH")
+                self.ui.log("MTGA COACH")
             self.ui.log("="*50)
             self.ui.status("BACKEND", f"{self.backend_name} ({actual_model or 'default'})")
             self.ui.status("VOICE", f"PTT (F4) + Kokoro")
