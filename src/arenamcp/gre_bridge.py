@@ -362,6 +362,56 @@ class GREBridge:
             return None
 
     # -------------------------------------------------------------------
+    # Phase 3: Replay recording commands
+    # -------------------------------------------------------------------
+
+    def enable_replay(self, replay_name: str = "mtgacoach") -> Optional[dict[str, Any]]:
+        """Enable MTGA's built-in replay recording.
+
+        Replays are saved as .rply files (line-delimited JSON with timestamps).
+        """
+        try:
+            cmd = {"action": "enable_replay", "replay_name": replay_name}
+            resp = self._send_safe(cmd)
+            if resp.get("ok"):
+                logger.info(f"Replay recording enabled: {resp.get('replay_folder')}")
+                return resp
+            else:
+                logger.warning(f"enable_replay failed: {resp.get('error')}")
+                return None
+        except GREBridgeError as e:
+            logger.debug(f"enable_replay error: {e}")
+            return None
+
+    def disable_replay(self) -> bool:
+        """Disable replay recording."""
+        try:
+            resp = self._send_safe({"action": "disable_replay"})
+            return resp.get("ok", False)
+        except GREBridgeError:
+            return False
+
+    def get_replay_status(self) -> Optional[dict[str, Any]]:
+        """Check if replay recording is active and get current status."""
+        try:
+            resp = self._send_safe({"action": "get_replay_status"})
+            if resp.get("ok"):
+                return resp
+            return None
+        except GREBridgeError:
+            return None
+
+    def list_replays(self) -> Optional[dict[str, Any]]:
+        """List available replay files (most recent first, max 50)."""
+        try:
+            resp = self._send_safe({"action": "list_replays"})
+            if resp.get("ok"):
+                return resp
+            return None
+        except GREBridgeError:
+            return None
+
+    # -------------------------------------------------------------------
     # Matching logic
     # -------------------------------------------------------------------
 

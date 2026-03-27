@@ -52,6 +52,23 @@ Plugin version bumped to 0.2.0. Changes to `Plugin.cs` and `gre_bridge.py`:
 - **Python client** (`gre_bridge.py`) — Added get_game_state(), get_timer_state(),
   get_match_info() methods
 
+### Phase 3 Status: COMPLETE (2026-03-26)
+
+Replay recording and match history system implemented. Plugin version 0.3.0.
+
+- **Plugin commands**: `enable_replay`, `disable_replay`, `get_replay_status`, `list_replays`
+  — toggles MTGA's built-in TimedReplayRecorder via PlayerPrefs, lists .rply files
+- **Python bridge** (`gre_bridge.py`) — enable_replay(), disable_replay(),
+  get_replay_status(), list_replays() methods
+- **Match history module** (`match_history.py`) — JSON-backed persistent history:
+  - `MatchRecord` dataclass: match_id, result, opponent name/rank/colors, turns,
+    life totals, deck colors, replay path
+  - `MatchHistory` class: add records, query win rates, matchup stats, session stats
+  - `parse_replay_cosmetics()` — extract player names/ranks from .rply header
+  - `parse_replay_result()` — scan replay for win/loss annotations
+  - `record_from_game_end()` — create record from game end snapshot + opponent cards
+  - Deduplication by match_id, 500-record cap, stored at ~/.arenamcp/match_history/
+
 ---
 
 ## Phase 1: Parse Missing GRE Data (Low Effort, High Impact)
@@ -475,8 +492,8 @@ annotations and zone transfers). Expose as `recent_actions` in game state.
 | 10 | 2.2 Plugin: rich interaction detail | 2 days | High | BepInEx rebuild | **DONE** (2026-03-26) |
 | 11 | 2.1 Plugin: get_game_state from GameManager | 3-5 days | **Transformative** | BepInEx rebuild, reflection exploration | **DONE** (2026-03-26) |
 | 12 | 2.4-2.5 Plugin: timer + match info | 1 day | Medium | BepInEx rebuild | **DONE** (2026-03-26) |
-| 13 | 3.1 Hook replay recorder | 2-3 days | High | BepInEx, replay format RE | Pending |
-| 14 | 3.2 Match history database | 2 days | High | 3.1 | Pending |
+| 13 | 3.1 Hook replay recorder | 2-3 days | High | BepInEx, replay format RE | **DONE** (2026-03-26) |
+| 14 | 3.2 Match history database | 2 days | High | 3.1 | **DONE** (2026-03-26) |
 | 15 | 4.2 Advisability flags | 0.5 day | Medium | None (from log) | Pending |
 | 16 | 4.1 GRE prediction engine | 3-5 days | **Transformative** | BepInEx, protocol RE |
 | 17 | 5.1-5.4 Social/tournament/draft | Weeks | Future | All above |

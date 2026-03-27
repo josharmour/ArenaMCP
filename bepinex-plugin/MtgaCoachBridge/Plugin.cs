@@ -217,6 +217,22 @@ namespace MtgaCoachBridge
                     HandleGetMatchInfo(cmd);
                     break;
 
+                case "enable_replay":
+                    HandleEnableReplay(cmd);
+                    break;
+
+                case "disable_replay":
+                    HandleDisableReplay(cmd);
+                    break;
+
+                case "get_replay_status":
+                    HandleGetReplayStatus(cmd);
+                    break;
+
+                case "list_replays":
+                    HandleListReplays(cmd);
+                    break;
+
                 default:
                     cmd.SetResponse(new JObject
                     {
@@ -1066,6 +1082,156 @@ namespace MtgaCoachBridge
 
             return obj;
         }
+
+        // -------------------------------------------------------------------
+        // Phase 3: Replay recording commands
+        // -------------------------------------------------------------------
+
+        private void HandleEnableReplay(PipeCommand cmd)
+        {
+            try
+            {
+                // Set the PlayerPrefs flag that TimedReplayRecorder checks
+                PlayerPrefs.SetInt("SaveDSReplay", 1);
+                PlayerPrefs.Save();
+
+                // Set replay name prefix if provided
+                string prefix = cmd.Json.Value<string>("replay_name");
+                if (!string.IsNullOrEmpty(prefix))
+                {
+                    PlayerPrefs.SetString("ReplayName", prefix);
+                    PlayerPrefs.Save();
+                }
+
+                _log.LogInfo($"Replay recording enabled (prefix: {prefix ?? "default"})");
+                cmd.SetResponse(new JObject
+                {
+                    ["ok"] = true,
+                    ["enabled"] = true,
+                    ["replay_folder"] = GetReplayFolder(),
+                });
+            }
+            catch (Exception ex)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = ex.Message });
+            }
+        }
+
+        private void HandleDisableReplay(PipeCommand cmd)
+        {
+            try
+            {
+                PlayerPrefs.SetInt("SaveDSReplay", 0);
+                PlayerPrefs.Save();
+                _log.LogInfo("Replay recording disabled");
+                cmd.SetResponse(new JObject { ["ok"] = true, ["enabled"] = false });
+            }
+            catch (Exception ex)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = ex.Message });
+            }
+        }
+
+        private void HandleGetReplayStatus(PipeCommand cmd)
+        {
+            try
+            {
+                bool enabled = PlayerPrefs.GetInt("SaveDSReplay", 0) == 1;
+                string replayName = PlayerPrefs.GetString("ReplayName", "");
+                string folder = GetReplayFolder();
+
+                var resp = new JObject
+                {
+                    ["ok"] = true,
+                    ["recording_enabled"] = enabled,
+                    ["replay_name"] = replayName,
+                    ["replay_folder"] = folder,
+                };
+
+                // Count existing replays
+                try
+                {
+                    if (System.IO.Directory.Exists(folder))
+                    {
+                        var files = System.IO.Directory.GetFiles(folder, "*.rply");
+                        resp["replay_count"] = files.Length;
+                        if (files.Length > 0)
+                        {
+                            // Most recent replay
+                            Array.Sort(files);
+                            resp["latest_replay"] = System.IO.Path.GetFileName(files[files.Length - 1]);
+                        }
+                    }
+                }
+                catch { }
+
+                cmd.SetResponse(resp);
+            }
+            catch (Exception ex)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = ex.Message });
+            }
+        }
+
+        private void HandleListReplays(PipeCommand cmd)
+        {
+            try
+            {
+                string folder = GetReplayFolder();
+                var resp = new JObject
+                {
+                    ["ok"] = true,
+                    ["replay_folder"] = folder,
+                };
+
+                if (System.IO.Directory.Exists(folder))
+                {
+                    var files = System.IO.Directory.GetFiles(folder, "*.rply");
+                    Array.Sort(files);
+                    var replays = new JArray();
+                    // Return most recent first, limit to 50
+                    int start = Math.Max(0, files.Length - 50);
+                    for (int i = files.Length - 1; i >= start; i--)
+                    {
+                        var fi = new System.IO.FileInfo(files[i]);
+                        replays.Add(new JObject
+                        {
+                            ["filename"] = fi.Name,
+                            ["path"] = fi.FullName,
+                            ["size_bytes"] = fi.Length,
+                            ["created"] = fi.CreationTime.ToString("o"),
+                            ["modified"] = fi.LastWriteTime.ToString("o"),
+                        });
+                    }
+                    resp["replays"] = replays;
+                    resp["total_count"] = files.Length;
+                }
+                else
+                {
+                    resp["replays"] = new JArray();
+                    resp["total_count"] = 0;
+                }
+
+                cmd.SetResponse(resp);
+            }
+            catch (Exception ex)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = ex.Message });
+            }
+        }
+
+        private static string GetReplayFolder()
+        {
+            // Desktop: Application.streamingAssetsPath + "/Tests"
+            // This matches ReplayUtilities.GetReplayFolder()
+            string folder = System.IO.Path.Combine(Application.streamingAssetsPath, "Tests");
+            if (!System.IO.Directory.Exists(folder))
+            {
+                // Fallback: persistent data path
+                folder = System.IO.Path.Combine(Application.persistentDataPath, "Replays");
+            }
+            return folder;
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1106,6 +1272,6 @@ namespace MtgaCoachBridge
     {
         public const string GUID = "com.mtgacoach.grebridge";
         public const string Name = "MtgaCoach GRE Bridge";
-        public const string Version = "0.2.0";
+        public const string Version = "0.3.0";
     }
 }
