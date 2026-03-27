@@ -2507,6 +2507,9 @@ class StandaloneCoach:
 
             # Uptime
             "uptime_seconds": (datetime.now() - self._start_time).total_seconds() if hasattr(self, '_start_time') else None,
+
+            # BepInEx plugin log (for bridge debugging)
+            "bepinex_log": self._read_bepinex_log(),
         }
 
         return report
@@ -2568,6 +2571,26 @@ class StandaloneCoach:
         except Exception as e:
             result["error"] = str(e)
         return result
+
+    def _read_bepinex_log(self) -> Optional[str]:
+        """Read BepInEx plugin log for bridge debugging."""
+        try:
+            import os
+            # Standard MTGA install path
+            candidates = [
+                Path(os.environ.get("PROGRAMFILES", "C:\\Program Files"))
+                / "Wizards of the Coast" / "MTGA" / "BepInEx" / "LogOutput.log",
+            ]
+            for p in candidates:
+                if p.exists():
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                    # Return last 4KB to keep report size reasonable
+                    if len(text) > 4096:
+                        return "...(truncated)...\n" + text[-4096:]
+                    return text
+        except Exception as e:
+            return f"Error reading BepInEx log: {e}"
+        return None
 
     def _get_match_context(self) -> dict:
         """Get match-level context: match ID, opponent cards, recent events."""
