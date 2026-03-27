@@ -80,6 +80,8 @@ class GREBridge:
             # Default restype is c_int (32-bit) but HANDLE is pointer-sized (64-bit).
             # Without this, INVALID_HANDLE_VALUE comparison always fails on Win64.
             kernel32.CreateFileW.restype = ctypes.wintypes.HANDLE
+            # use_last_error=True copies GetLastError() before Python can clobber it
+            kernel32.CreateFileW.use_last_error = True
 
             handle = kernel32.CreateFileW(
                 PIPE_NAME,
@@ -93,7 +95,17 @@ class GREBridge:
 
             if handle == INVALID_HANDLE_VALUE:
                 err = ctypes.get_last_error()
-                logger.info(f"GRE bridge pipe not available (error {err})")
+                # 2 = ERROR_FILE_NOT_FOUND (pipe doesn't exist / plugin not loaded)
+                # 231 = ERROR_PIPE_BUSY (another client has the pipe)
+                if err == 231:
+                    logger.warning(
+                        "GRE bridge pipe busy — another process holds the connection. "
+                        "Kill stale python processes or restart MTGA."
+                    )
+                elif err == 2:
+                    logger.info("GRE bridge pipe not found (BepInEx plugin not loaded?)")
+                else:
+                    logger.info(f"GRE bridge pipe not available (error {err})")
                 return False
 
             # Wrap the raw handle in a Python file object

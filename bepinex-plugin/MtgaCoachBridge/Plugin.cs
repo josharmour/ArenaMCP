@@ -82,10 +82,12 @@ namespace MtgaCoachBridge
                 NamedPipeServerStream pipe = null;
                 try
                 {
+                    // Allow 2 server instances so a new client can connect even if
+                    // a stale client from a previous session is still lingering.
                     pipe = new NamedPipeServerStream(
                         "mtgacoach_gre",
                         PipeDirection.InOut,
-                        1,
+                        2,
                         PipeTransmissionMode.Byte,
                         PipeOptions.Asynchronous
                     );
@@ -113,6 +115,11 @@ namespace MtgaCoachBridge
 
         private void HandleClient(NamedPipeServerStream pipe)
         {
+            // Set read timeout so we detect dead clients within 30s instead of
+            // blocking forever on ReadLine(). A healthy client sends pings or
+            // commands regularly; a stale process goes silent.
+            pipe.ReadTimeout = 30000;
+
             using var reader = new StreamReader(pipe, Encoding.UTF8, false, 4096, leaveOpen: true);
             using var writer = new StreamWriter(pipe, Encoding.UTF8, 4096, leaveOpen: true)
             {
@@ -125,6 +132,12 @@ namespace MtgaCoachBridge
                 try
                 {
                     line = reader.ReadLine();
+                }
+                catch (TimeoutException)
+                {
+                    // Client hasn't sent anything in 30s — check if still alive
+                    if (!pipe.IsConnected) break;
+                    continue;
                 }
                 catch
                 {
