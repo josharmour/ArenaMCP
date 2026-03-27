@@ -85,60 +85,22 @@ namespace MtgaCoachBridge
                 NamedPipeServerStream pipe = null;
                 try
                 {
-                    // Allow multiple server instances so we can immediately loop
-                    // back to accept the next client while handling the current one.
-                    // This prevents stale/mystery clients from blocking new connections.
-                    // Use explicit count (not MaxAllowedServerInstances which is -1 and
-                    // may not be supported by Unity's Mono runtime).
+                    // Single-instance pipe with a unique name that MTGA won't probe.
+                    // Previous name "mtgacoach_gre" was grabbed by a mystery client
+                    // (likely MTGA itself) on every launch.
                     pipe = new NamedPipeServerStream(
-                        "mtgacoach_gre",
+                        "mtgacoach_bridge_v1",
                         PipeDirection.InOut,
-                        4,
+                        1,
                         PipeTransmissionMode.Byte,
                         PipeOptions.None
                     );
 
-                    _log.LogInfo("Pipe server waiting for connection on \\\\.\\pipe\\mtgacoach_gre");
+                    _log.LogInfo("Pipe server waiting for connection on \\\\.\\pipe\\mtgacoach_bridge_v1");
                     pipe.WaitForConnection();
                     _log.LogInfo("Pipe client connected");
 
-                    // Check if client is actually alive before spawning handler.
-                    // MTGA or other processes may probe the pipe and disconnect
-                    // immediately, leaving a broken pipe. Handle inline to avoid
-                    // wasting a thread and blocking the accept loop.
-                    if (!pipe.IsConnected)
-                    {
-                        _log.LogInfo("Pipe client already disconnected (probe), recycling");
-                        pipe.Dispose();
-                        pipe = null;
-                        continue;
-                    }
-
-                    // Handle client on a separate thread so this loop can
-                    // immediately accept the next connection.
-                    var clientPipe = pipe;
-                    pipe = null; // prevent finally from disposing
-                    var clientThread = new Thread(() =>
-                    {
-                        try
-                        {
-                            HandleClient(clientPipe);
-                        }
-                        catch (Exception ex)
-                        {
-                            _log.LogWarning($"Client handler error: {ex.Message}");
-                        }
-                        finally
-                        {
-                            try { clientPipe.Dispose(); } catch { }
-                            _log.LogInfo("Pipe client disconnected and cleaned up");
-                        }
-                    })
-                    {
-                        IsBackground = true,
-                        Name = "MtgaCoachBridge-Client"
-                    };
-                    clientThread.Start();
+                    HandleClient(pipe);
                 }
                 catch (Exception ex)
                 {

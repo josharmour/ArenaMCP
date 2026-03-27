@@ -23,7 +23,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 # Named pipe path (Windows named pipe)
-PIPE_NAME = r"\\.\pipe\mtgacoach_gre"
+PIPE_NAME = r"\\.\pipe\mtgacoach_bridge_v1"
 PIPE_TIMEOUT_MS = 3000
 COMMAND_TIMEOUT = 5.0
 
