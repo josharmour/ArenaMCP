@@ -1556,6 +1556,17 @@ class StandaloneCoach:
                             # No change, but still enrich snapshot with latest bridge data
                             self._bridge_poller.enrich_snapshot(curr_state)
 
+                        # Update bridge status in UI (only on change)
+                        _bridge_now = self._bridge_poller.connected
+                        if not hasattr(self, '_last_bridge_ui_status'):
+                            self._last_bridge_ui_status = None
+                        if _bridge_now != self._last_bridge_ui_status:
+                            self._last_bridge_ui_status = _bridge_now
+                            if _bridge_now:
+                                self.ui.status("BRIDGE", "Connected")
+                            else:
+                                self.ui.status("BRIDGE", "Disconnected")
+
                     triggers = self._trigger.check_triggers(prev_state, curr_state)
 
                     # Bridge-detected decision takes priority over log-based detection

@@ -451,6 +451,7 @@ class TopBar(Vertical):
             yield Static("Voice: Initializing...", id="status-voice", classes="status-line")
             yield Static("Backend: Starting...", id="status-backend", classes="status-line")
             yield Static("Model: Default", id="status-model", classes="status-line")
+            yield Static("GRE: --", id="status-bridge", classes="status-line")
             yield Static("", id="status-log-health", classes="status-line")
 
         with Horizontal(id="actions-panel"):
@@ -954,6 +955,16 @@ class ArenaApp(App):
             self.query_one("#status-seat", Static).update(f"Seat: {value}")
         elif key == "BACKEND":
             self.query_one("#status-backend", Static).update(f"Backend: {value}")
+        elif key == "BRIDGE" or key == "GRE":
+            widget = self.query_one("#status-bridge", Static)
+            if value and "connect" in value.lower():
+                widget.update(f"[bold green]GRE: {value}[/]")
+            elif value and ("fail" in value.lower() or "off" in value.lower() or "disconnect" in value.lower()):
+                widget.update(f"[bold red]GRE: {value}[/]")
+            elif value:
+                widget.update(f"GRE: {value}")
+            else:
+                widget.update("GRE: --")
         elif key == "LOG":
             widget = self.query_one("#status-log-health", Static)
             if value:
