@@ -88,7 +88,7 @@ namespace MtgaCoachBridge
                     pipe = new NamedPipeServerStream(
                         "mtgacoach_bridge_v1",
                         PipeDirection.InOut,
-                        1,
+                        2,
                         PipeTransmissionMode.Byte,
                         PipeOptions.None
                     );
@@ -122,11 +122,12 @@ namespace MtgaCoachBridge
                     }
 
                     HandleClient(pipe, gotData);
+                    _log.LogInfo($"HandleClient returned, loop continuing (iteration {iteration})");
                 }
                 catch (Exception ex)
                 {
                     if (_running)
-                        _log.LogWarning($"Pipe server loop error: {ex.GetType().Name}: {ex.Message}");
+                        _log.LogWarning($"Pipe server loop error (iteration {iteration}): {ex.GetType().Name}: {ex.Message}");
                 }
                 finally
                 {
