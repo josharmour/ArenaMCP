@@ -358,7 +358,7 @@ namespace MtgaCoachBridge
             {
                 ["ok"] = true,
                 ["has_pending"] = true,
-                ["request_type"] = request.TimerType.ToString(),
+                ["request_type"] = request.Type.ToString(),
                 ["can_cancel"] = request.CanCancel,
                 ["allow_undo"] = request.AllowUndo
             };
