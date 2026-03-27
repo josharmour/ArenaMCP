@@ -74,14 +74,15 @@ class GREBridge:
             OPEN_EXISTING = 3
             INVALID_HANDLE_VALUE = ctypes.wintypes.HANDLE(-1).value
 
-            kernel32 = ctypes.windll.kernel32
+            # Use WinDLL with use_last_error=True so ctypes captures
+            # GetLastError() immediately after each call (before Python
+            # or other threads can clobber it). ctypes.windll doesn't
+            # support use_last_error reliably.
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
 
             # Set correct restype so handle comparison works on 64-bit Windows.
             # Default restype is c_int (32-bit) but HANDLE is pointer-sized (64-bit).
-            # Without this, INVALID_HANDLE_VALUE comparison always fails on Win64.
             kernel32.CreateFileW.restype = ctypes.wintypes.HANDLE
-            # use_last_error=True copies GetLastError() before Python can clobber it
-            kernel32.CreateFileW.use_last_error = True
 
             handle = kernel32.CreateFileW(
                 PIPE_NAME,
