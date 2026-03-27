@@ -1285,8 +1285,11 @@ class GameState:
 
         # Object Instance IDs
         # Critical: If missing, must preserve existing list to avoid wiping zone
+        # GRE protobuf may send a single int instead of a list for single-element zones
         if "objectInstanceIds" in zone_data:
             object_instance_ids = zone_data["objectInstanceIds"]
+            if isinstance(object_instance_ids, int):
+                object_instance_ids = [object_instance_ids]
         elif existing_zone:
             object_instance_ids = existing_zone.object_instance_ids
         else:
@@ -1539,8 +1542,12 @@ class GameState:
                         if target_id == seat_id:
                             self.damage_taken[seat_id] = self.damage_taken.get(seat_id, 0) + damage_amount
                     # Resolve source card name for event log
+                    # sourceId=0 means the detail didn't include the source —
+                    # fall back to affected_ids (the objects involved in the damage)
+                    if not source_id and affected_ids:
+                        source_id = affected_ids[0]
                     source_obj = self.game_objects.get(source_id)
-                    source_name = self._resolve_card_name(source_obj.grp_id) if source_obj else f"#{source_id}"
+                    source_name = self._resolve_card_name(source_obj.grp_id) if source_obj else (f"#{source_id}" if source_id else "unknown")
                     self._add_event({
                         "type": "damage_dealt",
                         "source": source_name,
