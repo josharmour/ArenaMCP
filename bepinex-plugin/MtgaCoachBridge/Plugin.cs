@@ -85,21 +85,40 @@ namespace MtgaCoachBridge
                 NamedPipeServerStream pipe = null;
                 try
                 {
-                    // Async mode so we can use BeginRead with timeout to detect
-                    // mystery clients that connect but never send data.
                     pipe = new NamedPipeServerStream(
                         "mtgacoach_bridge_v1",
                         PipeDirection.InOut,
                         1,
                         PipeTransmissionMode.Byte,
-                        PipeOptions.Asynchronous
+                        PipeOptions.None
                     );
 
                     _log.LogInfo("Pipe server waiting for connection on \\\\.\\pipe\\mtgacoach_bridge_v1");
                     pipe.WaitForConnection();
                     _log.LogInfo("Pipe client connected");
 
-                    HandleClient(pipe);
+                    // Use a watchdog thread to kill the pipe if no data arrives
+                    // within 200ms. This detects mystery clients (likely MTGA
+                    // internals) that connect but never send data.
+                    // Unity Mono's async pipe I/O doesn't work reliably.
+                    var watchdogPipe = pipe;
+                    var gotData = new int[] { 0 }; // shared flag: 0=no data, 1=got data
+                    var watchdog = new Thread(() =>
+                    {
+                        Thread.Sleep(200);
+                        if (gotData[0] == 0)
+                        {
+                            _log.LogInfo("Watchdog: no data in 200ms, disconnecting mystery client");
+                            try { watchdogPipe.Dispose(); } catch { }
+                        }
+                    })
+                    {
+                        IsBackground = true,
+                        Name = "MtgaCoachBridge-Watchdog"
+                    };
+                    watchdog.Start();
+
+                    HandleClient(pipe, gotData);
                 }
                 catch (Exception ex)
                 {
@@ -116,27 +135,20 @@ namespace MtgaCoachBridge
             }
         }
 
-        private void HandleClient(NamedPipeServerStream pipe)
+        private void HandleClient(NamedPipeServerStream pipe, int[] gotDataFlag = null)
         {
-            // Read with a timeout: accumulate bytes until newline or timeout.
-            // Named pipes don't support ReadTimeout, so we use async BeginRead
-            // with a deadline. First read uses 500ms to quickly detect mystery
-            // clients that connect but never send data. Subsequent reads use
-            // 30s since a real client may be idle between commands.
-            var buf = new byte[4096];
-            var lineBuffer = new System.IO.MemoryStream();
-            var writer = new StreamWriter(pipe, Encoding.UTF8, 4096, leaveOpen: true)
+            using var reader = new StreamReader(pipe, Encoding.UTF8, false, 4096, leaveOpen: true);
+            using var writer = new StreamWriter(pipe, Encoding.UTF8, 4096, leaveOpen: true)
             {
                 AutoFlush = true
             };
-            int readTimeoutMs = 200; // Short first-read timeout to detect mystery clients
 
             while (_running && pipe.IsConnected)
             {
                 string line;
                 try
                 {
-                    line = ReadLineWithTimeout(pipe, lineBuffer, buf, readTimeoutMs);
+                    line = reader.ReadLine();
                 }
                 catch
                 {
@@ -150,8 +162,9 @@ namespace MtgaCoachBridge
                 if (string.IsNullOrEmpty(line))
                     continue;
 
-                // First real data received — switch to long timeout for subsequent reads
-                readTimeoutMs = 30000;
+                // Signal watchdog that we got real data — cancel the kill timer
+                if (gotDataFlag != null)
+                    gotDataFlag[0] = 1;
 
                 try
                 {
@@ -175,65 +188,6 @@ namespace MtgaCoachBridge
 
             _log.LogInfo("Pipe client disconnected");
             writer.Dispose();
-        }
-
-        /// <summary>
-        /// Read a newline-terminated string from an async pipe with a timeout.
-        /// Returns null on disconnect/timeout, the line (without newline) on success.
-        /// </summary>
-        private static string ReadLineWithTimeout(
-            NamedPipeServerStream pipe,
-            System.IO.MemoryStream lineBuffer,
-            byte[] buf,
-            int timeoutMs)
-        {
-            lineBuffer.SetLength(0);
-            var deadline = Environment.TickCount + timeoutMs;
-
-            while (true)
-            {
-                var ar = pipe.BeginRead(buf, 0, buf.Length, null, null);
-
-                // Wait for data or timeout
-                int remaining = deadline - Environment.TickCount;
-                if (remaining <= 0 || !ar.AsyncWaitHandle.WaitOne(Math.Max(remaining, 0)))
-                {
-                    // Timeout — no data received within deadline
-                    // Cancel the pending read by closing, caller will catch the exception
-                    return null;
-                }
-
-                int bytesRead;
-                try
-                {
-                    bytesRead = pipe.EndRead(ar);
-                }
-                catch
-                {
-                    return null;
-                }
-
-                if (bytesRead == 0)
-                    return null; // Pipe closed
-
-                // Scan for newline
-                for (int i = 0; i < bytesRead; i++)
-                {
-                    if (buf[i] == (byte)'\n')
-                    {
-                        lineBuffer.Write(buf, 0, i);
-                        var result = Encoding.UTF8.GetString(lineBuffer.ToArray());
-                        lineBuffer.SetLength(0);
-                        // If there's leftover data after the newline, it's lost —
-                        // but our protocol is one line per command, so this is fine.
-                        return result;
-                    }
-                }
-
-                lineBuffer.Write(buf, 0, bytesRead);
-                // Reset deadline — we got data, extend timeout for next chunk
-                deadline = Environment.TickCount + timeoutMs;
-            }
         }
 
         // -------------------------------------------------------------------
