@@ -28,6 +28,30 @@ All Phase 1 items (1.1-1.4) and quick wins (6.1-6.3) implemented in branch
 - **Debug else clause** logs all unhandled annotation types at DEBUG level
 - **Known-but-skippable** annotation types explicitly listed (no false positives in debug log)
 
+### Phase 2 Status: COMPLETE (2026-03-26)
+
+BepInEx plugin expanded from 3 commands to 6, with dramatically richer data.
+Plugin version bumped to 0.2.0. Changes to `Plugin.cs` and `gre_bridge.py`:
+
+- **`get_game_state` command** — Serializes full MtgGameState from GameManager.CurrentGameState:
+  zones (battlefield/hand/stack/graveyard/exile/command/library) with full card instances,
+  players (life/mana/status/mulligan/dungeon/designations), turn info (phase/step/active/deciding),
+  combat info (attack/block mappings), timers, and pending interaction type
+- **`get_timer_state` command** — Per-player chess clock data: time remaining, timer type,
+  running state, warning threshold, behavior. Both game-level and player-level timers
+- **`get_match_info` command** — Match metadata: game state ID, stage, GameInfo fields,
+  local/opponent seat IDs and life totals
+- **Enhanced `SerializeAction`** — Now includes: AssumeCanBePaidFor (ground-truth castability),
+  FacetId, UniqueAbilityId, full AutoTapSolution with tap sequence (via reflection),
+  Targets, Highlight, ShouldStop, IsBatchable
+- **Enhanced `SerializeCard`** — Full MtgCardInstance serialization: power/toughness, loyalty,
+  defense, combat state, summoning sickness, phasing, damage, class level, copy info,
+  card types, subtypes, colors, counters, color production, targets, attachments,
+  visibility, face-down state, crew/saddle
+- **Cached GameManager lookup** — 5-second TTL cache avoids repeated FindObjectOfType
+- **Python client** (`gre_bridge.py`) — Added get_game_state(), get_timer_state(),
+  get_match_info() methods
+
 ---
 
 ## Phase 1: Parse Missing GRE Data (Low Effort, High Impact)
@@ -447,10 +471,10 @@ annotations and zone transfers). Expose as `recent_actions` in game state.
 | 6 | 6.2 Track sideboard | 0.5 day | Medium | None | **DONE** (2026-03-26) |
 | 7 | 6.3 Action history buffer | 0.5 day | Medium | None | **DONE** (2026-03-26) |
 | 8 | 6.4 Opponent archetype detection | 1 day | Medium | None | Pending |
-| 9 | 2.3 Plugin: serialize AutoTap solutions | 1 day | High | BepInEx rebuild | Pending |
-| 10 | 2.2 Plugin: rich interaction detail | 2 days | High | BepInEx rebuild | Pending |
-| 11 | 2.1 Plugin: get_game_state from MatchManager | 3-5 days | **Transformative** | BepInEx rebuild, reflection exploration | Pending |
-| 12 | 2.4-2.5 Plugin: timer + match info | 1 day | Medium | BepInEx rebuild | Pending |
+| 9 | 2.3 Plugin: serialize AutoTap solutions | 1 day | High | BepInEx rebuild | **DONE** (2026-03-26) |
+| 10 | 2.2 Plugin: rich interaction detail | 2 days | High | BepInEx rebuild | **DONE** (2026-03-26) |
+| 11 | 2.1 Plugin: get_game_state from GameManager | 3-5 days | **Transformative** | BepInEx rebuild, reflection exploration | **DONE** (2026-03-26) |
+| 12 | 2.4-2.5 Plugin: timer + match info | 1 day | Medium | BepInEx rebuild | **DONE** (2026-03-26) |
 | 13 | 3.1 Hook replay recorder | 2-3 days | High | BepInEx, replay format RE | Pending |
 | 14 | 3.2 Match history database | 2 days | High | 3.1 | Pending |
 | 15 | 4.2 Advisability flags | 0.5 day | Medium | None (from log) | Pending |

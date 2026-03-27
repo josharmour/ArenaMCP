@@ -306,6 +306,62 @@ class GREBridge:
             return False
 
     # -------------------------------------------------------------------
+    # Phase 2: new game state commands
+    # -------------------------------------------------------------------
+
+    def get_game_state(self) -> Optional[dict[str, Any]]:
+        """Get full game state directly from MTGA's MtgGameState.
+
+        Returns the complete game state including zones, cards, players,
+        turn info, combat, timers, and designations — bypassing log parsing.
+
+        Returns None if not connected or game not active.
+        """
+        try:
+            resp = self._send_safe({"action": "get_game_state"})
+            if resp.get("ok"):
+                return resp
+            else:
+                logger.debug(f"get_game_state: {resp.get('error')}")
+                return None
+        except GREBridgeError as e:
+            logger.debug(f"get_game_state error: {e}")
+            return None
+
+    def get_timer_state(self) -> Optional[dict[str, Any]]:
+        """Get timer/chess clock state from the game.
+
+        Returns per-player timer info including time remaining,
+        timer type, and running state.
+        """
+        try:
+            resp = self._send_safe({"action": "get_timer_state"})
+            if resp.get("ok"):
+                return resp
+            else:
+                logger.debug(f"get_timer_state: {resp.get('error')}")
+                return None
+        except GREBridgeError as e:
+            logger.debug(f"get_timer_state error: {e}")
+            return None
+
+    def get_match_info(self) -> Optional[dict[str, Any]]:
+        """Get match metadata (game number, format, stage, etc.).
+
+        Returns match-level info not available from individual GRE messages.
+        """
+        try:
+            resp = self._send_safe({"action": "get_match_info"})
+            if resp.get("ok"):
+                return resp
+            else:
+                logger.debug(f"get_match_info: {resp.get('error')}")
+                return None
+        except GREBridgeError as e:
+            logger.debug(f"get_match_info error: {e}")
+            return None
+
+    # -------------------------------------------------------------------
     # Matching logic
     # -------------------------------------------------------------------
 
