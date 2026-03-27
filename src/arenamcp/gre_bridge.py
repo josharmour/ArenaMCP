@@ -76,6 +76,11 @@ class GREBridge:
 
             kernel32 = ctypes.windll.kernel32
 
+            # Set correct restype so handle comparison works on 64-bit Windows.
+            # Default restype is c_int (32-bit) but HANDLE is pointer-sized (64-bit).
+            # Without this, INVALID_HANDLE_VALUE comparison always fails on Win64.
+            kernel32.CreateFileW.restype = ctypes.wintypes.HANDLE
+
             handle = kernel32.CreateFileW(
                 PIPE_NAME,
                 GENERIC_READ | GENERIC_WRITE,
@@ -88,7 +93,7 @@ class GREBridge:
 
             if handle == INVALID_HANDLE_VALUE:
                 err = ctypes.get_last_error()
-                logger.debug(f"GRE bridge pipe not available (error {err})")
+                logger.info(f"GRE bridge pipe not available (error {err})")
                 return False
 
             # Wrap the raw handle in a Python file object
@@ -122,7 +127,7 @@ class GREBridge:
             self._reconnect_cooldown = 60.0  # Don't spam on non-Windows
             return False
         except Exception as e:
-            logger.debug(f"GRE bridge connect error: {e}")
+            logger.info(f"GRE bridge connect error: {e}")
             return False
 
     def disconnect(self):
