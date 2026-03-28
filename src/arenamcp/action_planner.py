@@ -120,6 +120,7 @@ output a JSON action plan that the autopilot will execute by clicking in the MTG
 
 CRITICAL RULES:
 - ONLY suggest actions that appear in the "Legal:" line. Never hallucinate actions.
+- If a pending decision is active, resolve that decision instead of proposing a new cast/play from hand.
 - ONE ACTION PER PLAN: You must suggest only ONE card to play or ONE button to click per JSON response.
 - EXCEPTION: For "declare_attackers" or "declare_blockers", provide the full attacker/blocker set in one action. Do NOT add a separate "done" click action (the executor handles confirmation).
 - DO NOT sequence plays (e.g. do not suggest "play land" AND "cast spell"). Suggest the land, wait for the next trigger, then suggest the spell.
@@ -209,14 +210,32 @@ class ActionPlanner:
             if fallback.actions:
                 plan = fallback
 
-        # Attach GRE action refs if raw actions are available
-        # Prefer bridge actions (freshest data from live game state)
-        raw = legal_actions_raw or game_state.get("_bridge_actions") or game_state.get("legal_actions_raw")
+        # Attach GRE action refs if raw actions are available. If the bridge says
+        # the current request has no actions (e.g. PayCostsReq), do not fall back
+        # to stale ActionsAvailable actions from the previous window.
+        raw = self._resolve_raw_actions_for_matching(game_state, legal_actions_raw)
         if raw and plan.actions:
             self._attach_gre_refs(plan, raw, game_state)
 
         logger.info(f"Planned {len(plan.actions)} actions: {plan.overall_strategy}")
         return plan
+
+    @staticmethod
+    def _resolve_raw_actions_for_matching(
+        game_state: dict[str, Any],
+        legal_actions_raw: Optional[list[dict[str, Any]]] = None,
+    ) -> list[dict[str, Any]]:
+        """Choose the freshest raw GRE actions for ref attachment."""
+        if legal_actions_raw is not None:
+            return legal_actions_raw
+
+        bridge_request = game_state.get("_bridge_request_type")
+        bridge_actions = game_state.get("_bridge_actions")
+
+        if bridge_request and bridge_request != "ActionsAvailableReq":
+            return bridge_actions or []
+
+        return bridge_actions or game_state.get("legal_actions_raw") or []
 
     def _attach_gre_refs(
         self,
@@ -518,6 +537,8 @@ class ActionPlanner:
                 action_type=ActionType.SELECT_TARGET,
                 target_names=[act.split(":", 1)[1].strip()],
             )
+        if lower.startswith("pay costs for") or "auto-pay" in lower:
+            return GameAction(action_type=ActionType.PAY_COSTS)
         if "choose: play" in lower:
             return GameAction(action_type=ActionType.CHOOSE_STARTING_PLAYER, play_or_draw="play")
         if "choose: draw" in lower:

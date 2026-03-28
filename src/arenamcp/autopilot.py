@@ -10,6 +10,7 @@ The autopilot layers onto the existing coaching loop without replacing it:
 """
 
 import logging
+import re
 import threading
 import time
 import io
@@ -1483,7 +1484,7 @@ class AutopilotEngine:
             # New decision types — most resolve via Done/pass after LLM selection
             ActionType.ASSIGN_DAMAGE: lambda: self._exec_done_action("assign_damage"),
             ActionType.ORDER_COMBAT_DAMAGE: lambda: self._exec_done_action("order_combat_damage"),
-            ActionType.PAY_COSTS: lambda: self._exec_done_action("pay_costs"),
+            ActionType.PAY_COSTS: lambda: self._exec_pay_costs(action, game_state),
             ActionType.SEARCH_LIBRARY: lambda: self._exec_select_n(action, game_state),
             ActionType.DISTRIBUTE: lambda: self._exec_done_action("distribute"),
             ActionType.NUMERIC_INPUT: lambda: self._exec_done_action("numeric_input"),
@@ -2019,6 +2020,320 @@ class AutopilotEngine:
             return ClickResult(True, 0, 0, decision_name, "spacebar fallback")
         return result
 
+    @staticmethod
+    def _parse_pay_cost_requirements(decision_context: dict[str, Any]) -> dict[str, int]:
+        """Return normalized mana requirements for a Pay Costs decision."""
+        requirements = {
+            "generic": 0,
+            "W": 0,
+            "U": 0,
+            "B": 0,
+            "R": 0,
+            "G": 0,
+            "C": 0,
+            "Any": 0,
+        }
+
+        raw = decision_context.get("mana_requirements")
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if key in requirements:
+                    try:
+                        requirements[key] = int(value)
+                    except (TypeError, ValueError):
+                        continue
+            if any(requirements.values()):
+                return requirements
+
+        mana_cost = str(decision_context.get("mana_cost", "") or "")
+        if not mana_cost:
+            return requirements
+
+        token_map = {
+            "manacolor_white": "W",
+            "manacolor_blue": "U",
+            "manacolor_black": "B",
+            "manacolor_red": "R",
+            "manacolor_green": "G",
+            "manacolor_colorless": "C",
+            "manacolor_any": "Any",
+            "manacolor_generic": "generic",
+            "generic": "generic",
+            "w": "W",
+            "u": "U",
+            "b": "B",
+            "r": "R",
+            "g": "G",
+            "c": "C",
+            "any": "Any",
+        }
+        for count_str, token in re.findall(r"(\d+)x([^,]+)", mana_cost):
+            mapped = token_map.get(token.strip().lower())
+            if not mapped:
+                continue
+            requirements[mapped] += int(count_str)
+
+        return requirements
+
+    @staticmethod
+    def _infer_mana_source_colors(card: dict[str, Any]) -> set[str]:
+        """Infer which colors a permanent can produce when tapped for mana."""
+        colors: set[str] = set()
+        color_map = {
+            "1": "W",
+            "2": "U",
+            "3": "B",
+            "4": "R",
+            "5": "G",
+            "6": "C",
+            "manacolor_white": "W",
+            "manacolor_blue": "U",
+            "manacolor_black": "B",
+            "manacolor_red": "R",
+            "manacolor_green": "G",
+            "manacolor_colorless": "C",
+            "manacolor_any": "Any",
+            "w": "W",
+            "u": "U",
+            "b": "B",
+            "r": "R",
+            "g": "G",
+            "c": "C",
+            "any": "Any",
+        }
+
+        for raw in card.get("color_production", []) or []:
+            mapped = color_map.get(str(raw).strip().lower())
+            if mapped:
+                colors.add(mapped)
+
+        name = str(card.get("name", "") or "")
+        type_line = str(card.get("type_line", "") or "").lower()
+        oracle = str(card.get("oracle_text", "") or "")
+        oracle_lower = oracle.lower()
+
+        if "plains" in name.lower() or "plains" in type_line:
+            colors.add("W")
+        if "island" in name.lower() or "island" in type_line:
+            colors.add("U")
+        if "swamp" in name.lower() or "swamp" in type_line:
+            colors.add("B")
+        if "mountain" in name.lower() or "mountain" in type_line:
+            colors.add("R")
+        if "forest" in name.lower() or "forest" in type_line:
+            colors.add("G")
+        if re.search(r"\{o?W\}", oracle):
+            colors.add("W")
+        if re.search(r"\{o?U\}", oracle):
+            colors.add("U")
+        if re.search(r"\{o?B\}", oracle):
+            colors.add("B")
+        if re.search(r"\{o?R\}", oracle):
+            colors.add("R")
+        if re.search(r"\{o?G\}", oracle):
+            colors.add("G")
+        if re.search(r"\{o?C\}", oracle):
+            colors.add("C")
+        if "any color" in oracle_lower:
+            colors.add("Any")
+
+        return colors
+
+    @staticmethod
+    def _select_pay_cost_sources(
+        game_state: dict[str, Any],
+        decision_context: dict[str, Any],
+        local_seat: int,
+    ) -> list[dict[str, Any]]:
+        """Choose mana sources to tap for a Pay Costs decision."""
+        battlefield = game_state.get("battlefield", [])
+        by_instance = {
+            card.get("instance_id"): card
+            for card in battlefield
+            if card.get("instance_id") is not None
+        }
+
+        autotap = decision_context.get("autotap_solution") or {}
+        lands_to_tap = autotap.get("lands_to_tap") if isinstance(autotap, dict) else None
+        if isinstance(lands_to_tap, list) and lands_to_tap:
+            selected = []
+            for tap in lands_to_tap:
+                instance_id = tap.get("instanceId") if isinstance(tap, dict) else None
+                card = by_instance.get(instance_id)
+                if (
+                    card
+                    and card.get("controller_seat_id") == local_seat
+                    and not card.get("is_tapped")
+                ):
+                    selected.append(card)
+            if selected:
+                return selected
+
+        requirements = AutopilotEngine._parse_pay_cost_requirements(decision_context)
+        if not any(requirements.values()):
+            return []
+
+        turn_num = game_state.get("turn", {}).get("turn_number", 0)
+        candidates: list[dict[str, Any]] = []
+        for card in battlefield:
+            if card.get("controller_seat_id") != local_seat or card.get("is_tapped"):
+                continue
+
+            type_line = str(card.get("type_line", "") or "").lower()
+            oracle = str(card.get("oracle_text", "") or "")
+            is_land = "land" in type_line
+            is_creature = "creature" in type_line
+            has_mana_ability = bool(re.search(r"\{(?:o)?t\}.*add\s+(\{|one |two |three )", oracle, re.I))
+            entered = card.get("turn_entered_battlefield", -1)
+            has_haste = "haste" in oracle.lower()
+            is_sick = is_creature and entered == turn_num and not has_haste
+
+            if not (is_land or (has_mana_ability and not is_sick)):
+                continue
+
+            colors = AutopilotEngine._infer_mana_source_colors(card)
+            flexibility = len([color for color in colors if color != "Any"]) or 99
+            candidates.append(
+                {
+                    "card": card,
+                    "colors": colors,
+                    "flexibility": flexibility,
+                }
+            )
+
+        selected: list[dict[str, Any]] = []
+
+        def pick_candidate(color: Optional[str] = None) -> Optional[dict[str, Any]]:
+            pool = candidates
+            if color is not None:
+                pool = [
+                    candidate
+                    for candidate in candidates
+                    if color in candidate["colors"] or "Any" in candidate["colors"]
+                ]
+            if not pool:
+                return None
+            if color is None:
+                pool = sorted(
+                    pool,
+                    key=lambda candidate: (
+                        candidate["flexibility"],
+                        candidate["card"].get("name", ""),
+                        candidate["card"].get("instance_id", 0),
+                    ),
+                )
+            else:
+                pool = sorted(
+                    pool,
+                    key=lambda candidate: (
+                        0 if color in candidate["colors"] and "Any" not in candidate["colors"] else 1,
+                        candidate["flexibility"],
+                        candidate["card"].get("name", ""),
+                        candidate["card"].get("instance_id", 0),
+                    ),
+                )
+            chosen = pool[0]
+            candidates.remove(chosen)
+            selected.append(chosen)
+            return chosen
+
+        for color in ("W", "U", "B", "R", "G", "C"):
+            for _ in range(requirements.get(color, 0)):
+                if pick_candidate(color) is None:
+                    return [candidate["card"] for candidate in selected]
+
+        for _ in range(requirements.get("generic", 0) + requirements.get("Any", 0)):
+            if pick_candidate() is None:
+                break
+
+        return [candidate["card"] for candidate in selected]
+
+    def _click_battlefield_card(
+        self,
+        card: dict[str, Any],
+        battlefield: list[dict[str, Any]],
+        local_seat: int,
+        description: str,
+    ) -> ClickResult:
+        """Click a permanent on the battlefield by instance ID when possible."""
+        card_name = str(card.get("name", "") or description)
+        instance_id = card.get("instance_id")
+        owner_seat = card.get("owner_seat_id", local_seat)
+        coord = self._mapper.get_permanent_coord(
+            card_name,
+            instance_id,
+            battlefield,
+            owner_seat,
+            local_seat,
+        )
+
+        if coord is None and self._config.enable_vision_fallback:
+            coord = self._get_vision_coord(card_name, zone="battlefield_yours")
+
+        if coord is None:
+            return ClickResult(False, 0, 0, description, f"Permanent not found: {card_name}")
+
+        window_rect = self._mapper.window_rect
+        if not window_rect:
+            window_rect = self._mapper.refresh_window()
+        if not window_rect:
+            return ClickResult(False, 0, 0, description, "MTGA window not found")
+
+        abs_x, abs_y = coord.to_absolute(window_rect)
+        return self._controller.click(abs_x, abs_y, description, window_rect)
+
+    def _exec_pay_costs(
+        self, action: GameAction, game_state: dict[str, Any]
+    ) -> ClickResult:
+        """Resolve Pay Costs by tapping mana sources instead of blind Done clicks."""
+        decision_context = game_state.get("decision_context") or {}
+        if decision_context.get("type") != "pay_costs":
+            logger.info("pay_costs: no pay-costs context, falling back to Done")
+            return self._exec_done_action("pay_costs")
+
+        local_seat = None
+        for player in game_state.get("players", []):
+            if player.get("is_local"):
+                local_seat = player.get("seat_id")
+                break
+        if local_seat is None:
+            return ClickResult(False, 0, 0, "pay_costs", "Local seat not found")
+
+        battlefield = game_state.get("battlefield", [])
+        sources = self._select_pay_cost_sources(game_state, decision_context, local_seat)
+        if not sources:
+            if decision_context.get("has_autotap"):
+                logger.info("pay_costs: no explicit tap targets, confirming autotap/default")
+            else:
+                logger.warning("pay_costs: no mana sources resolved, falling back to Done")
+            return self._exec_done_action("pay_costs")
+
+        descriptions = [str(source.get("name", source.get("instance_id", "?"))) for source in sources]
+        self._log_execution_path(
+            ExecutionPath.DETERMINISTIC_GEOMETRY,
+            f"pay_costs: tapping {', '.join(descriptions)}",
+        )
+        logger.info("pay_costs: tapping mana sources %s", descriptions)
+
+        last_result: Optional[ClickResult] = None
+        for source in sources:
+            source_name = str(source.get("name", source.get("instance_id", "?")))
+            result = self._click_battlefield_card(
+                source,
+                battlefield,
+                local_seat,
+                f"Mana source: {source_name}",
+            )
+            if not result.success:
+                return result
+            last_result = result
+            time.sleep(0.08)
+
+        if last_result is None:
+            return ClickResult(False, 0, 0, "pay_costs", "No mana sources tapped")
+
+        return last_result
+
     def _exec_choose_play_draw(self, action: GameAction) -> ClickResult:
         """Handle choose starting player (play or draw)."""
         choice = action.play_or_draw.lower() if action.play_or_draw else "play"
@@ -2149,8 +2464,11 @@ class AutopilotEngine:
                 # This means the action was processed and MTGA is waiting for a
                 # follow-up choice (e.g. shock land "Pay 2 life?", scry, etc.)
                 post_pending = post_state.get("pending_decision")
-                if post_pending and post_pending != pre_pending:
-                    logger.info(f"Action verified: new pending decision '{post_pending}' (follow-up choice)")
+                if post_pending != pre_pending:
+                    if post_pending:
+                        logger.info(f"Action verified: pending decision changed to '{post_pending}'")
+                    else:
+                        logger.info("Action verified: pending decision cleared")
                     return True
 
                 # 1. Global state changes (Turn, Phase, Priority)
@@ -2182,6 +2500,24 @@ class AutopilotEngine:
                         # This is a bit weak if the card was already there, but better than nothing
                         # Ideally we'd track instance_id movement
                         pass
+
+                if action.action_type == ActionType.PAY_COSTS:
+                    pre_local = next((p.get("seat_id") for p in pre_state.get("players", []) if p.get("is_local")), None)
+                    post_local = next((p.get("seat_id") for p in post_state.get("players", []) if p.get("is_local")), None)
+                    if pre_local is not None and post_local == pre_local:
+                        pre_tapped = sum(
+                            1
+                            for card in pre_state.get("battlefield", [])
+                            if card.get("controller_seat_id") == pre_local and card.get("is_tapped")
+                        )
+                        post_tapped = sum(
+                            1
+                            for card in post_state.get("battlefield", [])
+                            if card.get("controller_seat_id") == post_local and card.get("is_tapped")
+                        )
+                        if post_tapped > pre_tapped:
+                            logger.info("Action verified: mana sources tapped")
+                            return True
 
                 if action.action_type == ActionType.DECLARE_ATTACKERS:
                     # Check if any creatures are now attacking that weren't before

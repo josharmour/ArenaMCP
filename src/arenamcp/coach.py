@@ -1848,12 +1848,18 @@ class CoachEngine:
             match_tag = f" [Match #{match_num} id={short_id}]"
         lines.append(f"=== NEW GAME ==={match_tag}" if turn_num <= 1 and match_tag else f"=== GAME ==={match_tag}")
         lines.append(f"Legal: {valid_moves_str}")
-        # Prefer bridge actions (fresher castability/autotap data) over log-parsed
-        raw_legal_actions = game_state.get("_bridge_actions") or game_state.get("legal_actions_raw") or []
-        if raw_legal_actions:
-            lines.append("LegalGRE: " + _format_legal_actions_raw_for_prompt(raw_legal_actions))
         # Bridge request type: authoritative decision classification from GRE
         bridge_req = game_state.get("_bridge_request_type")
+        # Prefer bridge actions (fresher castability/autotap data) over log-parsed.
+        # For non-ActionsAvailable bridge requests, an empty bridge action list is
+        # authoritative and must not fall back to stale priority actions.
+        bridge_actions = game_state.get("_bridge_actions")
+        if bridge_req and bridge_req != "ActionsAvailableReq":
+            raw_legal_actions = bridge_actions or []
+        else:
+            raw_legal_actions = bridge_actions or game_state.get("legal_actions_raw") or []
+        if raw_legal_actions:
+            lines.append("LegalGRE: " + _format_legal_actions_raw_for_prompt(raw_legal_actions))
         if bridge_req:
             lines.append(f"GRE_Request: {bridge_req}")
 

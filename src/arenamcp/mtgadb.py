@@ -9,6 +9,7 @@ import glob
 import logging
 import os
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -98,6 +99,7 @@ class MTGADatabase:
         """
         self._db_path = db_path or find_mtga_database()
         self._conn: Optional[sqlite3.Connection] = None
+        self._conn_lock = threading.RLock()
         self._available = False
         self._error_count = 0  # Track consecutive errors for reconnection
 
@@ -105,29 +107,36 @@ class MTGADatabase:
 
     def _connect(self) -> None:
         """Open a read-only SQLite connection to the MTGA database."""
-        self._conn = None
-        self._available = False
-        self._error_count = 0
+        with self._conn_lock:
+            if self._conn:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
 
-        if not self._db_path or not self._db_path.exists():
-            logger.warning("MTGA database not available")
-            return
+            self._conn = None
+            self._available = False
+            self._error_count = 0
 
-        try:
-            # Use non-URI mode to avoid path encoding issues on Windows
-            # (spaces, backslashes in "C:\Program Files (x86)\..." break URI mode)
-            self._conn = sqlite3.connect(
-                str(self._db_path),
-                check_same_thread=False
-            )
-            # Open as read-only via PRAGMA
-            self._conn.execute("PRAGMA query_only = true;")
-            self._conn.execute("PRAGMA read_uncommitted = true;")
-            self._conn.row_factory = sqlite3.Row
-            self._available = True
-            logger.info("MTGA database connected")
-        except Exception as e:
-            logger.error(f"Failed to open MTGA database: {e}")
+            if not self._db_path or not self._db_path.exists():
+                logger.warning("MTGA database not available")
+                return
+
+            try:
+                # Use non-URI mode to avoid path encoding issues on Windows
+                # (spaces, backslashes in "C:\Program Files (x86)\..." break URI mode)
+                self._conn = sqlite3.connect(
+                    str(self._db_path),
+                    check_same_thread=False
+                )
+                # Open as read-only via PRAGMA
+                self._conn.execute("PRAGMA query_only = true;")
+                self._conn.execute("PRAGMA read_uncommitted = true;")
+                self._conn.row_factory = sqlite3.Row
+                self._available = True
+                logger.info("MTGA database connected")
+            except Exception as e:
+                logger.error(f"Failed to open MTGA database: {e}")
 
     @property
     def available(self) -> bool:
@@ -146,45 +155,49 @@ class MTGADatabase:
         if not ability_ids_str:
             return ""
 
-        try:
-            # Parse 'AbilityGrpId:TextId' pairs — convert to integers,
-            # skipping malformed entries that would cause SQLite MISUSE errors.
-            text_ids: list[int] = []
-            for pair in ability_ids_str.split(','):
-                parts = pair.split(':')
-                if len(parts) >= 2:
-                    raw = parts[1].strip()
-                    if raw:
-                        try:
-                            text_ids.append(int(raw))
-                        except ValueError:
-                            continue
-
-            if not text_ids:
+        with self._conn_lock:
+            if not self._available or not self._conn:
                 return ""
 
-            # Query all text IDs at once, preserving original order
-            placeholders = ",".join("?" * len(text_ids))
-            # Embed integer IDs directly in CASE WHEN — SQLite doesn't support
-            # parameterized ? placeholders in CASE expressions (causes MISUSE error).
-            # Safe because text_ids are validated ints parsed on line 159 above.
-            case_whens = " ".join(
-                f"WHEN {tid} THEN {i}" for i, tid in enumerate(text_ids)
-            )
-            cursor = self._conn.execute(f"""
-                SELECT Loc FROM Localizations_enUS
-                WHERE LocId IN ({placeholders})
-                ORDER BY CASE LocId
-                    {case_whens}
-                END
-            """, text_ids)
+            try:
+                # Parse 'AbilityGrpId:TextId' pairs — convert to integers,
+                # skipping malformed entries that would cause SQLite MISUSE errors.
+                text_ids: list[int] = []
+                for pair in str(ability_ids_str).split(','):
+                    parts = pair.split(':')
+                    if len(parts) >= 2:
+                        raw = parts[1].strip()
+                        if raw:
+                            try:
+                                text_ids.append(int(raw))
+                            except ValueError:
+                                continue
 
-            texts = [row["Loc"] for row in cursor.fetchall() if row["Loc"]]
-            return "\n".join(texts)
+                if not text_ids:
+                    return ""
 
-        except Exception as e:
-            logger.warning(f"Failed to resolve oracle text: {e}")
-            return ""
+                # Query all text IDs at once, preserving original order
+                placeholders = ",".join("?" * len(text_ids))
+                # Embed integer IDs directly in CASE WHEN — SQLite doesn't support
+                # parameterized ? placeholders in CASE expressions (causes MISUSE error).
+                # Safe because text_ids are validated ints parsed above.
+                case_whens = " ".join(
+                    f"WHEN {tid} THEN {i}" for i, tid in enumerate(text_ids)
+                )
+                cursor = self._conn.execute(f"""
+                    SELECT Loc FROM Localizations_enUS
+                    WHERE LocId IN ({placeholders})
+                    ORDER BY CASE LocId
+                        {case_whens}
+                    END
+                """, text_ids)
+
+                texts = [row["Loc"] for row in cursor.fetchall() if row["Loc"]]
+                return "\n".join(texts)
+
+            except Exception as e:
+                logger.warning(f"Failed to resolve oracle text: {e}")
+                return ""
 
     def get_card(self, grp_id: int) -> Optional[MTGACard]:
         """Look up a card by GrpId (arena_id).
@@ -195,55 +208,56 @@ class MTGADatabase:
         Returns:
             MTGACard with card data, or None if not found.
         """
-        if not self._available or not self._conn:
-            return None
+        with self._conn_lock:
+            if not self._available or not self._conn:
+                return None
 
-        try:
-            cursor = self._conn.execute("""
-                SELECT
-                    c.GrpId,
-                    l.Loc as Name,
-                    c.Types,
-                    c.Power,
-                    c.Toughness,
-                    c.Colors,
-                    c.IsToken,
-                    c.ExpansionCode,
-                    c.AbilityIds,
-                    c.Order_Title
-                FROM Cards c
-                LEFT JOIN Localizations_enUS l ON c.TitleId = l.LocId AND l.Formatted = 1
-                WHERE c.GrpId = ?
-            """, (int(grp_id),))
+            try:
+                cursor = self._conn.execute("""
+                    SELECT
+                        c.GrpId,
+                        l.Loc as Name,
+                        c.Types,
+                        c.Power,
+                        c.Toughness,
+                        c.Colors,
+                        c.IsToken,
+                        c.ExpansionCode,
+                        c.AbilityIds,
+                        c.Order_Title
+                    FROM Cards c
+                    LEFT JOIN Localizations_enUS l ON c.TitleId = l.LocId AND l.Formatted = 1
+                    WHERE c.GrpId = ?
+                """, (int(grp_id),))
 
-            row = cursor.fetchone()
-            if row:
-                oracle_text = self._resolve_oracle_text(row["AbilityIds"])
-                name = row["Name"] or row["Order_Title"] or f"Unknown_({grp_id})"
-                # Strip HTML tags that MTGA injects into hyphenated names
-                if "<" in name:
-                    import re
-                    name = re.sub(r"<[^>]+>", "", name)
+                row = cursor.fetchone()
+                if row:
+                    oracle_text = self._resolve_oracle_text(row["AbilityIds"])
+                    name = row["Name"] or row["Order_Title"] or f"Unknown_({grp_id})"
+                    # Strip HTML tags that MTGA injects into hyphenated names
+                    if "<" in name:
+                        import re
+                        name = re.sub(r"<[^>]+>", "", name)
 
-                self._error_count = 0
-                return MTGACard(
-                    grp_id=row["GrpId"],
-                    name=name,
-                    types=row["Types"],
-                    power=row["Power"] or "",
-                    toughness=row["Toughness"] or "",
-                    colors=row["Colors"] or "",
-                    is_token=bool(row["IsToken"]),
-                    expansion_code=row["ExpansionCode"] or "",
-                    oracle_text=oracle_text
-                )
-        except Exception as e:
-            self._error_count += 1
-            if self._error_count <= 3:
-                logger.error(f"Database query error for grp_id {grp_id}: {e}")
-            if self._error_count >= 5:
-                logger.warning("MTGA database: too many errors, attempting reconnect")
-                self._connect()
+                    self._error_count = 0
+                    return MTGACard(
+                        grp_id=row["GrpId"],
+                        name=name,
+                        types=row["Types"],
+                        power=row["Power"] or "",
+                        toughness=row["Toughness"] or "",
+                        colors=row["Colors"] or "",
+                        is_token=bool(row["IsToken"]),
+                        expansion_code=row["ExpansionCode"] or "",
+                        oracle_text=oracle_text
+                    )
+            except Exception as e:
+                self._error_count += 1
+                if self._error_count <= 3:
+                    logger.error(f"Database query error for grp_id {grp_id}: {e}")
+                if self._error_count >= 5:
+                    logger.warning("MTGA database: too many errors, attempting reconnect")
+                    self._connect()
 
         return None
 
@@ -256,51 +270,61 @@ class MTGADatabase:
         Returns:
             Dict mapping grp_id to MTGACard for found cards.
         """
-        if not self._available or not self._conn or not grp_ids:
+        grp_ids = [int(grp_id) for grp_id in grp_ids]
+        if not grp_ids:
             return {}
 
-        results = {}
-        try:
-            placeholders = ",".join("?" * len(grp_ids))
-            cursor = self._conn.execute(f"""
-                SELECT
-                    c.GrpId,
-                    l.Loc as Name,
-                    c.Types,
-                    c.Power,
-                    c.Toughness,
-                    c.Colors,
-                    c.IsToken,
-                    c.ExpansionCode,
-                    c.AbilityIds,
-                    c.Order_Title
-                FROM Cards c
-                LEFT JOIN Localizations_enUS l ON c.TitleId = l.LocId AND l.Formatted = 1
-                WHERE c.GrpId IN ({placeholders})
-            """, grp_ids)
+        with self._conn_lock:
+            if not self._available or not self._conn:
+                return {}
 
-            for row in cursor.fetchall():
-                oracle_text = self._resolve_oracle_text(row["AbilityIds"])
-                name = row["Name"] or row["Order_Title"] or f"Unknown_({row['GrpId']})"
-                # Strip HTML tags that MTGA injects into hyphenated names
-                if "<" in name:
-                    import re
-                    name = re.sub(r"<[^>]+>", "", name)
+            results = {}
+            try:
+                placeholders = ",".join("?" * len(grp_ids))
+                cursor = self._conn.execute(f"""
+                    SELECT
+                        c.GrpId,
+                        l.Loc as Name,
+                        c.Types,
+                        c.Power,
+                        c.Toughness,
+                        c.Colors,
+                        c.IsToken,
+                        c.ExpansionCode,
+                        c.AbilityIds,
+                        c.Order_Title
+                    FROM Cards c
+                    LEFT JOIN Localizations_enUS l ON c.TitleId = l.LocId AND l.Formatted = 1
+                    WHERE c.GrpId IN ({placeholders})
+                """, grp_ids)
 
-                card = MTGACard(
-                    grp_id=row["GrpId"],
-                    name=name,
-                    types=row["Types"],
-                    power=row["Power"] or "",
-                    toughness=row["Toughness"] or "",
-                    colors=row["Colors"] or "",
-                    is_token=bool(row["IsToken"]),
-                    expansion_code=row["ExpansionCode"] or "",
-                    oracle_text=oracle_text
-                )
-                results[card.grp_id] = card
-        except Exception as e:
-            logger.error(f"Batch query error: {e}")
+                for row in cursor.fetchall():
+                    oracle_text = self._resolve_oracle_text(row["AbilityIds"])
+                    name = row["Name"] or row["Order_Title"] or f"Unknown_({row['GrpId']})"
+                    # Strip HTML tags that MTGA injects into hyphenated names
+                    if "<" in name:
+                        import re
+                        name = re.sub(r"<[^>]+>", "", name)
+
+                    card = MTGACard(
+                        grp_id=row["GrpId"],
+                        name=name,
+                        types=row["Types"],
+                        power=row["Power"] or "",
+                        toughness=row["Toughness"] or "",
+                        colors=row["Colors"] or "",
+                        is_token=bool(row["IsToken"]),
+                        expansion_code=row["ExpansionCode"] or "",
+                        oracle_text=oracle_text
+                    )
+                    results[card.grp_id] = card
+                self._error_count = 0
+            except Exception as e:
+                self._error_count += 1
+                logger.error(f"Batch query error: {e}")
+                if self._error_count >= 5:
+                    logger.warning("MTGA database: too many batch-query errors, attempting reconnect")
+                    self._connect()
 
         return results
 
@@ -313,40 +337,47 @@ class MTGADatabase:
         Returns:
             Review of the ability text, or None if not found.
         """
-        if not self._available or not self._conn:
-            return None
-            
-        try:
-            # First get TextId from Abilities table
-            cursor = self._conn.execute(
-                "SELECT TextId FROM Abilities WHERE Id = ?", 
-                (ability_id,)
-            )
-            row = cursor.fetchone()
-            
-            if not row:
+        with self._conn_lock:
+            if not self._available or not self._conn:
                 return None
-                
-            text_id = row["TextId"]
-            
-            # Then get text from Localizations
-            cursor = self._conn.execute(
-                "SELECT Loc FROM Localizations_enUS WHERE LocId = ?",
-                (text_id,)
-            )
-            loc_row = cursor.fetchone()
-            
-            if loc_row:
-                return loc_row["Loc"]
-                
-        except Exception as e:
-            logger.error(f"Ability lookup error for id {ability_id}: {e}")
-            
+
+            try:
+                # First get TextId from Abilities table
+                cursor = self._conn.execute(
+                    "SELECT TextId FROM Abilities WHERE Id = ?",
+                    (int(ability_id),)
+                )
+                row = cursor.fetchone()
+
+                if not row:
+                    return None
+
+                text_id = row["TextId"]
+
+                # Then get text from Localizations
+                cursor = self._conn.execute(
+                    "SELECT Loc FROM Localizations_enUS WHERE LocId = ?",
+                    (text_id,)
+                )
+                loc_row = cursor.fetchone()
+
+                if loc_row:
+                    self._error_count = 0
+                    return loc_row["Loc"]
+
+            except Exception as e:
+                self._error_count += 1
+                logger.error(f"Ability lookup error for id {ability_id}: {e}")
+                if self._error_count >= 5:
+                    logger.warning("MTGA database: too many ability lookup errors, attempting reconnect")
+                    self._connect()
+
         return None
 
     def close(self):
         """Close the database connection."""
-        if self._conn:
-            self._conn.close()
-            self._conn = None
-            self._available = False
+        with self._conn_lock:
+            if self._conn:
+                self._conn.close()
+                self._conn = None
+                self._available = False

@@ -24,6 +24,8 @@ namespace MtgaCoachBridge
         private Thread _pipeThread;
         private volatile bool _running;
         private readonly ConcurrentQueue<PipeCommand> _pendingCommands = new ConcurrentQueue<PipeCommand>();
+        private SynchronizationContext _unityContext;
+        private int _mainThreadId;
 
         private BaseUserRequest _lastKnownRequest;
         private readonly object _interactionLock = new object();
@@ -32,11 +34,35 @@ namespace MtgaCoachBridge
         private GameManager _cachedGameManager;
         private float _lastGameManagerLookup;
 
+        private sealed class CastingTimeOptionEntry
+        {
+            public JObject Payload { get; }
+            private readonly System.Action _submit;
+
+            public CastingTimeOptionEntry(JObject payload, System.Action submit)
+            {
+                Payload = payload;
+                _submit = submit;
+            }
+
+            public void Submit()
+            {
+                _submit();
+            }
+        }
+
         private void Awake()
         {
             _log = Logger;
             _log.LogInfo($"MtgaCoachBridge v{PluginInfo.Version} loaded");
             DontDestroyOnLoad(gameObject);
+            _unityContext = SynchronizationContext.Current;
+            _mainThreadId = Thread.CurrentThread.ManagedThreadId;
+            _log.LogInfo(
+                _unityContext != null
+                    ? $"Captured Unity synchronization context on thread {_mainThreadId}"
+                    : $"Unity synchronization context unavailable on thread {_mainThreadId}; falling back to Update() dispatch"
+            );
 
             _running = true;
             _pipeThread = new Thread(PipeClientLoop)
@@ -49,27 +75,58 @@ namespace MtgaCoachBridge
 
         private void OnDestroy()
         {
-            _log.LogInfo("OnDestroy called — pipe thread continues (IsBackground)");
+            _log.LogInfo("OnDestroy called — pipe thread continues and main-thread dispatch uses the captured synchronization context");
         }
 
         private void Update()
         {
+            DrainPendingCommands();
+        }
+
+        private void DrainPendingCommands()
+        {
             while (_pendingCommands.TryDequeue(out var cmd))
             {
-                try
-                {
-                    ProcessCommand(cmd);
-                }
-                catch (Exception ex)
-                {
-                    _log.LogError($"Error processing command: {ex}");
-                    cmd.SetResponse(new JObject
-                    {
-                        ["ok"] = false,
-                        ["error"] = ex.Message
-                    });
-                }
+                ExecutePipeCommand(cmd);
             }
+        }
+
+        private void ExecutePipeCommand(PipeCommand cmd)
+        {
+            try
+            {
+                ProcessCommand(cmd);
+            }
+            catch (Exception ex)
+            {
+                _log.LogError($"Error processing command: {ex}");
+                cmd.SetResponse(new JObject
+                {
+                    ["ok"] = false,
+                    ["error"] = ex.Message
+                });
+            }
+        }
+
+        private JObject DispatchCommandToUnityThread(PipeCommand cmd, int timeoutMs)
+        {
+            if (Thread.CurrentThread.ManagedThreadId == _mainThreadId)
+            {
+                ExecutePipeCommand(cmd);
+                return cmd.WaitForResponse(timeoutMs);
+            }
+
+            var unityContext = _unityContext;
+            if (unityContext != null)
+            {
+                unityContext.Post(_ => ExecutePipeCommand(cmd), null);
+            }
+            else
+            {
+                _pendingCommands.Enqueue(cmd);
+            }
+
+            return cmd.WaitForResponse(timeoutMs);
         }
 
         // -------------------------------------------------------------------
@@ -163,9 +220,7 @@ namespace MtgaCoachBridge
 
                     // All other commands need Unity main thread (GameManager access)
                     var cmd = new PipeCommand(json);
-                    _pendingCommands.Enqueue(cmd);
-
-                    var response = cmd.WaitForResponse(5000);
+                    var response = DispatchCommandToUnityThread(cmd, 5000);
                     writer.WriteLine(response.ToString(Formatting.None));
                 }
                 catch (Exception ex)
@@ -381,6 +436,7 @@ namespace MtgaCoachBridge
                 ["ok"] = true,
                 ["has_pending"] = true,
                 ["request_type"] = request.Type.ToString(),
+                ["request_class"] = request.GetType().Name,
                 ["can_cancel"] = request.CanCancel,
                 ["allow_undo"] = request.AllowUndo
             };
@@ -394,6 +450,17 @@ namespace MtgaCoachBridge
                 }
                 resp["actions"] = actionsArr;
                 resp["can_pass"] = actionsReq.CanPass;
+            }
+            else if (request is CastingTimeOptionRequest castingReq)
+            {
+                var entries = BuildCastingTimeOptionEntries(castingReq);
+                var actionsArr = new JArray();
+                foreach (var entry in entries)
+                {
+                    actionsArr.Add(entry.Payload.DeepClone());
+                }
+                resp["actions"] = actionsArr;
+                resp["decision_context"] = BuildCastingTimeOptionDecisionContext(entries);
             }
 
             cmd.SetResponse(resp);
@@ -420,9 +487,10 @@ namespace MtgaCoachBridge
                 return;
             }
 
+            int actionIndex = cmd.Json.Value<int>("action_index");
+
             if (request is ActionsAvailableRequest actionsReq)
             {
-                int actionIndex = cmd.Json.Value<int>("action_index");
                 bool autoPass = cmd.Json.Value<bool>("auto_pass");
 
                 if (actionIndex < 0 || actionIndex >= actionsReq.Actions.Count)
@@ -452,6 +520,45 @@ namespace MtgaCoachBridge
                     ["submitted_grp_id"] = (int)action.GrpId,
                     ["submitted_instance_id"] = (int)action.InstanceId
                 });
+            }
+            else if (request is CastingTimeOptionRequest castingReq)
+            {
+                var entries = BuildCastingTimeOptionEntries(castingReq);
+                if (actionIndex < 0 || actionIndex >= entries.Count)
+                {
+                    cmd.SetResponse(new JObject
+                    {
+                        ["ok"] = false,
+                        ["error"] = $"Casting-time option index {actionIndex} out of range (0-{entries.Count - 1})"
+                    });
+                    return;
+                }
+
+                var entry = entries[actionIndex];
+                string choiceKind = entry.Payload.Value<string>("choiceKind") ?? "unknown";
+                int submittedGrpId = entry.Payload.Value<int?>("grpId") ?? 0;
+                _log.LogInfo($"Submitting casting-time option [{actionIndex}]: {choiceKind} grpId={submittedGrpId}");
+
+                entry.Submit();
+
+                lock (_interactionLock)
+                {
+                    _lastKnownRequest = null;
+                }
+
+                var resp = new JObject
+                {
+                    ["ok"] = true,
+                    ["submitted_type"] = "CastingTimeOption",
+                    ["submitted_choice_kind"] = choiceKind,
+                    ["submitted_grp_id"] = submittedGrpId
+                };
+
+                var optionIndex = entry.Payload.Value<int?>("optionIndex");
+                if (optionIndex.HasValue)
+                    resp["submitted_option_index"] = optionIndex.Value;
+
+                cmd.SetResponse(resp);
             }
             else
             {
@@ -508,6 +615,220 @@ namespace MtgaCoachBridge
                     ["error"] = "Cannot pass on current interaction"
                 });
             }
+        }
+
+        private static JObject BuildCastingTimeOptionDecisionContext(IReadOnlyList<CastingTimeOptionEntry> entries)
+        {
+            var options = new JArray();
+            foreach (var entry in entries)
+            {
+                options.Add(entry.Payload.DeepClone());
+            }
+
+            return new JObject
+            {
+                ["type"] = "casting_time_options",
+                ["num_options"] = entries.Count,
+                ["options"] = options
+            };
+        }
+
+        private static JObject CreateCastingTimeOptionPayload(
+            string choiceKind,
+            BaseUserRequest request,
+            int childIndex,
+            string label,
+            int? optionIndex = null,
+            uint grpId = 0)
+        {
+            var payload = new JObject
+            {
+                ["actionType"] = "CastingTimeOption",
+                ["choiceKind"] = choiceKind,
+                ["requestClass"] = request.GetType().Name,
+                ["childIndex"] = childIndex,
+                ["label"] = label
+            };
+
+            if (optionIndex.HasValue)
+                payload["optionIndex"] = optionIndex.Value;
+            if (grpId != 0)
+                payload["grpId"] = (int)grpId;
+            if (request.SourceId != 0)
+                payload["sourceId"] = (int)request.SourceId;
+
+            return payload;
+        }
+
+        private static void AddManaCost(JObject payload, IEnumerable<ManaRequirement> manaCost)
+        {
+            if (manaCost == null)
+                return;
+
+            var costs = new JArray();
+            foreach (var cost in manaCost)
+            {
+                costs.Add(new JObject
+                {
+                    ["color"] = cost.Color.ToString(),
+                    ["count"] = (int)cost.Count
+                });
+            }
+
+            if (costs.Count > 0)
+                payload["manaCost"] = costs;
+        }
+
+        private List<CastingTimeOptionEntry> BuildCastingTimeOptionEntries(CastingTimeOptionRequest request)
+        {
+            var entries = new List<CastingTimeOptionEntry>();
+
+            for (int childIndex = 0; childIndex < request.ChildRequests.Count; childIndex++)
+            {
+                var child = request.ChildRequests[childIndex];
+                switch (child)
+                {
+                    case CastingTimeOption_ModalRequest modalReq:
+                        for (int optionIndex = 0; optionIndex < modalReq.ModalOptions.Count; optionIndex++)
+                        {
+                            uint grpId = modalReq.ModalOptions[optionIndex];
+                            var payload = CreateCastingTimeOptionPayload(
+                                "modal",
+                                modalReq,
+                                childIndex,
+                                $"Mode {optionIndex + 1}",
+                                optionIndex,
+                                grpId);
+                            if (modalReq.AbilityGrpId != 0)
+                                payload["abilityGrpId"] = (int)modalReq.AbilityGrpId;
+                            if (modalReq.Min > 0)
+                                payload["min"] = (int)modalReq.Min;
+                            if (modalReq.Max > 0)
+                                payload["max"] = (int)modalReq.Max;
+                            if (modalReq.OtherSelection != null && modalReq.OtherSelection.Count > 0)
+                            {
+                                var otherSelection = new JArray();
+                                foreach (var selection in modalReq.OtherSelection)
+                                    otherSelection.Add((int)selection);
+                                payload["otherSelection"] = otherSelection;
+                            }
+
+                            entries.Add(new CastingTimeOptionEntry(
+                                payload,
+                                () => modalReq.SubmitModal(new[] { grpId })));
+                        }
+                        break;
+
+                    case CastingTimeOption_ChooseOrCostRequest chooseReq:
+                        var chooseOptions = chooseReq.Options;
+                        for (int optionIndex = 0; optionIndex < chooseOptions.Count; optionIndex++)
+                        {
+                            uint promptId = chooseOptions[optionIndex].Key;
+                            uint selectionId = chooseOptions[optionIndex].Value;
+                            var payload = CreateCastingTimeOptionPayload(
+                                "choose_or_cost",
+                                chooseReq,
+                                childIndex,
+                                $"Choice {optionIndex + 1}",
+                                optionIndex,
+                                chooseReq.GrpId);
+                            if (promptId != 0)
+                                payload["promptId"] = (int)promptId;
+                            payload["selection"] = (int)selectionId;
+                            if (chooseReq.Min > 0)
+                                payload["min"] = chooseReq.Min;
+                            if (chooseReq.Max > 0)
+                                payload["max"] = (int)chooseReq.Max;
+
+                            entries.Add(new CastingTimeOptionEntry(
+                                payload,
+                                () => chooseReq.SubmitChoice(selectionId)));
+                        }
+                        break;
+
+                    case CastingTimeOption_DoneRequest doneReq:
+                        var donePayload = CreateCastingTimeOptionPayload(
+                            "done",
+                            doneReq,
+                            childIndex,
+                            "Done");
+                        AddManaCost(donePayload, doneReq.ManaCost);
+                        entries.Add(new CastingTimeOptionEntry(donePayload, doneReq.SubmitDone));
+                        break;
+
+                    case CastingTimeOption_TimingPermissionRequest timingReq:
+                        var timingPayload = CreateCastingTimeOptionPayload(
+                            "timing_permission",
+                            timingReq,
+                            childIndex,
+                            "Timing Permission",
+                            grpId: timingReq.GrpId);
+                        AddManaCost(timingPayload, timingReq.ManaCost);
+                        entries.Add(new CastingTimeOptionEntry(timingPayload, timingReq.SubmitFlash));
+                        break;
+
+                    case CastingTimeOption_KickerRequest kickerReq:
+                        var kickerPayload = CreateCastingTimeOptionPayload(
+                            "kicker",
+                            kickerReq,
+                            childIndex,
+                            "Kicker",
+                            grpId: kickerReq.GrpId);
+                        AddManaCost(kickerPayload, kickerReq.ManaCost);
+                        entries.Add(new CastingTimeOptionEntry(kickerPayload, kickerReq.SubmitKicked));
+                        break;
+
+                    case CastingTimeOption_AdditionalCostRequest additionalReq:
+                        var additionalPayload = CreateCastingTimeOptionPayload(
+                            "additional_cost",
+                            additionalReq,
+                            childIndex,
+                            "Additional Cost",
+                            grpId: additionalReq.GrpId);
+                        AddManaCost(additionalPayload, additionalReq.ManaCost);
+                        entries.Add(new CastingTimeOptionEntry(additionalPayload, additionalReq.SubmitAdditionalCost));
+                        break;
+
+                    case CastingTimeOption_CostKeywordRequest keywordReq:
+                        var keywordPayload = CreateCastingTimeOptionPayload(
+                            "cost_keyword",
+                            keywordReq,
+                            childIndex,
+                            keywordReq.OptionType.ToString(),
+                            grpId: keywordReq.GrpId);
+                        entries.Add(new CastingTimeOptionEntry(keywordPayload, keywordReq.SubmitKeywordAction));
+                        break;
+
+                    case CastingTimeOption_NumericInputRequest numericReq when numericReq.Min == numericReq.Max:
+                        uint numericValue = numericReq.Min;
+                        var numericPayload = CreateCastingTimeOptionPayload(
+                            "numeric_input",
+                            numericReq,
+                            childIndex,
+                            $"Value {numericValue}",
+                            grpId: numericReq.GrpId);
+                        numericPayload["numericValue"] = (int)numericValue;
+                        entries.Add(new CastingTimeOptionEntry(
+                            numericPayload,
+                            () => numericReq.SubmitX(numericValue)));
+                        break;
+
+                    case CastingTimeOption_Replicate replicateReq when replicateReq.Min == replicateReq.Max:
+                        uint replicateValue = replicateReq.Min;
+                        var replicatePayload = CreateCastingTimeOptionPayload(
+                            "replicate",
+                            replicateReq,
+                            childIndex,
+                            $"Replicate {replicateValue}");
+                        replicatePayload["numericValue"] = (int)replicateValue;
+                        entries.Add(new CastingTimeOptionEntry(
+                            replicatePayload,
+                            () => replicateReq.SubmitValue(replicateValue)));
+                        break;
+                }
+            }
+
+            return entries;
         }
 
         // -------------------------------------------------------------------
@@ -1296,7 +1617,7 @@ namespace MtgaCoachBridge
             return new JObject
             {
                 ["ok"] = false,
-                ["error"] = "Command timed out waiting for main thread"
+                ["error"] = "Command timed out waiting for Unity main thread"
             };
         }
     }
@@ -1305,6 +1626,6 @@ namespace MtgaCoachBridge
     {
         public const string GUID = "com.mtgacoach.grebridge";
         public const string Name = "MtgaCoach GRE Bridge";
-        public const string Version = "0.3.0";
+        public const string Version = "0.4.0";
     }
 }

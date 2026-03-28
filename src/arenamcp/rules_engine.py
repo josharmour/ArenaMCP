@@ -546,18 +546,18 @@ class RulesEngine:
 
     @staticmethod
     def get_legal_actions(game_state: Dict[str, Any]) -> List[str]:
-        # PREFERENCE: Use ground-truth legal actions from GRE if available
-        if game_state.get("legal_actions"):
-            return game_state["legal_actions"]
-
         target_actions = RulesEngine._get_target_selection_actions(game_state)
         if target_actions:
             return target_actions
 
-        # Check for new decision types from expanded GRE handling
+        # Decision windows must override any stale ActionsAvailable list.
         decision_actions = RulesEngine._get_decision_actions(game_state)
         if decision_actions:
             return decision_actions
+
+        # PREFERENCE: Use ground-truth legal actions from GRE if available
+        if game_state.get("legal_actions"):
+            return game_state["legal_actions"]
 
         actions = []
 

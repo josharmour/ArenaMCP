@@ -6,6 +6,49 @@ cross-referenced against the current codebase architecture.
 
 **Date:** 2026-03-26
 
+## 2026-03-28 Architecture Update: Bridge-Authoritative Runtime
+
+The original turbo plan correctly pushed toward richer bridge access, but the current
+reverse-engineering work makes the target architecture much clearer:
+
+- **Direct bridge state must become the in-match source of truth.**
+  `Player.log` tailing should not remain the primary runtime model for live games.
+- **Direct bridge interaction snapshots must become the source of truth for decisions.**
+  Pending decisions should come from live `BaseUserRequest` objects, not inferred log diffs.
+- **Autopilot should submit through GRE for request families, not just priority actions.**
+  The bridge should cover casts, passes, casting-time choices, searches, selections,
+  pay-costs branches, and later targets/blockers/grouping.
+- **Logs should be demoted to fallback, bootstrapping, and diagnostics.**
+  Keep them for match lifecycle events, draft/out-of-game flows, and bug reports,
+  but not as the main engine for in-game synchronization.
+
+### Critical RE Findings That Change the Design
+
+- `BaseUserRequest.Type.ToString()` returns **enum-style request names** like
+  `ActionsAvailable`, `CastingTimeOptions`, `Search`, and `Mulligan`.
+- `request.GetType().Name` returns **CLR class names** like
+  `ActionsAvailableRequest`, `CastingTimeOptionRequest`, `SearchRequest`, and `MulliganRequest`.
+- The bridge layer must normalize these two identities. Any Python mapping that assumes
+  only one naming style will drift or silently misclassify requests.
+- `CastingTimeOptionRequest` is **not** a flat action list. It is a parent wrapper over
+  `ChildRequests`, and each child has its own submit method.
+- `PayCostsRequest` is also a parent wrapper over child requests such as
+  `SelectNRequest`, `ActionsAvailableRequest`, `EffectCostRequest`, and `AutoTapActionsRequest`.
+- The correct bridge abstraction is therefore a **typed interaction snapshot**, not just
+  `actions[]`.
+
+### Updated End State
+
+The intended runtime architecture should be:
+
+1. Plugin reads live MTGA state from `GameManager.CurrentGameState`.
+2. Plugin serializes live interaction state from `BaseUserRequest` trees.
+3. Python builds snapshots from bridge state first.
+4. Python uses logs only when the bridge is unavailable or for metadata the bridge
+   does not yet expose.
+5. Autopilot executes through direct GRE submission whenever the request family has
+   a stable submit path.
+
 ### Phase 1 Status: COMPLETE (2026-03-26)
 
 All Phase 1 items (1.1-1.4) and quick wins (6.1-6.3) implemented in branch
@@ -52,6 +95,11 @@ Plugin version bumped to 0.2.0. Changes to `Plugin.cs` and `gre_bridge.py`:
 - **Python client** (`gre_bridge.py`) — Added get_game_state(), get_timer_state(),
   get_match_info() methods
 
+**2026-03-28 note:** These Phase 2 items are now best understood as **foundation complete**,
+not final architecture complete. The remaining work is to make direct bridge state and
+typed bridge interactions the primary live pipeline, replacing log-first state assembly
+during matches.
+
 ### Phase 3 Status: COMPLETE (2026-03-26)
 
 Replay recording and match history system implemented. Plugin version 0.3.0.
@@ -68,6 +116,114 @@ Replay recording and match history system implemented. Plugin version 0.3.0.
   - `parse_replay_result()` — scan replay for win/loss annotations
   - `record_from_game_end()` — create record from game end snapshot + opponent cards
   - Deduplication by match_id, 500-record cap, stored at ~/.arenamcp/match_history/
+
+---
+
+## Phase 0: Installation, Bootstrap, and Productization
+
+The original turbo plan assumed a power-user workflow: unzip, install Python manually,
+install BepInEx manually, copy the plugin DLL manually, and run the TUI from scripts.
+
+That is no longer the right product model.
+
+Now that direct GRE tracking and direct GRE injection are part of the core runtime,
+**BepInEx is effectively a required dependency** for the full product. That means the
+installation story has to be first-class.
+
+### 0.1 Build a Real Windows Installer
+
+**Goal:** install mtgacoach like a normal Windows desktop app.
+
+Expected outcomes:
+- installed under `Program Files`
+- visible in **Add/Remove Programs**
+- installs/uninstalls cleanly
+- creates Start Menu and Desktop shortcuts
+- can register logs/config/data locations cleanly
+- launches reliably without depending on fragile `.bat` files or ad hoc shortcuts
+
+**Installer responsibilities:**
+- install the app binaries/runtime
+- detect MTGA install path
+- detect whether BepInEx is already installed
+- install or upgrade BepInEx when missing/outdated
+- deploy `MtgaCoachBridge.dll` into `MTGA\\BepInEx\\plugins`
+- write uninstall metadata
+- create shortcuts for:
+  - Coach
+  - Autopilot
+  - Voice Advisor
+  - optionally a diagnostics / repair tool
+
+**Likely implementation options:**
+- WiX Burn bootstrapper + MSI
+- Inno Setup
+- NSIS
+
+The exact packaging stack matters less than the outcome: a signed, versioned Windows
+installer with repair/uninstall support.
+
+### 0.2 Automatic BepInEx Detection and Installation
+
+**New requirement:** because bridge-first runtime depends on the plugin, BepInEx can no
+longer be a manual README step.
+
+**Installer/runtime should do:**
+- locate MTGA install path via:
+  - common install paths
+  - registry / uninstall keys
+  - existing shortcuts if needed
+  - user browse fallback
+- detect BepInEx presence and version
+- verify key files:
+  - `BepInEx\\core\\BepInEx.dll`
+  - `BepInEx\\plugins\\MtgaCoachBridge.dll`
+  - `BepInEx\\LogOutput.log`
+- install or repair BepInEx automatically when missing
+- install/update the plugin DLL automatically
+- verify plugin version compatibility with Python app version
+
+**Repair flow should support:**
+- "MTGA moved"
+- "BepInEx missing or corrupted"
+- "Plugin DLL missing"
+- "Bridge version mismatch"
+
+### 0.3 Replace Script-Based Launch With a Proper Launcher
+
+The current launch model depends on shell scripts, terminal setup, and user-managed
+shortcuts. A proper launcher should:
+
+- start the GUI app directly
+- start background services/components in the right order
+- verify bridge prerequisites before launch
+- surface actionable status:
+  - MTGA found / not found
+  - BepInEx installed / missing
+  - plugin loaded / not loaded
+  - bridge connected / disconnected
+- offer one-click repair actions where possible
+
+### 0.4 Installation/Packaging Compatibility Matrix
+
+The productized installer must explicitly handle:
+- fresh install on a machine with MTGA but no BepInEx
+- upgrade from current script/TUI-based install
+- MTGA update that replaces/modifies files
+- per-user data migration from `~/.arenamcp`
+- uninstall without removing user data unless requested
+
+### 0.5 Versioning and Compatibility Contract
+
+Once installer-managed, we need a compatibility contract across:
+- Python app version
+- bridge protocol version
+- `MtgaCoachBridge.dll` version
+- minimum supported BepInEx version
+- minimum supported MTGA client build
+
+The installer and launcher should detect incompatible combinations and either repair
+them or block launch with a clear message.
 
 ---
 
@@ -180,78 +336,110 @@ they may be considering a big play." Autopilot can adjust execution speed.
 
 ---
 
-## Phase 2: Expand BepInEx Plugin (Medium Effort, Transformative)
+## Phase 2: Expand BepInEx Plugin Into the Primary Runtime (Medium Effort, Transformative)
 
-The current BepInEx plugin only exposes 3 commands: `get_pending_actions`,
-`submit_action`, `submit_pass`. The MTGA internals accessed via `MatchManager` and
-`InteractionDirector` are far richer.
+The bridge now exposes the first wave of commands, but the remaining work is no longer
+"add a few more plugin helpers." The real architectural goal is to make the bridge the
+primary live runtime surface for both state and decisions.
 
-### 2.1 Add `get_game_state` Command to Plugin
+This phase should now be read as:
 
-**Current state:** All game state comes from tailing Player.log — a 40+ MB file that
-requires brace-depth JSON accumulation, 15MB backfill scanning, and complex
-state reconstruction with workarounds for missing data.
+- direct live state from MTGA objects
+- typed live interaction snapshots from `BaseUserRequest`
+- direct GRE submission across request families
+- logs relegated to fallback and diagnostic roles
 
-**Proposed:** Add a `get_game_state` command to Plugin.cs that reads directly from
-`MatchManager`'s GRE interface.
+### 2.1 Make `get_game_state` the Authoritative In-Match State Source
 
-**What MatchManager exposes (from ReVa analysis):**
-- `MatchManager._pendingInteraction` — full pending decision (already accessed, line 242)
-- `MatchManager.GreInterface` — direct access to the GRE game state object
-- Via GreInterface: full game objects, zones, players, turn info, annotations — the same
-  data the log gets, but live and complete (no partial diffs, no missing fields)
+**Current state:** `get_game_state` exists, but Python still relies heavily on
+log-derived reconstruction. This means the runtime model can still drift when the log
+lags, truncates, or emits partial context during transitions.
+
+**Updated goal:** Treat bridge state as authoritative during live games. Build the
+Python snapshot from the plugin first, then merge logs only for missing metadata or
+events the bridge does not yet expose.
+
+**Primary live source:**
+- `GameManager.CurrentGameState`
+- `GameManager.WorkflowController`
+- `GameManager.MatchManager`
+
+This should be used to derive:
+- zones / objects / players / turn / combat / timers
+- local pending request metadata
+- request-linked state like deciding player or source object
 
 **Implementation approach:**
 ```csharp
 case "get_game_state":
     var gameManager = FindObjectOfType<GameManager>();
-    var matchManager = gameManager?.MatchManager;
-    var greInterface = matchManager?.GreInterface;
-    // Access game state via greInterface
+    var state = gameManager?.CurrentGameState;
     // Serialize zones, objects, players, turn info
     // Return as JSON
     break;
 ```
 
 **Why this matters:**
-- **Eliminates log tailing entirely** for in-game state (keep log for match start/end/draft events)
+- **Eliminates log tailing as the primary in-game source**
 - **No more stale data** — get state at the exact moment you ask
 - **No more missing fields** — full state, not partial diffs
 - **No more backfill scanning** — instant state on coach startup mid-game
 - **Eliminates entire bug classes**: brace-depth parser errors, truncated JSON, race conditions between log write and our read
 - **Performance**: one JSON response vs. continuously tailing a 40MB+ file
 
-**Risk:** MatchManager's internal API may change between MTGA updates. Use reflection
-as a safety net (already done for _pendingInteraction).
+**Risk:** internal MTGA APIs may change between client updates. Use reflection as a
+safety net where direct references are brittle.
 
 **Files to change:**
-- `bepinex-plugin/MtgaCoachBridge/Plugin.cs` — add `get_game_state` command handler
+- `bepinex-plugin/MtgaCoachBridge/Plugin.cs` — keep expanding `get_game_state` fidelity
 - `src/arenamcp/gre_bridge.py` — add `get_game_state()` method
-- `src/arenamcp/gamestate.py` — add `update_from_bridge(data)` path alongside log parsing
+- `src/arenamcp/gamestate.py` — bridge-first snapshot update path
 - `src/arenamcp/standalone.py` — prefer bridge state when available, fall back to log
 
-### 2.2 Add `get_interaction_detail` Command
+### 2.2 Replace Action-Only Polling With a Typed `get_interaction_snapshot`
 
-**Current state:** The plugin returns the pending action list from `ActionsAvailableRequest`
-but nothing about other request types (mulligan, target selection, search, etc.).
+**Current state:** `get_pending_actions` is still conceptually action-centric. That works
+for `ActionsAvailableRequest`, but it is the wrong abstraction for request trees like
+`CastingTimeOptionRequest` and `PayCostsRequest`.
 
-**Proposed:** Return rich decision context for all request types:
+**Updated goal:** Expose one normalized interaction snapshot for all request families.
+
+**Snapshot shape should include:**
+- normalized request identity:
+  - enum-style request type
+  - CLR request class
+- source metadata:
+  - `sourceId`
+  - prompt / label / can-cancel / allow-undo
+- request-specific decision context:
+  - option counts
+  - selection IDs / grp IDs
+  - constraints (min/max, repeatable, etc.)
+- child request data when the request is a wrapper
+- direct bridge-submit indices where possible
+
+**Proposed coverage for request families:**
 - `ActionsAvailableRequest` → legal actions (existing)
-- `SelectTargetsReq` → valid targets with instance IDs and context
-- `DeclareAttackersReq` → legal attackers with attack warnings
-- `DeclareBlockersReq` → legal blockers with block warnings
-- `SearchReq` → searchable cards with zone info
-- `GroupReq` / `SelectNReq` → grouping/selection constraints
-- `MulliganReq` → hand contents and mulligan count
-- `DistributionReq` → distribution constraints (min/max per target)
+- `CastingTimeOptionRequest` → flattened child choices, one bridge-facing option per
+  submit path when possible
+- `SearchRequest` → searchable grp IDs / zones / selection limits
+- `SelectNRequest` → IDs, list type, ID type, min/max, context
+- `PayCostsRequest` → child request decomposition (`SelectN`, `ActionsAvailable`,
+  `EffectCost`, `AutoTapActions`)
+- `SelectTargetsRequest` → valid target groups / target indices / ability group
+- `MulliganRequest` → mulligan counts, free mulligan info, starting hand size
+- `GroupRequest` / `SelectFromGroupsRequest` / `SelectNGroupRequest` → grouping constraints
+- `DistributionReq` / `NumericInputReq` / `SelectCountersReq` → min/max/targets/values
 
 **Impact:** The coach and autopilot get structured decision context instead of inferring
 it from log messages (which are often incomplete or arrive out of order).
 
 **Files to change:**
-- `bepinex-plugin/MtgaCoachBridge/Plugin.cs` — expand ProcessCommand with per-type serializers
-- `src/arenamcp/gre_bridge.py` — add `get_interaction_detail()` method
-- `src/arenamcp/autopilot.py` — use rich context for better action planning
+- `bepinex-plugin/MtgaCoachBridge/Plugin.cs` — normalize request identity and serialize
+  typed interaction snapshots
+- `src/arenamcp/gre_bridge.py` — parse and expose normalized request snapshots
+- `src/arenamcp/gamestate.py` — enrich `decision_context` from bridge snapshots
+- `src/arenamcp/autopilot.py` — use typed request context for better action planning
 
 ### 2.3 Add `get_autotap_solutions` Command
 
@@ -301,6 +489,56 @@ case "get_timer_state":
 - Opponent display name
 - Sideboard contents (between games)
 - Previous game results in this match
+
+### 2.6 Normalize Request Identity Across Plugin and Python
+
+**Problem discovered in live debugging:** MTGA exposes request identity in two forms:
+
+- enum-style via `BaseUserRequest.Type.ToString()`
+- CLR class name via `request.GetType().Name`
+
+These differ materially:
+
+- `ActionsAvailable` vs `ActionsAvailableRequest`
+- `CastingTimeOptions` vs `CastingTimeOptionRequest`
+- `Search` vs `SearchRequest`
+
+**Why this matters:** Python mappings, prompt context, trigger detection, and autopilot
+routing all become brittle if they assume only one naming convention.
+
+**Proposed fix:**
+- plugin should return both forms explicitly
+- Python should normalize to a stable internal bridge request ID
+- prompting / planning / verification should use that normalized ID
+
+### 2.7 Direct GRE-First Autopilot Coverage
+
+The direct bridge execution path should be expanded from "submit pass / cast / play"
+to request-family coverage.
+
+**Priority order:**
+- `ActionsAvailableRequest`
+- `CastingTimeOptionRequest` child choices
+- `SearchRequest`
+- `SelectNRequest`
+- `PayCostsRequest` child requests
+- `MulliganRequest`
+- `SelectTargetsRequest`
+- combat declarations / grouping / counters / numeric input
+
+**Design rule:** If a request exposes a stable submit method in MTGA's managed code,
+autopilot should prefer GRE injection over screen clicks.
+
+### 2.8 Demote Log Tailing to Fallback and Diagnostics
+
+**Revised role for logs:**
+- startup / recovery when the bridge is unavailable
+- match start/end metadata not yet bridged
+- draft / menus / out-of-game flows
+- F7 bug reports and forensic trails
+
+**Non-goal:** logs should no longer be required for correct in-game synchronization
+once the bridge is connected and state snapshots are available.
 
 ---
 
@@ -476,7 +714,86 @@ annotations and zone transfers). Expose as `recent_actions` in game state.
 
 ---
 
-## Implementation Priority
+## Phase 7: Desktop GUI and Operator Experience
+
+The current TUI has been useful for development, but it is not the right primary
+interface for a product that installs into Windows, owns a bridge runtime, and needs
+repair/status workflows.
+
+### 7.1 Build a Real Desktop GUI
+
+**Goal:** replace or wrap the TUI with a proper Windows desktop application that exposes
+the product's main modes and runtime status clearly.
+
+Core GUI responsibilities:
+- mode selection:
+  - Coach
+  - Autopilot
+  - Voice Advisor
+  - Draft
+- backend/model settings
+- bridge/plugin/BepInEx health status
+- MTGA detection status
+- one-click start/stop/reconnect actions
+- logs and diagnostics access
+- bug report submission / export
+
+### 7.2 Add Guided Setup and Repair UX
+
+Because BepInEx and the GRE bridge are now operational dependencies, the GUI should
+include setup/repair flows rather than expecting the user to manage files manually.
+
+Setup/repair screens should support:
+- locate MTGA
+- install/repair BepInEx
+- install/update plugin
+- verify bridge connectivity
+- explain failures with concrete actions
+
+### 7.3 Surface Live Runtime State in the GUI
+
+The GUI should make the bridge-first runtime visible:
+- MTGA running / not running
+- plugin loaded / not loaded
+- bridge connected / disconnected
+- current request type
+- current match / game status
+- current autopilot state and last executed action
+
+### 7.4 GUI Technology Direction
+
+The GUI should be chosen based on Windows installability and reliability, not terminal
+reuse. Good options include:
+- PySide6 / Qt for a native-feeling packaged desktop app
+- a small local web UI wrapped in a desktop shell if packaging is robust enough
+
+The important product requirement is:
+- packaged cleanly
+- launched without shell scripts
+- repairable
+- friendly to installers, shortcuts, and standard Windows UX
+
+---
+
+## 2026-03-28 Reprioritization
+
+These items now supersede the older sequencing below.
+
+| Priority | Upgrade | Effort | Impact | Status |
+|---|---|---|---|---|
+| 1 | Windows installer + BepInEx bootstrap/repair + proper launcher | 3-7 days | **Transformative** | Pending |
+| 2 | Bridge-authoritative live state pipeline (`get_game_state` first, logs second) | 2-4 days | **Transformative** | Pending |
+| 3 | Typed `get_interaction_snapshot` / normalized request identity | 2-4 days | **Transformative** | In progress |
+| 4 | Direct GRE submission for casting-time and pay-costs request trees | 2-5 days | **Transformative** | In progress |
+| 5 | Direct GRE submission for search / select / mulligan / targets | 3-5 days | High | Pending |
+| 6 | Demote log tailing to fallback / diagnostics only | 1-3 days | High | Pending |
+| 7 | Desktop GUI with setup/repair/runtime status | 4-10 days | High | Pending |
+| 8 | GRE prediction engine / advisability after bridge-first runtime is stable | 3-5 days | **Transformative** | Pending |
+
+## Historical Implementation Priority
+
+The table below captures the original sequence prior to the 2026-03-28 bridge-first
+architecture update.
 
 | # | Upgrade | Effort | Impact | Dependencies | Status |
 |---|---------|--------|--------|-------------|--------|

@@ -17,6 +17,76 @@ from typing import Any, Callable, Optional
 logger = logging.getLogger(__name__)
 
 
+def _ensure_list(value: Any) -> list[Any]:
+    """Normalize GRE repeated fields that sometimes arrive as scalars."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _ensure_dict_list(value: Any) -> list[dict[str, Any]]:
+    """Normalize repeated GRE dict fields that may arrive as a single dict."""
+    return [item for item in _ensure_list(value) if isinstance(item, dict)]
+
+
+def _ensure_int_list(value: Any) -> list[int]:
+    """Normalize repeated GRE integer fields that may arrive as a scalar."""
+    result: list[int] = []
+    for item in _ensure_list(value):
+        if item is None or isinstance(item, bool):
+            continue
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            logger.debug("Skipping non-integer GRE list item: %r", item)
+    return result
+
+
+def _collapse_gre_value(value: Any) -> Any:
+    """Collapse single-item repeated values while preserving true lists."""
+    if isinstance(value, (list, tuple)):
+        items = [item for item in value if item is not None]
+        if not items:
+            return ""
+        if len(items) == 1:
+            return items[0]
+        return items
+    return value
+
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    """Best-effort integer coercion for GRE scalar-or-list fields."""
+    value = _collapse_gre_value(value)
+    if isinstance(value, list):
+        value = value[0] if value else default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_optional_int(value: Any) -> Optional[int]:
+    """Best-effort optional integer coercion for GRE scalar-or-list fields."""
+    value = _collapse_gre_value(value)
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_str_list(value: Any) -> list[str]:
+    """Normalize repeated GRE string/enum fields that may arrive as scalars."""
+    return [str(item) for item in _ensure_list(value) if item not in (None, "")]
+
+
 class ZoneType(Enum):
     """Zone types in MTGA."""
     BATTLEFIELD = "ZoneType_Battlefield"
@@ -1009,17 +1079,17 @@ class GameState:
                 self._update_turn_info(turn_info)
 
             # Update game objects
-            game_objects = message.get("gameObjects", [])
+            game_objects = _ensure_dict_list(message.get("gameObjects", []))
             for obj_data in game_objects:
                 self._update_game_object(obj_data)
 
             # Update zones
-            zones = message.get("zones", [])
+            zones = _ensure_dict_list(message.get("zones", []))
             for zone_data in zones:
                 self._update_zone(zone_data)
 
             # Update players
-            players = message.get("players", [])
+            players = _ensure_dict_list(message.get("players", []))
             for player_data in players:
                 self._update_player(player_data)
 
@@ -1032,10 +1102,10 @@ class GameState:
                 self._process_game_info(game_info)
 
             # Process annotations (damage, counters, zone transfers, reveals, etc.)
-            annotations = message.get("annotations", [])
+            annotations = _ensure_list(message.get("annotations", []))
             if annotations:
                 self._process_annotations(annotations)
-            persistent_annotations = message.get("persistentAnnotations", [])
+            persistent_annotations = _ensure_list(message.get("persistentAnnotations", []))
             if persistent_annotations:
                 self._process_annotations(persistent_annotations)
 
@@ -1138,11 +1208,11 @@ class GameState:
         if "isBlocking" in obj_data: is_blocking = bool(obj_data["isBlocking"])
 
         if "cardTypes" in obj_data:
-            card_types = list(obj_data["cardTypes"])
+            card_types = _coerce_str_list(obj_data["cardTypes"])
 
         if "subtypes" in obj_data:
             subtypes = []
-            for st in obj_data["subtypes"]:
+            for st in _ensure_list(obj_data["subtypes"]):
                 clean_subtype = st.replace("SubType_", "") if isinstance(st, str) else str(st)
                 subtypes.append(clean_subtype)
 
@@ -1158,9 +1228,9 @@ class GameState:
         # Parse counters on this object
         if "counters" in obj_data:
             counters = {}
-            for counter_data in obj_data["counters"]:
+            for counter_data in _ensure_dict_list(obj_data["counters"]):
                 ctype = counter_data.get("type", counter_data.get("counterType", "unknown"))
-                ccount = counter_data.get("count", 1)
+                ccount = _coerce_int(counter_data.get("count", 1), 1)
                 counters[ctype] = ccount
 
         game_object = GameObject(
@@ -1287,9 +1357,7 @@ class GameState:
         # Critical: If missing, must preserve existing list to avoid wiping zone
         # GRE protobuf may send a single int instead of a list for single-element zones
         if "objectInstanceIds" in zone_data:
-            object_instance_ids = zone_data["objectInstanceIds"]
-            if isinstance(object_instance_ids, int):
-                object_instance_ids = [object_instance_ids]
+            object_instance_ids = _ensure_int_list(zone_data["objectInstanceIds"])
         elif existing_zone:
             object_instance_ids = existing_zone.object_instance_ids
         else:
@@ -1396,10 +1464,10 @@ class GameState:
         }
         if "manaPool" in player_data:
             mana_pool = {}
-            for mana_data in player_data["manaPool"]:
+            for mana_data in _ensure_dict_list(player_data["manaPool"]):
                 raw_color = mana_data.get("color", mana_data.get("type", ""))
                 mana_type = _MANA_COLOR_MAP.get(raw_color, raw_color or "unknown")
-                mana_count = mana_data.get("count", 0)
+                mana_count = _coerce_int(mana_data.get("count", 0), 0)
                 mana_pool[mana_type] = mana_pool.get(mana_type, 0) + mana_count
         elif existing:
             mana_pool = existing.mana_pool
@@ -1507,36 +1575,31 @@ class GameState:
         Args:
             annotations: List of annotation dicts from GameStateMessage.
         """
-        for ann in annotations:
-            ann_types = ann.get("type", [])
-            if isinstance(ann_types, (str, int)):
-                ann_types = [str(ann_types)]
-            elif isinstance(ann_types, list):
-                ann_types = [str(t) for t in ann_types]
-            details = ann.get("details", [])
-            affected_ids = ann.get("affectedIds", [])
-            if isinstance(affected_ids, int):
-                affected_ids = [affected_ids]
+        for ann in _ensure_dict_list(annotations):
+            ann_types = [str(t) for t in _ensure_list(ann.get("type", [])) if t is not None]
+            details = _ensure_dict_list(ann.get("details", []))
+            affected_ids = _ensure_int_list(ann.get("affectedIds", []))
             # Build a quick detail lookup
-            # GRE protobuf repeated fields (valueInt32, valueInt64) may arrive
-            # as lists instead of scalars — unwrap single-element lists.
             detail_map = {}
             for d in details:
                 key = d.get("key", "")
                 if key:
-                    raw = d.get("valueInt32", d.get("valueString", d.get("valueInt64", "")))
-                    # Unwrap single-element lists to scalar (protobuf repeated fields)
-                    if isinstance(raw, list):
-                        raw = raw[0] if len(raw) == 1 else (sum(raw) if raw and all(isinstance(x, (int, float)) for x in raw) else raw)
-                    detail_map[key] = raw
+                    raw = d.get("valueInt32")
+                    if raw in (None, [], ""):
+                        raw = d.get("valueString")
+                    if raw in (None, [], ""):
+                        raw = d.get("valueInt64")
+                    detail_map[key] = _collapse_gre_value(raw)
 
             for ann_type in ann_types:
                 if ann_type == "AnnotationType_DamageDealt":
                     # Track damage: who dealt how much to whom
-                    _raw_dmg = detail_map.get("damage", 0)
-                    damage_amount = _raw_dmg if isinstance(_raw_dmg, int) else int(_raw_dmg[0]) if isinstance(_raw_dmg, list) and _raw_dmg else 0
-                    source_id = detail_map.get("sourceId", 0)
-                    target_id = detail_map.get("targetId", affected_ids[0] if affected_ids else 0)
+                    damage_amount = _coerce_int(detail_map.get("damage", 0), 0)
+                    source_id = _coerce_int(detail_map.get("sourceId", 0), 0)
+                    target_id = _coerce_int(
+                        detail_map.get("targetId", affected_ids[0] if affected_ids else 0),
+                        affected_ids[0] if affected_ids else 0,
+                    )
                     # If target is a player seat, track cumulative damage
                     for seat_id in self.players:
                         if target_id == seat_id:
@@ -1575,8 +1638,10 @@ class GameState:
 
                 elif ann_type in ("AnnotationType_CounterAdded", "AnnotationType_CounterRemoved"):
                     counter_type = detail_map.get("counterType", "unknown")
-                    _raw_cnt = detail_map.get("counterCount", detail_map.get("count", 1))
-                    counter_count = _raw_cnt if isinstance(_raw_cnt, int) else int(_raw_cnt[0]) if isinstance(_raw_cnt, list) and _raw_cnt else 1
+                    counter_count = _coerce_int(
+                        detail_map.get("counterCount", detail_map.get("count", 1)),
+                        1,
+                    )
                     is_added = "Added" in ann_type
                     for obj_id in affected_ids:
                         obj = self.game_objects.get(obj_id)
@@ -1600,7 +1665,7 @@ class GameState:
                 elif ann_type == "AnnotationType_ControllerChanged":
                     for obj_id in affected_ids:
                         obj = self.game_objects.get(obj_id)
-                        new_controller = detail_map.get("controllerId", 0)
+                        new_controller = _coerce_int(detail_map.get("controllerId", 0), 0)
                         if obj:
                             self._add_event({
                                 "type": "controller_changed",
@@ -1659,8 +1724,11 @@ class GameState:
 
                 elif ann_type == "AnnotationType_TriggeringObject":
                     # Links a triggered ability to its source
-                    source_id = detail_map.get("sourceId", affected_ids[0] if affected_ids else 0)
-                    trigger_id = detail_map.get("triggerId", 0)
+                    source_id = _coerce_int(
+                        detail_map.get("sourceId", affected_ids[0] if affected_ids else 0),
+                        affected_ids[0] if affected_ids else 0,
+                    )
+                    trigger_id = _coerce_int(detail_map.get("triggerId", 0), 0)
                     source_obj = self.game_objects.get(source_id)
                     if source_obj:
                         self._add_event({
@@ -1688,8 +1756,8 @@ class GameState:
                     self._add_event(event)
                     # Build a concise action history entry
                     action_type = detail_map.get("actionType", "")
-                    grp_id = detail_map.get("grpId", 0)
-                    seat = detail_map.get("seatId", 0)
+                    grp_id = _coerce_int(detail_map.get("grpId", 0), 0)
+                    seat = _coerce_int(detail_map.get("seatId", 0), 0)
                     card_name = self._resolve_card_name(grp_id) if grp_id else ""
                     history_entry = {
                         "turn": self.turn_info.turn_number,
@@ -1753,10 +1821,8 @@ class GameState:
 
                 elif ann_type == "AnnotationType_TargetSpec":
                     # Spell/ability targeting — links source to target instance IDs
-                    source_id = detail_map.get("sourceId", 0)
-                    target_ids = detail_map.get("targetIds", affected_ids)
-                    if isinstance(target_ids, int):
-                        target_ids = [target_ids]
+                    source_id = _coerce_int(detail_map.get("sourceId", 0), 0)
+                    target_ids = _ensure_int_list(detail_map.get("targetIds", affected_ids))
                     source_obj = self.game_objects.get(source_id)
                     if source_obj:
                         source_obj.targeting = list(target_ids)
@@ -1789,8 +1855,9 @@ class GameState:
                     new_power = detail_map.get("value", detail_map.get("power"))
                     for obj_id in affected_ids:
                         obj = self.game_objects.get(obj_id)
-                        if obj and new_power is not None:
-                            obj.modified_power = int(new_power) if not isinstance(new_power, int) else new_power
+                        new_power_int = _coerce_optional_int(new_power)
+                        if obj and new_power_int is not None:
+                            obj.modified_power = new_power_int
 
                 elif ann_type == "AnnotationType_ModifiedCost":
                     cost_str = detail_map.get("value", detail_map.get("cost", ""))
@@ -1800,18 +1867,14 @@ class GameState:
                             obj.modified_cost = str(cost_str)
 
                 elif ann_type == "AnnotationType_ModifiedColor":
-                    colors = detail_map.get("colors", detail_map.get("value", []))
-                    if isinstance(colors, str):
-                        colors = [colors]
+                    colors = _coerce_str_list(detail_map.get("colors", detail_map.get("value", [])))
                     for obj_id in affected_ids:
                         obj = self.game_objects.get(obj_id)
                         if obj and colors:
                             obj.modified_colors = list(colors)
 
                 elif ann_type == "AnnotationType_ModifiedType":
-                    types = detail_map.get("types", detail_map.get("value", []))
-                    if isinstance(types, str):
-                        types = [types]
+                    types = _coerce_str_list(detail_map.get("types", detail_map.get("value", [])))
                     for obj_id in affected_ids:
                         obj = self.game_objects.get(obj_id)
                         if obj and types:
@@ -1900,14 +1963,15 @@ class GameState:
 
                 elif ann_type == "AnnotationType_ClassLevel":
                     level = detail_map.get("level", detail_map.get("value", 1))
+                    level_int = _coerce_optional_int(level)
                     for obj_id in affected_ids:
                         obj = self.game_objects.get(obj_id)
-                        if obj:
-                            obj.class_level = int(level) if not isinstance(level, int) else level
+                        if obj and level_int is not None:
+                            obj.class_level = level_int
                     self._add_event({
                         "type": "class_level",
                         "affected_ids": affected_ids,
-                        "level": level,
+                        "level": level_int if level_int is not None else level,
                     })
 
                 elif ann_type == "AnnotationType_DungeonStatus":
@@ -1935,7 +1999,7 @@ class GameState:
 
                 elif ann_type in ("AnnotationType_LinkedDamage", "AnnotationType_DamageSource"):
                     # Damage attribution — which source dealt what
-                    source_id = detail_map.get("sourceId", 0)
+                    source_id = _coerce_int(detail_map.get("sourceId", 0), 0)
                     source_obj = self.game_objects.get(source_id)
                     self._add_event({
                         "type": "damage_attribution",
@@ -1954,20 +2018,20 @@ class GameState:
                     })
 
                 elif ann_type == "AnnotationType_ColorProduction":
-                    colors = detail_map.get("colors", detail_map.get("value", []))
-                    if isinstance(colors, str):
-                        colors = [colors]
+                    colors = _coerce_str_list(detail_map.get("colors", detail_map.get("value", [])))
                     for obj_id in affected_ids:
                         obj = self.game_objects.get(obj_id)
                         if obj and colors:
                             obj.color_production = list(colors)
 
                 elif ann_type == "AnnotationType_CopiedObject":
-                    source_grp = detail_map.get("sourceGrpId", detail_map.get("grpId", 0))
+                    source_grp = _coerce_optional_int(
+                        detail_map.get("sourceGrpId", detail_map.get("grpId", 0))
+                    )
                     for obj_id in affected_ids:
                         obj = self.game_objects.get(obj_id)
-                        if obj and source_grp:
-                            obj.copied_from_grp_id = int(source_grp)
+                        if obj and source_grp is not None:
+                            obj.copied_from_grp_id = source_grp
                     self._add_event({
                         "type": "copied_object",
                         "affected_ids": affected_ids,
@@ -2331,6 +2395,7 @@ def _set_simple_decision(game_state: GameState, label: str, dec_type: str,
     import time as _time
     logger.info(f"Captured Decision: {label}")
     game_state.pending_decision = label
+    game_state.decision_seat_id = game_state.local_seat_id
     game_state.decision_timestamp = _time.time()
     ctx: dict[str, Any] = {"type": dec_type}
     if raw is not None:
@@ -2427,7 +2492,7 @@ def _handle_decision_message(game_state: GameState, msg_type: str,
 
     elif msg_type == "GREMessageType_GroupOptionReq":
         req = msg.get("groupOptionReq", {})
-        options = req.get("options", [])
+        options = _ensure_list(req.get("options", []))
         logger.info(f"Captured Decision: Choose Mode ({len(options)} options)")
         game_state.pending_decision = "Choose Mode"
         game_state.decision_timestamp = _time.time()
@@ -2439,7 +2504,7 @@ def _handle_decision_message(game_state: GameState, msg_type: str,
 
     elif msg_type == "GREMessageType_ConnectResp":
         connect_resp = msg.get("connectResp", {})
-        deck_cards = connect_resp.get("deckMessage", {}).get("deckCards", [])
+        deck_cards = _ensure_int_list(connect_resp.get("deckMessage", {}).get("deckCards", []))
         if deck_cards:
             game_state.deck_cards = deck_cards
             logger.info(f"Captured deck list from ConnectResp: {len(deck_cards)} cards")
@@ -2447,10 +2512,13 @@ def _handle_decision_message(game_state: GameState, msg_type: str,
 
     elif msg_type == "GREMessageType_DeclareAttackersReq":
         req = msg.get("declareAttackersReq", {})
-        legal_attackers = req.get("attackers", req.get("qualifiedAttackers", []))
+        legal_attackers = _ensure_list(req.get("attackers", req.get("qualifiedAttackers", [])))
         attacker_names, attacker_ids = [], []
         for atk in legal_attackers:
-            obj_id = atk if isinstance(atk, int) else atk.get("instanceId", atk.get("attackerInstanceId", 0))
+            obj_id = atk if isinstance(atk, int) else _coerce_int(
+                atk.get("instanceId", atk.get("attackerInstanceId", 0)),
+                0,
+            )
             obj = game_state.game_objects.get(obj_id)
             if obj:
                 attacker_names.append(game_state._resolve_card_name(obj.grp_id))
@@ -2466,10 +2534,13 @@ def _handle_decision_message(game_state: GameState, msg_type: str,
 
     elif msg_type == "GREMessageType_DeclareBlockersReq":
         req = msg.get("declareBlockersReq", {})
-        legal_blockers = req.get("blockers", req.get("qualifiedBlockers", []))
+        legal_blockers = _ensure_list(req.get("blockers", req.get("qualifiedBlockers", [])))
         blocker_names, blocker_ids = [], []
         for blk in legal_blockers:
-            obj_id = blk if isinstance(blk, int) else blk.get("instanceId", blk.get("blockerInstanceId", 0))
+            obj_id = blk if isinstance(blk, int) else _coerce_int(
+                blk.get("instanceId", blk.get("blockerInstanceId", 0)),
+                0,
+            )
             obj = game_state.game_objects.get(obj_id)
             if obj:
                 blocker_names.append(game_state._resolve_card_name(obj.grp_id))
@@ -2608,10 +2679,10 @@ def _handle_select_n_req(game_state: GameState, msg: dict) -> bool:
     import time as _time
     req = msg.get("selectNReq", {})
     context_data = req.get("context", {})
-    num_to_select = req.get("count", 1)
-    min_select = req.get("minCount", num_to_select)
-    max_select = req.get("maxCount", num_to_select)
-    option_ids = req.get("ids", [])
+    num_to_select = _coerce_int(req.get("count", 1), 1)
+    min_select = _coerce_int(req.get("minCount", num_to_select), num_to_select)
+    max_select = _coerce_int(req.get("maxCount", num_to_select), num_to_select)
+    option_ids = _ensure_int_list(req.get("ids", []))
 
     context_str = str(context_data).lower()
     prior_prompt = ""
@@ -2671,7 +2742,7 @@ def _handle_actions_available(game_state: GameState, msg: dict) -> bool:
     """Handle ActionsAvailableReq messages. Returns True if snapshot_dirty."""
     import time as _time
     req = msg.get("actionsAvailableReq", {})
-    raw_actions = req.get("actions", [])
+    raw_actions = _ensure_dict_list(req.get("actions", []))
 
     # ── Phase 1: Enrich raw actions with AutoTap + ability metadata ──
     enriched_actions = []
@@ -2679,10 +2750,10 @@ def _handle_actions_available(game_state: GameState, msg: dict) -> bool:
         enriched = copy.deepcopy(action)
         # Extract AutoTap castability — the game engine's own mana solver
         autotap = action.get("autoTapSolution")
-        if autotap is not None:
+        if isinstance(autotap, dict):
             enriched["_castable"] = True
             # Parse tap actions if present
-            tap_actions = autotap.get("autoTapActions", [])
+            tap_actions = _ensure_dict_list(autotap.get("autoTapActions", []))
             if tap_actions:
                 enriched["_autotap_lands"] = [
                     {"instanceId": ta.get("instanceId"), "mana": ta.get("manaProduced", "")}
@@ -2701,7 +2772,7 @@ def _handle_actions_available(game_state: GameState, msg: dict) -> bool:
             enriched["_alternative_grp_id"] = action["alternativeGrpId"]
 
         # Mana cost structured extraction
-        mana_cost = action.get("manaCost", [])
+        mana_cost = _ensure_dict_list(action.get("manaCost", []))
         if mana_cost:
             _MANA_ABBREV = {
                 "ManaColor_White": "W", "ManaColor_Blue": "U",
@@ -2711,8 +2782,8 @@ def _handle_actions_available(game_state: GameState, msg: dict) -> bool:
             }
             cost_parts = []
             for mc in mana_cost:
-                colors = mc.get("color", [])
-                count = mc.get("count", 1)
+                colors = _coerce_str_list(mc.get("color", []))
+                count = _coerce_int(mc.get("count", 1), 1)
                 if colors:
                     symbols = [_MANA_ABBREV.get(c, c) for c in colors]
                     cost_parts.append(f"{count}{''.join(symbols)}")
@@ -2820,10 +2891,10 @@ def _handle_pay_costs(game_state: GameState, msg: dict) -> bool:
     """Handle PayCostsReq messages."""
     import time as _time
     req = msg.get("payCostsReq", {})
-    mana_cost = req.get("manaCost", [])
+    mana_cost = _ensure_dict_list(req.get("manaCost", []))
     source_id = 0
     for mc in mana_cost:
-        oid = mc.get("objectId", 0)
+        oid = _coerce_int(mc.get("objectId", 0), 0)
         if oid:
             source_id = oid
             break
@@ -2834,27 +2905,44 @@ def _handle_pay_costs(game_state: GameState, msg: dict) -> bool:
         "ManaColor_White": "W", "ManaColor_Blue": "U",
         "ManaColor_Black": "B", "ManaColor_Red": "R",
         "ManaColor_Green": "G", "ManaColor_Colorless": "C",
-        "ManaColor_Any": "Any",
+        "ManaColor_Any": "Any", "ManaColor_Generic": "Generic",
+    }
+    mana_requirements = {
+        "generic": 0,
+        "W": 0,
+        "U": 0,
+        "B": 0,
+        "R": 0,
+        "G": 0,
+        "C": 0,
+        "Any": 0,
     }
     mana_parts = []
     for mc in mana_cost:
-        colors = mc.get("color", [])
-        count = mc.get("count", 1)
+        colors = _coerce_str_list(mc.get("color", []))
+        count = _coerce_int(mc.get("count", 1), 1)
         if colors:
             symbols = [_MANA_ABBREV.get(c, c) for c in colors]
+            if all(symbol == "Generic" for symbol in symbols):
+                mana_requirements["generic"] += count
+            elif len(symbols) == 1 and symbols[0] in mana_requirements:
+                mana_requirements[symbols[0]] += count
             mana_parts.append(f"{count}x{''.join(symbols)}")
         else:
+            mana_requirements["generic"] += count
             mana_parts.append(f"{count}")
     mana_str = ", ".join(mana_parts) if mana_parts else "unknown"
 
     # ── Phase 1: Extract full AutoTap solution ──
     autotap_req = req.get("autoTapActionsReq", {})
-    autotap_solutions = autotap_req.get("autoTapSolutions", [])
+    if not isinstance(autotap_req, dict):
+        autotap_req = {}
+    autotap_solutions = _ensure_dict_list(autotap_req.get("autoTapSolutions", []))
     has_autotap = bool(autotap_solutions)
     autotap_info = None
-    if has_autotap and isinstance(autotap_solutions, list) and autotap_solutions:
+    if has_autotap:
         first_solution = autotap_solutions[0]
-        tap_actions = first_solution.get("autoTapActions", [])
+        tap_actions = _ensure_dict_list(first_solution.get("autoTapActions", []))
         autotap_info = {
             "lands_to_tap": [
                 {"instanceId": ta.get("instanceId"), "mana": ta.get("manaProduced", "")}
@@ -2863,13 +2951,26 @@ def _handle_pay_costs(game_state: GameState, msg: dict) -> bool:
             "num_lands": len(tap_actions),
         }
 
+    # PayCostsReq replaces the previous priority window. Keeping the old
+    # ActionsAvailable data around causes the planner to try to cast again.
+    if game_state.legal_actions or game_state.legal_actions_raw:
+        logger.info(
+            "Clearing stale legal actions for Pay Costs (%d summarized, %d raw)",
+            len(game_state.legal_actions),
+            len(game_state.legal_actions_raw),
+        )
+        game_state.legal_actions = []
+        game_state.legal_actions_raw = []
+
     logger.info(f"Captured Decision: Pay Costs (source: {source_name}, mana: {mana_str}, autotap={has_autotap})")
     game_state.pending_decision = "Pay Costs"
+    game_state.decision_seat_id = game_state.local_seat_id
     game_state.decision_timestamp = _time.time()
     game_state.decision_context = {
         "type": "pay_costs", "source_card": source_name,
         "source_id": source_id if source_id else None,
         "mana_cost": mana_str, "has_autotap": has_autotap,
+        "mana_requirements": {k: v for k, v in mana_requirements.items() if v},
         "autotap_solution": autotap_info,
     }
     return False
@@ -2924,7 +3025,9 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
     def handler(payload: dict) -> None:
         # GreToClientEvent contains greToClientMessages array
         gre_event = payload.get("greToClientEvent", {})
-        messages = gre_event.get("greToClientMessages", [])
+        if not isinstance(gre_event, dict):
+            gre_event = {}
+        messages = _ensure_list(gre_event.get("greToClientMessages", []))
         snapshot_dirty = False
 
         def apply_game_state_update(msg_payload: dict) -> None:
@@ -2934,11 +3037,13 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
             snapshot_dirty = False
 
         for msg in messages:
+            if not isinstance(msg, dict):
+                continue
             msg_type = msg.get("type", "")
-            seat_hint = msg.get("systemSeatId")
+            seat_hint = _coerce_optional_int(msg.get("systemSeatId"))
             if seat_hint is None:
-                system_seat_ids = msg.get("systemSeatIds", [])
-                if isinstance(system_seat_ids, list) and len(system_seat_ids) == 1:
+                system_seat_ids = _ensure_int_list(msg.get("systemSeatIds", []))
+                if len(system_seat_ids) == 1:
                     seat_hint = system_seat_ids[0]
             if (
                 isinstance(seat_hint, int)
@@ -2980,13 +3085,13 @@ def create_game_state_handler(game_state: GameState) -> Callable[[dict], None]:
             elif msg_type == "GREMessageType_TimerStateMessage":
                 # ── Phase 1: Parse chess clock / timer data ──
                 timer_msg = msg.get("timerStateMessage", msg.get("timerState", {}))
-                if timer_msg:
-                    timers = timer_msg.get("timers", [])
+                if isinstance(timer_msg, dict) and timer_msg:
+                    timers = _ensure_dict_list(timer_msg.get("timers", []))
                     timer_data = {}
                     for timer in timers:
-                        player_id = timer.get("playerId", timer.get("seatId", 0))
+                        player_id = _coerce_int(timer.get("playerId", timer.get("seatId", 0)), 0)
                         timer_type = timer.get("type", timer.get("timerType", ""))
-                        remaining = timer.get("timeRemainingMs", timer.get("durationMs", 0))
+                        remaining = _coerce_int(timer.get("timeRemainingMs", timer.get("durationMs", 0)), 0)
                         behavior = timer.get("behavior", "")
                         if player_id:
                             timer_data[player_id] = {

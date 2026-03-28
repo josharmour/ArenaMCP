@@ -927,6 +927,8 @@ def get_game_state() -> dict[str, Any]:
 
     local_seat_id = snap.get("local_seat_id")
     decision_seat_id = snap.get("decision_seat_id")
+    if decision_seat_id is None and snap.get("pending_decision"):
+        decision_seat_id = local_seat_id
     decision_context = snap.get("decision_context")
     if decision_context is not None:
         decision_context = copy.deepcopy(decision_context)
