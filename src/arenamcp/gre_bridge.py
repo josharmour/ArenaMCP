@@ -611,7 +611,7 @@ class BridgeDecisionPoller:
             poller.enrich_snapshot(curr_state)
     """
 
-    _MAX_CONSECUTIVE_ERRORS = 3
+    _MAX_CONSECUTIVE_ERRORS = 30  # High tolerance — commands may time out when Update() is dead
 
     def __init__(self, bridge: GREBridge):
         self._bridge = bridge
@@ -677,9 +677,9 @@ class BridgeDecisionPoller:
             if self._was_connected and self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
                 self._fallback_mode = True
                 self._was_connected = False
-                logger.warning(
-                    f"Bridge polling failed {self._consecutive_errors}x consecutively, "
-                    "entering fallback mode"
+                logger.info(
+                    f"Bridge polling failed {self._consecutive_errors}x, "
+                    "entering fallback (will recover automatically)"
                 )
             return None
 
