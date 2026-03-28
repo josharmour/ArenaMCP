@@ -37,6 +37,11 @@ namespace MtgaCoachBridge
             _log = Logger;
             _log.LogInfo($"MtgaCoachBridge v{PluginInfo.Version} loaded");
 
+            // Survive scene transitions (loading → menu → match).
+            // Without this, Unity destroys the MonoBehaviour on scene change,
+            // setting _running=false and killing the pipe server thread.
+            DontDestroyOnLoad(gameObject);
+
             _running = true;
             _pipeThread = new Thread(PipeServerLoop)
             {
