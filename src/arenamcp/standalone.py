@@ -1903,10 +1903,9 @@ class StandaloneCoach:
                             self.speak_advice(advice)
                             continue  # Don't send to LLM
 
-                        # AUTOPILOT: If enabled, route trigger through autopilot
-                        # instead of the LLM coaching call. Never fall through to
-                        # coaching — a failed plan will retry on the next poll cycle
-                        # with fresh state, avoiding a double LLM call (~5s wasted).
+                        # AUTOPILOT: If enabled, route trigger through autopilot.
+                        # On success, skip coaching. On failure, fall through to
+                        # regular coaching so the user still gets advice.
                         if self._autopilot_enabled and self._autopilot:
                             try:
                                 handled = self._autopilot.process_trigger(
@@ -1915,14 +1914,15 @@ class StandaloneCoach:
                                 if handled:
                                     last_advice_turn = turn_num
                                     last_advice_phase = phase
+                                    continue  # Autopilot handled it
                                 else:
                                     logger.info(
                                         f"Autopilot failed for trigger '{trigger}' — "
-                                        "skipping coaching fallback, will retry next cycle"
+                                        "falling through to coaching"
                                     )
                             except Exception as e:
                                 logger.error(f"Autopilot error: {e}", exc_info=True)
-                            continue  # Always skip coaching when autopilot is enabled
+                            # Fall through to coaching below
 
                         if self._coach:
                             # Snapshot turn state BEFORE the (slow) LLM call
