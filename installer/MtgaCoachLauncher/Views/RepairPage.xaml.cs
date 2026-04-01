@@ -1,4 +1,6 @@
+using System.Net.Http;
 using System.Text;
+using System.Text.Json;
 using Microsoft.UI;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Navigation;
@@ -165,6 +167,93 @@ public partial class RepairPage : Page
 
     private void RefreshLogs_Click(object sender, RoutedEventArgs e)
         => RefreshLogTails();
+
+    private async void CheckUpdate_Click(object sender, RoutedEventArgs e)
+    {
+        BtnUpdate.IsEnabled = false;
+        UpdateStatus.Text = "Checking...";
+
+        try
+        {
+            using var http = new HttpClient();
+            http.DefaultRequestHeaders.UserAgent.ParseAdd("mtgacoach-launcher/1.0");
+            var json = await http.GetStringAsync(
+                "https://api.github.com/repos/josharmour/mtgacoach/releases/latest");
+
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            var latestTag = root.GetProperty("tag_name").GetString() ?? "";
+            var currentVersion = "v" + RuntimeDetector.ReadVersion();
+
+            if (latestTag == currentVersion)
+            {
+                UpdateStatus.Text = $"Up to date ({currentVersion})";
+                BtnUpdate.IsEnabled = true;
+                return;
+            }
+
+            UpdateStatus.Text = $"New version available: {latestTag} (you have {currentVersion})";
+
+            // Find the installer asset
+            string? downloadUrl = null;
+            if (root.TryGetProperty("assets", out var assets))
+            {
+                foreach (var asset in assets.EnumerateArray())
+                {
+                    var name = asset.GetProperty("name").GetString() ?? "";
+                    if (name.Contains("Setup") && name.EndsWith(".exe"))
+                    {
+                        downloadUrl = asset.GetProperty("browser_download_url").GetString();
+                        break;
+                    }
+                }
+            }
+
+            if (downloadUrl is null)
+            {
+                UpdateStatus.Text = $"{latestTag} available — no installer found in release";
+                BtnUpdate.IsEnabled = true;
+                return;
+            }
+
+            var result = await new ContentDialog
+            {
+                Title = "Update Available",
+                Content = $"Download {latestTag}?\n\nCurrent: {currentVersion}",
+                PrimaryButtonText = "Download & Install",
+                CloseButtonText = "Later",
+                XamlRoot = this.XamlRoot,
+            }.ShowAsync();
+
+            if (result != ContentDialogResult.Primary)
+            {
+                BtnUpdate.IsEnabled = true;
+                return;
+            }
+
+            UpdateStatus.Text = "Downloading...";
+            var tempFile = Path.Combine(Path.GetTempPath(), "mtgacoach-Setup.exe");
+            var bytes = await http.GetByteArrayAsync(downloadUrl);
+            await File.WriteAllBytesAsync(tempFile, bytes);
+
+            UpdateStatus.Text = "Launching installer...";
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(tempFile)
+            {
+                UseShellExecute = true
+            });
+
+            // Exit the app so the installer can overwrite files
+            Application.Current.Exit();
+        }
+        catch (Exception ex)
+        {
+            UpdateStatus.Text = $"Update check failed: {ex.Message}";
+        }
+        finally
+        {
+            BtnUpdate.IsEnabled = true;
+        }
+    }
 
     private async void Browse_Click(object sender, RoutedEventArgs e)
     {

@@ -212,9 +212,35 @@ class PipeAdapter:
             return
         current = coach._backend_name
         new_mode = "local" if current in ("online", "proxy", "auto") else "online"
-        threading.Thread(
-            target=coach._verify_and_switch, args=(new_mode, None), daemon=True
-        ).start()
+
+        def _do_switch():
+            try:
+                from arenamcp.backend_detect import validate_backend
+                mode_label = "Online" if new_mode == "online" else "Local"
+                self.log(f"Connecting to {mode_label}...")
+
+                if new_mode == "online":
+                    from arenamcp.settings import get_settings
+                    key = get_settings().get("license_key", "")
+                    if not key:
+                        self.error("No license key configured.")
+                        return
+
+                ok, err = validate_backend(new_mode)
+                if not ok:
+                    self.error(f"{mode_label} unavailable: {err}")
+                    return
+
+                coach.set_backend(new_mode, None)
+                actual = coach.backend_name
+                model = coach.model_name
+                self.status("BACKEND", f"{actual} ({model or 'default'})")
+                self.status("MODEL", model or "default")
+                self.log(f"Switched to {actual}/{model or 'default'}")
+            except Exception as e:
+                self.error(f"Mode switch failed: {e}")
+
+        threading.Thread(target=_do_switch, daemon=True).start()
 
     def _cycle_model(self) -> None:
         """Cycle through available models for the current backend."""
@@ -247,7 +273,10 @@ class PipeAdapter:
 
             def _do_switch():
                 try:
-                    coach._verify_and_switch(mode, next_id)
+                    coach.set_backend(mode, next_id)
+                    actual_model = coach.model_name
+                    self.status("MODEL", actual_model or "default")
+                    self.log(f"Switched to {actual_model}")
                 except Exception as e:
                     self.error(f"Model switch failed: {e}")
 

@@ -1263,7 +1263,9 @@ class StandaloneCoach:
         sealed_analyzed = False
         last_draft_pack = 0
         last_draft_pick = 0
+        last_active_draft_at = 0.0
         last_inactive_log = 0
+        draft_inactive_grace_seconds = 5.0
 
         while self._running:
             try:
@@ -1274,6 +1276,7 @@ class StandaloneCoach:
                 draft_pack = self._mcp.get_draft_pack()
 
                 if draft_pack.get("is_active"):
+                    last_active_draft_at = time.time()
                     is_sealed = draft_pack.get("is_sealed", False)
 
                     if is_sealed:
@@ -1328,9 +1331,6 @@ class StandaloneCoach:
                                 self.ui.log("[DRAFT] Auto-switching to draft advice mode\n")
                                 logger.info(f"Auto-detected draft: {set_code}")
 
-                            last_draft_pack = pack_num
-                            last_draft_pick = pick_num
-
                             # Use composite evaluation (WR + on-color + synergy + card type)
                             eval_result = self._mcp.evaluate_draft_pack()
                             if eval_result.get("is_active") and eval_result.get("evaluations"):
@@ -1348,14 +1348,26 @@ class StandaloneCoach:
                                 self.ui.log(f"\n[DRAFT P{pack_num}P{pick_num}] ({picked} picked)\n{detail_log}\n")
                                 logger.info(f"DRAFT: P{pack_num}P{pick_num} - {advice}")
                                 self.speak_advice(advice)
+                                last_draft_pack = pack_num
+                                last_draft_pick = pick_num
                             elif eval_result.get("is_active"):
                                 self.ui.log(f"\n[DRAFT P{pack_num}P{pick_num}] No evaluated picks\n")
                                 logger.warning(f"Draft eval returned no evaluations for P{pack_num}P{pick_num}")
+                                last_draft_pack = pack_num
+                                last_draft_pick = pick_num
 
                         time.sleep(1.0)  # Faster polling during draft
                         continue
 
                 else:
+                    if in_draft_mode or in_sealed_mode:
+                        inactive_for = time.time() - last_active_draft_at
+                        if inactive_for < draft_inactive_grace_seconds:
+                            # MTGA briefly clears the current pack between picks.
+                            # Keep draft mode alive until the next pack arrives.
+                            time.sleep(0.5)
+                            continue
+
                     # Inactive draft/sealed
                     if time.time() - last_inactive_log > 10.0:
                         logger.info("Draft inactive (waiting for event entry...)")
@@ -1369,6 +1381,7 @@ class StandaloneCoach:
                     in_sealed_mode = False
                     sealed_analyzed = False
                     self.draft_mode = False
+                    last_active_draft_at = 0.0
                     self.ui.log(f"\n[{mode_name.upper()}] {mode_name} complete, switching to game coaching\n")
                     logger.info(f"{mode_name} ended, resuming game coaching")
                     last_draft_pack = 0

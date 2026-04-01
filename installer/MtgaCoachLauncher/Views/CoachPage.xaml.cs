@@ -19,6 +19,7 @@ public partial class CoachPage : Page
     public CoachPage()
     {
         this.InitializeComponent();
+        this.NavigationCacheMode = NavigationCacheMode.Required;
         _dispatcher = DispatcherQueue.GetForCurrentThread();
     }
 
@@ -66,14 +67,13 @@ public partial class CoachPage : Page
         switch (type)
         {
             case "log":
-                AppendLog(evt.GetProperty("message").GetString() ?? "");
+                AppendLog(evt.GetProperty("message").GetString() ?? "", "dim");
                 break;
             case "advice":
                 var seatInfo = evt.GetProperty("seat_info").GetString() ?? "";
                 var adviceText = evt.GetProperty("text").GetString() ?? "";
-                AppendLog($"--- COACH ({seatInfo}) ---");
-                AppendLog(adviceText);
-                AppendLog("");
+                AppendLog($"COACH ({seatInfo})", "header");
+                AppendLog(adviceText, "advice");
                 break;
             case "status":
                 UpdateStatus(
@@ -81,12 +81,12 @@ public partial class CoachPage : Page
                     evt.GetProperty("value").GetString() ?? "");
                 break;
             case "error":
-                AppendLog($"ERROR: {evt.GetProperty("message").GetString()}");
+                AppendLog($"ERROR: {evt.GetProperty("message").GetString()}", "error");
                 break;
             case "subtask":
                 var status = evt.GetProperty("status").GetString() ?? "";
                 if (!string.IsNullOrEmpty(status))
-                    AppendLog($"  > {status}");
+                    AppendLog($"  > {status}", "status");
                 break;
             case "game_state":
                 if (evt.TryGetProperty("data", out var data))
@@ -95,19 +95,31 @@ public partial class CoachPage : Page
         }
     }
 
-    private void AppendLog(string text)
+    private void AppendLog(string text, string color = "default")
     {
         _allLogLines.Add(text);
+
+        var brush = color switch
+        {
+            "advice" => new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, 100, 220, 100)),  // green
+            "header" => new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, 180, 140, 255)),  // purple
+            "error" => new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, 255, 100, 100)),   // red
+            "status" => new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, 100, 200, 220)),  // cyan
+            "dim" => new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.ColorHelper.FromArgb(255, 130, 130, 130)),     // gray
+            _ => null,
+        };
 
         var tb = new TextBlock
         {
             Text = text,
             TextWrapping = Microsoft.UI.Xaml.TextWrapping.Wrap,
             FontFamily = new Microsoft.UI.Xaml.Media.FontFamily("Consolas"),
-            FontSize = 13,
-            Padding = new Thickness(12, 3, 12, 3),
+            FontSize = color == "advice" ? 14 : 13,
+            FontWeight = color == "advice" ? Microsoft.UI.Text.FontWeights.SemiBold : Microsoft.UI.Text.FontWeights.Normal,
+            Padding = new Thickness(12, color == "advice" ? 6 : 3, 12, color == "advice" ? 6 : 3),
             IsTextSelectionEnabled = true,
         };
+        if (brush is not null) tb.Foreground = brush;
         LogPanel.Children.Add(tb);
         _logCount++;
 
