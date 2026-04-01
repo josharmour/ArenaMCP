@@ -4030,27 +4030,35 @@ class StandaloneCoach:
         self._register_hotkeys()
 
         # Print status
-        self.ui.log("\n" + "="*50)
-        if self.draft_mode:
-            self.ui.log("MTGA DRAFT HELPER")
-            self.ui.log("="*50)
-            self.ui.log(f"Set: {self.set_code or 'auto-detect'}")
-            self.ui.log("Using MCP server's draft evaluation")
-        else:
-            if self._autopilot_enabled:
-                mode = "DRY-RUN" if self._autopilot_dry_run else "LIVE"
-                afk = " AFK" if self._autopilot_afk else ""
-                self.ui.log(f"MTGA AUTOPILOT ({mode}{afk})")
-            else:
-                self.ui.log("MTGA COACH")
-            self.ui.log("="*50)
+        _is_pipe = hasattr(self.ui, 'emit_game_state')
+
+        if _is_pipe:
+            # Pipe mode: minimal status, no TUI hotkey references
             self.ui.status("BACKEND", f"{self.backend_name} ({actual_model or 'default'})")
-            self.ui.status("VOICE", f"PTT (F4) + Kokoro")
-        self.ui.log("-"*50)
-        self.ui.log("F5=mute F6=voice F7=bug F8=seat F9=restart F10=speed F12=model Num1=land")
-        self.ui.log("="*50)
-        self.ui.log("\nWaiting for MTGA...")
-        self.ui.log("F8=swap seat if wrong | F9=restart coach\n")
+            self.ui.log("Waiting for MTGA...")
+        else:
+            # TUI/CLI mode: full banner with hotkeys
+            self.ui.log("\n" + "="*50)
+            if self.draft_mode:
+                self.ui.log("MTGA DRAFT HELPER")
+                self.ui.log("="*50)
+                self.ui.log(f"Set: {self.set_code or 'auto-detect'}")
+                self.ui.log("Using MCP server's draft evaluation")
+            else:
+                if self._autopilot_enabled:
+                    mode = "DRY-RUN" if self._autopilot_dry_run else "LIVE"
+                    afk = " AFK" if self._autopilot_afk else ""
+                    self.ui.log(f"MTGA AUTOPILOT ({mode}{afk})")
+                else:
+                    self.ui.log("MTGA COACH")
+                self.ui.log("="*50)
+                self.ui.status("BACKEND", f"{self.backend_name} ({actual_model or 'default'})")
+                self.ui.status("VOICE", f"PTT (F4) + Kokoro")
+            self.ui.log("-"*50)
+            self.ui.log("F5=mute F6=voice F7=bug F8=seat F9=restart F10=speed F12=model Num1=land")
+            self.ui.log("="*50)
+            self.ui.log("\nWaiting for MTGA...")
+            self.ui.log("F8=swap seat if wrong | F9=restart coach\n")
 
     def stop(self) -> None:
         """Stop the coach and clean up all resources.

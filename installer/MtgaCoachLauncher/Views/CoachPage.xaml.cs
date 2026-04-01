@@ -128,9 +128,27 @@ public partial class CoachPage : Page
         switch (key.ToUpperInvariant())
         {
             case "SEAT_INFO": StatusSeat.Text = value; break;
-            case "BACKEND": StatusBackend.Text = value; break;
-            case "MODEL": StatusModel.Text = value; break;
+            case "BACKEND":
+                StatusBackend.Text = value;
+                BtnMode.Content = value.Contains("online") ? "Online" : value.Contains("local") ? "Local" : value;
+                break;
+            case "MODEL":
+                StatusModel.Text = value;
+                BtnModel.Content = string.IsNullOrEmpty(value) ? "Model" : value;
+                break;
             case "BRIDGE": case "GRE": StatusBridge.Text = value; break;
+            case "VOICE": case "VOICE_ID":
+                BtnVoice.Content = string.IsNullOrEmpty(value) ? "Voice" : value;
+                break;
+            case "SPEED":
+                BtnSpeed.Content = string.IsNullOrEmpty(value) ? "1.0x" : value;
+                break;
+            case "AUTOPILOT":
+                BtnAutopilot.Content = value;
+                break;
+            case "MUTE":
+                BtnMute.Content = value.Contains("Muted") ? "Unmute" : "Mute";
+                break;
         }
     }
 
@@ -208,6 +226,10 @@ public partial class CoachPage : Page
         => _process?.SendCommand("cycle_mode");
     private void Model_Click(object sender, RoutedEventArgs e)
         => _process?.SendCommand("cycle_model");
+    private void Voice_Click(object sender, RoutedEventArgs e)
+        => _process?.SendCommand("cycle_voice");
+    private void Speed_Click(object sender, RoutedEventArgs e)
+        => _process?.SendCommand("cycle_speed");
     private void Mute_Click(object sender, RoutedEventArgs e)
         => _process?.SendCommand("toggle_mute");
     private void Autopilot_Click(object sender, RoutedEventArgs e)

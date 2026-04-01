@@ -246,17 +246,13 @@ class VoiceOutput:
 
     # Available Kokoro voices (name, description)
     VOICES = [
-        ("af_heart", "American Female - Heart (Grade A)"),
-        ("af_bella", "American Female - Bella"),
-        ("af_nicole", "American Female - Nicole"),
-        ("af_sarah", "American Female - Sarah"),
-        ("af_sky", "American Female - Sky"),
-        ("am_adam", "American Male - Adam"),
-        ("am_michael", "American Male - Michael"),
-        ("bf_emma", "British Female - Emma"),
-        ("bf_isabella", "British Female - Isabella"),
-        ("bm_george", "British Male - George"),
-        ("bm_lewis", "British Male - Lewis"),
+        ("am_adam", "Adam"),
+        ("am_michael", "Michael"),
+        ("af_heart", "Heart"),
+        ("af_bella", "Bella"),
+        ("af_nicole", "Nicole"),
+        ("af_sarah", "Sarah"),
+        ("af_sky", "Sky"),
     ]
 
     def __init__(

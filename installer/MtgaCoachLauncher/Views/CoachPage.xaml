@@ -62,6 +62,8 @@
                         Style="{StaticResource AccentButtonStyle}" />
                 <Button x:Name="BtnModel" Content="Model" Click="Model_Click"
                         Style="{StaticResource AccentButtonStyle}" />
+                <Button x:Name="BtnVoice" Content="Voice" Click="Voice_Click" />
+                <Button x:Name="BtnSpeed" Content="1.0x" Click="Speed_Click" />
                 <Button x:Name="BtnMute" Content="Mute" Click="Mute_Click" />
                 <Button x:Name="BtnAutopilot" Content="AP:OFF" Click="Autopilot_Click" />
                 <Button Content="Screen" Click="Screen_Click" />

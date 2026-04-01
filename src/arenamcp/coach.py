@@ -455,6 +455,7 @@ CRITICAL GAME RULES:
 
 CRITICAL MANA RULES:
 - Cards tagged [OK] or [CAN CAST] are castable RIGHT NOW with available mana - no additional mana needed!
+- Cards WITHOUT [OK] CANNOT be cast right now — NEVER recommend casting them!
 - Cards tagged [NEED:{G}] need GREEN mana specifically — adding non-green sources won't help!
 - Cards tagged [NEED:{R}{R}] need TWO RED mana — check which lands produce that color.
 - Cards tagged [NEED:3] need 3 more TOTAL mana from any source.
@@ -550,6 +551,7 @@ RULES:
 - NEVER suggest actions not in Legal:. If you want to "flash in" a creature, it MUST show "Cast [creature]" in Legal:.
 - Creatures tagged [SS] have SUMMONING SICKNESS — they CANNOT attack. Check "Declare Attackers:" for legal attackers.
 - Cards tagged [OK] are castable NOW with current mana - no additional mana needed! Don't waste life for more mana.
+- Cards WITHOUT [OK] CANNOT be cast right now — NEVER recommend casting them! Only suggest [OK] cards.
 - Cards tagged [NEED X] CANNOT be cast - do NOT suggest or mention them! Focus only on playable options.
 - Cards tagged [OK,X=0] have X=0 — the X effect does nothing. Don't cast unless the non-X part alone is valuable.
 - Cards tagged [NO TARGETS] have no valid targets — do NOT cast them.

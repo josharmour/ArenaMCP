@@ -19,12 +19,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Regex to strip Textual/Rich markup tags like [bold], [red], [/], [link=...]
-_MARKUP_RE = re.compile(r"\[/?[a-zA-Z_][a-zA-Z0-9_ =.:#/\"'-]*\]")
+_MARKUP_RE = re.compile(r"\[/?[a-zA-Z_][a-zA-Z0-9_ =.:#/\"'-]*\]|\[/\]")
 
 
 def strip_markup(text: str) -> str:
     """Remove Rich/Textual markup tags from text."""
-    return _MARKUP_RE.sub("", text)
+    return _MARKUP_RE.sub("", text).strip()
 
 
 class PipeAdapter:
@@ -126,9 +126,13 @@ class PipeAdapter:
         action = cmd.get("cmd", "")
         try:
             if action == "toggle_autopilot":
-                coach.toggle_autopilot()
+                enabled = coach.toggle_autopilot()
+                self.status("AUTOPILOT", "AP:ON" if enabled else "AP:OFF")
             elif action == "toggle_mute":
-                coach._on_mute_hotkey()
+                if coach._voice_output:
+                    muted = coach._voice_output.toggle_mute()
+                    self.status("MUTE", "Muted" if muted else "Unmuted")
+                    self.log(f"Voice {'muted' if muted else 'unmuted'}")
             elif action == "cycle_mode":
                 self._cycle_mode()
             elif action == "cycle_model":
