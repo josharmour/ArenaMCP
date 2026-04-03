@@ -491,6 +491,7 @@ class StandaloneCoach:
         self._last_match_result: Optional[str] = None
         self._last_match_final_state: Optional[dict] = None
         self._game_end_handled: bool = False  # Prevents duplicate triggers
+        self._match_boundary_ts: float = 0.0  # Suppress stale triggers after reset
         self._last_game_end_check_error: str = ""
         self._pending_post_match_analysis: Optional[str] = None  # For GH issue filing via F7
         self._pending_post_match_result: Optional[str] = None
@@ -1513,6 +1514,11 @@ class StandaloneCoach:
                     self._bridge_poller.reset()
                     if self._coach:
                         self._coach.clear_deck_strategy()
+                    # Suppress stale triggers for one cycle after match
+                    # boundary reset. prev_state={} causes check_triggers to
+                    # fire false positives (new_turn, land_played, etc.)
+                    # because it sees the reconstructed state as entirely new.
+                    self._match_boundary_ts = time.time()
                 if match_id_changed:
                     last_match_id = curr_match_id
 
@@ -1570,6 +1576,7 @@ class StandaloneCoach:
                     self._bridge_poller.reset()
                     if self._coach:
                         self._coach.clear_deck_strategy()
+                    self._match_boundary_ts = time.time()
                     logger.info("Cleared advice history for new match")
 
                 # Announce seat detection when game starts
@@ -1748,6 +1755,19 @@ class StandaloneCoach:
                                     )
                         else:
                             self._last_forced_decision_sig = None
+
+                    # Suppress stale triggers right after a match boundary
+                    # reset. prev_state={} causes check_triggers to see the
+                    # reconstructed game state as entirely new, firing false
+                    # new_turn/land_played/opponent_low_life triggers against
+                    # a game that already ended (bridge shows Intermission).
+                    _boundary_age = time.time() - getattr(self, '_match_boundary_ts', 0)
+                    if triggers and _boundary_age < 2.0:
+                        logger.info(
+                            f"Suppressing {len(triggers)} stale triggers "
+                            f"{triggers} ({_boundary_age:.1f}s after match boundary)"
+                        )
+                        triggers = []
 
                     # Debug: Log trigger results
                     if triggers:
@@ -2641,6 +2661,9 @@ class StandaloneCoach:
             # Autopilot state
             "autopilot": self._collect_autopilot_info(),
 
+            # Bridge poller state (last poll result, connection, request type)
+            "bridge_state": self._collect_bridge_state(),
+
             # Error state
             "errors": list(self._recent_errors) if hasattr(self, '_recent_errors') else [],
 
@@ -2668,6 +2691,42 @@ class StandaloneCoach:
             except Exception as e:
                 info["engine_error"] = str(e)
         return info
+
+    def _collect_bridge_state(self) -> dict:
+        """Collect GRE bridge/poller state for bug reports."""
+        bp = getattr(self, '_bridge_poller', None)
+        if not bp:
+            return {"available": False}
+        try:
+            info: dict = {
+                "available": True,
+                "connected": bp.connected,
+                "bridge_connected": bp._bridge.connected if bp._bridge else False,
+                "fallback_mode": bp._fallback_mode,
+                "last_request_type": bp._last_request_type,
+                "last_has_pending": bp._last_has_pending,
+                "last_action_sig": bp._last_action_sig,
+                "consecutive_errors": bp._consecutive_errors,
+                "match_boundary_age_s": round(
+                    time.time() - getattr(self, '_match_boundary_ts', 0), 1
+                ),
+            }
+            # Include last poll result summary (actions count, request type)
+            poll = bp._last_poll_result
+            if poll:
+                info["last_poll"] = {
+                    "has_pending": poll.get("has_pending"),
+                    "request_type": poll.get("request_type"),
+                    "request_class": poll.get("request_class"),
+                    "num_actions": len(poll.get("actions", [])),
+                    "can_pass": poll.get("can_pass"),
+                    "can_cancel": poll.get("can_cancel"),
+                }
+            else:
+                info["last_poll"] = None
+            return info
+        except Exception as e:
+            return {"available": True, "error": str(e)}
 
     @staticmethod
     def _get_package_versions() -> dict[str, str]:

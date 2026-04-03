@@ -1406,9 +1406,9 @@ class ArenaApp(App):
             if self.coach and hasattr(self.coach, 'save_bug_report'):
                 bug_path = self.coach.save_bug_report("Copy Debug (F7)", announce=False)
                 if bug_path:
-                    file_url = f"file:///{str(bug_path).replace(chr(92), '/')}"
-                    self.call_from_thread(self.write_log, "[green]Bug report saved.[/]")
-                    self.call_from_thread(self.write_log, f"[dim]{file_url}[/]")
+                    copy_to_clipboard(str(bug_path))
+                    self.call_from_thread(self.write_log, "[green]Bug report saved (path copied).[/]")
+                    self.call_from_thread(self.write_log, f"[dim]{bug_path}[/]")
                     self.call_from_thread(
                         self.write_log,
                         "[yellow]Type /bugreport to submit to GitHub.[/]",

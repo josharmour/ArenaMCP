@@ -151,6 +151,9 @@ JSON SCHEMA:
 class ActionPlanner:
     """Converts game state + trigger into structured JSON action commands via LLM."""
 
+    # Ring buffer size for recent planning diagnostics (kept for debug reports)
+    _DIAG_BUFFER_SIZE = 10
+
     def __init__(self, backend: Any, timeout: float = 5.0):
         """Initialize the action planner.
 
@@ -160,6 +163,8 @@ class ActionPlanner:
         """
         self._backend = backend
         self._timeout = timeout
+        # Recent planning diagnostics ring buffer for debug reports
+        self._recent_diagnostics: list[dict[str, Any]] = []
 
     def plan_actions(
         self,
@@ -182,12 +187,21 @@ class ActionPlanner:
             ActionPlan with structured actions to execute.
         """
         start = time.perf_counter()
+        diag: dict[str, Any] = {
+            "timestamp": time.time(),
+            "trigger": trigger,
+            "turn": game_state.get("turn", {}).get("turn_number", 0),
+            "legal_actions": legal_actions,
+            "decision_context_type": (decision_context or {}).get("type"),
+            "bridge_request": game_state.get("_bridge_request_type"),
+        }
 
         # Build the prompt
         system_prompt = AUTOPILOT_SYSTEM_PROMPT
         user_message = self._build_action_prompt(
             game_state, trigger, legal_actions, decision_context
         )
+        diag["prompt_len"] = len(user_message)
 
         # Call LLM with enforced timeout
         import concurrent.futures
@@ -200,10 +214,19 @@ class ActionPlanner:
         except concurrent.futures.TimeoutError:
             elapsed = (time.perf_counter() - start) * 1000
             logger.error(f"Action planning timed out after {elapsed:.0f}ms (limit {self._timeout}s)")
+            diag["failure"] = "timeout"
+            diag["elapsed_ms"] = elapsed
+            self._record_diagnostic(diag)
             return ActionPlan(trigger=trigger)
         except Exception as e:
             logger.error(f"Action planning LLM call failed: {e}")
+            diag["failure"] = f"llm_error: {e}"
+            self._record_diagnostic(diag)
             return ActionPlan(trigger=trigger)
+
+        diag["elapsed_ms"] = (time.perf_counter() - start) * 1000
+        diag["response_len"] = len(response) if response else 0
+        diag["response_preview"] = (response or "")[:300]
 
         # Parse response
         plan = self._parse_response(response, legal_actions or [])
@@ -211,11 +234,22 @@ class ActionPlanner:
         plan.turn_number = game_state.get("turn", {}).get("turn_number", 0)
 
         if not plan.actions:
+            logger.warning(
+                f"Planner JSON parse returned 0 actions for trigger={trigger}, "
+                f"legal_actions={legal_actions}, response={response[:200] if response else 'None'!r}"
+            )
             fallback = self._fallback_plan(response, legal_actions or [])
             fallback.trigger = trigger
             fallback.turn_number = plan.turn_number
             if fallback.actions:
+                logger.info(f"Planner fallback recovered: {fallback.overall_strategy}")
                 plan = fallback
+            else:
+                diag["failure"] = "empty_plan"
+                logger.warning(
+                    f"Planner fallback also failed: trigger={trigger}, "
+                    f"{len(legal_actions or [])} legal actions"
+                )
 
         # Attach GRE action refs if raw actions are available. If the bridge says
         # the current request has no actions (e.g. PayCostsReq), do not fall back
@@ -223,6 +257,10 @@ class ActionPlanner:
         raw = self._resolve_raw_actions_for_matching(game_state, legal_actions_raw)
         if raw and plan.actions:
             self._attach_gre_refs(plan, raw, game_state)
+
+        diag["planned_actions"] = len(plan.actions)
+        diag["strategy"] = plan.overall_strategy
+        self._record_diagnostic(diag)
 
         logger.info(f"Planned {len(plan.actions)} actions: {plan.overall_strategy}")
         return plan
@@ -485,6 +523,16 @@ class ActionPlanner:
 
         return plan
 
+    def _record_diagnostic(self, diag: dict[str, Any]) -> None:
+        """Append a planning diagnostic entry to the ring buffer."""
+        self._recent_diagnostics.append(diag)
+        if len(self._recent_diagnostics) > self._DIAG_BUFFER_SIZE:
+            self._recent_diagnostics.pop(0)
+
+    def get_recent_diagnostics(self) -> list[dict[str, Any]]:
+        """Return recent planning diagnostics for debug reports."""
+        return list(self._recent_diagnostics)
+
     def _fallback_plan(self, response: str, legal_actions: list[str]) -> ActionPlan:
         """Fallback parser for non-JSON backend output.
 
@@ -492,16 +540,20 @@ class ActionPlanner:
         """
         plan = ActionPlan()
         if not legal_actions:
+            logger.debug("Planner fallback: no legal actions available")
             return plan
 
         selected = self._match_legal_action_in_text(response, legal_actions)
         if not selected:
+            logger.debug("Planner fallback: no text match in response, trying heuristic")
             selected = self._pick_preferred_legal_action(legal_actions)
         if not selected:
+            logger.debug(f"Planner fallback: heuristic also failed, legal={legal_actions}")
             return plan
 
         action = self._legal_action_to_action(selected)
         if not action:
+            logger.debug(f"Planner fallback: could not convert legal action {selected!r}")
             return plan
 
         plan.actions = [action]

@@ -337,6 +337,12 @@ class AutopilotEngine:
             logger.debug(f"Could not read planner backend info: {e}")
             info["planner_backend"] = "unknown"
 
+        # Recent planner diagnostics (LLM calls, parse failures, fallback paths)
+        try:
+            info["planner_diagnostics"] = self._planner.get_recent_diagnostics()
+        except Exception:
+            info["planner_diagnostics"] = []
+
         return info
 
     def _log_execution_path(self, path: str, action_desc: str) -> None:
@@ -642,6 +648,14 @@ class AutopilotEngine:
 
             legal_actions = self._get_legal_actions(game_state)
             decision_context = game_state.get("decision_context")
+
+            logger.info(
+                f"Autopilot planning: trigger={trigger}, "
+                f"legal_actions={len(legal_actions or [])} "
+                f"({legal_actions[:3] if legal_actions else []}{'...' if legal_actions and len(legal_actions) > 3 else ''}), "
+                f"decision={decision_context.get('type') if decision_context else None}, "
+                f"bridge={game_state.get('_bridge_request_type')}"
+            )
 
             plan = self._planner.plan_actions(
                 game_state, trigger, legal_actions, decision_context
