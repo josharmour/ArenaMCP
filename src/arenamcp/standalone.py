@@ -1731,25 +1731,30 @@ class StandaloneCoach:
                                 triggers.append("decision_required")
                                 logger.info(f"Forced decision_required for {pending_now}")
 
-                        if self._autopilot_enabled and self._autopilot and pending_now:
-                            if "decision_required" not in triggers:
-                                dec_ctx = curr_state.get("decision_context") or {}
-                                dec_type = dec_ctx.get("type", "")
-                                legal = curr_state.get("legal_actions", []) or []
-                                sig = f"{pending_now}|{dec_type}|{len(legal)}"
-                                now = time.time()
-                                if (
-                                    sig != self._last_forced_decision_sig
-                                    or (now - self._last_forced_decision_ts) > 2.0
-                                ):
-                                    triggers.append("decision_required")
-                                    self._last_forced_decision_sig = sig
-                                    self._last_forced_decision_ts = now
-                                    logger.info(
-                                        f"Autopilot backstop: forced decision_required for '{pending_now}'"
-                                    )
-                        else:
-                            self._last_forced_decision_sig = None
+                    # Autopilot backstop: force decision_required when autopilot
+                    # is enabled and a decision is pending but no trigger fired.
+                    # Runs regardless of bridge status — the bridge detects
+                    # *transitions* but the autopilot needs to act on *any*
+                    # pending decision that hasn't been handled yet.
+                    if self._autopilot_enabled and self._autopilot and pending_now:
+                        if "decision_required" not in triggers:
+                            dec_ctx = curr_state.get("decision_context") or {}
+                            dec_type = dec_ctx.get("type", "")
+                            legal = curr_state.get("legal_actions", []) or []
+                            sig = f"{pending_now}|{dec_type}|{len(legal)}"
+                            now = time.time()
+                            if (
+                                sig != self._last_forced_decision_sig
+                                or (now - self._last_forced_decision_ts) > 2.0
+                            ):
+                                triggers.append("decision_required")
+                                self._last_forced_decision_sig = sig
+                                self._last_forced_decision_ts = now
+                                logger.info(
+                                    f"Autopilot backstop: forced decision_required for '{pending_now}'"
+                                )
+                    else:
+                        self._last_forced_decision_sig = None
 
                     # Suppress stale triggers right after a match boundary
                     # reset. prev_state={} causes check_triggers to see the
