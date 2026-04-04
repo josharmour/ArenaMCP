@@ -504,6 +504,26 @@ class AutopilotEngine:
                 self._state = AutopilotState.IDLE
                 return True
 
+            # Optional actions with no legal actions — auto-decline via pass
+            if (
+                bridge_request_type in ("OptionalAction", "OptionalActionReq", "OptionalActionRequest")
+                or bridge_request_class in ("OptionalAction", "OptionalActionReq", "OptionalActionRequest")
+                or ((game_state.get("decision_context") or {}).get("type") == "optional_action")
+            ):
+                legal = self._get_legal_actions(game_state)
+                meaningful = [a for a in legal if a.lower() not in {"pass", "action: activate_mana", "action: floatmana"} and "Wait" not in a]
+                if not meaningful:
+                    logger.info("Autopilot: auto-declining optional action (no meaningful actions)")
+                    if not self._config.dry_run:
+                        if self._gre_bridge.connected or self._gre_bridge.connect():
+                            if self._gre_bridge.submit_pass():
+                                self._log_execution_path(ExecutionPath.GRE_AWARE, "auto-decline optional via GRE bridge")
+                                return True
+                        self._controller.focus_mtga_window()
+                        time.sleep(0.06)
+                    self._exec_pass_priority()
+                    return True
+
             # "Priority (Pass Only)" means only Pass is legal — auto-pass immediately
             # without LLM planning. MTGA may also auto-pass these, so speed is key.
             if pending == "Priority (Pass Only)":
@@ -689,6 +709,26 @@ class AutopilotEngine:
                     )
 
                 if not plan.actions:
+                    # If there are no legal actions at all, auto-pass rather
+                    # than returning False (which drops to coaching).  This
+                    # handles unknown decision types, prompts, and optional
+                    # actions that the planner can't parse.
+                    meaningful = [
+                        a for a in (legal_actions or [])
+                        if a.lower() not in {"pass", "action: activate_mana", "action: floatmana"}
+                        and "Wait" not in a
+                    ]
+                    if not meaningful:
+                        logger.info("Autopilot: auto-passing (planner empty, no meaningful actions)")
+                        if not self._config.dry_run:
+                            if self._gre_bridge.connected or self._gre_bridge.connect():
+                                if self._gre_bridge.submit_pass():
+                                    self._log_execution_path(ExecutionPath.GRE_AWARE, "auto-pass via GRE bridge (planner empty)")
+                                    self._state = AutopilotState.IDLE
+                                    return True
+                        self._exec_pass_priority()
+                        self._state = AutopilotState.IDLE
+                        return True
                     self._state = AutopilotState.IDLE
                     return False
 
