@@ -736,42 +736,48 @@ class AutopilotEngine:
             # Re-poll game state after planning (LLM call may take 5-15s).
             # If the game has moved on (different turn, phase, or active player),
             # discard the stale plan instead of executing outdated actions.
-            try:
-                fresh_state = self._get_game_state()
-                fresh_turn = fresh_state.get("turn", {})
-                stale = False
+            # Skip for pre-game actions (mulligan, choose starting player) —
+            # nothing to go stale and the bridge poll can block during animations.
+            _skip_staleness = (
+                pre_turn_num == 0
+                and plan.actions
+                and plan.actions[0].action_type in (
+                    ActionType.MULLIGAN_KEEP, ActionType.MULLIGAN_MULL,
+                    ActionType.CHOOSE_STARTING_PLAYER,
+                )
+            )
+            if not _skip_staleness:
+                try:
+                    fresh_state = self._get_game_state()
+                    fresh_turn = fresh_state.get("turn", {})
+                    stale = False
 
-                if fresh_turn.get("turn_number", 0) != pre_turn_num:
-                    logger.warning(f"STALE: turn advanced {pre_turn_num} → {fresh_turn.get('turn_number')}")
-                    stale = True
-                elif fresh_turn.get("active_player", 0) != pre_active:
-                    logger.warning(f"STALE: active player changed {pre_active} → {fresh_turn.get('active_player')}")
-                    stale = True
-                elif fresh_turn.get("phase", "") != pre_phase:
-                    # Lenient phase check: allow Main1 -> Main2 or Combat steps as long as it's still
-                    # the same turn and player. BUT if a sorcery/land action was planned and we are
-                    # now in Combat, it's stale.
-                    is_sorcery_play = any(a.action_type in (ActionType.PLAY_LAND, ActionType.CAST_SPELL) for a in plan.actions)
-                    now_combat = "Combat" in fresh_turn.get("phase", "")
-
-                    if is_sorcery_play and now_combat:
-                        logger.warning(f"STALE: phase changed {pre_phase} → {fresh_turn.get('phase')} (sorcery plan in combat)")
+                    if fresh_turn.get("turn_number", 0) != pre_turn_num:
+                        logger.warning(f"STALE: turn advanced {pre_turn_num} → {fresh_turn.get('turn_number')}")
                         stale = True
-                    else:
-                        # For other changes (Main1->Main2, or combat step changes), we can try to proceed
-                        # but we should update the game_state so coordinates are fresh.
-                        logger.info(f"Phase changed {pre_phase} → {fresh_turn.get('phase')}, proceeding with caution")
+                    elif fresh_turn.get("active_player", 0) != pre_active:
+                        logger.warning(f"STALE: active player changed {pre_active} → {fresh_turn.get('active_player')}")
+                        stale = True
+                    elif fresh_turn.get("phase", "") != pre_phase:
+                        is_sorcery_play = any(a.action_type in (ActionType.PLAY_LAND, ActionType.CAST_SPELL) for a in plan.actions)
+                        now_combat = "Combat" in fresh_turn.get("phase", "")
 
-                if stale:
-                    self._notify("AUTOPILOT", "Plan discarded (game moved on)")
-                    self._state = AutopilotState.IDLE
-                    return False
+                        if is_sorcery_play and now_combat:
+                            logger.warning(f"STALE: phase changed {pre_phase} → {fresh_turn.get('phase')} (sorcery plan in combat)")
+                            stale = True
+                        else:
+                            logger.info(f"Phase changed {pre_phase} → {fresh_turn.get('phase')}, proceeding with caution")
 
-                # Use the fresh state for execution (more accurate coordinates)
-                game_state = fresh_state
-            except Exception as e:
-                logger.error(f"Staleness check failed: {e}")
-                # Continue with original state if re-poll fails
+                    if stale:
+                        self._notify("AUTOPILOT", "Plan discarded (game moved on)")
+                        self._state = AutopilotState.IDLE
+                        return False
+
+                    # Use the fresh state for execution (more accurate coordinates)
+                    game_state = fresh_state
+                except Exception as e:
+                    logger.error(f"Staleness check failed: {e}")
+                    # Continue with original state if re-poll fails
 
             self._current_plan = plan
             self._current_action_idx = 0
