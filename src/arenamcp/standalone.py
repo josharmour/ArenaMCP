@@ -1835,7 +1835,12 @@ class StandaloneCoach:
                         is_critical = trigger in CRITICAL_PRIORITY
                         if trigger == "decision_required":
                             pending = curr_state.get("pending_decision")
-                            if pending == "Action Required" and turn_num == last_advice_turn and phase == last_advice_phase:
+                            if (
+                                pending == "Action Required"
+                                and turn_num == last_advice_turn
+                                and phase == last_advice_phase
+                                and not (self._autopilot_enabled and self._autopilot)
+                            ):
                                 logger.info(f"Suppressing decision_required: 'Action Required' already advised this turn+phase")
                                 continue
 
