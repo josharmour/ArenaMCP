@@ -934,11 +934,22 @@ class BridgeDecisionPoller:
         if not has_pending:
             return
 
-        # Enrich pending_decision if log hasn't caught up yet
-        if not snapshot.get("pending_decision") and request_type:
+        # Enrich pending_decision from bridge.  Override the log-parsed
+        # value when the bridge reports a *different* request — the bridge is
+        # authoritative and the log parser may lag behind (e.g. player chose
+        # play/draw but log hasn't processed MulliganReq yet).
+        if request_type:
             label = _get_bridge_request_label(request_type, request_class)
-            snapshot["pending_decision"] = label
-            logger.debug(f"Bridge set pending_decision: {label}")
+            existing = snapshot.get("pending_decision")
+            if not existing:
+                snapshot["pending_decision"] = label
+                logger.debug(f"Bridge set pending_decision: {label}")
+            elif existing != label:
+                logger.info(
+                    f"Bridge overriding stale pending_decision: "
+                    f"{existing!r} → {label!r}"
+                )
+                snapshot["pending_decision"] = label
 
         # Enrich decision_context type from bridge's authoritative request_type
         decision_type = _get_bridge_decision_type(request_type, request_class)
