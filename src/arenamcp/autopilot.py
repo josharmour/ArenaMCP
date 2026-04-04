@@ -1471,6 +1471,16 @@ class AutopilotEngine:
         Maps card names in action.blocker_assignments to instance IDs
         from the current game state's decision context.
         """
+        # Verify the bridge actually has a DeclareBlockers request pending
+        pending = self._gre_bridge.get_pending_actions()
+        if not pending or not pending.get("has_pending"):
+            logger.info("GRE bridge blockers: no pending interaction, falling back")
+            return None
+        req_class = pending.get("request_class", "")
+        if "DeclareBlockers" not in req_class:
+            logger.info(f"GRE bridge blockers: pending is {req_class}, not DeclareBlockers, falling back")
+            return None
+
         game_state = self._get_game_state()
         blocker_id_map = self._build_blocker_id_map(game_state)
         battlefield = game_state.get("battlefield", [])
@@ -1520,6 +1530,16 @@ class AutopilotEngine:
         Maps card names in action.attacker_names to instance IDs and
         targets the opponent's face by default.
         """
+        # Verify the bridge actually has a DeclareAttacker request pending
+        pending = self._gre_bridge.get_pending_actions()
+        if not pending or not pending.get("has_pending"):
+            logger.info("GRE bridge attackers: no pending interaction, falling back")
+            return None
+        req_class = pending.get("request_class", "")
+        if "DeclareAttacker" not in req_class:
+            logger.info(f"GRE bridge attackers: pending is {req_class}, not DeclareAttacker, falling back")
+            return None
+
         game_state = self._get_game_state()
         attacker_id_map = self._build_attacker_id_map(game_state)
         battlefield = game_state.get("battlefield", [])
