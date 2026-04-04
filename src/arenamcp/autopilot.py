@@ -1450,6 +1450,45 @@ class AutopilotEngine:
         if action.action_type == ActionType.DECLARE_ATTACKERS:
             return self._try_gre_bridge_attackers(action)
 
+        # MULLIGAN — submit keep/mulligan via bridge
+        if action.action_type in (ActionType.MULLIGAN_KEEP, ActionType.MULLIGAN_MULL):
+            keep = action.action_type == ActionType.MULLIGAN_KEEP
+            if self._gre_bridge.submit_mulligan(keep):
+                self._log_execution_path(
+                    ExecutionPath.GRE_AWARE,
+                    f"mulligan: {'keep' if keep else 'mulligan'} via GRE bridge"
+                )
+                return ClickResult(True, 0, 0, "mulligan", "GRE bridge")
+            logger.info("GRE bridge mulligan failed, falling back to clicks")
+            self._gre_bridge_failed_methods.add(method)
+            return None
+
+        # CHOOSE STARTING PLAYER — submit play/draw via bridge
+        if action.action_type == ActionType.CHOOSE_STARTING_PLAYER:
+            game_state = self._get_game_state()
+            local_seat = None
+            opp_seat = None
+            for p in game_state.get("players", []):
+                if p.get("is_local"):
+                    local_seat = p.get("seat_id")
+                else:
+                    opp_seat = p.get("seat_id")
+            # play_or_draw field from LLM: "play" means we go first (our seat)
+            seat = local_seat if getattr(action, 'play_or_draw', 'play') == 'play' else opp_seat
+            if seat and self._gre_bridge.submit_choose_starting_player(seat):
+                self._log_execution_path(
+                    ExecutionPath.GRE_AWARE,
+                    f"choose_starting_player: seat {seat} via GRE bridge"
+                )
+                return ClickResult(True, 0, 0, "choose_starting_player", "GRE bridge")
+            logger.info("GRE bridge choose_starting_player failed, falling back to clicks")
+            self._gre_bridge_failed_methods.add(method)
+            return None
+
+        # SELECT TARGET — submit via bridge if target instance IDs are resolvable
+        if action.action_type == ActionType.SELECT_TARGET:
+            return self._try_gre_bridge_select_target(action)
+
         # For actions with a GRE ref, match by identity fields
         if gre_ref is not None:
             action_type = gre_ref.action_type if hasattr(gre_ref, 'action_type') else ""
@@ -1621,6 +1660,53 @@ class AutopilotEngine:
 
         logger.info("GRE bridge submit_attackers failed, falling back to clicks")
         self._gre_bridge_failed_methods.add("declare_attackers")
+        return None
+
+    def _try_gre_bridge_select_target(self, action: GameAction) -> Optional[ClickResult]:
+        """Submit target selection via bridge using SelectN/Search submission.
+
+        The target names from the LLM plan are resolved to instance IDs
+        and submitted as a selection.
+        """
+        pending = self._gre_bridge.get_pending_actions()
+        if not pending or not pending.get("has_pending"):
+            return None
+
+        req_class = pending.get("request_class", "")
+        game_state = self._get_game_state()
+        battlefield = game_state.get("battlefield", [])
+
+        # Resolve target names to instance IDs
+        target_ids = []
+        for name in (action.target_names or [action.card_name] if action.card_name else []):
+            for card in battlefield:
+                if card.get("name", "").lower() == name.lower():
+                    iid = card.get("instance_id")
+                    if iid:
+                        target_ids.append(iid)
+                        break
+            # Also check players
+            for p in game_state.get("players", []):
+                if name.lower() in ("opponent", "player", p.get("name", "").lower()):
+                    sid = p.get("seat_id")
+                    if sid:
+                        target_ids.append(sid)
+                        break
+
+        if not target_ids:
+            logger.info(f"GRE bridge select_target: can't resolve IDs for {action.target_names or [action.card_name]}, falling back")
+            return None
+
+        if self._gre_bridge.submit_selection(target_ids):
+            names = ", ".join(action.target_names or [action.card_name])
+            self._log_execution_path(
+                ExecutionPath.GRE_AWARE,
+                f"select_target: {names} (ids={target_ids}) via GRE bridge"
+            )
+            return ClickResult(True, 0, 0, "select_target", "GRE bridge")
+
+        logger.info("GRE bridge select_target failed, falling back to clicks")
+        self._gre_bridge_failed_methods.add("select_target")
         return None
 
     def _execute_action(

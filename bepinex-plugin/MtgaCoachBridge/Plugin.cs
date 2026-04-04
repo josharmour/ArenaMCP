@@ -291,6 +291,34 @@ namespace MtgaCoachBridge
                     HandleSubmitAttackers(cmd);
                     break;
 
+                case "submit_mulligan":
+                    HandleSubmitMulligan(cmd);
+                    break;
+
+                case "submit_choose_starting_player":
+                    HandleSubmitChooseStartingPlayer(cmd);
+                    break;
+
+                case "submit_selection":
+                    HandleSubmitSelection(cmd);
+                    break;
+
+                case "submit_group":
+                    HandleSubmitGroup(cmd);
+                    break;
+
+                case "submit_optional":
+                    HandleSubmitOptional(cmd);
+                    break;
+
+                case "submit_numeric":
+                    HandleSubmitNumeric(cmd);
+                    break;
+
+                case "submit_targets":
+                    HandleSubmitTargets(cmd);
+                    break;
+
                 case "get_game_state":
                     HandleGetGameState(cmd);
                     break;
@@ -810,6 +838,173 @@ namespace MtgaCoachBridge
                     ["ok"] = false,
                     ["error"] = $"Pending request is {request.GetType().Name}, not DeclareAttackerRequest"
                 });
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Generic decision handlers (mulligan, starting player, selection, etc.)
+        // -------------------------------------------------------------------
+
+        private void HandleSubmitMulligan(PipeCommand cmd)
+        {
+            var request = _lastKnownRequest ?? FindPendingInteraction();
+            if (request is MulliganRequest mulliganReq)
+            {
+                bool keep = cmd.Json.Value<bool>("keep");
+                if (keep)
+                {
+                    _log.LogInfo("Submitting mulligan: KEEP");
+                    mulliganReq.KeepHand();
+                }
+                else
+                {
+                    _log.LogInfo("Submitting mulligan: MULLIGAN");
+                    mulliganReq.MulliganHand();
+                }
+                lock (_interactionLock) { _lastKnownRequest = null; }
+                cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = keep ? "Keep" : "Mulligan" });
+            }
+            else
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not MulliganRequest" });
+            }
+        }
+
+        private void HandleSubmitChooseStartingPlayer(PipeCommand cmd)
+        {
+            var request = _lastKnownRequest ?? FindPendingInteraction();
+            if (request is ChooseStartingRequest chooseReq)
+            {
+                uint seatId = (uint)cmd.Json.Value<int>("seat_id");
+                _log.LogInfo($"Submitting choose starting player: seat {seatId}");
+                chooseReq.ChooseStartingPlayer(seatId);
+                lock (_interactionLock) { _lastKnownRequest = null; }
+                cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "ChooseStartingPlayer", ["seat_id"] = (int)seatId });
+            }
+            else
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not ChooseStartingRequest" });
+            }
+        }
+
+        private void HandleSubmitSelection(PipeCommand cmd)
+        {
+            var request = _lastKnownRequest ?? FindPendingInteraction();
+
+            if (request is SelectNRequest selectNReq)
+            {
+                var idsArr = cmd.Json["ids"] as JArray;
+                if (idsArr == null || idsArr.Count == 0)
+                {
+                    _log.LogInfo("Submitting SelectN: arbitrary/empty");
+                    selectNReq.SubmitArbitrary();
+                }
+                else
+                {
+                    var ids = new List<uint>();
+                    foreach (var id in idsArr) ids.Add((uint)id.Value<int>());
+                    _log.LogInfo($"Submitting SelectN: {ids.Count} selections");
+                    selectNReq.SubmitSelection(ids);
+                }
+                lock (_interactionLock) { _lastKnownRequest = null; }
+                cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "SelectN" });
+            }
+            else if (request is SearchRequest searchReq)
+            {
+                var idsArr = cmd.Json["ids"] as JArray;
+                var ids = new List<uint>();
+                if (idsArr != null)
+                    foreach (var id in idsArr) ids.Add((uint)id.Value<int>());
+                _log.LogInfo($"Submitting Search: {ids.Count} selections");
+                searchReq.SubmitSelection(ids);
+                lock (_interactionLock) { _lastKnownRequest = null; }
+                cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "Search" });
+            }
+            else
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not SelectN/Search" });
+            }
+        }
+
+        private void HandleSubmitGroup(PipeCommand cmd)
+        {
+            var request = _lastKnownRequest ?? FindPendingInteraction();
+            if (request is GroupRequest groupReq)
+            {
+                var groupsArr = cmd.Json["groups"] as JArray;
+                var groups = new List<Group>();
+                if (groupsArr != null)
+                {
+                    foreach (var g in groupsArr)
+                    {
+                        var group = new Group();
+                        var idsArr = g["ids"] as JArray;
+                        if (idsArr != null)
+                            foreach (var id in idsArr) group.Ids.Add((uint)id.Value<int>());
+                        groups.Add(group);
+                    }
+                }
+                _log.LogInfo($"Submitting Group: {groups.Count} groups");
+                groupReq.SubmitGroups(groups);
+                lock (_interactionLock) { _lastKnownRequest = null; }
+                cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "Group" });
+            }
+            else
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not GroupRequest" });
+            }
+        }
+
+        private void HandleSubmitOptional(PipeCommand cmd)
+        {
+            var request = _lastKnownRequest ?? FindPendingInteraction();
+            if (request is OptionalActionMessageRequest optionalReq)
+            {
+                bool accept = cmd.Json.Value<bool>("accept");
+                var response = accept ? OptionResponse.Yes : OptionResponse.No;
+                _log.LogInfo($"Submitting Optional: {response}");
+                optionalReq.SubmitResponse(response);
+                lock (_interactionLock) { _lastKnownRequest = null; }
+                cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "Optional", ["response"] = response.ToString() });
+            }
+            else
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not OptionalActionMessageRequest" });
+            }
+        }
+
+        private void HandleSubmitNumeric(PipeCommand cmd)
+        {
+            var request = _lastKnownRequest ?? FindPendingInteraction();
+            if (request is NumericInputRequest numericReq)
+            {
+                uint value = (uint)cmd.Json.Value<int>("value");
+                _log.LogInfo($"Submitting NumericInput: {value}");
+                numericReq.SubmitValue(value);
+                lock (_interactionLock) { _lastKnownRequest = null; }
+                cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "NumericInput", ["value"] = (int)value });
+            }
+            else
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not NumericInputRequest" });
+            }
+        }
+
+        private void HandleSubmitTargets(PipeCommand cmd)
+        {
+            var request = _lastKnownRequest ?? FindPendingInteraction();
+            if (request is SelectTargetsRequest targetsReq)
+            {
+                // For now: submit targets as-is (the client's target selections
+                // are already set by the game UI or prior interactions).
+                _log.LogInfo("Submitting targets");
+                targetsReq.SubmitTargets();
+                lock (_interactionLock) { _lastKnownRequest = null; }
+                cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "SelectTargets" });
+            }
+            else
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not SelectTargetsRequest" });
             }
         }
 

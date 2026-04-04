@@ -434,6 +434,90 @@ class GREBridge:
             logger.warning(f"GRE bridge submit_attackers error: {e}")
             return False
 
+    def submit_mulligan(self, keep: bool) -> bool:
+        """Submit mulligan decision (keep or mulligan)."""
+        try:
+            resp = self._send_safe({"action": "submit_mulligan", "keep": keep})
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted mulligan: {'keep' if keep else 'mulligan'}")
+                return True
+            logger.warning(f"GRE bridge submit_mulligan failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_mulligan error: {e}")
+        return False
+
+    def submit_choose_starting_player(self, seat_id: int) -> bool:
+        """Submit choose starting player (play/draw)."""
+        try:
+            resp = self._send_safe({"action": "submit_choose_starting_player", "seat_id": seat_id})
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted choose starting player: seat {seat_id}")
+                return True
+            logger.warning(f"GRE bridge submit_choose failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_choose error: {e}")
+        return False
+
+    def submit_selection(self, ids: list[int]) -> bool:
+        """Submit selection for SelectN or Search requests."""
+        try:
+            resp = self._send_safe({"action": "submit_selection", "ids": ids})
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted selection: {len(ids)} ids")
+                return True
+            logger.warning(f"GRE bridge submit_selection failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_selection error: {e}")
+        return False
+
+    def submit_group(self, groups: list[dict[str, Any]]) -> bool:
+        """Submit group ordering (scry top/bottom, etc.)."""
+        try:
+            resp = self._send_safe({"action": "submit_group", "groups": groups})
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted {len(groups)} groups")
+                return True
+            logger.warning(f"GRE bridge submit_group failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_group error: {e}")
+        return False
+
+    def submit_optional(self, accept: bool) -> bool:
+        """Submit optional action response (accept/decline)."""
+        try:
+            resp = self._send_safe({"action": "submit_optional", "accept": accept})
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted optional: {'accept' if accept else 'decline'}")
+                return True
+            logger.warning(f"GRE bridge submit_optional failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_optional error: {e}")
+        return False
+
+    def submit_numeric(self, value: int) -> bool:
+        """Submit numeric input (X cost, etc.)."""
+        try:
+            resp = self._send_safe({"action": "submit_numeric", "value": value})
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted numeric: {value}")
+                return True
+            logger.warning(f"GRE bridge submit_numeric failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_numeric error: {e}")
+        return False
+
+    def submit_targets(self) -> bool:
+        """Submit current target selections."""
+        try:
+            resp = self._send_safe({"action": "submit_targets"})
+            if resp.get("ok"):
+                logger.info("GRE bridge submitted targets")
+                return True
+            logger.warning(f"GRE bridge submit_targets failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_targets error: {e}")
+        return False
+
     # -------------------------------------------------------------------
     # Phase 2: new game state commands
     # -------------------------------------------------------------------
