@@ -283,6 +283,14 @@ namespace MtgaCoachBridge
                     HandleSubmitPass(cmd);
                     break;
 
+                case "submit_blockers":
+                    HandleSubmitBlockers(cmd);
+                    break;
+
+                case "submit_attackers":
+                    HandleSubmitAttackers(cmd);
+                    break;
+
                 case "get_game_state":
                     HandleGetGameState(cmd);
                     break;
@@ -450,6 +458,61 @@ namespace MtgaCoachBridge
                 }
                 resp["actions"] = actionsArr;
                 resp["can_pass"] = actionsReq.CanPass;
+            }
+            else if (request is DeclareBlockersRequest blockersReq)
+            {
+                var blockersArr = new JArray();
+                foreach (var b in blockersReq.AllBlockers)
+                {
+                    var bo = new JObject
+                    {
+                        ["blockerInstanceId"] = (int)b.BlockerInstanceId,
+                        ["mustBlock"] = b.MustBlock,
+                        ["minAttackers"] = (int)b.MinAttackers,
+                        ["maxAttackers"] = (int)b.MaxAttackers
+                    };
+                    var attackerIds = new JArray();
+                    foreach (var aid in b.AttackerInstanceIds) attackerIds.Add((int)aid);
+                    bo["attackerInstanceIds"] = attackerIds;
+                    blockersArr.Add(bo);
+                }
+                resp["blockers"] = blockersArr;
+                resp["can_pass"] = false;
+            }
+            else if (request is DeclareAttackerRequest attackerReq)
+            {
+                var attackersArr = new JArray();
+                foreach (var a in attackerReq.QualifiedAttackers)
+                {
+                    var ao = new JObject
+                    {
+                        ["attackerInstanceId"] = (int)a.AttackerInstanceId,
+                        ["mustAttack"] = a.MustAttack
+                    };
+                    var recipients = new JArray();
+                    foreach (var dr in a.LegalDamageRecipients)
+                    {
+                        var drObj = new JObject { ["type"] = dr.Type.ToString() };
+                        switch (dr.IdCase)
+                        {
+                            case DamageRecipient.IdOneofCase.PlayerSystemSeatId:
+                                drObj["playerSystemSeatId"] = (int)dr.PlayerSystemSeatId;
+                                break;
+                            case DamageRecipient.IdOneofCase.PlaneswalkerInstanceId:
+                                drObj["planeswalkerInstanceId"] = (int)dr.PlaneswalkerInstanceId;
+                                break;
+                            case DamageRecipient.IdOneofCase.TeamId:
+                                drObj["teamId"] = (int)dr.TeamId;
+                                break;
+                        }
+                        recipients.Add(drObj);
+                    }
+                    ao["legalDamageRecipients"] = recipients;
+                    attackersArr.Add(ao);
+                }
+                resp["attackers"] = attackersArr;
+                resp["can_submit"] = attackerReq.CanSubmit;
+                resp["can_pass"] = false;
             }
             else if (request is CastingTimeOptionRequest castingReq)
             {
@@ -626,6 +689,126 @@ namespace MtgaCoachBridge
                 {
                     ["ok"] = false,
                     ["error"] = "Cannot pass on current interaction"
+                });
+            }
+        }
+
+        private void HandleSubmitBlockers(PipeCommand cmd)
+        {
+            BaseUserRequest request;
+            lock (_interactionLock) { request = _lastKnownRequest; }
+            if (request == null) request = FindPendingInteraction();
+            if (request == null)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = "No pending interaction" });
+                return;
+            }
+
+            if (request is DeclareBlockersRequest blockersReq)
+            {
+                // Parse blocker assignments: array of {blockerInstanceId, attackerInstanceIds}
+                var assignments = cmd.Json["assignments"] as JArray;
+                if (assignments == null || assignments.Count == 0)
+                {
+                    // No blockers selected — submit empty (no blocks)
+                    _log.LogInfo("Submitting blockers: no blocks (empty assignment)");
+                    blockersReq.UpdateBlockers();
+                }
+                else
+                {
+                    var blockers = new List<Blocker>();
+                    foreach (var a in assignments)
+                    {
+                        var blocker = new Blocker
+                        {
+                            BlockerInstanceId = (uint)a.Value<int>("blockerInstanceId")
+                        };
+                        var attackerIds = a["attackerInstanceIds"] as JArray;
+                        if (attackerIds != null)
+                        {
+                            foreach (var aid in attackerIds)
+                                blocker.SelectedAttackerInstanceIds.Add((uint)aid.Value<int>());
+                        }
+                        blockers.Add(blocker);
+                    }
+                    _log.LogInfo($"Submitting blockers: {blockers.Count} block assignments");
+                    blockersReq.UpdateBlockers(blockers.ToArray());
+                }
+
+                lock (_interactionLock) { _lastKnownRequest = null; }
+                cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "DeclareBlockers" });
+            }
+            else
+            {
+                cmd.SetResponse(new JObject
+                {
+                    ["ok"] = false,
+                    ["error"] = $"Pending request is {request.GetType().Name}, not DeclareBlockersRequest"
+                });
+            }
+        }
+
+        private void HandleSubmitAttackers(PipeCommand cmd)
+        {
+            BaseUserRequest request;
+            lock (_interactionLock) { request = _lastKnownRequest; }
+            if (request == null) request = FindPendingInteraction();
+            if (request == null)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = "No pending interaction" });
+                return;
+            }
+
+            if (request is DeclareAttackerRequest attackerReq)
+            {
+                // Parse attacker list: array of {attackerInstanceId, damageRecipient: {type, seatId, instanceId}}
+                var attackerList = cmd.Json["attackers"] as JArray;
+                if (attackerList == null || attackerList.Count == 0)
+                {
+                    // No attackers — submit empty (don't attack)
+                    _log.LogInfo("Submitting attackers: no attacks (empty list)");
+                    attackerReq.UpdateAttacker();
+                }
+                else
+                {
+                    var attackers = new List<Attacker>();
+                    foreach (var a in attackerList)
+                    {
+                        var attacker = new Attacker
+                        {
+                            AttackerInstanceId = (uint)a.Value<int>("attackerInstanceId")
+                        };
+                        var dr = a["damageRecipient"] as JObject;
+                        if (dr != null)
+                        {
+                            var recipient = new DamageRecipient();
+                            var drType = dr.Value<string>("type");
+                            if (!string.IsNullOrEmpty(drType) && System.Enum.TryParse<DamageRecType>(drType, out var parsed))
+                                recipient.Type = parsed;
+                            // Set the appropriate oneof field
+                            if (dr["playerSystemSeatId"] != null)
+                                recipient.PlayerSystemSeatId = (uint)dr.Value<int>("playerSystemSeatId");
+                            else if (dr["planeswalkerInstanceId"] != null)
+                                recipient.PlaneswalkerInstanceId = (uint)dr.Value<int>("planeswalkerInstanceId");
+                            else if (dr["teamId"] != null)
+                                recipient.TeamId = (uint)dr.Value<int>("teamId");
+                            attacker.SelectedDamageRecipient = recipient;
+                        }
+                        attackers.Add(attacker);
+                    }
+                    _log.LogInfo($"Submitting attackers: {attackers.Count} attackers");
+                    attackerReq.UpdateAttacker(attackers.ToArray());
+                }
+
+                lock (_interactionLock) { _lastKnownRequest = null; }
+                cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "DeclareAttackers" });
+            }
+            else
+            {
+                cmd.SetResponse(new JObject
+                {
+                    ["ok"] = false,
+                    ["error"] = $"Pending request is {request.GetType().Name}, not DeclareAttackerRequest"
                 });
             }
         }

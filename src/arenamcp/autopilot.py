@@ -61,7 +61,7 @@ class AutopilotConfig:
     auto_pass_priority: bool = True
     auto_resolve: bool = True
     verify_after_action: bool = True
-    verification_timeout: float = 1.5
+    verification_timeout: float = 2.5
     action_delay: float = 0.25
     post_action_delay: float = 0.4  # Delay after action to allow GRE to update
     planning_timeout: float = 8.0
@@ -137,7 +137,7 @@ class AutopilotEngine:
 
         # GRE bridge for direct action submission (bypasses mouse clicks)
         self._gre_bridge: GREBridge = get_bridge()
-        self._gre_bridge_failed_this_plan: bool = False
+        self._gre_bridge_failed_methods: set[str] = set()
         self._bridge_preloaded_actions: Optional[list[dict[str, Any]]] = None
 
         # Execution path tracking
@@ -792,7 +792,7 @@ class AutopilotEngine:
 
             # --- 3. EXECUTING ---
             self._state = AutopilotState.EXECUTING
-            self._gre_bridge_failed_this_plan = False
+            self._gre_bridge_failed_methods = set()
 
             # Focus MTGA now — no more user input expected (skip if GRE bridge is active)
             if not self._config.dry_run and not self._gre_bridge.connected:
@@ -1381,10 +1381,11 @@ class AutopilotEngine:
         Returns a ClickResult if the bridge handled it, or None to fall
         through to mouse-click execution.
         """
-        if self._gre_bridge_failed_this_plan:
+        if not self._gre_bridge.connect():
             return None
 
-        if not self._gre_bridge.connect():
+        method = action.action_type.value
+        if method in self._gre_bridge_failed_methods:
             return None
 
         gre_ref = getattr(action, 'gre_action_ref', None)
@@ -1398,8 +1399,16 @@ class AutopilotEngine:
                 )
                 return ClickResult(True, 0, 0, "pass", "GRE bridge")
             logger.info("GRE bridge pass failed, falling back to mouse click")
-            self._gre_bridge_failed_this_plan = True
+            self._gre_bridge_failed_methods.add(method)
             return None
+
+        # DECLARE BLOCKERS — submit blocker assignments via bridge
+        if action.action_type == ActionType.DECLARE_BLOCKERS:
+            return self._try_gre_bridge_blockers(action)
+
+        # DECLARE ATTACKERS — submit attacker list via bridge
+        if action.action_type == ActionType.DECLARE_ATTACKERS:
+            return self._try_gre_bridge_attackers(action)
 
         # For actions with a GRE ref, match by identity fields
         if gre_ref is not None:
@@ -1422,7 +1431,7 @@ class AutopilotEngine:
                 return ClickResult(True, 0, 0, action.card_name or str(action), "GRE bridge")
 
             logger.info(f"GRE bridge match failed for {action.action_type.value}, falling back to mouse")
-            self._gre_bridge_failed_this_plan = True
+            self._gre_bridge_failed_methods.add(method)
             return None
 
         # No GRE ref but bridge is connected — try matching by game action type
@@ -1454,6 +1463,104 @@ class AutopilotEngine:
                             )
                             return ClickResult(True, 0, 0, action.card_name or str(action), "GRE bridge")
 
+        return None
+
+    def _try_gre_bridge_blockers(self, action: GameAction) -> Optional[ClickResult]:
+        """Submit blocker assignments via the GRE bridge.
+
+        Maps card names in action.blocker_assignments to instance IDs
+        from the current game state's decision context.
+        """
+        game_state = self._get_game_state()
+        blocker_id_map = self._build_blocker_id_map(game_state)
+        battlefield = game_state.get("battlefield", [])
+        opp_seat = None
+        for p in game_state.get("players", []):
+            if not p.get("is_local"):
+                opp_seat = p.get("seat_id")
+
+        assignments = []
+        for blocker_name, attacker_name in action.blocker_assignments.items():
+            blocker_id = blocker_id_map.get(blocker_name)
+            if blocker_id is None:
+                blocker_id = self._find_instance_id(
+                    blocker_name, battlefield,
+                    next((p.get("seat_id") for p in game_state.get("players", []) if p.get("is_local")), None)
+                )
+            attacker_id = self._find_instance_id(attacker_name, battlefield, opp_seat)
+
+            if blocker_id is None or attacker_id is None:
+                logger.warning(
+                    f"GRE bridge blockers: can't resolve IDs for "
+                    f"{blocker_name}({blocker_id}) -> {attacker_name}({attacker_id}), "
+                    "falling back to clicks"
+                )
+                return None
+
+            assignments.append({
+                "blockerInstanceId": blocker_id,
+                "attackerInstanceIds": [attacker_id],
+            })
+
+        if self._gre_bridge.submit_blockers(assignments):
+            desc = ", ".join(f"{b}->{a}" for b, a in action.blocker_assignments.items())
+            self._log_execution_path(
+                ExecutionPath.GRE_AWARE,
+                f"declare_blockers: {desc} submitted via GRE bridge"
+            )
+            return ClickResult(True, 0, 0, "declare_blockers", "GRE bridge")
+
+        logger.info("GRE bridge submit_blockers failed, falling back to clicks")
+        self._gre_bridge_failed_methods.add("declare_blockers")
+        return None
+
+    def _try_gre_bridge_attackers(self, action: GameAction) -> Optional[ClickResult]:
+        """Submit attacker declarations via the GRE bridge.
+
+        Maps card names in action.attacker_names to instance IDs and
+        targets the opponent's face by default.
+        """
+        game_state = self._get_game_state()
+        attacker_id_map = self._build_attacker_id_map(game_state)
+        battlefield = game_state.get("battlefield", [])
+        local_seat = None
+        opp_seat = None
+        for p in game_state.get("players", []):
+            if p.get("is_local"):
+                local_seat = p.get("seat_id")
+            else:
+                opp_seat = p.get("seat_id")
+
+        attacker_list = []
+        for name in action.attacker_names:
+            instance_id = attacker_id_map.get(name)
+            if instance_id is None:
+                instance_id = self._find_instance_id(name, battlefield, local_seat)
+            if instance_id is None:
+                logger.warning(
+                    f"GRE bridge attackers: can't resolve ID for '{name}', "
+                    "falling back to clicks"
+                )
+                return None
+
+            attacker_list.append({
+                "attackerInstanceId": instance_id,
+                "damageRecipient": {
+                    "type": "DamageRecType_Player",
+                    "playerSystemSeatId": opp_seat or 0,
+                },
+            })
+
+        if self._gre_bridge.submit_attackers(attacker_list):
+            names = ", ".join(action.attacker_names)
+            self._log_execution_path(
+                ExecutionPath.GRE_AWARE,
+                f"declare_attackers: {names} submitted via GRE bridge"
+            )
+            return ClickResult(True, 0, 0, "declare_attackers", "GRE bridge")
+
+        logger.info("GRE bridge submit_attackers failed, falling back to clicks")
+        self._gre_bridge_failed_methods.add("declare_attackers")
         return None
 
     def _execute_action(
@@ -1798,6 +1905,7 @@ class AutopilotEngine:
             blocker_coord = self._mapper.get_permanent_coord(
                 blocker_name, blocker_instance_id, battlefield, local_seat, local_seat
             )
+            blocker_found = False
             if blocker_coord:
                 self._log_execution_path(
                     ExecutionPath.DETERMINISTIC_GEOMETRY,
@@ -1806,6 +1914,7 @@ class AutopilotEngine:
                 bx, by = blocker_coord.to_absolute(window_rect)
                 self._controller.click(bx, by, f"Blocker: {blocker_name}", window_rect)
                 self._controller.wait(0.2, "blocker selected")
+                blocker_found = True
             elif self._config.enable_vision_fallback:
                 coord = self._get_vision_coord(blocker_name, zone="battlefield_yours")
                 if coord:
@@ -1816,12 +1925,21 @@ class AutopilotEngine:
                     bx, by = coord.to_absolute(window_rect)
                     self._controller.click(bx, by, f"Blocker: {blocker_name}", window_rect)
                     self._controller.wait(0.2, "blocker selected")
+                    blocker_found = True
+
+            if not blocker_found:
+                logger.warning(
+                    f"Could not locate blocker '{blocker_name}' "
+                    f"(instance_id={blocker_instance_id}) — aborting block assignment"
+                )
+                return ClickResult(False, 0, 0, "blockers", f"Blocker '{blocker_name}' not found")
 
             # Click the attacker (opponent's creature) — use instance_id if available
             attacker_instance_id = self._find_instance_id(attacker_name, battlefield, opp_seat)
             attacker_coord = self._mapper.get_permanent_coord(
                 attacker_name, attacker_instance_id, battlefield, opp_seat, local_seat
             )
+            attacker_found = False
             if attacker_coord:
                 self._log_execution_path(
                     ExecutionPath.DETERMINISTIC_GEOMETRY,
@@ -1832,6 +1950,7 @@ class AutopilotEngine:
                     ax, ay, f"Block {attacker_name} with {blocker_name}", window_rect
                 )
                 last_result = result
+                attacker_found = True
             elif self._config.enable_vision_fallback:
                 coord = self._get_vision_coord(attacker_name, zone="battlefield_opponent")
                 if coord:
@@ -1844,6 +1963,14 @@ class AutopilotEngine:
                         ax, ay, f"Block {attacker_name} with {blocker_name}", window_rect
                     )
                     last_result = result
+                    attacker_found = True
+
+            if not attacker_found:
+                logger.warning(
+                    f"Could not locate attacker '{attacker_name}' "
+                    f"(instance_id={attacker_instance_id}) — aborting block assignment"
+                )
+                return ClickResult(False, 0, 0, "blockers", f"Attacker '{attacker_name}' not found")
             self._controller.wait(self._config.action_delay, "between block assignments")
 
         # Click Done

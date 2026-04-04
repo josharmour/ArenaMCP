@@ -374,6 +374,66 @@ class GREBridge:
             logger.warning(f"GRE bridge pass error: {e}")
             return False
 
+    def submit_blockers(
+        self,
+        assignments: list[dict[str, Any]],
+    ) -> bool:
+        """Submit blocker assignments via the GRE bridge.
+
+        Args:
+            assignments: List of dicts, each with:
+                - blockerInstanceId: int — the blocking creature's instance ID
+                - attackerInstanceIds: list[int] — which attacker(s) it blocks
+
+                Pass an empty list to submit "no blocks".
+
+        Returns True if submitted successfully.
+        """
+        try:
+            resp = self._send_safe({
+                "action": "submit_blockers",
+                "assignments": assignments,
+            })
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted {len(assignments)} blocker assignments")
+                return True
+            else:
+                logger.warning(f"GRE bridge submit_blockers failed: {resp.get('error')}")
+                return False
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_blockers error: {e}")
+            return False
+
+    def submit_attackers(
+        self,
+        attackers: list[dict[str, Any]],
+    ) -> bool:
+        """Submit attacker declarations via the GRE bridge.
+
+        Args:
+            attackers: List of dicts, each with:
+                - attackerInstanceId: int — the attacking creature's instance ID
+                - damageRecipient: dict with type, seatId, instanceId
+
+                Pass an empty list to submit "no attacks".
+
+        Returns True if submitted successfully.
+        """
+        try:
+            resp = self._send_safe({
+                "action": "submit_attackers",
+                "attackers": attackers,
+            })
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted {len(attackers)} attackers")
+                return True
+            else:
+                logger.warning(f"GRE bridge submit_attackers failed: {resp.get('error')}")
+                return False
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_attackers error: {e}")
+            return False
+
     # -------------------------------------------------------------------
     # Phase 2: new game state commands
     # -------------------------------------------------------------------
