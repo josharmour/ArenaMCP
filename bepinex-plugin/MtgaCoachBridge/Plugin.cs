@@ -873,7 +873,7 @@ namespace MtgaCoachBridge
         private void HandleSubmitChooseStartingPlayer(PipeCommand cmd)
         {
             var request = _lastKnownRequest ?? FindPendingInteraction();
-            if (request is ChooseStartingRequest chooseReq)
+            if (request is ChooseStartingPlayerRequest chooseReq)
             {
                 uint seatId = (uint)cmd.Json.Value<int>("seat_id");
                 _log.LogInfo($"Submitting choose starting player: seat {seatId}");
@@ -883,7 +883,7 @@ namespace MtgaCoachBridge
             }
             else
             {
-                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not ChooseStartingRequest" });
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not ChooseStartingPlayerRequest" });
             }
         }
 
@@ -961,7 +961,7 @@ namespace MtgaCoachBridge
             if (request is OptionalActionMessageRequest optionalReq)
             {
                 bool accept = cmd.Json.Value<bool>("accept");
-                var response = accept ? OptionResponse.Yes : OptionResponse.No;
+                var response = accept ? OptionResponse.AllowYes : OptionResponse.CancelNo;
                 _log.LogInfo($"Submitting Optional: {response}");
                 optionalReq.SubmitResponse(response);
                 lock (_interactionLock) { _lastKnownRequest = null; }
