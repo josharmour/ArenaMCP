@@ -1756,8 +1756,10 @@ class StandaloneCoach:
                     # reconstructed game state as entirely new, firing false
                     # new_turn/land_played/opponent_low_life triggers against
                     # a game that already ended (bridge shows Intermission).
+                    # BUT: keep bridge-detected triggers — those are real
+                    # (e.g. mulligan prompt in a new game).
                     _boundary_age = time.time() - getattr(self, '_match_boundary_ts', 0)
-                    if triggers and _boundary_age < 2.0:
+                    if triggers and _boundary_age < 2.0 and not bridge_trigger:
                         logger.info(
                             f"Suppressing {len(triggers)} stale triggers "
                             f"{triggers} ({_boundary_age:.1f}s after match boundary)"
