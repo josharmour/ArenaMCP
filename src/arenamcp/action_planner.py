@@ -388,7 +388,15 @@ class ActionPlanner:
         ]
 
         if legal_actions:
-            parts.append(f"\nLegal: {', '.join(legal_actions)}")
+            # Filter out spells that can't be cast (no [OK] marker).
+            # Keep non-cast actions (Play Land, Pass, Activate, etc.) as-is.
+            filtered = []
+            for a in legal_actions:
+                lower = a.lower()
+                if lower.startswith("cast ") and "[ok]" not in lower:
+                    continue  # Skip uncastable spells
+                filtered.append(a)
+            parts.append(f"\nLegal: {', '.join(filtered or legal_actions)}")
 
         if decision_context:
             parts.append(f"\nDecision: {json.dumps(decision_context, indent=2)}")
