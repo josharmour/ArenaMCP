@@ -771,11 +771,12 @@ class AutopilotEngine:
             # Skip for pre-game actions (mulligan, choose starting player) —
             # nothing to go stale and the bridge poll can block during animations.
             _skip_staleness = (
-                pre_turn_num == 0
-                and plan.actions
+                plan.actions
                 and plan.actions[0].action_type in (
                     ActionType.MULLIGAN_KEEP, ActionType.MULLIGAN_MULL,
                     ActionType.CHOOSE_STARTING_PLAYER,
+                    ActionType.PASS_PRIORITY, ActionType.RESOLVE,
+                    ActionType.CLICK_BUTTON,
                 )
             )
             if not _skip_staleness:
