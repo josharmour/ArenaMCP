@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import struct
+import threading
 import time
 from typing import Any, Optional
 
@@ -50,6 +51,7 @@ class GREBridge:
         self._reconnect_cooldown = 2.0  # seconds between reconnect attempts
         self._server_pipe_handle = None  # Raw HANDLE for the server pipe (created once)
         self._pipe_created = False  # Whether the server pipe exists
+        self._pipe_lock = threading.Lock()  # Serialize pipe I/O across threads
 
     @property
     def connected(self) -> bool:
@@ -202,33 +204,37 @@ class GREBridge:
     def _send_command(self, cmd: dict[str, Any]) -> dict[str, Any]:
         """Send a JSON command and read the JSON response.
 
+        Thread-safe: serializes pipe I/O so the bridge poller and
+        autopilot don't interleave commands/responses.
+
         Raises GREBridgeError on communication failure.
         """
-        if not self._connected or not self._pipe_file:
-            raise GREBridgeError("Not connected")
+        with self._pipe_lock:
+            if not self._connected or not self._pipe_file:
+                raise GREBridgeError("Not connected")
 
-        try:
-            line = json.dumps(cmd, separators=(",", ":")) + "\n"
-            self._pipe_file.write(line.encode("utf-8"))
-            self._pipe_file.flush()
+            try:
+                line = json.dumps(cmd, separators=(",", ":")) + "\n"
+                self._pipe_file.write(line.encode("utf-8"))
+                self._pipe_file.flush()
 
-            # Read response line
-            response_bytes = b""
-            while True:
-                chunk = self._pipe_file.read(1)
-                if not chunk:
-                    raise GREBridgeError("Pipe closed")
-                if chunk == b"\n":
-                    break
-                response_bytes += chunk
+                # Read response line
+                response_bytes = b""
+                while True:
+                    chunk = self._pipe_file.read(1)
+                    if not chunk:
+                        raise GREBridgeError("Pipe closed")
+                    if chunk == b"\n":
+                        break
+                    response_bytes += chunk
 
-            # Strip UTF-8 BOM if present (C# StreamWriter may emit one)
-            text = response_bytes.decode("utf-8-sig")
-            return json.loads(text)
+                # Strip UTF-8 BOM if present (C# StreamWriter may emit one)
+                text = response_bytes.decode("utf-8-sig")
+                return json.loads(text)
 
-        except (BrokenPipeError, OSError, IOError) as e:
-            self.disconnect()
-            raise GREBridgeError(f"Pipe communication error: {e}")
+            except (BrokenPipeError, OSError, IOError) as e:
+                self.disconnect()
+                raise GREBridgeError(f"Pipe communication error: {e}")
 
     def _send_safe(self, cmd: dict[str, Any]) -> dict[str, Any]:
         """Send command with auto-reconnect on failure."""
