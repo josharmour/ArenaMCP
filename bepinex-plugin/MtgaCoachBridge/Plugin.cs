@@ -734,34 +734,11 @@ namespace MtgaCoachBridge
 
             if (request is DeclareBlockersRequest blockersReq)
             {
-                // Parse blocker assignments: array of {blockerInstanceId, attackerInstanceIds}
+                // Use SubmitBlockers — same pattern as MTGA's built-in bot
+                // (GoldfishStrategy). Submits current UI blocker selection state.
                 var assignments = cmd.Json["assignments"] as JArray;
-                if (assignments == null || assignments.Count == 0)
-                {
-                    // No blockers selected — submit empty (no blocks)
-                    _log.LogInfo("Submitting blockers: no blocks (empty assignment)");
-                    blockersReq.UpdateBlockers();
-                }
-                else
-                {
-                    var blockers = new List<Blocker>();
-                    foreach (var a in assignments)
-                    {
-                        var blocker = new Blocker
-                        {
-                            BlockerInstanceId = (uint)a.Value<int>("blockerInstanceId")
-                        };
-                        var attackerIds = a["attackerInstanceIds"] as JArray;
-                        if (attackerIds != null)
-                        {
-                            foreach (var aid in attackerIds)
-                                blocker.SelectedAttackerInstanceIds.Add((uint)aid.Value<int>());
-                        }
-                        blockers.Add(blocker);
-                    }
-                    _log.LogInfo($"Submitting blockers: {blockers.Count} block assignments");
-                    blockersReq.UpdateBlockers(blockers.ToArray());
-                }
+                _log.LogInfo($"SubmitBlockers (GoldfishStrategy pattern, {assignments?.Count ?? 0} requested)");
+                blockersReq.SubmitBlockers();
 
                 lock (_interactionLock) { _lastKnownRequest = null; }
                 cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "DeclareBlockers" });
@@ -791,66 +768,13 @@ namespace MtgaCoachBridge
                 var attackerList = cmd.Json["attackers"] as JArray;
                 if (attackerList == null || attackerList.Count == 0)
                 {
-                    // No attackers — submit current state (don't attack)
-                    _log.LogInfo("Submitting attackers: no attacks (SubmitAttackers)");
+                    // No attackers or any list — use SubmitAttackers (same as MTGA's
+                    // built-in bot GoldfishStrategy). This submits whatever the current
+                    // UI selection state is. For "no attack", nothing is selected.
+                    // For autopilot, the UI auto-selects when there's only one legal
+                    // attacker, so SubmitAttackers confirms it.
+                    _log.LogInfo($"SubmitAttackers (GoldfishStrategy pattern, {attackerList?.Count ?? 0} requested)");
                     attackerReq.SubmitAttackers();
-                }
-                else
-                {
-                    // Build the damage recipient for the target (usually opponent's face)
-                    // Use the first attacker's damageRecipient for DeclareAllAttackers
-                    var firstDr = attackerList[0]["damageRecipient"] as JObject;
-                    var requestedIds = new HashSet<uint>();
-                    foreach (var a in attackerList)
-                        requestedIds.Add((uint)a.Value<int>("attackerInstanceId"));
-
-                    // Check if ALL qualified attackers are being sent — use DeclareAllAttackers shortcut
-                    var qualifiedIds = new HashSet<uint>();
-                    foreach (var qa in attackerReq.QualifiedAttackers)
-                        qualifiedIds.Add(qa.AttackerInstanceId);
-
-                    bool attackAll = requestedIds.SetEquals(qualifiedIds) && firstDr != null;
-
-                    if (attackAll)
-                    {
-                        // Use DeclareAllAttackers — most reliable path
-                        var recipient = new DamageRecipient { Type = DamageRecType.Player };
-                        if (firstDr["playerSystemSeatId"] != null)
-                            recipient.PlayerSystemSeatId = (uint)firstDr.Value<int>("playerSystemSeatId");
-                        _log.LogInfo($"DeclareAllAttackers: {requestedIds.Count} attackers, recipient=Player seatId={recipient.PlayerSystemSeatId}");
-                        attackerReq.DeclareAllAttackers(recipient);
-                    }
-                    else
-                    {
-                        // Selective attack — use UpdateAttacker with specific attackers
-                        var attackers = new List<Attacker>();
-                        foreach (var a in attackerList)
-                        {
-                            var attacker = new Attacker
-                            {
-                                AttackerInstanceId = (uint)a.Value<int>("attackerInstanceId")
-                            };
-                            var dr = a["damageRecipient"] as JObject;
-                            if (dr != null)
-                            {
-                                var recipient = new DamageRecipient();
-                                var drType = dr.Value<string>("type") ?? "";
-                                var normalizedType = drType.Replace("DamageRecType_", "");
-                                if (!string.IsNullOrEmpty(normalizedType) && System.Enum.TryParse<DamageRecType>(normalizedType, true, out var parsed))
-                                    recipient.Type = parsed;
-                                if (dr["playerSystemSeatId"] != null)
-                                    recipient.PlayerSystemSeatId = (uint)dr.Value<int>("playerSystemSeatId");
-                                else if (dr["planeswalkerInstanceId"] != null)
-                                    recipient.PlaneswalkerInstanceId = (uint)dr.Value<int>("planeswalkerInstanceId");
-                                else if (dr["teamId"] != null)
-                                    recipient.TeamId = (uint)dr.Value<int>("teamId");
-                                attacker.SelectedDamageRecipient = recipient;
-                            }
-                            attackers.Add(attacker);
-                        }
-                        _log.LogInfo($"UpdateAttacker: {attackers.Count} selective attackers");
-                        attackerReq.UpdateAttacker(attackers.ToArray());
-                    }
                 }
 
                 lock (_interactionLock) { _lastKnownRequest = null; }
