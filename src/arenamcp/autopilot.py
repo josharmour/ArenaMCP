@@ -511,6 +511,9 @@ class AutopilotEngine:
                 self._state = AutopilotState.IDLE
                 return True
 
+            # Fetch legal actions once for all shortcut checks below
+            legal = self._get_legal_actions(game_state)
+
             # "Auto-pay" in legal actions — just pass to accept autotap
             if any(a.lower() == "auto-pay" for a in legal):
                 logger.info("Autopilot: auto-paying (accepting autotap)")
@@ -525,8 +528,6 @@ class AutopilotEngine:
             # "Done (confirm attackers/blockers)" — auto-submit when it's
             # the only meaningful action. MTGA auto-selected creatures;
             # just confirm via bridge SubmitAttackers/SubmitBlockers.
-            legal = self._get_legal_actions(game_state)
-            legal = self._get_legal_actions(game_state)
             has_done_confirm = any(a.lower().startswith("done (confirm") for a in legal)
             meaningful_non_done = [
                 a for a in legal
