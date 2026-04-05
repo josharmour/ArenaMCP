@@ -33,8 +33,13 @@ class PipeAdapter:
     def __init__(self) -> None:
         self._coach: StandaloneCoach | None = None
         self._stdin_thread: threading.Thread | None = None
+        self._stdout_thread: threading.Thread | None = None
         self._running = False
         self._lock = threading.Lock()
+        # Non-blocking write queue — prevents coaching loop from freezing
+        # when the parent WinUI process is slow to read stdout
+        import queue
+        self._write_queue: queue.Queue[str] = queue.Queue(maxsize=500)
 
     def bind_coach(self, coach: StandaloneCoach) -> None:
         """Bind to a coach instance for command dispatch."""
@@ -43,12 +48,16 @@ class PipeAdapter:
         self._emit({"type": "log", "message": "Pipe adapter connected."})
 
     def start_stdin_reader(self) -> None:
-        """Start the background thread that reads commands from stdin."""
+        """Start background threads for stdin reading and stdout writing."""
         self._running = True
         self._stdin_thread = threading.Thread(
             target=self._stdin_loop, daemon=True, name="pipe-stdin"
         )
         self._stdin_thread.start()
+        self._stdout_thread = threading.Thread(
+            target=self._stdout_loop, daemon=True, name="pipe-stdout"
+        )
+        self._stdout_thread.start()
 
     def stop(self) -> None:
         self._running = False
@@ -85,16 +94,43 @@ class PipeAdapter:
     # ── Internal ─────────────────────────────────────────────────────
 
     def _emit(self, event: dict[str, Any]) -> None:
-        """Write a single JSON line to stdout."""
-        with self._lock:
+        """Queue a JSON line for the stdout writer thread.
+
+        Non-blocking: if the queue is full (parent not reading), drops
+        the oldest event to prevent the coaching loop from freezing.
+        """
+        try:
+            line = json.dumps(event, default=str, ensure_ascii=False) + "\n"
+        except Exception as e:
+            logger.error("pipe _emit JSON encode failed: %s (event type: %s)", e,
+                         event.get("type", "?"))
+            return
+
+        import queue
+        try:
+            self._write_queue.put_nowait(line)
+        except queue.Full:
+            # Drop oldest to make room — better than blocking the coaching loop
             try:
-                line = json.dumps(event, default=str, ensure_ascii=False)
-                sys.stdout.write(line + "\n")
+                self._write_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._write_queue.put_nowait(line)
+            except queue.Full:
+                pass
+
+    def _stdout_loop(self) -> None:
+        """Background thread that drains the write queue to stdout."""
+        while self._running:
+            try:
+                line = self._write_queue.get(timeout=0.5)
+                sys.stdout.write(line)
                 sys.stdout.flush()
-            except Exception as e:
-                # Log to file so we can debug pipe failures
-                logger.error("pipe _emit failed: %s (event type: %s)", e,
-                             event.get("type", "?"))
+            except Exception:
+                # queue.Empty on timeout, or broken pipe
+                if not self._running:
+                    break
 
     def _stdin_loop(self) -> None:
         """Read JSON line commands from stdin and dispatch to coach."""
