@@ -765,6 +765,13 @@ class AutopilotEngine:
                     if not self._config.dry_run and (self._gre_bridge.connected or self._gre_bridge.connect()):
                         if self._gre_bridge.auto_respond():
                             self._log_execution_path(ExecutionPath.GRE_AWARE, "auto_respond (planner empty)")
+                            logger.warning(
+                                f"AUTO_RESPOND_FALLBACK (planner empty): trigger={trigger}, "
+                                f"legal_actions={legal_actions}, "
+                                f"decision={(decision_context or {}).get('type')}, "
+                                f"bridge={game_state.get('_bridge_request_type')} — "
+                                "needs proper planner/bridge handling"
+                            )
                             self._state = AutopilotState.IDLE
                             return True
                     # Last resort: try pass
@@ -1829,10 +1836,44 @@ class AutopilotEngine:
         }
 
         handler = handlers.get(action.action_type)
+        if handler:
+            result = handler()
+            if result.success:
+                return result
+            # Click handler failed — try auto_respond as universal fallback
+            logger.warning(
+                f"Action handler failed for {action.action_type.value}: {result.error}. "
+                "Trying auto_respond fallback."
+            )
+
+        # Universal fallback: auto_respond unblocks any GRE request
+        if not self._config.dry_run and (self._gre_bridge.connected or self._gre_bridge.connect()):
+            if self._gre_bridge.auto_respond():
+                self._log_execution_path(
+                    ExecutionPath.GRE_AWARE,
+                    f"auto_respond fallback: {action.action_type.value} '{action.card_name}'"
+                )
+                # Log diagnostic for future fix
+                game_state_summary = {
+                    "action_type": action.action_type.value,
+                    "card_name": action.card_name,
+                    "target_names": action.target_names,
+                    "attacker_names": action.attacker_names,
+                    "blocker_assignments": action.blocker_assignments,
+                    "pending_decision": game_state.get("pending_decision"),
+                    "bridge_request": game_state.get("_bridge_request_type"),
+                    "bridge_class": game_state.get("_bridge_request_class"),
+                    "legal_actions": game_state.get("legal_actions", [])[:5],
+                }
+                logger.warning(
+                    f"AUTO_RESPOND_FALLBACK: {game_state_summary} — "
+                    "this action type needs a proper bridge handler"
+                )
+                return ClickResult(True, 0, 0, action.card_name or str(action), "auto_respond fallback")
+
         if not handler:
             return ClickResult(False, 0, 0, str(action), f"No handler for {action.action_type}")
-
-        return handler()
+        return result
 
     def _click_fixed(self, name: str) -> ClickResult:
         """Click a fixed-position button by name."""
