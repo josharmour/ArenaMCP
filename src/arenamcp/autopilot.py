@@ -504,6 +504,24 @@ class AutopilotEngine:
                 self._state = AutopilotState.IDLE
                 return True
 
+            # "Done (confirm attackers/blockers)" as only option — auto-submit
+            # MTGA auto-selected creatures; just confirm via bridge pass.
+            if has_decision:
+                legal = self._get_legal_actions(game_state)
+                done_only = (
+                    len(legal) == 1
+                    and legal[0].lower().startswith("done (confirm")
+                )
+                if done_only:
+                    logger.info(f"Autopilot: auto-confirming '{legal[0]}' via bridge pass")
+                    if not self._config.dry_run:
+                        if self._gre_bridge.connected or self._gre_bridge.connect():
+                            if self._gre_bridge.submit_pass():
+                                self._log_execution_path(ExecutionPath.GRE_AWARE, f"auto-confirm: {legal[0]}")
+                                return True
+                    self._exec_pass_priority()
+                    return True
+
             # Optional actions with no legal actions — auto-decline via pass
             if (
                 bridge_request_type in ("OptionalAction", "OptionalActionReq", "OptionalActionRequest")
