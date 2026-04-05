@@ -734,11 +734,59 @@ namespace MtgaCoachBridge
 
             if (request is DeclareBlockersRequest blockersReq)
             {
-                // Use SubmitBlockers — same pattern as MTGA's built-in bot
-                // (GoldfishStrategy). Submits current UI blocker selection state.
                 var assignments = cmd.Json["assignments"] as JArray;
-                _log.LogInfo($"SubmitBlockers (GoldfishStrategy pattern, {assignments?.Count ?? 0} requested)");
-                blockersReq.SubmitBlockers();
+                if (assignments == null || assignments.Count == 0)
+                {
+                    // No blocks — submit empty (like Goldfish bot)
+                    _log.LogInfo("SubmitBlockers: no blocks");
+                    blockersReq.SubmitBlockers();
+                }
+                else
+                {
+                    // Match blocker instance IDs to the request's own AllBlockers
+                    // objects, set SelectedAttackerInstanceIds, then submit.
+                    var selectedBlockers = new List<Blocker>();
+                    foreach (var a in assignments)
+                    {
+                        uint blockerInstanceId = (uint)a.Value<int>("blockerInstanceId");
+                        var attackerIds = a["attackerInstanceIds"] as JArray;
+
+                        // Find matching blocker from request's AllBlockers
+                        Blocker matched = null;
+                        foreach (var b in blockersReq.AllBlockers)
+                        {
+                            if (b.BlockerInstanceId == blockerInstanceId)
+                            {
+                                matched = b;
+                                break;
+                            }
+                        }
+
+                        if (matched != null)
+                        {
+                            // Set which attackers this blocker blocks
+                            matched.SelectedAttackerInstanceIds.Clear();
+                            if (attackerIds != null)
+                                foreach (var aid in attackerIds)
+                                    matched.SelectedAttackerInstanceIds.Add((uint)aid.Value<int>());
+                            selectedBlockers.Add(matched);
+                            _log.LogInfo($"UpdateBlockers: blocker={blockerInstanceId} blocking={string.Join(",", matched.SelectedAttackerInstanceIds)}");
+                        }
+                        else
+                        {
+                            _log.LogWarning($"Blocker instanceId={blockerInstanceId} not found in AllBlockers");
+                        }
+                    }
+
+                    if (selectedBlockers.Count > 0)
+                    {
+                        blockersReq.UpdateBlockers(selectedBlockers.ToArray());
+                    }
+                    else
+                    {
+                        blockersReq.SubmitBlockers();
+                    }
+                }
 
                 lock (_interactionLock) { _lastKnownRequest = null; }
                 cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "DeclareBlockers" });
@@ -768,13 +816,47 @@ namespace MtgaCoachBridge
                 var attackerList = cmd.Json["attackers"] as JArray;
                 if (attackerList == null || attackerList.Count == 0)
                 {
-                    // No attackers or any list — use SubmitAttackers (same as MTGA's
-                    // built-in bot GoldfishStrategy). This submits whatever the current
-                    // UI selection state is. For "no attack", nothing is selected.
-                    // For autopilot, the UI auto-selects when there's only one legal
-                    // attacker, so SubmitAttackers confirms it.
-                    _log.LogInfo($"SubmitAttackers (GoldfishStrategy pattern, {attackerList?.Count ?? 0} requested)");
+                    // No attackers — submit with no attacks (like Goldfish bot)
+                    _log.LogInfo("SubmitAttackers: no attacks");
                     attackerReq.SubmitAttackers();
+                }
+                else
+                {
+                    // Find the matching Attacker objects from the REQUEST's own
+                    // QualifiedAttackers list — we must use these exact objects
+                    // (with their internal state) and set SelectedDamageRecipient
+                    // from their own LegalDamageRecipients. Creating new Attacker
+                    // objects doesn't work — the GRE ignores them.
+                    // (Pattern from DeclareAttackerRequestRandomHandler in SharedClientCore)
+                    var requestedIds = new HashSet<uint>();
+                    foreach (var a in attackerList)
+                        requestedIds.Add((uint)a.Value<int>("attackerInstanceId"));
+
+                    var matchedAttackers = new List<Attacker>();
+                    foreach (var qa in attackerReq.QualifiedAttackers)
+                    {
+                        if (requestedIds.Contains(qa.AttackerInstanceId))
+                        {
+                            // Set damage recipient: use first legal recipient (usually opponent's face)
+                            if (qa.SelectedDamageRecipient == null && qa.LegalDamageRecipients.Count > 0)
+                            {
+                                qa.SelectedDamageRecipient = qa.LegalDamageRecipients[0];
+                            }
+                            matchedAttackers.Add(qa);
+                            _log.LogInfo($"UpdateAttacker: instanceId={qa.AttackerInstanceId}, recipient={qa.SelectedDamageRecipient?.Type}:{qa.SelectedDamageRecipient?.IdCase}");
+                        }
+                    }
+
+                    if (matchedAttackers.Count > 0)
+                    {
+                        _log.LogInfo($"UpdateAttacker: {matchedAttackers.Count} attackers from QualifiedAttackers");
+                        attackerReq.UpdateAttacker(matchedAttackers.ToArray());
+                    }
+                    else
+                    {
+                        _log.LogWarning($"No matching QualifiedAttackers found for IDs: {string.Join(",", requestedIds)}");
+                        attackerReq.SubmitAttackers();
+                    }
                 }
 
                 lock (_interactionLock) { _lastKnownRequest = null; }
