@@ -1080,6 +1080,13 @@ class StandaloneCoach:
                 self._autopilot_afk = False
                 self._init_autopilot()
             if self._autopilot:
+                # Reset lock in case previous session left it stuck
+                if self._autopilot._lock.locked():
+                    logger.warning("Autopilot: releasing stuck lock from previous session")
+                    try:
+                        self._autopilot._lock.release()
+                    except RuntimeError:
+                        pass  # Lock wasn't held by this thread
                 self._autopilot_enabled = True
                 logger.info("Autopilot toggled ON")
                 return True
