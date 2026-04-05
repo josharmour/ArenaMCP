@@ -791,47 +791,66 @@ namespace MtgaCoachBridge
                 var attackerList = cmd.Json["attackers"] as JArray;
                 if (attackerList == null || attackerList.Count == 0)
                 {
-                    // No attackers — submit empty (don't attack)
-                    _log.LogInfo("Submitting attackers: no attacks (empty list)");
-                    attackerReq.UpdateAttacker();
+                    // No attackers — submit current state (don't attack)
+                    _log.LogInfo("Submitting attackers: no attacks (SubmitAttackers)");
+                    attackerReq.SubmitAttackers();
                 }
                 else
                 {
-                    var attackers = new List<Attacker>();
+                    // Build the damage recipient for the target (usually opponent's face)
+                    // Use the first attacker's damageRecipient for DeclareAllAttackers
+                    var firstDr = attackerList[0]["damageRecipient"] as JObject;
+                    var requestedIds = new HashSet<uint>();
                     foreach (var a in attackerList)
+                        requestedIds.Add((uint)a.Value<int>("attackerInstanceId"));
+
+                    // Check if ALL qualified attackers are being sent — use DeclareAllAttackers shortcut
+                    var qualifiedIds = new HashSet<uint>();
+                    foreach (var qa in attackerReq.QualifiedAttackers)
+                        qualifiedIds.Add(qa.AttackerInstanceId);
+
+                    bool attackAll = requestedIds.SetEquals(qualifiedIds) && firstDr != null;
+
+                    if (attackAll)
                     {
-                        var attacker = new Attacker
+                        // Use DeclareAllAttackers — most reliable path
+                        var recipient = new DamageRecipient { Type = DamageRecType.Player };
+                        if (firstDr["playerSystemSeatId"] != null)
+                            recipient.PlayerSystemSeatId = (uint)firstDr.Value<int>("playerSystemSeatId");
+                        _log.LogInfo($"DeclareAllAttackers: {requestedIds.Count} attackers, recipient=Player seatId={recipient.PlayerSystemSeatId}");
+                        attackerReq.DeclareAllAttackers(recipient);
+                    }
+                    else
+                    {
+                        // Selective attack — use UpdateAttacker with specific attackers
+                        var attackers = new List<Attacker>();
+                        foreach (var a in attackerList)
                         {
-                            AttackerInstanceId = (uint)a.Value<int>("attackerInstanceId")
-                        };
-                        var dr = a["damageRecipient"] as JObject;
-                        if (dr != null)
-                        {
-                            var recipient = new DamageRecipient();
-                            var drType = dr.Value<string>("type") ?? "";
-                            // Handle both "Player" and "DamageRecType_Player" formats
-                            var normalizedType = drType.Replace("DamageRecType_", "");
-                            if (!string.IsNullOrEmpty(normalizedType) && System.Enum.TryParse<DamageRecType>(normalizedType, true, out var parsed))
-                                recipient.Type = parsed;
-                            // Set the appropriate oneof field
-                            if (dr["playerSystemSeatId"] != null)
-                                recipient.PlayerSystemSeatId = (uint)dr.Value<int>("playerSystemSeatId");
-                            else if (dr["planeswalkerInstanceId"] != null)
-                                recipient.PlaneswalkerInstanceId = (uint)dr.Value<int>("planeswalkerInstanceId");
-                            else if (dr["teamId"] != null)
-                                recipient.TeamId = (uint)dr.Value<int>("teamId");
-                            attacker.SelectedDamageRecipient = recipient;
+                            var attacker = new Attacker
+                            {
+                                AttackerInstanceId = (uint)a.Value<int>("attackerInstanceId")
+                            };
+                            var dr = a["damageRecipient"] as JObject;
+                            if (dr != null)
+                            {
+                                var recipient = new DamageRecipient();
+                                var drType = dr.Value<string>("type") ?? "";
+                                var normalizedType = drType.Replace("DamageRecType_", "");
+                                if (!string.IsNullOrEmpty(normalizedType) && System.Enum.TryParse<DamageRecType>(normalizedType, true, out var parsed))
+                                    recipient.Type = parsed;
+                                if (dr["playerSystemSeatId"] != null)
+                                    recipient.PlayerSystemSeatId = (uint)dr.Value<int>("playerSystemSeatId");
+                                else if (dr["planeswalkerInstanceId"] != null)
+                                    recipient.PlaneswalkerInstanceId = (uint)dr.Value<int>("planeswalkerInstanceId");
+                                else if (dr["teamId"] != null)
+                                    recipient.TeamId = (uint)dr.Value<int>("teamId");
+                                attacker.SelectedDamageRecipient = recipient;
+                            }
+                            attackers.Add(attacker);
                         }
-                        attackers.Add(attacker);
+                        _log.LogInfo($"UpdateAttacker: {attackers.Count} selective attackers");
+                        attackerReq.UpdateAttacker(attackers.ToArray());
                     }
-                    foreach (var att in attackers)
-                    {
-                        var drInfo = att.SelectedDamageRecipient != null
-                            ? $"type={att.SelectedDamageRecipient.Type}, idCase={att.SelectedDamageRecipient.IdCase}, seatId={att.SelectedDamageRecipient.PlayerSystemSeatId}"
-                            : "null";
-                        _log.LogInfo($"Submitting attacker: instanceId={att.AttackerInstanceId}, damageRecipient=[{drInfo}]");
-                    }
-                    attackerReq.UpdateAttacker(attackers.ToArray());
                 }
 
                 lock (_interactionLock) { _lastKnownRequest = null; }

@@ -788,7 +788,7 @@ class AutopilotEngine:
 
             self._notify("AUTOPILOT", plan_text)
             if self._config.enable_tts_preview and self._speak_fn:
-                self._speak_fn(f"Plan: {plan.overall_strategy}", False)
+                self._speak_fn(plan.overall_strategy, False)
 
             # Auto-execute countdown: executes after delay unless user cancels
             if self._config.confirm_plan:
