@@ -79,6 +79,26 @@ public static class ProcessLauncher
             CopyDirectory(bundle, targetDir);
         }
 
+        // Also install doorstop bootstrapper files (winhttp.dll + doorstop_config.ini)
+        // These must be in the MTGA root directory for BepInEx to load
+        var appRoot = RuntimeDetector.GetAppRoot();
+        foreach (var filename in new[] { "winhttp.dll", "doorstop_config.ini" })
+        {
+            // Check next to the bundle directory (assets/ or third_party/)
+            var bundleParent = Directory.GetParent(bundle)?.FullName ?? appRoot;
+            var src = Path.Combine(bundleParent, filename);
+            if (!File.Exists(src))
+                src = Path.Combine(appRoot, "assets", filename);
+            if (!File.Exists(src))
+                src = Path.Combine(appRoot, "third_party", filename);
+
+            if (File.Exists(src))
+            {
+                var dest = Path.Combine(mtgaDir, filename);
+                File.Copy(src, dest, overwrite: true);
+            }
+        }
+
         return targetDir;
     }
 

@@ -1824,16 +1824,27 @@ class AutopilotEngine:
         if not self._gre_bridge.connect():
             return None
 
+        method = action.action_type.value
+        if method in self._gre_bridge_failed_methods:
+            return None
+
+        # DECLARE ATTACKERS and DECLARE BLOCKERS bypass the bridge-idle check
+        # because their dedicated methods query get_pending_actions() directly
+        # and will fail gracefully if no request is actually pending.
+        # The bridge-idle check uses game_state metadata that may not be
+        # populated at the moment this method is called, causing false skips.
+        if action.action_type == ActionType.DECLARE_ATTACKERS:
+            return self._try_bridge_declare_attackers(action)
+
+        if action.action_type == ActionType.DECLARE_BLOCKERS:
+            return self._try_gre_bridge_blockers(action)
+
         if game_state.get("_bridge_connected") and not (
             game_state.get("_bridge_request_type")
             or game_state.get("_bridge_request_class")
             or game_state.get("_bridge_has_pending")
         ):
             logger.info("GRE bridge execution skipped: bridge is connected but reports no pending window")
-            return None
-
-        method = action.action_type.value
-        if method in self._gre_bridge_failed_methods:
             return None
 
         gre_ref = getattr(action, 'gre_action_ref', None)
@@ -1849,16 +1860,6 @@ class AutopilotEngine:
             logger.info("GRE bridge pass failed, falling back to mouse click")
             self._gre_bridge_failed_methods.add(method)
             return None
-
-        # DECLARE ATTACKERS — two-step bridge flow (NPE handler pattern):
-        # Step 1: UpdateAttacker with selected attackers (sets SelectedDamageRecipient)
-        # Step 2: SubmitAttackers to finalize (after GRE sends new DeclareAttackersReq)
-        if action.action_type == ActionType.DECLARE_ATTACKERS:
-            return self._try_bridge_declare_attackers(action)
-
-        # DECLARE BLOCKERS — still click-based (bridge not yet implemented)
-        if action.action_type == ActionType.DECLARE_BLOCKERS:
-            return None  # Fall through to click handler
 
         # MULLIGAN — submit keep/mulligan via bridge
         if action.action_type in (ActionType.MULLIGAN_KEEP, ActionType.MULLIGAN_MULL):

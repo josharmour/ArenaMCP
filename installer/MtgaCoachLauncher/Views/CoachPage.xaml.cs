@@ -19,7 +19,7 @@ public partial class CoachPage : Page
     public CoachPage()
     {
         this.InitializeComponent();
-        this.NavigationCacheMode = NavigationCacheMode.Required;
+        this.NavigationCacheMode = NavigationCacheMode.Disabled;
         _dispatcher = DispatcherQueue.GetForCurrentThread();
     }
 
@@ -46,63 +46,6 @@ public partial class CoachPage : Page
             _process.Exited -= OnProcessExited;
             _process.StderrLine -= OnStderrLine;
             _process = null;
-        }
-    }
-
-    // ── F-key handler ───────────────────────────────────────────────
-
-    private void Grid_KeyDown(object sender, KeyRoutedEventArgs e)
-    {
-        // Don't intercept keys while typing in the chat box
-        if (ChatInput.FocusState != Microsoft.UI.Xaml.FocusState.Unfocused)
-            return;
-
-        switch (e.Key)
-        {
-            case Windows.System.VirtualKey.F1:
-                _process?.SendCommand("autopilot_cancel");
-                e.Handled = true;
-                break;
-            case Windows.System.VirtualKey.F2:
-                _process?.SendCommand("toggle_style");
-                e.Handled = true;
-                break;
-            case Windows.System.VirtualKey.F3:
-                _process?.SendCommand("analyze_screen");
-                e.Handled = true;
-                break;
-            case Windows.System.VirtualKey.F4:
-                _process?.SendCommand("autopilot_abort");
-                e.Handled = true;
-                break;
-            case Windows.System.VirtualKey.F5:
-                _process?.SendCommand("toggle_mute");
-                e.Handled = true;
-                break;
-            case Windows.System.VirtualKey.F6:
-                _process?.SendCommand("cycle_voice");
-                e.Handled = true;
-                break;
-            case Windows.System.VirtualKey.F7:
-                CopyDebug_Click(sender, new RoutedEventArgs());
-                e.Handled = true;
-                break;
-            case Windows.System.VirtualKey.F8:
-                _process?.SendCommand("cycle_speed");
-                e.Handled = true;
-                break;
-            case Windows.System.VirtualKey.F9:
-                _process?.SendCommand("toggle_afk");
-                e.Handled = true;
-                break;
-            case Windows.System.VirtualKey.F10:
-                _process?.SendCommand("toggle_land_only");
-                e.Handled = true;
-                break;
-            case Windows.System.VirtualKey.F12:
-                _process?.SendCommand("toggle_autopilot");
-                e.Handled = true;
-                break;
         }
     }
 

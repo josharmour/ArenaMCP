@@ -1,4 +1,4 @@
-using MtgaCoachLauncher.Models;
+using Microsoft.UI.Dispatching;
 
 namespace MtgaCoachLauncher.Views;
 
@@ -6,16 +6,22 @@ public partial class MainPage : Page
 {
     private RuntimeState? _state;
     private CoachProcess? _coachProcess;
+    private readonly DispatcherQueue _dispatcher;
 
     public MainPage()
     {
         this.InitializeComponent();
+        _dispatcher = DispatcherQueue.GetForCurrentThread();
         this.Loaded += MainPage_Loaded;
     }
 
-    private void MainPage_Loaded(object sender, RoutedEventArgs e)
+    private async void MainPage_Loaded(object sender, RoutedEventArgs e)
     {
         _state = RuntimeDetector.DetectRuntimeState();
+
+        // Delay navigation slightly to let XAML type system finish initialization.
+        // This avoids a race in CoreMessagingXP.dll during page activation.
+        await Task.Delay(50);
 
         // Auto-start coach and go straight to Coach tab
         NavView.SelectedItem = NavView.MenuItems[0];
@@ -27,17 +33,30 @@ public partial class MainPage : Page
         if (args.SelectedItem is NavigationViewItem item)
         {
             var tag = item.Tag?.ToString();
-            switch (tag)
+            // Defer navigation to a fresh dispatcher tick so XAML activation
+            // doesn't collide with the SelectionChanged callback stack.
+            _dispatcher.TryEnqueue(DispatcherQueuePriority.Normal, () =>
             {
-                case "coach":
-                    ContentFrame.Navigate(typeof(CoachPage), this);
-                    if (_coachProcess is not null && ContentFrame.Content is CoachPage cp)
-                        cp.AttachProcess(_coachProcess);
-                    break;
-                case "repair":
-                    ContentFrame.Navigate(typeof(RepairPage), this);
-                    break;
-            }
+                try
+                {
+                    switch (tag)
+                    {
+                        case "coach":
+                            ContentFrame.Navigate(typeof(CoachPage), this);
+                            if (_coachProcess is not null && ContentFrame.Content is CoachPage cp)
+                                cp.AttachProcess(_coachProcess);
+                            break;
+                        case "repair":
+                            ContentFrame.Navigate(typeof(RepairPage), this);
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Navigation failed: {ex.Message}");
+                    SummaryText.Text = $"Coach page failed to load: {ex.Message}";
+                }
+            });
         }
     }
 

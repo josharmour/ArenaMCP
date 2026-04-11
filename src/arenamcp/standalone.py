@@ -4126,12 +4126,21 @@ class StandaloneCoach:
 
     def _register_hotkeys(self) -> None:
         """Register hotkeys."""
-        if not self._register_keyboard:
-            logger.info("Skipping global keyboard hotkey registration (TUI/Active Mode)")
-            return
-
         if not keyboard:
             return
+
+        if not self._register_keyboard:
+            # In pipe/launcher mode, only register critical global hotkeys
+            # that must work even when MTGA has focus (autopilot steals it)
+            try:
+                keyboard.on_press_key("f1", lambda _: self._autopilot and self._autopilot.on_cancel(), suppress=False)
+                keyboard.on_press_key("f4", lambda _: self._autopilot and self._autopilot.on_abort(), suppress=False)
+                keyboard.on_press_key("f12", lambda _: self.toggle_autopilot(), suppress=False)
+                logger.info("Global autopilot hotkeys registered (F1/F4/F12)")
+            except Exception as e:
+                logger.warning(f"Global hotkey registration failed: {e}")
+            return
+
         try:
             keyboard.on_press_key("f2", lambda _: self._on_style_toggle_hotkey(), suppress=False)
             keyboard.on_press_key("f3", lambda _: self._on_frequency_toggle_hotkey(), suppress=False)

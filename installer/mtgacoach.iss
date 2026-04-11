@@ -3,7 +3,7 @@
 #define MyAppURL "https://github.com/josharmour/mtgacoach"
 
 #ifndef AppVersion
-  #define AppVersion "1.8.0"
+  #define AppVersion "1.9.1"
 #endif
 
 [Setup]
@@ -58,9 +58,10 @@ Source: "..\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; BepInEx plugin build output
 Source: "..\bepinex-plugin\MtgaCoachBridge\bin\Release\net472\MtgaCoachBridge.dll"; DestDir: "{app}\bepinex-plugin\MtgaCoachBridge\bin\Release\net472"; Flags: ignoreversion skipifsourcedoesntexist
 
-; BepInEx bundles (optional, for repair/install)
-Source: "..\assets\BepInEx\*"; DestDir: "{app}\assets\BepInEx"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
-Source: "..\third_party\BepInEx\*"; DestDir: "{app}\third_party\BepInEx"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+; BepInEx bundles (for repair/install)
+Source: "..\assets\BepInEx\*"; DestDir: "{app}\assets\BepInEx"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\assets\winhttp.dll"; DestDir: "{app}\assets"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\assets\doorstop_config.ini"; DestDir: "{app}\assets"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{autoprograms}\mtgacoach"; Filename: "{app}\launcher\MtgaCoachLauncher.exe"; WorkingDir: "{app}"; IconFilename: "{app}\mtga_coach.ico"

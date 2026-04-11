@@ -6,7 +6,7 @@
     xmlns:local="using:MtgaCoachLauncher.Views"
 >
 
-    <Grid Padding="16" KeyDown="Grid_KeyDown">
+    <Grid Padding="16">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />   <!-- Status bar -->
             <RowDefinition Height="Auto" />   <!-- Game state panel -->

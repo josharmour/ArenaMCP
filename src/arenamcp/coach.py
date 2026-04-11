@@ -695,6 +695,12 @@ DECK_ANALYSIS_PROMPT = """Analyze this Magic: The Gathering deck list. Provide a
 
 Be specific to THIS deck's cards. Name card names, not generic advice. Keep under 600 characters total."""
 
+DECK_STRATEGY_BRIEF_PROMPT = """You are an expert MTG coach. Given a deck list, provide a brief spoken strategy summary in 3-5 sentences.
+
+Cover: the deck's archetype, primary win condition, and the 1-2 most important sequencing tips.
+
+Be specific — name actual cards from the list. Keep it conversational and under 200 characters. This will be read aloud via TTS."""
+
 POST_MATCH_ANALYSIS_PROMPT = """You are an expert Magic: The Gathering coach providing a post-match debrief.
 
 Given a chronological log of coaching advice given during the match, the match result, and game event data, provide a strategic analysis:
