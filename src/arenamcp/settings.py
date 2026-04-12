@@ -35,6 +35,8 @@ DEFAULTS = {
     "voice_speed": 1.0,
     "muted": False,
     "auto_speak": True,
+    "auto_deck_strategy": False,
+    "auto_post_match_analysis": False,
     "voice_mode": "ptt",
     "device_index": None,
     # Language for TTS and STT (e.g., "en", "nl", "es", "fr", "de", "ja")

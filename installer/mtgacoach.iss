@@ -3,7 +3,7 @@
 #define MyAppURL "https://github.com/josharmour/mtgacoach"
 
 #ifndef AppVersion
-  #define AppVersion "1.9.1"
+  #define AppVersion "2.0.0"
 #endif
 
 [Setup]
@@ -35,37 +35,16 @@ Name: "desktopicon"; Description: "Create a desktop icon"; GroupDescription: "Ad
 [Dirs]
 Name: "{localappdata}\mtgacoach"
 
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\launcher"
+
 [Files]
-; Native WinUI launcher (self-contained publish output)
-Source: "MtgaCoachLauncher\bin\Release\net8.0-windows10.0.19041.0\win-x64\publish\*"; DestDir: "{app}\launcher"; Flags: ignoreversion recursesubdirs createallsubdirs
-
-; Python coaching engine
-Source: "..\src\*"; DestDir: "{app}\src"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "__pycache__\*,*.pyc"
-Source: "..\pyproject.toml"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\requirements.txt"; DestDir: "{app}"; Flags: ignoreversion
-
-; Setup and legacy launch support
-Source: "..\setup_wizard.py"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\launcher.py"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\windows_integration.py"; DestDir: "{app}"; Flags: ignoreversion
-
-; Docs and assets
-Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\INSTALL.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\mtga_coach.ico"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
-
-; BepInEx plugin build output
-Source: "..\bepinex-plugin\MtgaCoachBridge\bin\Release\net472\MtgaCoachBridge.dll"; DestDir: "{app}\bepinex-plugin\MtgaCoachBridge\bin\Release\net472"; Flags: ignoreversion skipifsourcedoesntexist
-
-; BepInEx bundles (for repair/install)
-Source: "..\assets\BepInEx\*"; DestDir: "{app}\assets\BepInEx"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\assets\winhttp.dll"; DestDir: "{app}\assets"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\assets\doorstop_config.ini"; DestDir: "{app}\assets"; Flags: ignoreversion skipifsourcedoesntexist
+; PySide desktop app release payload staged by scripts/build_release.ps1
+Source: "..\dist\desktop-release\app\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\mtgacoach"; Filename: "{app}\launcher\MtgaCoachLauncher.exe"; WorkingDir: "{app}"; IconFilename: "{app}\mtga_coach.ico"
-Name: "{autodesktop}\mtgacoach"; Filename: "{app}\launcher\MtgaCoachLauncher.exe"; WorkingDir: "{app}"; IconFilename: "{app}\mtga_coach.ico"; Tasks: desktopicon
+Name: "{autoprograms}\mtgacoach"; Filename: "{app}\runtime\Scripts\pythonw.exe"; Parameters: """{app}\scripts\launch_installed.py"""; WorkingDir: "{app}"; IconFilename: "{app}\mtga_coach.ico"
+Name: "{autodesktop}\mtgacoach"; Filename: "{app}\runtime\Scripts\pythonw.exe"; Parameters: """{app}\scripts\launch_installed.py"""; WorkingDir: "{app}"; IconFilename: "{app}\mtga_coach.ico"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\launcher\MtgaCoachLauncher.exe"; Description: "Launch mtgacoach"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\runtime\Scripts\pythonw.exe"; Parameters: """{app}\scripts\launch_installed.py"""; Description: "Launch mtgacoach"; Flags: nowait postinstall skipifsilent

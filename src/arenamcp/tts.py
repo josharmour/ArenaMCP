@@ -15,7 +15,9 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
+import ctypes
 import wave
 from pathlib import Path
 from typing import Optional
@@ -31,11 +33,17 @@ def _ensure_numpy():
         import numpy
         np = numpy
 
-# Use winsound on Windows (no PortAudio dependency), sounddevice elsewhere
+# Audio backend selection:
+# - Windows: use winsound with temp WAV files. SND_MEMORY blocks when the
+#   process has no foreground window; file-based playback avoids this.
+#   sounddevice/PortAudio hangs during device enumeration on some systems.
+# - Other platforms: use sounddevice (PortAudio).
 _USE_WINSOUND = sys.platform == "win32"
-sd = None  # lazy import, only if needed
+sd = None
+winsound = None
 if _USE_WINSOUND:
     import winsound
+    import wave as _wave_mod
 else:
     try:
         import sounddevice as sd
@@ -43,6 +51,33 @@ else:
         sd = None
 
 logger = logging.getLogger(__name__)
+
+if _USE_WINSOUND:
+    _winmm = ctypes.WinDLL("winmm", use_last_error=True)
+    _play_sound_w = _winmm.PlaySoundW
+    _play_sound_w.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint]
+    _play_sound_w.restype = ctypes.c_bool
+
+    _SND_ASYNC = 0x00000001
+    _SND_NODEFAULT = 0x00000002
+    _SND_PURGE = 0x00000040
+    _SND_FILENAME = 0x00020000
+    # Route pipe-mode playback through the system audio session instead of the
+    # hidden python.exe session. This avoids the focus/input gating seen when
+    # the launcher window has not yet received user input.
+    _SND_SYSTEM = 0x00200000
+
+
+def _native_play_sound(path: Optional[str], flags: int) -> bool:
+    if not _USE_WINSOUND:
+        return False
+
+    ctypes.set_last_error(0)
+    ok = bool(_play_sound_w(path, None, flags))
+    err = ctypes.get_last_error()
+    target = path if path is not None else "<null>"
+    logger.info("PlaySoundW(path=%s, flags=0x%08X) => ok=%s last_error=%s", target, flags, ok, err)
+    return ok
 
 
 def _samples_to_wav_bytes(samples, sample_rate: int) -> bytes:
@@ -56,6 +91,50 @@ def _samples_to_wav_bytes(samples, sample_rate: int) -> bytes:
         wf.setframerate(sample_rate)
         wf.writeframes(int_samples.tobytes())
     return buf.getvalue()
+
+
+# Temp WAV file for winsound file-based playback (avoids SND_MEMORY focus bug)
+_winsound_tmp_path: Optional[str] = None
+
+
+def _winsound_play_samples(samples, sample_rate: int, blocking: bool = True) -> None:
+    """Play samples via winsound using a temp WAV file.
+
+    Always uses SND_ASYNC to avoid blocking when the process has no
+    foreground window. Playback is routed through the Windows system audio
+    session so the hidden pipe child is not dependent on window focus.
+    For blocking mode, sleeps for the audio duration.
+    """
+    global _winsound_tmp_path
+    _ensure_numpy()
+
+    wav_data = _samples_to_wav_bytes(samples, sample_rate)
+
+    # Write to a persistent temp file (reused across calls)
+    if _winsound_tmp_path is None:
+        fd, _winsound_tmp_path = tempfile.mkstemp(suffix=".wav", prefix="mtgacoach_")
+        os.close(fd)
+
+    with open(_winsound_tmp_path, 'wb') as f:
+        f.write(wav_data)
+
+    # Always use SND_ASYNC — blocking PlaySound hangs when the process
+    # lacks a foreground window (no active audio session).
+    flags = _SND_FILENAME | _SND_ASYNC | _SND_NODEFAULT | _SND_SYSTEM
+    if not _native_play_sound(_winsound_tmp_path, flags):
+        # Fall back to winsound's wrapper without the system-session flag if
+        # the native call fails for any reason on the current machine.
+        logger.warning("PlaySoundW with SND_SYSTEM failed; falling back to winsound.PlaySound")
+        winsound.PlaySound(
+            _winsound_tmp_path,
+            winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+        )
+
+    if blocking:
+        # Approximate playback duration and wait
+        duration = len(samples) / sample_rate
+        import time as _time
+        _time.sleep(duration)
 
 
 # Default model cache location
@@ -302,6 +381,30 @@ class VoiceOutput:
         self._windows_tts_proc: Optional[subprocess.Popen] = None
         self._fallback_tts_error_logged = False
 
+    def warmup(self, delay: float = 0) -> None:
+        """Pre-load the TTS model so first speak() has no delay.
+
+        Call this in a background thread during startup. Loads the ONNX
+        model (~300MB) and runs a tiny synthesis to warm the inference path.
+
+        Args:
+            delay: Seconds to wait before starting warmup. Allows other
+                   startup threads (coaching loop) to initialize first.
+        """
+        try:
+            if delay > 0:
+                import time as _time
+                _time.sleep(delay)
+            self._ensure_tts()
+            # Run a tiny synthesis to warm the ONNX runtime session.
+            # Must hold _speak_lock to serialize with speak()/speak_async(),
+            # otherwise concurrent ONNX calls trigger access violations.
+            with self._speak_lock:
+                self._tts_engine.synthesize(".")
+            logger.info("TTS model warmed up")
+        except Exception as e:
+            logger.warning(f"TTS warmup failed: {e}")
+
     def _ensure_tts(self) -> None:
         """Initialize TTS on first use."""
         if self._tts_engine is None:
@@ -389,6 +492,11 @@ class VoiceOutput:
         """Get current voice (id, description)."""
         return self.VOICES[self._voice_index]
 
+    @property
+    def speed(self) -> float:
+        """Get the current speed multiplier."""
+        return float(self._speed)
+
     def toggle_mute(self) -> bool:
         """Toggle mute state.
 
@@ -451,6 +559,77 @@ class VoiceOutput:
         # Persist setting
         self._settings.set("voice_speed", self._speed)
         return self._speed
+
+    def set_speed(self, speed: float) -> float:
+        """Set TTS speed directly.
+
+        Args:
+            speed: Speech speed multiplier.
+
+        Returns:
+            The applied speed value.
+        """
+        try:
+            new_speed = float(speed)
+        except (TypeError, ValueError):
+            return self._speed
+
+        if new_speed <= 0:
+            return self._speed
+
+        self._speed = new_speed
+
+        if self._tts_engine is not None:
+            self._tts_engine = None
+
+        self._settings.set("voice_speed", self._speed)
+        return self._speed
+
+    def render_to_wav_file(self, text: str) -> tuple[str, float] | None:
+        """Render speech to a temp WAV file for parent-process playback."""
+        if self._muted:
+            return None
+
+        text = self._clean_text(text)
+        if not text or not text.strip():
+            return None
+
+        self._ensure_tts()
+
+        with self._speak_lock:
+            try:
+                samples, sample_rate = self._tts_engine.synthesize(text)
+            except (ImportError, FileNotFoundError) as e:
+                logger.warning(
+                    "Kokoro unavailable while rendering pipe audio (%s); "
+                    "falling back to in-process playback",
+                    e,
+                )
+                return None
+
+            if len(samples) == 0:
+                return None
+
+            # Keep the same lead-in used for direct playback so the first word
+            # is not clipped when the parent process starts the stream.
+            silence_len = int(sample_rate * 0.5)
+            _ensure_numpy()
+            silence = np.zeros(silence_len, dtype=np.float32)
+            samples = np.concatenate([silence, samples])
+
+            fd, path = tempfile.mkstemp(suffix=".wav", prefix="mtgacoach_pipe_")
+            os.close(fd)
+            with open(path, "wb") as f:
+                f.write(_samples_to_wav_bytes(samples, sample_rate))
+
+            duration = len(samples) / sample_rate
+            logger.info(
+                "Rendered pipe audio wav=%s duration=%.2fs text=%s...",
+                path,
+                duration,
+                text[:50],
+            )
+            return path, duration
 
     def set_voice(self, voice_id: str) -> None:
         """Set the current voice directly by ID.
@@ -571,8 +750,7 @@ class VoiceOutput:
             try:
                 logger.info(f"Speaking (device={self._device_index}): {text[:50]}...")
                 if _USE_WINSOUND:
-                    wav_data = _samples_to_wav_bytes(samples, sample_rate)
-                    winsound.PlaySound(wav_data, winsound.SND_MEMORY)
+                    _winsound_play_samples(samples, sample_rate, blocking=True)
                 elif sd is not None:
                     sd.play(samples, sample_rate, device=self._device_index)
                     sd.wait()
@@ -633,10 +811,7 @@ class VoiceOutput:
                 try:
                     logger.info(f"Speaking async (device={self._device_index}): {text[:50]}...")
                     if _USE_WINSOUND:
-                        wav_data = _samples_to_wav_bytes(samples, sample_rate)
-                        # SND_MEMORY plays from bytes, SND_ASYNC not used here
-                        # because we're already in a background thread
-                        winsound.PlaySound(wav_data, winsound.SND_MEMORY)
+                        _winsound_play_samples(samples, sample_rate, blocking=True)
                     elif sd is not None:
                         sd.play(samples, sample_rate, device=self._device_index)
                         sd.wait()
@@ -672,7 +847,8 @@ class VoiceOutput:
         # Stop audio playback
         if _USE_WINSOUND:
             try:
-                winsound.PlaySound(None, winsound.SND_PURGE)
+                if not _native_play_sound(None, _SND_PURGE):
+                    winsound.PlaySound(None, winsound.SND_PURGE)
             except Exception:
                 pass
         elif sd is not None:

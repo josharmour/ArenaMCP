@@ -1899,6 +1899,15 @@ class AutopilotEngine:
         if action.action_type == ActionType.SELECT_TARGET:
             return self._try_gre_bridge_select_target(action)
 
+        # MODAL CHOICE / CASTING OPTIONS — submit via bridge by matching
+        # CastingTimeOption entries (actionType="CastingTimeOption").
+        # The generic type-match path can't handle these because the bridge
+        # uses "CastingTimeOption" not "ActionType_Cast" etc.
+        if action.action_type in (ActionType.MODAL_CHOICE, ActionType.CASTING_OPTIONS):
+            result = self._try_bridge_casting_time_option(action)
+            if result:
+                return result
+
         # For actions with a GRE ref, match by identity fields
         if gre_ref is not None:
             action_type = gre_ref.action_type if hasattr(gre_ref, 'action_type') else ""
@@ -1937,21 +1946,124 @@ class AutopilotEngine:
                 if pending and pending.get("has_pending") and pending.get("actions"):
                     bridge_actions = pending["actions"]
             if bridge_actions:
-                # Find matching action by GRE type and grpId
+                # Find matching action by GRE type AND card identity.
+                # Without card name verification, the first type match wins —
+                # which submits the wrong card when multiple casts are legal
+                # (e.g. submitting Michelangelo instead of Emerald Medallion).
+                best_idx = None
                 for idx, ba in enumerate(bridge_actions):
                     ba_type = ba.get("actionType", "")
                     # Normalize comparison
-                    if ba_type == gre_type or f"ActionType_{ba_type}" == gre_type or ba_type == gre_type.replace("ActionType_", ""):
-                        # For named actions, try to verify card identity via game_objects
-                        if self._gre_bridge.submit_action_by_index(
-                            idx, auto_pass=self._config.auto_pass_priority
-                        ):
-                            self._log_execution_path(
-                                ExecutionPath.GRE_AWARE,
-                                f"{action.action_type.value}: '{action.card_name}' submitted via GRE bridge (type match)"
-                            )
-                            return ClickResult(True, 0, 0, action.card_name or str(action), "GRE bridge")
+                    if not (ba_type == gre_type or f"ActionType_{ba_type}" == gre_type or ba_type == gre_type.replace("ActionType_", "")):
+                        continue
+                    # Verify card identity via grpId → card name lookup
+                    if action.card_name:
+                        ba_grp_id = ba.get("grpId", 0)
+                        if ba_grp_id:
+                            try:
+                                from arenamcp import server
+                                card_info = server.get_card_info(ba_grp_id)
+                                ba_name = card_info.get("name", "")
+                            except Exception:
+                                ba_name = ""
+                            if ba_name and ba_name.lower() != action.card_name.lower():
+                                continue  # Wrong card — skip
+                    best_idx = idx
+                    break
 
+                if best_idx is not None:
+                    if self._gre_bridge.submit_action_by_index(
+                        best_idx, auto_pass=self._config.auto_pass_priority
+                    ):
+                        self._log_execution_path(
+                            ExecutionPath.GRE_AWARE,
+                            f"{action.action_type.value}: '{action.card_name}' submitted via GRE bridge (type+name match)"
+                        )
+                        return ClickResult(True, 0, 0, action.card_name or str(action), "GRE bridge")
+                    else:
+                        logger.warning(
+                            f"GRE bridge type+name match found idx={best_idx} for "
+                            f"'{action.card_name}' but submit_action_by_index failed"
+                        )
+                elif action.card_name:
+                    logger.warning(
+                        f"GRE bridge type match: no action matched card name "
+                        f"'{action.card_name}' among {len(bridge_actions)} bridge actions"
+                    )
+
+        return None
+
+    def _try_bridge_casting_time_option(self, action: GameAction) -> Optional[ClickResult]:
+        """Submit a casting-time option (modal choice, done, kicker, etc.) via GRE bridge.
+
+        Bridge actions for CastingTimeOptionRequest have actionType="CastingTimeOption"
+        with a choiceKind field ("modal", "done", "choose_or_cost", etc.) and an
+        optionIndex for modals. We match the LLM's modal_index to the bridge's
+        optionIndex to pick the right entry.
+        """
+        bridge_actions = None
+        if self._bridge_preloaded_actions:
+            bridge_actions = self._bridge_preloaded_actions
+        else:
+            pending = self._gre_bridge.get_pending_actions()
+            if pending and pending.get("has_pending") and pending.get("actions"):
+                bridge_actions = pending["actions"]
+
+        if not bridge_actions:
+            return None
+
+        # Filter to CastingTimeOption entries
+        casting_entries = [
+            (idx, ba) for idx, ba in enumerate(bridge_actions)
+            if ba.get("actionType") == "CastingTimeOption"
+        ]
+
+        if not casting_entries:
+            return None
+
+        # For modal_choice: match by optionIndex (from LLM's modal_index field)
+        modal_index = getattr(action, 'modal_index', 0) or 0
+
+        # For casting_options (the "done/confirm" step), just pick the first
+        # non-modal entry (usually "done")
+        if action.action_type == ActionType.CASTING_OPTIONS:
+            # Prefer "done" entries, then fall back to first entry
+            for idx, ba in casting_entries:
+                if ba.get("choiceKind") == "done":
+                    if self._gre_bridge.submit_action_by_index(
+                        idx, auto_pass=self._config.auto_pass_priority
+                    ):
+                        self._log_execution_path(
+                            ExecutionPath.GRE_AWARE,
+                            f"casting_options: '{action.card_name}' done via GRE bridge"
+                        )
+                        return ClickResult(True, 0, 0, action.card_name or "casting_option", "GRE bridge")
+            # No "done" entry — fall through to mouse
+            return None
+
+        # modal_choice: find the entry with matching optionIndex
+        for idx, ba in casting_entries:
+            if ba.get("choiceKind") == "modal" and ba.get("optionIndex", -1) == modal_index:
+                if self._gre_bridge.submit_action_by_index(
+                    idx, auto_pass=self._config.auto_pass_priority
+                ):
+                    self._log_execution_path(
+                        ExecutionPath.GRE_AWARE,
+                        f"modal_choice: '{action.card_name}' option {modal_index} via GRE bridge"
+                    )
+                    return ClickResult(True, 0, 0, action.card_name or "modal", "GRE bridge")
+                else:
+                    logger.warning(
+                        f"GRE bridge modal submit failed for '{action.card_name}' option {modal_index}"
+                    )
+                    return None
+
+        # optionIndex not found — log and fall through to mouse
+        available = [(ba.get("choiceKind"), ba.get("optionIndex")) for _, ba in casting_entries]
+        logger.warning(
+            f"GRE bridge modal: no entry with optionIndex={modal_index} "
+            f"among {len(casting_entries)} entries: {available}"
+        )
         return None
 
     def _try_bridge_declare_attackers(self, action: GameAction) -> Optional[ClickResult]:

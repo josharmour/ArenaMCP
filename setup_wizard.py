@@ -660,7 +660,7 @@ def step_install_dependencies() -> bool:
 
     # Install extras from requirements.txt not covered by pyproject.toml
     extras = [
-        "textual", "openai", "websocket-client", "scipy", "Pillow",
+        "openai", "websocket-client", "scipy", "Pillow",
         "networkx", "beautifulsoup4", "pyedhrec", "lxml",
         "pyautogui", "pydirectinput-rgx",
     ]

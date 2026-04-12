@@ -147,7 +147,6 @@ def check_core_deps() -> list[str]:
         ("mcp", "mcp", "MCP server framework"),
         ("watchdog", "watchdog", "File system monitoring"),
         ("requests", "requests", "HTTP client"),
-        ("textual", "textual", "Terminal UI"),
     ]
     if os.name == "nt":
         core_deps.append(("keyboard", "keyboard", "Hotkey support (Windows)"))

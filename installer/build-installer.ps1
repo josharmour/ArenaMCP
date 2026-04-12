@@ -26,8 +26,14 @@ if (-not (Test-Path $PluginDll)) {
     Write-Warning "Build the plugin before cutting a release installer."
 }
 
+$ReleaseBuilder = Join-Path $RepoRoot "scripts\build_release.ps1"
+if (-not (Test-Path $ReleaseBuilder)) {
+    throw "Desktop release builder not found: $ReleaseBuilder"
+}
+
 Push-Location $ScriptDir
 try {
+    & $ReleaseBuilder
     & $InnoSetupCompiler "/DAppVersion=$Version" "mtgacoach.iss"
 }
 finally {

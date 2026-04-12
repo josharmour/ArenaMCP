@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "arenamcp"
-version = "1.8.6"
+version = "2.0.0"
 description = "Real-time MCP server bridging MTGA game logs to Claude for conversational game analysis"
 requires-python = ">=3.10"
 license = "MIT"
@@ -18,6 +18,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+desktop = [
+    "PySide6>=6.7.0",
+    "kokoro-onnx",
+]
 voice = [
     "faster-whisper>=1.0.0",
     "kokoro-onnx",
@@ -28,9 +32,6 @@ llm = [
     "anthropic>=0.18.0",
     "ollama>=0.1.0",
     "openai>=1.0.0",
-]
-tui = [
-    "textual>=0.47.0",
 ]
 autopilot = [
     "pyautogui>=0.9.54",
@@ -44,13 +45,16 @@ scraping = [
     "networkx>=3.0",
 ]
 full = [
-    "arenamcp[voice,llm,tui,autopilot,scraping]",
+    "arenamcp[desktop,voice,llm,autopilot,scraping]",
     "websocket-client>=1.6.0",
     "scipy>=1.10.0",
 ]
 dev = [
     "pytest>=7.0.0",
 ]
+
+[project.gui-scripts]
+mtgacoach-desktop = "arenamcp.desktop.app:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/arenamcp"]

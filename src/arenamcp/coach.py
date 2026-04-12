@@ -701,18 +701,25 @@ Cover: the deck's archetype, primary win condition, and the 1-2 most important s
 
 Be specific — name actual cards from the list. Keep it conversational and under 200 characters. This will be read aloud via TTS."""
 
-POST_MATCH_ANALYSIS_PROMPT = """You are an expert Magic: The Gathering coach providing a post-match debrief.
+POST_MATCH_ANALYSIS_PROMPT = """You are an expert Magic: The Gathering coach providing a post-match debrief. You are also reviewing your OWN coaching performance — the advice log shows what YOU told the player to do during the match.
 
-Given a chronological log of coaching advice given during the match, the match result, and game event data, provide a strategic analysis:
+Given a chronological log of coaching advice given during the match, the match result, game event data, and optionally a REPLAY DATA section with authoritative GRE decision history, provide a strategic analysis:
 
 1. RESULT: One sentence on the match outcome and how it was decided.
 2. KEY TURNING POINTS: 2-3 moments that most influenced the outcome (reference specific turns and cards).
-3. WHAT WENT WELL: 1-2 things the player did correctly.
-4. MISTAKES & IMPROVEMENTS: 1-2 concrete mistakes or missed opportunities, with what should have been done instead.
-5. OPPONENT STRATEGY: Brief assessment of the opponent's game plan and how it could be countered next time.
-6. TAKEAWAY: One actionable lesson for future games.
+3. WHAT WENT WELL: 1-2 things the player/autopilot did correctly.
+4. COACHING ERRORS: Identify moments where YOUR advice was wrong, illegal, or suboptimal. For each:
+   - What you advised and why it was wrong
+   - What the correct play was
+   - Root cause (e.g. "didn't account for mana cost", "ignored opponent's open mana", "recommended a card not in hand")
+5. AUTOPILOT ERRORS: If REPLAY DATA is present, identify where the autopilot executed the wrong action (e.g. submitted wrong card, failed to pay costs, got stuck in a loop). Note the turn and what actually happened vs. what was intended.
+6. OPPONENT STRATEGY: Brief assessment of the opponent's game plan and how it could be countered next time.
+7. COACHING IMPROVEMENTS: 1-3 concrete, actionable improvements to the coaching AI. These should be specific rules or heuristics, not vague suggestions. Examples:
+   - "Always verify mana availability before recommending a cast — check both total mana and color requirements"
+   - "When multiple cast actions share the same type, verify card identity before submitting"
+   - "Don't recommend attacking with the only blocker when opponent has lethal on board"
 
-Keep the full analysis under 400 words. Be specific — reference actual cards and turns from the match log.
+Keep the full analysis under 500 words. Be specific — reference actual cards and turns from the match log.
 Do NOT be generic. Use the advice history to identify where the player followed or ignored coaching advice.
 CRITICAL: ONLY reference card names that appear in the provided match log. Do NOT substitute, guess, or invent card names from your general MTG knowledge. If you cannot find a card name in the log, describe it by its effect instead.
 
@@ -1152,6 +1159,15 @@ class CoachEngine:
             try:
                 from arenamcp.rules_engine import RulesEngine
                 valid_moves = RulesEngine.get_legal_actions(game_state)
+
+                # Override generic casting_time_options legal actions with
+                # resolved modal option names from bridge data
+                dec_ctx = game_state.get("decision_context") or {}
+                if dec_ctx.get("type") == "casting_time_options":
+                    modal_moves = self._resolve_modal_legal_actions(game_state)
+                    if modal_moves:
+                        valid_moves = modal_moves
+
                 if not valid_moves:
                     return [], 'NONE \u2014 say "pass priority"'
                 else:
@@ -1159,6 +1175,37 @@ class CoachEngine:
             except Exception as e:
                 logger.error(f"RulesEngine error: {e}")
                 return [], "Error"
+
+    def _resolve_modal_legal_actions(self, game_state: dict[str, Any]) -> list[str]:
+        """Resolve bridge CastingTimeOption modal entries to readable legal actions."""
+        bridge_actions = game_state.get("_bridge_actions") or []
+        modal_actions: list[tuple[int, str]] = []
+
+        for ba in bridge_actions:
+            if ba.get("actionType") != "CastingTimeOption":
+                continue
+            kind = ba.get("choiceKind", "")
+            opt_idx = ba.get("optionIndex", 0)
+            grp_id = ba.get("grpId", 0)
+
+            if kind == "modal" and grp_id:
+                try:
+                    from arenamcp import server
+                    info = server.get_card_info(grp_id)
+                    oracle = info.get("oracle_text", "")
+                    # Modal option oracle texts are typically short single-line effects
+                    label = oracle.split("\n")[0].strip() if oracle else info.get("name", f"Mode {opt_idx + 1}")
+                except Exception:
+                    label = f"Mode {opt_idx + 1}"
+                modal_actions.append((opt_idx, f"Mode {opt_idx}: {label}"))
+            elif kind == "done":
+                modal_actions.append((999, "Done (confirm cast)"))
+
+        if not modal_actions:
+            return []
+
+        modal_actions.sort(key=lambda x: x[0])
+        return [label for _, label in modal_actions]
 
     def _format_post_land_planning(self, game_state: dict[str, Any],
                                    local_seat: int, valid_moves: list[str],
@@ -1246,6 +1293,60 @@ class CoachEngine:
             lines.append(f"THEN: {'; '.join(post_land_parts)}")
         return lines
 
+    def _format_casting_time_options(
+        self, game_state: dict[str, Any], decision_context: dict[str, Any]
+    ) -> list[str]:
+        """Format casting-time options with resolved modal option names.
+
+        When bridge actions contain CastingTimeOption entries with choiceKind="modal",
+        resolve each option's grpId to a card name so the LLM knows exactly what
+        modal_index 0 vs 1 vs 2 means (e.g. "Search library" vs "Proliferate").
+        """
+        lines: list[str] = []
+
+        # Try to extract modal options from bridge actions
+        bridge_actions = game_state.get("_bridge_actions") or []
+        modal_options: list[tuple[int, str]] = []  # (optionIndex, resolved_name)
+
+        for ba in bridge_actions:
+            if ba.get("actionType") != "CastingTimeOption":
+                continue
+            if ba.get("choiceKind") != "modal":
+                continue
+            opt_idx = ba.get("optionIndex", 0)
+            grp_id = ba.get("grpId", 0)
+            if grp_id:
+                try:
+                    from arenamcp import server
+                    info = server.get_card_info(grp_id)
+                    name = info.get("name", f"Option {opt_idx}")
+                    oracle = info.get("oracle_text", "")
+                    # For modal options, the grpId resolves to the mode's
+                    # oracle text (e.g. "Search your library for a basic land...")
+                    # Use the oracle text if short enough, otherwise just the name
+                    if oracle and len(oracle) < 120:
+                        label = oracle.split("\n")[0].strip()
+                    else:
+                        label = name
+                except Exception:
+                    label = f"Option {opt_idx}"
+            else:
+                label = ba.get("label", f"Option {opt_idx}")
+            modal_options.append((opt_idx, label))
+
+        if modal_options:
+            modal_options.sort(key=lambda x: x[0])
+            lines.append(f"!!! DECISION: CHOOSE MODE ({len(modal_options)} options) !!!")
+            for opt_idx, label in modal_options:
+                lines.append(f"  modal_index={opt_idx}: {label}")
+            lines.append("Set modal_index to the number of the best option.")
+        else:
+            # Fallback: no bridge data, generic casting-time prompt
+            lines.append("!!! DECISION: CHOOSE CASTING OPTION !!!")
+            lines.append("Evaluate: alternative cost vs normal cost (Foretell, Flashback, Escape)")
+
+        return lines
+
     def _format_decision_lines(self, game_state: dict[str, Any]) -> list[str]:
         """Format decision context into display lines for the LLM prompt."""
         lines: list[str] = []
@@ -1280,8 +1381,7 @@ class CoachEngine:
                     "Keep land on top if needed, otherwise bottom for a better draw"],
                 "select_replacement": lambda ctx: ["!!! DECISION: ORDER REPLACEMENT EFFECTS !!!",
                     "Choose: apply the replacement that gives most advantage first"],
-                "casting_time_options": lambda ctx: ["!!! DECISION: CHOOSE CASTING OPTION !!!",
-                    "Evaluate: alternative cost vs normal cost (Foretell, Flashback, Escape)"],
+                "casting_time_options": None,  # Handled below with modal option resolution
                 "select_counters": lambda ctx: ["!!! DECISION: SELECT COUNTERS !!!",
                     "Choose: remove least valuable counters, keep most impactful"],
                 "order_triggers": lambda ctx: ["!!! DECISION: ORDER TRIGGERED ABILITIES !!!",
@@ -1291,8 +1391,10 @@ class CoachEngine:
                 "search_from_groups": lambda ctx: ["!!! DECISION: SEARCH FROM GROUPS !!!"],
                 "gather": lambda ctx: ["!!! DECISION: GATHER !!!"],
             }
-            if dec_type in _simple:
+            if dec_type in _simple and _simple[dec_type] is not None:
                 lines.extend(_simple[dec_type](decision_context))
+            elif dec_type == "casting_time_options":
+                lines.extend(self._format_casting_time_options(game_state, decision_context))
             elif dec_type == "discard":
                 lines.append(f"!!! DECISION: DISCARD {decision_context.get('count', 1)} card(s) !!!")
                 lines.append("Choose: excess lands > high CMC uncastables > redundant copies")
@@ -2622,6 +2724,7 @@ class CoachEngine:
         opponent_played_cards: Optional[list[str]] = None,
         backend: Optional[Any] = None,
         missed_decisions: Optional[list[dict]] = None,
+        replay_context: Optional[str] = None,
     ) -> str:
         """Generate a post-match strategic analysis from the advice log.
 
@@ -2634,6 +2737,7 @@ class CoachEngine:
             opponent_played_cards: Card names the opponent revealed
             backend: Optional dedicated backend (avoids lock contention)
             missed_decisions: Vision watchdog detections (unmapped decision points)
+            replay_context: Parsed replay decision-point summary (from .rply file)
 
         Returns:
             Analysis string from the LLM, or "" on failure.
@@ -2717,11 +2821,16 @@ class CoachEngine:
                     f"(stall={md.get('stall_duration_s', '?')}s, conf={md.get('confidence', '?')})"
                 )
 
+        if replay_context:
+            lines.append(f"\nREPLAY DATA (authoritative GRE decision history):")
+            lines.append(replay_context)
+
         user_message = "\n".join(lines)
 
         logger.info(
             f"[POST-MATCH] Generating analysis: {len(advice_history)} entries, "
             f"result={match_result}, turns={match_duration_turns}, "
+            f"replay={'yes' if replay_context else 'no'}, "
             f"prompt={len(user_message)} chars"
         )
 

@@ -1,16 +1,19 @@
 """Pipe-based UI adapter for headless operation with a native GUI frontend.
 
-Writes JSON lines to stdout (coach → GUI) and reads JSON lines from stdin
-(GUI → coach). Designed for use with the WinUI 3 launcher app.
+Writes JSON lines to stdout (coach -> GUI) and reads JSON lines from stdin
+(GUI -> coach). Used by the desktop app to keep the coaching engine isolated
+from the UI process.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sys
 import threading
+import webbrowser
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -44,20 +47,34 @@ class PipeAdapter:
     def bind_coach(self, coach: StandaloneCoach) -> None:
         """Bind to a coach instance for command dispatch."""
         self._coach = coach
+        # Start the stdout writer thread IMMEDIATELY — before coach.start()
+        # emits initialization events. Otherwise those events queue up
+        # unbounded and eventually get dropped.
+        self._running = True
+        if self._stdout_thread is None:
+            self._stdout_thread = threading.Thread(
+                target=self._stdout_loop, daemon=True, name="pipe-stdout"
+            )
+            self._stdout_thread.start()
         # Startup beacon — confirms pipe is alive
         self._emit({"type": "log", "message": "Pipe adapter connected."})
 
     def start_stdin_reader(self) -> None:
-        """Start background threads for stdin reading and stdout writing."""
+        """Start the stdin reader thread. Stdout thread was already started
+        in bind_coach() so no events are dropped during coach init."""
         self._running = True
-        self._stdin_thread = threading.Thread(
-            target=self._stdin_loop, daemon=True, name="pipe-stdin"
-        )
-        self._stdin_thread.start()
-        self._stdout_thread = threading.Thread(
-            target=self._stdout_loop, daemon=True, name="pipe-stdout"
-        )
-        self._stdout_thread.start()
+        if self._stdin_thread is None:
+            self._stdin_thread = threading.Thread(
+                target=self._stdin_loop, daemon=True, name="pipe-stdin"
+            )
+            self._stdin_thread.start()
+        # Stdout thread is already running from bind_coach(); start it here
+        # only if it somehow wasn't started (defensive)
+        if self._stdout_thread is None:
+            self._stdout_thread = threading.Thread(
+                target=self._stdout_loop, daemon=True, name="pipe-stdout"
+            )
+            self._stdout_thread.start()
 
     def stop(self) -> None:
         self._running = False
@@ -81,6 +98,47 @@ class PipeAdapter:
         if self._coach and self._coach._voice_output:
             self._coach._voice_output.speak(text, blocking=False)
         self._emit({"type": "speak", "text": strip_markup(text)})
+
+    def emit_speech_audio(
+        self,
+        *,
+        path: str,
+        text: str,
+        duration: float,
+        voice_id: str,
+        voice_name: str,
+    ) -> None:
+        self._emit(
+            {
+                "type": "speak_audio",
+                "path": path,
+                "text": strip_markup(text),
+                "duration": round(duration, 3),
+                "voice_id": voice_id,
+                "voice_name": voice_name,
+            }
+        )
+
+    def emit_speech_request(
+        self,
+        *,
+        text: str,
+        voice_id: str,
+        voice_name: str,
+        speed: float,
+    ) -> None:
+        self._emit(
+            {
+                "type": "speak_request",
+                "text": strip_markup(text),
+                "voice_id": voice_id,
+                "voice_name": voice_name,
+                "speed": speed,
+            }
+        )
+
+    def emit_speech_stop(self) -> None:
+        self._emit({"type": "speak_stop"})
 
     def subtask(self, status: str) -> None:
         self._emit({"type": "subtask", "status": strip_markup(status)})
@@ -121,16 +179,38 @@ class PipeAdapter:
                 pass
 
     def _stdout_loop(self) -> None:
-        """Background thread that drains the write queue to stdout."""
+        """Background thread that drains the write queue to stdout.
+
+        Writes directly to the underlying binary buffer. On Windows this
+        uses WriteFile which blocks, but the Python buffered writer's
+        Lock is avoided and the write is one syscall per line.
+        """
+        # Get the raw binary writer (bypass text encoding layer)
+        try:
+            raw_out = sys.stdout.buffer
+        except AttributeError:
+            raw_out = sys.stdout
+
         while self._running:
             try:
                 line = self._write_queue.get(timeout=0.5)
-                sys.stdout.write(line)
-                sys.stdout.flush()
             except Exception:
-                # queue.Empty on timeout, or broken pipe
                 if not self._running:
                     break
+                continue
+
+            try:
+                if isinstance(line, str):
+                    raw_out.write(line.encode("utf-8"))
+                else:
+                    raw_out.write(line)
+                raw_out.flush()
+            except (OSError, ValueError, BrokenPipeError):
+                # Parent exited or pipe broken
+                self._running = False
+                if self._coach:
+                    self._coach._running = False
+                break
 
     def _stdin_loop(self) -> None:
         """Read JSON line commands from stdin and dispatch to coach."""
@@ -214,12 +294,45 @@ class PipeAdapter:
                 ).start()
             elif action == "read_win_plan":
                 coach._on_read_win_plan()
+            elif action == "win_probability":
+                threading.Thread(
+                    target=self._handle_win_probability, daemon=True
+                ).start()
+            elif action == "deck_strategy":
+                threading.Thread(
+                    target=self._handle_deck_strategy, daemon=True
+                ).start()
+            elif action == "bugreport":
+                msg = cmd.get("text", "")
+                threading.Thread(
+                    target=self._handle_bugreport, args=(msg,), daemon=True
+                ).start()
+            elif action == "subscribe":
+                threading.Thread(
+                    target=self._handle_subscribe, daemon=True
+                ).start()
+            elif action == "set_local_endpoint":
+                self._handle_local_config(cmd.get("text", ""))
+            elif action == "switch_online":
+                threading.Thread(
+                    target=self._handle_switch_online, daemon=True
+                ).start()
+            elif action == "set_license_key":
+                self._handle_set_key(cmd.get("text", ""))
+            elif action == "analyze_match":
+                threading.Thread(
+                    target=self._handle_analyze_match, daemon=True
+                ).start()
             elif action == "chat":
                 text = cmd.get("text", "")
                 if text:
-                    threading.Thread(
-                        target=self._handle_chat, args=(text,), daemon=True
-                    ).start()
+                    # Intercept slash commands from the chat input
+                    if self._try_slash_command(text):
+                        pass  # Handled
+                    else:
+                        threading.Thread(
+                            target=self._handle_chat, args=(text,), daemon=True
+                        ).start()
             elif action == "restart":
                 coach._restart_requested = True
                 coach._running = False
@@ -335,3 +448,294 @@ class PipeAdapter:
             threading.Thread(target=_do_switch, daemon=True).start()
         except Exception as e:
             self.error(f"Cycle model failed: {e}")
+
+    # --- Slash command interception for chat input ---
+
+    def _try_slash_command(self, text: str) -> bool:
+        """Intercept slash commands typed in the chat input. Returns True if handled."""
+        t = text.strip().lower()
+        if t in ("/chance", "/winrate", "/odds"):
+            threading.Thread(target=self._handle_win_probability, daemon=True).start()
+            return True
+        if t in ("/deck-strategy", "/deckstrategy", "/deck"):
+            threading.Thread(target=self._handle_deck_strategy, daemon=True).start()
+            return True
+        if t.startswith("/bugreport"):
+            msg = text.strip()[len("/bugreport"):].strip()
+            threading.Thread(target=self._handle_bugreport, args=(msg,), daemon=True).start()
+            return True
+        if t == "/subscribe":
+            threading.Thread(target=self._handle_subscribe, daemon=True).start()
+            return True
+        if t.startswith("/local"):
+            self._handle_local_config(text.strip())
+            return True
+        if t == "/online":
+            threading.Thread(target=self._handle_switch_online, daemon=True).start()
+            return True
+        if t.startswith("/key"):
+            self._handle_set_key(text.strip())
+            return True
+        if t == "/analyze":
+            threading.Thread(target=self._handle_analyze_match, daemon=True).start()
+            return True
+        return False
+
+    # --- Handler implementations ---
+
+    def _handle_win_probability(self) -> None:
+        """Estimate win probability and display/speak it."""
+        coach = self._coach
+        if not coach or not coach._coach:
+            self.log("Coach not available")
+            return
+        self.log("Evaluating win probability...")
+        try:
+            game_state = coach._mcp.get_game_state() if coach._mcp else {}
+            coach._inject_library_summary_if_needed(game_state)
+            opp_cards = getattr(coach, '_opponent_played_cards', None)
+            if opp_cards is None:
+                opp_cards = game_state.get("_match_context", {}).get("opponent_played_cards", [])
+            result = coach._coach.generate_win_probability(game_state, opp_cards)
+            if result:
+                self.advice(result, "WIN PROBABILITY")
+                coach.speak_advice(result, blocking=False)
+            else:
+                self.log("Could not estimate win probability.")
+        except Exception as e:
+            self.error(f"Win probability error: {e}")
+
+    def _handle_deck_strategy(self) -> None:
+        """Generate or recall deck strategy."""
+        coach = self._coach
+        if not coach:
+            self.log("Coach not available")
+            return
+        existing = coach.get_deck_strategy()
+        if existing:
+            self.advice(existing, "DECK STRATEGY")
+            coach.speak_advice(existing, blocking=False)
+            return
+        self.log("Generating deck strategy...")
+        coach._generate_deck_strategy_brief()
+
+    def _handle_bugreport(self, user_message: str = "") -> None:
+        """Save and submit a bug report to GitHub."""
+        coach = self._coach
+        if not coach:
+            self.error("Coach not available")
+            return
+
+        # Auto-save a bug report
+        report_path = None
+        if hasattr(coach, 'save_bug_report'):
+            report_path = coach.save_bug_report("/bugreport", announce=False)
+
+        from arenamcp.logging_config import LOG_DIR
+        from arenamcp.bugreport import GITHUB_REPO, build_issue_payload, build_issue_url
+        bug_dir = LOG_DIR / "bug_reports"
+        if not bug_dir.exists():
+            self.error("No bug reports found.")
+            return
+
+        reports = sorted(bug_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not reports:
+            self.error("No bug reports found.")
+            return
+
+        report_path = reports[0]
+        try:
+            import json as _json
+            report_data = _json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            self.error(f"Failed to read bug report: {e}")
+            return
+
+        title, body = build_issue_payload(report_data, report_path, user_message)
+
+        try:
+            import requests
+
+            token = os.environ.get("MTGACOACH_GITHUB_TOKEN", "").strip() or os.environ.get("GITHUB_TOKEN", "").strip()
+            if token:
+                response = requests.post(
+                    f"https://api.github.com/repos/{GITHUB_REPO}/issues",
+                    headers={
+                        "Accept": "application/vnd.github+json",
+                        "Authorization": f"Bearer {token}",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                    json={"title": title, "body": body, "labels": ["bug"]},
+                    timeout=30,
+                )
+                if response.ok:
+                    payload = response.json()
+                    url = str(payload.get("html_url", "")).strip()
+                    self.log(f"Bug report submitted: {url}")
+                    return
+                self.error(f"GitHub API issue creation failed: {response.status_code} {response.text[:240]}")
+        except Exception as e:
+            logger.warning("GitHub API submission failed: %s", e)
+
+        import shutil
+        gh = shutil.which("gh")
+        if gh:
+            try:
+                import subprocess
+                result = subprocess.run(
+                    [gh, "issue", "create", "--repo", GITHUB_REPO, "--title", title, "--body", body],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0:
+                    url = result.stdout.strip()
+                    self.log(f"Bug report submitted: {url}")
+                    return
+                logger.warning("gh issue create failed: %s", result.stderr.strip())
+            except Exception as e:
+                logger.warning("gh issue submission failed: %s", e)
+
+        issue_url = build_issue_url(title, body)
+        self.log(f"Bug report saved: {report_path}")
+        self.log("Opened a prefilled GitHub issue in the browser. Submit it there if prompted.")
+        try:
+            webbrowser.open(issue_url)
+        except Exception as e:
+            self.error(f"Bug report submission failed: {e}")
+
+    def _handle_subscribe(self) -> None:
+        """Show subscription status."""
+        try:
+            from arenamcp.settings import get_settings
+            from arenamcp.subscription import check_subscription, SUBSCRIBE_URL
+
+            license_key = get_settings().get("license_key", "")
+            if not license_key:
+                self.log(f"No license key configured. Visit {SUBSCRIBE_URL} to subscribe, "
+                         "then use /key YOUR_LICENSE_KEY")
+                return
+
+            status = check_subscription(license_key, force=True)
+            if status.is_valid:
+                msg = f"Subscription active! Status: {status.status}"
+                if status.expires_at:
+                    msg += f", expires: {status.expires_at}"
+                self.log(msg)
+            else:
+                self.log(f"Subscription issue: {status.message}. Visit {SUBSCRIBE_URL}")
+        except Exception as e:
+            self.error(f"Subscription check failed: {e}")
+
+    def _handle_local_config(self, text: str) -> None:
+        """Configure local model endpoint."""
+        from arenamcp.settings import get_settings
+        settings = get_settings()
+
+        parts = text.split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if not arg:
+            url = settings.get("local_url", "http://localhost:11434/v1")
+            model = settings.get("local_model", "auto-detect")
+            api_key = settings.get("local_api_key", "ollama")
+            self.log(f"Local config: URL={url}, Model={model or 'auto-detect'}, Key={api_key}")
+            return
+
+        arg_parts = arg.split(maxsplit=1)
+        provider = arg_parts[0].lower()
+
+        if provider == "ollama":
+            settings.set("local_url", "http://localhost:11434/v1", save=False)
+            settings.set("local_api_key", "ollama", save=False)
+            settings.set("local_model", None, save=True)
+            self.log("Local config set to Ollama (localhost:11434)")
+        elif provider in ("lmstudio", "lm-studio", "lm_studio"):
+            settings.set("local_url", "http://localhost:1234/v1", save=False)
+            settings.set("local_api_key", "lm-studio", save=False)
+            settings.set("local_model", None, save=True)
+            self.log("Local config set to LM Studio (localhost:1234)")
+        elif provider.startswith("http"):
+            url = provider
+            api_key = arg_parts[1].strip() if len(arg_parts) > 1 else "no-key"
+            settings.set("local_url", url, save=False)
+            settings.set("local_api_key", api_key, save=False)
+            settings.set("local_model", None, save=True)
+            self.log(f"Local config set to {url}")
+        else:
+            self.error(f"Unknown provider: {provider}. Use ollama, lmstudio, or a URL.")
+            return
+
+        # Switch to local mode
+        coach = self._coach
+        if coach:
+            threading.Thread(target=self._handle_switch_local, daemon=True).start()
+
+    def _handle_switch_online(self) -> None:
+        """Switch to online mode with validation."""
+        coach = self._coach
+        if not coach:
+            return
+        try:
+            from arenamcp.backend_detect import validate_backend
+            from arenamcp.settings import get_settings
+
+            key = get_settings().get("license_key", "")
+            if not key:
+                self.error("No license key configured. Use /key to set one.")
+                return
+
+            self.log("Connecting to Online...")
+            ok, err = validate_backend("online")
+            if not ok:
+                self.error(f"Online unavailable: {err}")
+                return
+
+            coach.set_backend("online", None)
+            self.status("BACKEND", f"{coach.backend_name} ({coach.model_name or 'default'})")
+            self.status("MODEL", coach.model_name or "default")
+            self.log(f"Switched to {coach.backend_name}/{coach.model_name or 'default'}")
+        except Exception as e:
+            self.error(f"Online switch failed: {e}")
+
+    def _handle_switch_local(self) -> None:
+        """Switch to local mode with validation."""
+        coach = self._coach
+        if not coach:
+            return
+        try:
+            from arenamcp.backend_detect import validate_backend
+
+            self.log("Connecting to Local...")
+            ok, err = validate_backend("local")
+            if not ok:
+                self.error(f"Local unavailable: {err}")
+                return
+
+            coach.set_backend("local", None)
+            self.status("BACKEND", f"{coach.backend_name} ({coach.model_name or 'default'})")
+            self.status("MODEL", coach.model_name or "default")
+            self.log(f"Switched to {coach.backend_name}/{coach.model_name or 'default'}")
+        except Exception as e:
+            self.error(f"Local switch failed: {e}")
+
+    def _handle_set_key(self, text: str) -> None:
+        """Set license key."""
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            self.log("Usage: /key YOUR_LICENSE_KEY")
+            return
+
+        key = parts[1].strip()
+        from arenamcp.settings import get_settings
+        get_settings().set("license_key", key)
+        self.log(f"License key set: {key[:8]}...")
+
+    def _handle_analyze_match(self) -> None:
+        """Run post-match analysis on current game state."""
+        coach = self._coach
+        if not coach or not coach._coach:
+            self.log("Coach not available")
+            return
+        try:
+            coach.trigger_match_analysis()
+        except Exception as e:
+            self.error(f"Match analysis failed: {e}")

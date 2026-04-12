@@ -51,7 +51,7 @@ from arenamcp.settings import get_settings
 from arenamcp.logging_config import configure_logging, LOG_DIR, LOG_FILE
 
 # Configure logging (shared with server.py via logging_config)
-# Console handler disabled -- TUI handles user-facing output.
+# Console handler disabled -- GUI/pipe adapter handles user-facing output.
 configure_logging(console=False)
 
 WATCHDOG_SCREENSHOT_DIR = LOG_DIR / "watchdog_screenshots"
@@ -124,6 +124,62 @@ class _SAPIVoice:
 
     def next_voice(self):
         pass  # SAPI uses system default
+
+
+class _PipeVoiceOutput:
+    """Wrap VoiceOutput so the visible desktop parent owns audio playback."""
+
+    def __init__(self, ui: Any, inner: Any):
+        self._ui = ui
+        self._inner = inner
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def speak(self, text: str, blocking: bool = True) -> None:
+        if not text or not text.strip():
+            return
+
+        text = self._inner._clean_text(text)
+        if not text or not text.strip():
+            return
+
+        if getattr(self._inner, "muted", False):
+            return
+
+        emit_request = getattr(self._ui, "emit_speech_request", None)
+        if callable(emit_request):
+            try:
+                self._inner.stop()
+            except Exception:
+                pass
+
+            try:
+                voice_id, voice_name = self._inner.current_voice
+                speed = float(getattr(self._inner, "speed", getattr(self._inner, "_speed", 1.0)))
+                emit_request(
+                    text=text,
+                    voice_id=voice_id,
+                    voice_name=voice_name,
+                    speed=speed,
+                )
+                logger.info(
+                    "Pipe voice delegated to desktop worker voice=%s speed=%.2f",
+                    voice_id,
+                    speed,
+                )
+                return
+            except Exception as e:
+                logger.error("Pipe voice delegation failed: %s", e)
+
+        # Fallback for non-pipe environments or if the desktop bridge is unavailable.
+        self._inner.speak(text, blocking=blocking)
+
+    def stop(self) -> None:
+        emit_stop = getattr(self._ui, "emit_speech_stop", None)
+        if callable(emit_stop):
+            emit_stop()
+        self._inner.stop()
 
 
 def _probe_sounddevice_import(timeout_seconds: float = 8.0) -> tuple[bool, str]:
@@ -206,7 +262,7 @@ except ImportError:
 
 
 class UIAdapter:
-    """Interface for UI feedback (CLI or TUI)."""
+    """Interface for UI feedback (CLI or pipe adapter)."""
     def log(self, message: str) -> None: pass
     def advice(self, text: str, seat_info: str) -> None: pass
     def status(self, key: str, value: str) -> None: pass
@@ -441,6 +497,10 @@ class StandaloneCoach:
         # State
         self.advice_style = "concise"
         self._advice_frequency = self.settings.get("advice_frequency", "start_of_turn")
+        self._auto_deck_strategy = bool(self.settings.get("auto_deck_strategy", False))
+        self._auto_post_match_analysis = bool(
+            self.settings.get("auto_post_match_analysis", False)
+        )
 
         # TTS always enabled
         self._auto_speak = True
@@ -490,9 +550,11 @@ class StandaloneCoach:
         self._saved_missed_decisions: list[dict] = []
         self._last_match_result: Optional[str] = None
         self._last_match_final_state: Optional[dict] = None
+        self._last_match_replay_path: Optional[str] = None
         self._game_end_handled: bool = False  # Prevents duplicate triggers
         self._match_boundary_ts: float = 0.0  # Suppress stale triggers after reset
         self._last_game_end_check_error: str = ""
+        self._post_match_analysis_running: bool = False
         self._pending_post_match_analysis: Optional[str] = None  # For GH issue filing via F7
         self._pending_post_match_result: Optional[str] = None
 
@@ -695,6 +757,16 @@ class StandaloneCoach:
                 self._voice_output.speak(text, blocking=blocking)
             except Exception as e:
                 logger.error(f"Kokoro TTS error: {e}")
+                # Kokoro ONNX sometimes raises access violations on the first
+                # synthesis after model load. Retry once — subsequent calls
+                # typically succeed.
+                try:
+                    import time as _time
+                    _time.sleep(0.1)
+                    self._voice_output.speak(text, blocking=blocking)
+                    logger.info("Kokoro speak retry succeeded")
+                except Exception as e2:
+                    logger.error(f"Kokoro speak retry also failed: {e2}")
 
     @property
     def backend_name(self) -> str:
@@ -816,12 +888,75 @@ class StandaloneCoach:
             return self._coach._deck_strategy
         return None
 
+    def _stage_post_match_analysis(
+        self,
+        *,
+        match_result: Optional[str],
+        final_state: Optional[dict],
+        replay_path: Optional[str],
+        advice_history: Optional[list[dict]] = None,
+        missed_decisions: Optional[list[dict]] = None,
+        reason: str,
+        announce_ready: bool = True,
+        auto_start: Optional[bool] = None,
+    ) -> bool:
+        """Persist completed-match data so analysis can be run later."""
+        staged_history = list(self._advice_history if advice_history is None else advice_history)
+        if not staged_history:
+            logger.info(f"Skipping post-match staging ({reason}): no advice history")
+            return False
+
+        self._saved_advice_history = staged_history
+        self._saved_missed_decisions = list(
+            self._missed_decisions if missed_decisions is None else missed_decisions
+        )
+        self._last_match_result = match_result or "unknown"
+        self._last_match_final_state = dict(final_state) if isinstance(final_state, dict) else final_state
+        self._last_match_replay_path = replay_path
+
+        logger.info(
+            "Staged post-match analysis (%s): entries=%s result=%s replay=%s auto=%s",
+            reason,
+            len(self._saved_advice_history),
+            self._last_match_result,
+            replay_path or "none",
+            self._auto_post_match_analysis if auto_start is None else auto_start,
+        )
+
+        should_auto_start = self._auto_post_match_analysis if auto_start is None else auto_start
+        if should_auto_start:
+            return self._start_post_match_analysis_worker(reason=f"{reason}/auto")
+
+        if announce_ready:
+            self.ui.status("ANALYSIS", "Ready")
+            self.ui.log("[cyan]Match analysis ready. Use Analyze Match or /analyze to run it.[/]")
+        return True
+
+    def _start_post_match_analysis_worker(self, reason: str) -> bool:
+        """Launch the post-match worker if saved data is available."""
+        if self._post_match_analysis_running:
+            logger.info(f"Post-match analysis already running; skipping launch ({reason})")
+            return False
+
+        if not self._saved_advice_history:
+            logger.info(f"No saved post-match data; skipping launch ({reason})")
+            return False
+
+        self._post_match_analysis_running = True
+        threading.Thread(
+            target=self._post_match_analysis_worker,
+            daemon=True,
+            name="post-match-analysis",
+        ).start()
+        logger.info(f"Started post-match analysis worker ({reason})")
+        return True
+
     def _init_mcp(self) -> None:
         """Initialize MCP client connection."""
         logger.info("Initializing MCP server...")
         self._mcp = MCPClient()
 
-        # Warm local databases in the background so the TUI becomes usable
+        # Warm local databases in the background so the UI becomes usable
         # immediately. Scryfall stays fully lazy to avoid startup downloads.
         if not getattr(self, "_card_cache_warm_started", False):
             self._card_cache_warm_started = True
@@ -1116,7 +1251,6 @@ class StandaloneCoach:
         # If it hangs (numpy/PortAudio DLL issues), fall back to Windows SAPI.
         if hasattr(self.ui, 'emit_game_state'):
             self.ui.log("Initializing TTS...")
-            kokoro_ok = False
             kokoro_result = [None]  # mutable container for thread result
 
             def _try_kokoro():
@@ -1131,11 +1265,15 @@ class StandaloneCoach:
             t.join(timeout=10.0)
 
             if kokoro_result[0] is not None:
-                self._voice_output = kokoro_result[0]
-                voice_id, voice_desc = self._voice_output.current_voice
+                self._voice_output = _PipeVoiceOutput(self.ui, kokoro_result[0])
+                voice_id, voice_desc = kokoro_result[0].current_voice
                 logger.info(f"TTS voice (Kokoro): {voice_desc}")
                 self.ui.status("VOICE", f"{voice_desc}")
                 self.ui.log(f"TTS ready: {voice_desc}")
+                # DO NOT warm up here — the ONNX Kokoro() constructor holds
+                # the GIL for 10+ seconds during model loading, which blocks
+                # the coaching thread from ever starting via threading.Thread.
+                # Warmup is deferred until the coaching loop is running.
             else:
                 reason = "timeout" if t.is_alive() else "init failed"
                 logger.warning(f"Kokoro unavailable ({reason}), using Windows SAPI")
@@ -1164,10 +1302,15 @@ class StandaloneCoach:
         try:
             logger.info("Initializing TTS...")
             self._voice_output = VoiceOutput()
-
             voice_id, voice_desc = self._voice_output.current_voice
             logger.info(f"TTS voice: {voice_desc}")
             self.ui.status("VOICE", f"TTS Voice: {voice_desc}")
+
+            # Warm up ONNX model in background so first speak() is fast
+            threading.Thread(
+                target=self._voice_output.warmup, daemon=True,
+                name="tts-warmup"
+            ).start()
         except Exception as e:
             logger.error(f"TTS init failed - disabling voice: {e}")
             self._voice_output = None
@@ -1203,6 +1346,11 @@ class StandaloneCoach:
             logger.info(f"TTS voice: {voice_desc}")
             self.ui.status("VOICE", f"{voice_desc}")
             self.ui.log(f"TTS ready: {voice_desc}")
+            # Warm up ONNX model in background so first speak() is fast
+            threading.Thread(
+                target=self._voice_output.warmup, daemon=True,
+                name="tts-warmup"
+            ).start()
         except Exception as e:
             logger.error(f"Voice init failed: {e}")
             self.ui.status("VOICE", "TTS init failed")
@@ -1262,6 +1410,25 @@ class StandaloneCoach:
     def _coaching_loop(self) -> None:
         """Poll MCP for game state and provide coaching, with auto-draft detection."""
         logger.info("Coaching loop started")
+
+        # Now that the coaching loop is running, we can optionally kick off
+        # TTS warmup in a background thread. On this machine the Kokoro ONNX
+        # load can still monopolize the GIL for long stretches even from a
+        # worker thread, which stalls the live coaching loop after its first
+        # iteration and leaves the GUI stuck on "waiting for MTGA".
+        #
+        # Keep eager warmup for the legacy in-process UI, but skip it for the
+        # pipe/desktop frontend where coaching responsiveness matters more than
+        # hiding first-speech latency.
+        if self._voice_output and hasattr(self._voice_output, 'warmup'):
+            if hasattr(self.ui, 'emit_game_state'):
+                logger.info("Skipping eager TTS warmup in pipe mode to keep coaching loop responsive")
+            else:
+                threading.Thread(
+                    target=self._voice_output.warmup, daemon=True,
+                    name="tts-warmup"
+                ).start()
+
         prev_state: dict[str, Any] = {}
         seat_announced = False
 
@@ -1472,17 +1639,15 @@ class StandaloneCoach:
                             self._game_end_handled = True
                             result, snapshot = gs.consume_game_end()
                             game_result = result or "unknown"
-                            logger.info(f"Game ended (event signal): {game_result} — launching post-match analysis")
-                            self._saved_advice_history = list(self._advice_history)
-                            self._saved_missed_decisions = list(self._missed_decisions)
-                            self._last_match_result = game_result
+                            logger.info(f"Game ended (event signal): {game_result}")
                             # Use pre-reset snapshot (full final state) if available,
                             # otherwise fall back to current (already-reset) state
-                            self._last_match_final_state = snapshot or dict(curr_state)
-                            threading.Thread(
-                                target=self._post_match_analysis_worker,
-                                daemon=True,
-                            ).start()
+                            self._stage_post_match_analysis(
+                                match_result=game_result,
+                                final_state=snapshot or dict(curr_state),
+                                replay_path=self._get_latest_replay_path(),
+                                reason="event-signal",
+                            )
                 except Exception as e:
                     msg = str(e)
                     if msg != self._last_game_end_check_error:
@@ -1499,15 +1664,14 @@ class StandaloneCoach:
                     logger.info(f"Match boundary detected ({last_match_id} -> {curr_match_id}), match #{self._match_number}, resetting coaching state")
 
                     # Trigger analysis if game_end detection above missed it
-                    if self._advice_history and not self._saved_advice_history:
-                        self._saved_advice_history = list(self._advice_history)
-                        self._saved_missed_decisions = list(self._missed_decisions)
-                        self._last_match_result = self._detect_match_result()
-                        self._last_match_final_state = dict(prev_state) if prev_state else None
-                        threading.Thread(
-                            target=self._post_match_analysis_worker,
-                            daemon=True,
-                        ).start()
+                    if self._advice_history and not self._game_end_handled:
+                        self._game_end_handled = True
+                        self._stage_post_match_analysis(
+                            match_result=self._detect_match_result(),
+                            final_state=dict(prev_state) if prev_state else None,
+                            replay_path=self._get_latest_replay_path(),
+                            reason="match-boundary",
+                        )
 
                     prev_state = {}
                     last_advice_turn = 0
@@ -1553,18 +1717,17 @@ class StandaloneCoach:
                     # causes false "post-match analysis" loops.
                     if (
                         self._advice_history
-                        and not self._saved_advice_history
+                        and not self._game_end_handled
                         and self._has_explicit_game_end_evidence()
                     ):
-                        self._saved_advice_history = list(self._advice_history)
-                        self._saved_missed_decisions = list(self._missed_decisions)
-                        self._last_match_result = self._detect_match_result()
-                        self._last_match_final_state = dict(prev_state) if prev_state else None
-                        threading.Thread(
-                            target=self._post_match_analysis_worker,
-                            daemon=True,
-                        ).start()
-                    elif self._advice_history and not self._saved_advice_history:
+                        self._game_end_handled = True
+                        self._stage_post_match_analysis(
+                            match_result=self._detect_match_result(),
+                            final_state=dict(prev_state) if prev_state else None,
+                            replay_path=self._get_latest_replay_path(),
+                            reason="turn-drop",
+                        )
+                    elif self._advice_history and not self._game_end_handled:
                         logger.info(
                             "Skipping fallback post-match analysis on turn-drop: "
                             "no explicit game-end evidence"
@@ -1597,15 +1760,22 @@ class StandaloneCoach:
                     for p in players:
                         if p.get("is_local"):
                             seat_id = p.get("seat_id")
-                            self.ui.status("GAME", f"Detected as Seat {seat_id} - press F8 if this is wrong")
+                            self.ui.status("SEAT_INFO", f"Seat {seat_id}")
+                            self.ui.log(f"Detected as Seat {seat_id} (F8 to swap)")
                             logger.info(f"Game detected, local seat = {seat_id}")
                             seat_announced = True
                             # Auto-enable replay recording for debug reports
                             self._enable_replay_recording()
                             break
 
-                # Deck strategy analysis (once per match)
-                if not self._deck_analyzed and self._coach and turn_num > 0:
+                # Deck strategy analysis (once per match, after seat is confirmed)
+                if (
+                    self._auto_deck_strategy
+                    and not self._deck_analyzed
+                    and self._coach
+                    and turn_num > 0
+                    and seat_announced
+                ):
                     deck_cards = curr_state.get("deck_cards", [])
 
                     # Fallback for mid-game join: ConnectResp was missed,
@@ -2065,7 +2235,7 @@ class StandaloneCoach:
                         if trigger == "losing_badly" and self._coach:
                             logger.info("Proactive win probability check (losing badly)")
                             self._inject_library_summary_if_needed(curr_state)
-                            opp_cards = self._match_context.get("opponent_played_cards", [])
+                            opp_cards = self._get_match_context().get("opponent_played_cards", [])
                             prob = self._coach.generate_win_probability(curr_state, opp_cards)
                             if prob:
                                 self._record_advice(prob, trigger, game_state=curr_state)
@@ -2437,8 +2607,8 @@ class StandaloneCoach:
         """Save comprehensive bug report and return path.
 
         When ``announce`` is false, skip UI logging and only write the report.
-        This is used by the TUI background worker so all widget updates stay on
-        the Textual thread.
+        This is used by background workers so UI updates stay on the
+        correct thread.
         """
         bug_dir = LOG_DIR / "bug_reports"
         bug_dir.mkdir(parents=True, exist_ok=True)
@@ -2839,6 +3009,26 @@ class StandaloneCoach:
             info["error"] = str(e)
         return info
 
+    def _get_latest_replay_path(self) -> Optional[str]:
+        """Get the most recent replay file path from the bridge."""
+        try:
+            bridge = self._bridge_poller._bridge if self._bridge_poller else None
+            if not bridge or not bridge.connected:
+                return None
+            # Check active recording first
+            status = bridge.get_replay_status()
+            if status and status.get("replay_file"):
+                return status["replay_file"]
+            # Fall back to most recent in replay folder
+            replays = bridge.list_replays()
+            if replays:
+                replay_list = replays.get("replays", [])
+                if replay_list:
+                    return replay_list[0].get("path")
+        except Exception as e:
+            logger.debug(f"Failed to get latest replay path: {e}")
+        return None
+
     @staticmethod
     def _get_package_versions() -> dict[str, str]:
         """Get versions of key installed packages."""
@@ -3133,6 +3323,105 @@ class StandaloneCoach:
             logger.debug(f"Could not inspect game-end evidence: {e}")
         return False
 
+    def _extract_replay_context(self, replay_path: Optional[str]) -> Optional[str]:
+        """Parse a replay file and extract decision-point context for analysis.
+
+        Returns a compact text summary of key decision points from the replay:
+        - Actions the player submitted (OUT messages)
+        - Decision requests the GRE sent (ActionsAvailable, SelectTargets, etc.)
+        - Turn/phase context for each decision
+
+        Returns None if replay is unavailable or unparseable.
+        """
+        if not replay_path:
+            return None
+        try:
+            from pathlib import Path
+            from arenamcp.arena_replay import ArenaReplay
+
+            rp = Path(replay_path)
+            if not rp.exists():
+                logger.debug(f"Replay file not found: {replay_path}")
+                return None
+
+            replay = ArenaReplay(rp)
+            if not replay.load():
+                logger.warning(f"Failed to load replay: {replay_path}")
+                return None
+
+            lines = [f"REPLAY FILE: {rp.name} ({replay.get_message_count()} messages)"]
+
+            # Extract player submissions (OUT messages) and GRE decision requests
+            turn = 0
+            phase = ""
+            decision_count = 0
+            action_count = 0
+            max_entries = 80  # Cap to avoid prompt bloat
+
+            for msg in replay.iter_messages():
+                if decision_count + action_count >= max_entries:
+                    lines.append(f"[...truncated at {max_entries} entries]")
+                    break
+
+                # Track turn/phase from game state messages
+                gs_msg = msg.get("gameStateMessage", {})
+                turn_info = gs_msg.get("turnInfo", {})
+                if turn_info:
+                    new_turn = turn_info.get("turnNumber", turn)
+                    new_phase = turn_info.get("phase", phase)
+                    if new_turn != turn or new_phase != phase:
+                        turn = new_turn
+                        phase = new_phase
+
+                # GRE decision requests (server → client)
+                direction = msg.get("_direction", "")
+                msg_type = msg.get("type", "")
+
+                if "ActionsAvailableReq" in msg_type:
+                    actions_req = msg.get("actionsAvailableReq", {})
+                    action_list = actions_req.get("actions", [])
+                    cast_names = []
+                    for a in action_list:
+                        if isinstance(a, dict):
+                            at = a.get("actionType", "")
+                            grp = a.get("grpId", 0)
+                            if "Cast" in str(at) and grp:
+                                try:
+                                    from arenamcp import server
+                                    info = server.get_card_info(grp)
+                                    cast_names.append(info.get("name", f"#{grp}"))
+                                except Exception:
+                                    cast_names.append(f"#{grp}")
+                    summary = f"castable: {', '.join(cast_names)}" if cast_names else f"{len(action_list)} actions"
+                    lines.append(f"  T{turn} {phase}: GRE ActionsAvailable ({summary})")
+                    decision_count += 1
+
+                elif "SelectTargetsReq" in msg_type or "SelectNReq" in msg_type:
+                    lines.append(f"  T{turn} {phase}: GRE {msg_type.replace('GREMessageType_', '')}")
+                    decision_count += 1
+
+                # Player submissions (client → server)
+                elif direction == "out":
+                    client_msg = msg.get("clientToGREMessage", msg)
+                    resp_type = client_msg.get("type", "")
+                    if "PerformActionResp" in resp_type or "ActionResp" in resp_type:
+                        lines.append(f"  T{turn} {phase}: PLAYER submitted action")
+                        action_count += 1
+                    elif "PassResp" in resp_type or "PassPriorityResp" in resp_type:
+                        pass  # Too noisy
+                    elif resp_type and "Resp" in resp_type:
+                        lines.append(f"  T{turn} {phase}: PLAYER {resp_type.replace('ClientMessageType_', '')}")
+                        action_count += 1
+
+            lines.append(f"Total: {decision_count} decision points, {action_count} player actions")
+            context = "\n".join(lines)
+            logger.info(f"Extracted replay context: {len(context)} chars from {rp.name}")
+            return context
+
+        except Exception as e:
+            logger.warning(f"Failed to extract replay context: {e}", exc_info=True)
+            return None
+
     def _post_match_analysis_worker(self) -> None:
         """Background worker: generate post-match strategic analysis.
 
@@ -3143,6 +3432,7 @@ class StandaloneCoach:
             advice_history = self._saved_advice_history
             match_result = self._last_match_result or "unknown"
             final_state = self._last_match_final_state
+            replay_path = self._last_match_replay_path
 
             if not advice_history:
                 logger.info("No advice history for post-match analysis")
@@ -3153,9 +3443,13 @@ class StandaloneCoach:
                 return
 
             logger.info(
-                f"Post-match analysis started: {len(advice_history)} entries, result={match_result}"
+                f"Post-match analysis started: {len(advice_history)} entries, "
+                f"result={match_result}, replay={replay_path or 'none'}"
             )
             self.ui.status("ANALYSIS", "Generating post-match analysis...")
+
+            # Parse replay file for decision-point context
+            replay_context = self._extract_replay_context(replay_path)
 
             # Compute match duration from advice snapshots
             turns = [
@@ -3194,6 +3488,7 @@ class StandaloneCoach:
                 final_life_totals=final_life,
                 opponent_played_cards=opponent_cards,
                 missed_decisions=self._saved_missed_decisions,
+                replay_context=replay_context,
             )
 
             if not analysis:
@@ -3212,7 +3507,7 @@ class StandaloneCoach:
                 display_analysis = parts[0].strip()
                 spoken_summary = parts[1].strip()
 
-            # Display in TUI
+            # Display in UI
             result_label = (
                 "VICTORY" if match_result == "win"
                 else "DEFEAT" if match_result == "loss"
@@ -3248,11 +3543,14 @@ class StandaloneCoach:
             self._saved_missed_decisions = []
             self._last_match_result = None
             self._last_match_final_state = None
+            self._last_match_replay_path = None
 
         except Exception as e:
             logger.error(f"Post-match analysis error: {e}", exc_info=True)
             self.ui.log(f"[red]Post-match analysis failed: {e}[/]")
             self.ui.status("ANALYSIS", "")
+        finally:
+            self._post_match_analysis_running = False
 
     def _offer_missed_decision_issue(self) -> None:
         """Offer to file a GH issue if vision detected missed decisions this match."""
@@ -3391,37 +3689,38 @@ class StandaloneCoach:
     def trigger_match_analysis(self) -> None:
         """Manually trigger post-match analysis (from Analyze Match button).
 
-        Uses current advice history, or falls back to saved history from a
-        previous failed analysis attempt (e.g. after timeout).
+        Prefer the most recently completed match if one was staged already.
         """
-        has_current = bool(self._advice_history)
-        has_saved = bool(self._saved_advice_history)
-
-        if not has_current and not has_saved:
-            self.ui.log("[yellow]No advice history to analyze.[/]")
-            return
-
-        if has_saved and not has_current:
-            # Retry with saved data from a previous failed analysis
-            self.ui.log("[cyan]Retrying with saved match data...[/]")
-        elif has_saved:
+        if self._post_match_analysis_running:
             self.ui.log("[yellow]Analysis already in progress...[/]")
             return
-        else:
-            self._saved_advice_history = list(self._advice_history)
-            self._saved_missed_decisions = list(self._missed_decisions)
-        self._last_match_result = self._detect_match_result()
-        try:
-            game_state = self._mcp.get_game_state()
-            self._last_match_final_state = game_state
-        except Exception as e:
-            logger.debug(f"Could not capture final game state for post-match: {e}")
-            self._last_match_final_state = None
 
-        threading.Thread(
-            target=self._post_match_analysis_worker,
-            daemon=True,
-        ).start()
+        has_saved = bool(self._saved_advice_history)
+        has_current = bool(self._advice_history)
+
+        if has_saved:
+            self.ui.log("[cyan]Analyzing the most recently completed match...[/]")
+        elif not has_current:
+            self.ui.log("[yellow]No advice history to analyze.[/]")
+            return
+        else:
+            self.ui.log("[cyan]Analyzing the current match snapshot...[/]")
+            try:
+                game_state = self._mcp.get_game_state() if self._mcp else None
+            except Exception as e:
+                logger.debug(f"Could not capture final game state for post-match: {e}")
+                game_state = None
+
+            self._stage_post_match_analysis(
+                match_result=self._detect_match_result(),
+                final_state=game_state,
+                replay_path=self._get_latest_replay_path(),
+                reason="manual-current",
+                announce_ready=False,
+                auto_start=False,
+            )
+
+        self._start_post_match_analysis_worker(reason="manual")
 
     def _on_swap_seat_hotkey(self) -> None:
         """F8 - Swap local seat (fix wrong player detection)."""
@@ -3970,7 +4269,7 @@ class StandaloneCoach:
 
         Auth/billing errors (401, expired, credit) are deterministic — retrying
         won't help.  These trigger an immediate local fallback with a persistent
-        error shown in the TUI.
+        error shown in the UI.
 
         Transient errors (timeouts, rate limits) use a counter: after 3
         consecutive failures, fall back to a local backend.
@@ -4098,7 +4397,7 @@ class StandaloneCoach:
                 voice_id, desc = self._voice_output.next_voice(step=2)
                 self.ui.status("VOICE_ID", desc)
                 self.ui.log(f"\n[VOICE] Changed to: {desc}\n")
-                self.ui.speak("Voice changed.")
+                self.speak_advice("Voice changed.", blocking=False)
             except Exception as e:
                 self.ui.log(f"Error changing voice: {e}")
 
@@ -4219,17 +4518,21 @@ class StandaloneCoach:
                 )
                 self._voice_thread.start()
 
-        self._register_hotkeys()
+        # Register hotkeys in a background thread (the keyboard module's
+        # low-level Windows hook install can take a few seconds).
+        threading.Thread(
+            target=self._register_hotkeys, daemon=True, name="hotkey-register"
+        ).start()
 
         # Print status
         _is_pipe = hasattr(self.ui, 'emit_game_state')
 
         if _is_pipe:
-            # Pipe mode: minimal status, no TUI hotkey references
+            # Pipe mode: minimal status for GUI
             self.ui.status("BACKEND", f"{self.backend_name} ({actual_model or 'default'})")
             self.ui.log("Waiting for MTGA...")
         else:
-            # TUI/CLI mode: full banner with hotkeys
+            # CLI mode: full banner with hotkeys
             self.ui.log("\n" + "="*50)
             if self.draft_mode:
                 self.ui.log("MTGA DRAFT HELPER")
@@ -4446,9 +4749,9 @@ Examples:
     parser.add_argument("--language", "-l", default=None,
                         help="Language code for voice (e.g., en, nl, es, fr, de, ja)")
     parser.add_argument("--cli", action="store_true",
-                        help="Run in legacy CLI mode (default is TUI)")
+                        help="Run in headless CLI mode (no GUI)")
     parser.add_argument("--pipe", action="store_true",
-                        help="Headless mode: JSON lines on stdout/stdin (for native GUI)")
+                        help="Pipe mode: JSON lines on stdout/stdin (for native GUI launcher)")
     parser.add_argument("--diagnose", action="store_true",
                         help="Run diagnostic checks and exit")
 
@@ -4505,17 +4808,6 @@ Examples:
             pipe.error(str(e))
             sys.exit(1)
         return
-
-    # Launch TUI unless CLI mode requested or show-log
-    if not args.cli and not args.show_log:
-        try:
-            from arenamcp.tui import run_tui
-            run_tui(args)
-            return
-        except ImportError as e:
-            print(f"Failed to load TUI (install 'textual'): {e}")
-            print("Falling back to CLI mode...")
-
 
     if args.show_log:
         print(f"Log: {LOG_FILE}")

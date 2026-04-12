@@ -36,9 +36,7 @@ lxml>=5.0.0
 
 # Utilities
 numpy>=1.24.0
-
-# TUI
-textual>=0.47.0
+PySide6>=6.7.0
 
 # OpenAI / Azure OpenAI
 openai>=1.0.0
