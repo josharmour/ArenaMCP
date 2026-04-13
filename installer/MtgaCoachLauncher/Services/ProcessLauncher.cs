@@ -38,7 +38,7 @@ public static class ProcessLauncher
             ?? throw new InvalidOperationException("Failed to start process");
     }
 
-    public static Process RunSetupWizard()
+    public static Process RunSetupWizard(string? mode = null)
     {
         var appRoot = RuntimeDetector.GetAppRoot();
         var runtimeRoot = RuntimeDetector.GetRuntimeRoot();
@@ -47,7 +47,13 @@ public static class ProcessLauncher
         if (pythonExe is null)
             throw new InvalidOperationException("Python executable not found");
 
-        var fullCmd = $"set \"MTGACOACH_RUNTIME_ROOT={runtimeRoot}\" && \"{pythonExe}\" setup_wizard.py";
+        var modeArg = mode switch
+        {
+            "create_venv" => " --create-venv",
+            "setup_environment" => " --setup-environment",
+            _ => "",
+        };
+        var fullCmd = $"set \"MTGACOACH_RUNTIME_ROOT={runtimeRoot}\" && \"{pythonExe}\" setup_wizard.py{modeArg}";
 
         var psi = new ProcessStartInfo("cmd.exe", $"/c {fullCmd}")
         {
@@ -151,6 +157,75 @@ public static class ProcessLauncher
     public static void OpenUrl(string url)
     {
         Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+    }
+
+    public static bool CanLaunchPySideDesktop()
+    {
+        var appRoot = RuntimeDetector.GetAppRoot();
+        var runtimeRoot = RuntimeDetector.GetRuntimeRoot();
+        var (pythonExe, _) = RuntimeDetector.FindPythonExecutable();
+
+        if (pythonExe is null)
+            return false;
+
+        var psi = new ProcessStartInfo(pythonExe,
+            "-c \"import PySide6; import arenamcp.desktop.app\"")
+        {
+            WorkingDirectory = appRoot,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        psi.Environment["PYTHONPATH"] = Path.Combine(appRoot, "src");
+        psi.Environment["MTGACOACH_RUNTIME_ROOT"] = runtimeRoot;
+        psi.Environment["PYTHONUNBUFFERED"] = "1";
+        psi.Environment["PYTHONIOENCODING"] = "utf-8";
+
+        using var process = Process.Start(psi);
+        if (process is null)
+            return false;
+        process.WaitForExit(15000);
+        return process.ExitCode == 0;
+    }
+
+    public static Process LaunchPySideDesktop()
+    {
+        var appRoot = RuntimeDetector.GetAppRoot();
+        var runtimeRoot = RuntimeDetector.GetRuntimeRoot();
+        var (pythonExe, _) = RuntimeDetector.FindPythonExecutable();
+
+        if (pythonExe is null)
+            throw new InvalidOperationException("Python executable not found");
+
+        var guiPython = pythonExe;
+        try
+        {
+            var candidate = Path.Combine(Path.GetDirectoryName(pythonExe) ?? "", "pythonw.exe");
+            if (File.Exists(candidate))
+                guiPython = candidate;
+        }
+        catch { }
+
+        var launchScript = Path.Combine(appRoot, "scripts", "launch_installed.py");
+        if (!File.Exists(launchScript))
+            throw new FileNotFoundException($"Launch script not found at {launchScript}");
+
+        var args = $"\"{launchScript}\"";
+        var psi = new ProcessStartInfo(guiPython, args)
+        {
+            WorkingDirectory = appRoot,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        psi.Environment["PYTHONPATH"] = Path.Combine(appRoot, "src");
+        psi.Environment["MTGACOACH_APP_ROOT"] = appRoot;
+        psi.Environment["MTGACOACH_RUNTIME_ROOT"] = runtimeRoot;
+        psi.Environment["PYTHONUNBUFFERED"] = "1";
+        psi.Environment["PYTHONIOENCODING"] = "utf-8";
+
+        return Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to launch PySide desktop");
     }
 
     private static void CopyDirectory(string source, string dest)

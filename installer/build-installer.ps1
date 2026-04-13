@@ -4,8 +4,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RepoRoot = Resolve-Path (Join-Path $ScriptDir "..")
+$ScriptPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+    $MyInvocation.MyCommand.Path
+)
+$ScriptDir = Split-Path -Parent $ScriptPath
+$RepoRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+    (Join-Path $ScriptDir "..")
+)
 $Pyproject = Join-Path $RepoRoot "pyproject.toml"
 
 if (-not (Test-Path $InnoSetupCompiler)) {
@@ -26,15 +31,27 @@ if (-not (Test-Path $PluginDll)) {
     Write-Warning "Build the plugin before cutting a release installer."
 }
 
-$ReleaseBuilder = Join-Path $RepoRoot "scripts\build_release.ps1"
-if (-not (Test-Path $ReleaseBuilder)) {
-    throw "Desktop release builder not found: $ReleaseBuilder"
+$LauncherProject = Join-Path $RepoRoot "installer\MtgaCoachLauncher\MtgaCoachLauncher.csproj"
+if (-not (Test-Path $LauncherProject)) {
+    throw "Launcher project not found: $LauncherProject"
 }
+
+$PublishRoot = Join-Path $env:TEMP "mtgacoach-installer-build"
+$PublishDir = Join-Path $PublishRoot "launcher-publish"
 
 Push-Location $ScriptDir
 try {
-    & $ReleaseBuilder
-    & $InnoSetupCompiler "/DAppVersion=$Version" "mtgacoach.iss"
+    if (Test-Path $PublishRoot) {
+        Remove-Item -Recurse -Force $PublishRoot
+    }
+    New-Item -ItemType Directory -Force -Path $PublishDir | Out-Null
+
+    & dotnet publish $LauncherProject -c Release -p:Platform=x64 --self-contained `
+        -p:BaseIntermediateOutputPath="$PublishRoot\obj\" `
+        -p:BaseOutputPath="$PublishRoot\bin\" `
+        -p:MSBuildProjectExtensionsPath="$PublishRoot\obj\" `
+        -p:PublishDir="$PublishDir\"
+    & $InnoSetupCompiler "/DAppVersion=$Version" "/DLauncherPublishDir=$PublishDir" "mtgacoach.iss"
 }
 finally {
     Pop-Location

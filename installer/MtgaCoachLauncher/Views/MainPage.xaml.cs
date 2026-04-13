@@ -24,6 +24,9 @@ public partial class MainPage : Page
         CrashLogger.LogBreadcrumb(
             $"MainPage loaded. AppRoot={RuntimeDetector.GetAppRoot()} Python={_state?.PythonExe ?? "missing"} Source={_state?.PythonSource ?? "unknown"}");
 
+        if (await TryHandOffToPySideAsync())
+            return;
+
         // Delay navigation slightly to let XAML type system finish initialization.
         // This avoids a race in CoreMessagingXP.dll during page activation.
         await Task.Delay(50);
@@ -31,6 +34,60 @@ public partial class MainPage : Page
         // Auto-start coach and go straight to Coach tab
         NavView.SelectedItem = NavView.MenuItems[0];
         AutoStartCoach();
+    }
+
+    private async Task<bool> TryHandOffToPySideAsync()
+    {
+        if (_state?.PythonExe is null)
+        {
+            SummaryText.Text = "Python not found. Go to Repair to set up.";
+            return false;
+        }
+
+        if (_state.RuntimeVenvExists && ProcessLauncher.CanLaunchPySideDesktop())
+        {
+            try
+            {
+                SummaryText.Text = "Launching PySide desktop app...";
+                ProcessLauncher.LaunchPySideDesktop();
+                Application.Current.Exit();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                CrashLogger.LogException("MainPage.TryHandOffToPySideAsync.Launch", ex);
+                SummaryText.Text = $"PySide launch failed: {ex.Message}";
+                return false;
+            }
+        }
+
+        if (_state.RuntimeVenvExists)
+        {
+            try
+            {
+                SummaryText.Text = "Updating environment for PySide desktop...";
+                var process = ProcessLauncher.RunSetupWizard("setup_environment");
+                await Task.Run(() => process.WaitForExit(600000));
+                RefreshState();
+
+                if (_state?.RuntimeVenvExists == true && ProcessLauncher.CanLaunchPySideDesktop())
+                {
+                    SummaryText.Text = "Launching PySide desktop app...";
+                    ProcessLauncher.LaunchPySideDesktop();
+                    Application.Current.Exit();
+                    return true;
+                }
+
+                SummaryText.Text = "Setup finished, but the PySide app is still unavailable. Use Repair.";
+            }
+            catch (Exception ex)
+            {
+                CrashLogger.LogException("MainPage.TryHandOffToPySideAsync.SetupEnvironment", ex);
+                SummaryText.Text = $"Environment setup failed: {ex.Message}";
+            }
+        }
+
+        return false;
     }
 
     private void NavView_SelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)

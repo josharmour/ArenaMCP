@@ -9,6 +9,7 @@ model selection, language configuration, and settings persistence.
 Runs with system Python (no venv needed). Uses only stdlib modules.
 """
 
+import argparse
 import io
 import json
 import os
@@ -674,6 +675,48 @@ def step_install_dependencies() -> bool:
     return True
 
 
+def run_create_venv_only() -> int:
+    if not step_check_python():
+        return 1
+    if not step_virtual_environment():
+        return 1
+
+    settings = load_settings()
+    settings["install_dir"] = str(ROOT)
+    settings["runtime_root"] = str(RUNTIME_ROOT)
+    save_settings(settings)
+
+    print()
+    print("    " + "=" * 44)
+    print("    Venv ready.")
+    print(f"      Runtime: {RUNTIME_ROOT}")
+    print("    " + "=" * 44)
+    print()
+    return 0
+
+
+def run_setup_environment_only() -> int:
+    if not step_check_python():
+        return 1
+    if not step_virtual_environment():
+        return 1
+    if not step_install_dependencies():
+        return 1
+
+    settings = load_settings()
+    settings["install_dir"] = str(ROOT)
+    settings["runtime_root"] = str(RUNTIME_ROOT)
+    save_settings(settings)
+
+    print()
+    print("    " + "=" * 44)
+    print("    Environment setup complete.")
+    print(f"      Runtime: {RUNTIME_ROOT}")
+    print("    " + "=" * 44)
+    print()
+    return 0
+
+
 def step_detect_and_choose_backend(settings: dict) -> tuple[str, str]:
     """Step 5: Choose mode (online or local). Returns (mode, model)."""
     print_header(5, "LLM Backend")
@@ -978,6 +1021,11 @@ def step_desktop_shortcut() -> None:
 # -- Main ---------------------------------------------------------------------
 
 def main() -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--create-venv", action="store_true")
+    parser.add_argument("--setup-environment", action="store_true")
+    args, _unknown = parser.parse_known_args()
+
     print()
     print("=" * 52)
     print("  mtgacoach Setup Wizard")
@@ -994,6 +1042,12 @@ def main() -> int:
     settings["install_dir"] = str(ROOT)
     settings["runtime_root"] = str(RUNTIME_ROOT)
     save_settings(settings)
+
+    if args.create_venv:
+        return run_create_venv_only()
+
+    if args.setup_environment:
+        return run_setup_environment_only()
 
     # -- Existing repo detected -> offer quick update --
     has_venv = VENV_DIR.exists() and PIP_PATH.exists()

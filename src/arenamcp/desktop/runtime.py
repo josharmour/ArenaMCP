@@ -419,7 +419,7 @@ def _subprocess_creationflags() -> int:
     return getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
 
 
-def run_setup_wizard() -> subprocess.Popen[str]:
+def run_setup_wizard(mode: str | None = None) -> subprocess.Popen[str]:
     app_root = Path(get_app_root())
     runtime_root = get_runtime_root()
     python_exe, _ = find_python_executable()
@@ -428,8 +428,13 @@ def run_setup_wizard() -> subprocess.Popen[str]:
 
     env = os.environ.copy()
     env["MTGACOACH_RUNTIME_ROOT"] = runtime_root
+    args = [python_exe, "setup_wizard.py"]
+    if mode == "create_venv":
+        args.append("--create-venv")
+    elif mode == "setup_environment":
+        args.append("--setup-environment")
     return subprocess.Popen(
-        [python_exe, "setup_wizard.py"],
+        args,
         cwd=app_root,
         env=env,
         creationflags=_subprocess_creationflags(),

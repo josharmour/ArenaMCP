@@ -192,7 +192,7 @@ public partial class RepairPage : Page
             // ── 2. Python / venv ────────────────────────────────────
             if (state.PythonExe is null)
             {
-                Log("[!!] No Python found — cannot auto-fix. Use 'Provision Runtime' manually.");
+                Log("[!!] No Python found — cannot auto-fix. Use 'Create venv' manually after installing Python.");
                 SetStep("Blocked: no Python");
                 return;
             }
@@ -201,7 +201,7 @@ public partial class RepairPage : Page
             {
                 SetStep("Provisioning Python venv...");
                 Log("[..] Creating runtime venv...");
-                var wizard = ProcessLauncher.RunSetupWizard();
+                var wizard = ProcessLauncher.RunSetupWizard("create_venv");
                 await Task.Run(() => wizard.WaitForExit(120_000));
                 state = RuntimeDetector.DetectRuntimeState();
 
@@ -497,9 +497,15 @@ public partial class RepairPage : Page
         await ShowInfo($"Saved MTGA folder:\n{path}");
     }
 
-    private async void ProvisionRuntime_Click(object sender, RoutedEventArgs e)
+    private async void CreateVenv_Click(object sender, RoutedEventArgs e)
     {
-        try { ProcessLauncher.RunSetupWizard(); }
+        try { ProcessLauncher.RunSetupWizard("create_venv"); }
+        catch (Exception ex) { await ShowError(ex.Message); }
+    }
+
+    private async void SetupEnvironment_Click(object sender, RoutedEventArgs e)
+    {
+        try { ProcessLauncher.RunSetupWizard("setup_environment"); }
         catch (Exception ex) { await ShowError(ex.Message); }
     }
 

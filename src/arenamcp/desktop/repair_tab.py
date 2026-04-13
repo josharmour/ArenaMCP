@@ -125,9 +125,12 @@ class RepairTab(QWidget):
         self.fix_all_button = QPushButton("Fix Everything")
         self.fix_all_button.clicked.connect(self.fix_everything)
         action_row.addWidget(self.fix_all_button)
-        provision_button = QPushButton("Provision Runtime")
-        provision_button.clicked.connect(self._provision_runtime)
-        action_row.addWidget(provision_button)
+        create_venv_button = QPushButton("Create venv")
+        create_venv_button.clicked.connect(self._create_venv)
+        action_row.addWidget(create_venv_button)
+        setup_env_button = QPushButton("Setup environment")
+        setup_env_button.clicked.connect(self._setup_environment)
+        action_row.addWidget(setup_env_button)
         repair_button = QPushButton("Repair MTGA Bridge")
         repair_button.clicked.connect(self._repair_bridge)
         action_row.addWidget(repair_button)
@@ -262,10 +265,10 @@ class RepairTab(QWidget):
                 return
 
             if not state.runtime_venv_exists:
-                self._append_fix_log("[..] Launching setup wizard to provision the runtime")
-                run_setup_wizard()
-                self._append_fix_log("[ok] Setup wizard launched. Finish it, then click Refresh Status.")
-                self._set_fix_step("Runtime setup started")
+                self._append_fix_log("[..] Launching setup wizard to create the runtime venv")
+                run_setup_wizard("create_venv")
+                self._append_fix_log("[ok] Create venv started. Finish it, then click Refresh Status.")
+                self._set_fix_step("Create venv started")
                 return
 
             if not mtga_dir:
@@ -334,15 +337,19 @@ class RepairTab(QWidget):
         self.refresh_state()
         QMessageBox.information(self, "mtgacoach", f"Saved MTGA folder:\n{path}")
 
-    def _provision_runtime(self) -> None:
-        if self._state and self._state.python_source == "app_runtime":
-            QMessageBox.information(self, "mtgacoach", "Bundled runtime is already installed.")
-            return
+    def _create_venv(self) -> None:
         try:
-            run_setup_wizard()
-            QMessageBox.information(self, "mtgacoach", "Setup wizard launched.")
+            run_setup_wizard("create_venv")
+            QMessageBox.information(self, "mtgacoach", "Create venv launched.")
         except Exception as exc:
-            QMessageBox.critical(self, "Provision Runtime Failed", str(exc))
+            QMessageBox.critical(self, "Create venv Failed", str(exc))
+
+    def _setup_environment(self) -> None:
+        try:
+            run_setup_wizard("setup_environment")
+            QMessageBox.information(self, "mtgacoach", "Setup environment launched.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Setup Environment Failed", str(exc))
 
     def _repair_bridge(self) -> None:
         try:

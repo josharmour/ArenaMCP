@@ -4,8 +4,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..")).Path
+$ScriptPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+    $MyInvocation.MyCommand.Path
+)
+$ScriptDir = Split-Path -Parent $ScriptPath
+$RepoRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+    (Join-Path $ScriptDir "..")
+)
 $StageRoot = Join-Path $RepoRoot "dist\desktop-release"
 $StageApp = Join-Path $StageRoot "app"
 $RuntimeDir = Join-Path $StageApp "runtime"

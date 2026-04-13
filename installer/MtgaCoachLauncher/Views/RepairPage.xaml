@@ -73,7 +73,8 @@
             <TextBlock Text="Individual Repairs" Style="{StaticResource SubtitleTextBlockStyle}"
                        Margin="0,4,0,0" />
             <StackPanel Orientation="Horizontal" Spacing="8">
-                <Button Content="Provision Runtime" Click="ProvisionRuntime_Click" />
+                <Button Content="Create venv" Click="CreateVenv_Click" />
+                <Button Content="Setup environment" Click="SetupEnvironment_Click" />
                 <Button Content="Repair MTGA Bridge" Click="RepairBridge_Click" />
                 <Button Content="Install BepInEx" Click="InstallBepInEx_Click" />
                 <Button Content="Install Plugin" Click="InstallPlugin_Click" />
