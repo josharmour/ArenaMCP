@@ -31,27 +31,9 @@ if (-not (Test-Path $PluginDll)) {
     Write-Warning "Build the plugin before cutting a release installer."
 }
 
-$LauncherProject = Join-Path $RepoRoot "installer\MtgaCoachLauncher\MtgaCoachLauncher.csproj"
-if (-not (Test-Path $LauncherProject)) {
-    throw "Launcher project not found: $LauncherProject"
-}
-
-$PublishRoot = Join-Path $env:TEMP "mtgacoach-installer-build"
-$PublishDir = Join-Path $PublishRoot "launcher-publish"
-
 Push-Location $ScriptDir
 try {
-    if (Test-Path $PublishRoot) {
-        Remove-Item -Recurse -Force $PublishRoot
-    }
-    New-Item -ItemType Directory -Force -Path $PublishDir | Out-Null
-
-    & dotnet publish $LauncherProject -c Release -p:Platform=x64 --self-contained `
-        -p:BaseIntermediateOutputPath="$PublishRoot\obj\" `
-        -p:BaseOutputPath="$PublishRoot\bin\" `
-        -p:MSBuildProjectExtensionsPath="$PublishRoot\obj\" `
-        -p:PublishDir="$PublishDir\"
-    & $InnoSetupCompiler "/DAppVersion=$Version" "/DLauncherPublishDir=$PublishDir" "mtgacoach.iss"
+    & $InnoSetupCompiler "/DAppVersion=$Version" "mtgacoach.iss"
 }
 finally {
     Pop-Location

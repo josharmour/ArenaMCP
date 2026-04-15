@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 
 title mtgacoach
 
@@ -13,87 +13,68 @@ if not defined MTGACOACH_RUNTIME_ROOT (
     )
 )
 
+set "MTGACOACH_APP_ROOT=%~dp0"
 set "PYTHONPATH=%~dp0src;%PYTHONPATH%"
 
-call :resolve_console_python
-if errorlevel 1 exit /b 1
+set "VENV_PYTHON=%MTGACOACH_RUNTIME_ROOT%\venv\Scripts\python.exe"
+set "VENV_PYTHONW=%MTGACOACH_RUNTIME_ROOT%\venv\Scripts\pythonw.exe"
 
-call :resolve_gui_python
-if errorlevel 1 exit /b 1
+set "MODE=%~1"
 
-if /I "%~1"=="--coach" (
-    shift
-    "%PY_CONSOLE%" launcher.py %*
-    exit /b %errorlevel%
+if /I "%MODE%"=="--wizard" goto :run_wizard
+if /I "%MODE%"=="--setup" goto :run_wizard
+if /I "%MODE%"=="--repair" goto :run_wizard
+if /I "%MODE%"=="--console" goto :launch_console
+
+if not exist "%VENV_PYTHON%" goto :run_wizard
+
+goto :launch_gui
+
+:run_wizard
+call :resolve_system_python
+if errorlevel 1 (
+    echo.
+    echo ERROR: Python 3.10 or newer was not found on PATH.
+    echo Install Python from https://www.python.org/downloads/ and re-run.
+    echo.
+    pause
+    exit /b 1
 )
-
-if /I "%~1"=="--autopilot" (
-    shift
-    "%PY_CONSOLE%" launcher.py --autopilot %*
-    exit /b %errorlevel%
+"%SYSTEM_PY%" setup_wizard.py --setup-environment
+if errorlevel 1 (
+    echo.
+    echo Setup did not complete successfully.
+    pause
+    exit /b 1
 )
-
-if /I "%~1"=="--setup" (
-    shift
-    "%PY_GUI%" launcher_gui.py --setup %*
-    exit /b %errorlevel%
+if not exist "%VENV_PYTHON%" (
+    echo.
+    echo Setup finished but the venv was not created at:
+    echo     %VENV_PYTHON%
+    pause
+    exit /b 1
 )
+if /I "%MODE%"=="--wizard" exit /b 0
+if /I "%MODE%"=="--setup" exit /b 0
+if /I "%MODE%"=="--repair" exit /b 0
+goto :launch_gui
 
-if /I "%~1"=="--repair" (
-    shift
-    "%PY_GUI%" launcher_gui.py --setup %*
-    exit /b %errorlevel%
+:launch_gui
+if exist "%VENV_PYTHONW%" (
+    start "" "%VENV_PYTHONW%" scripts\launch_installed.py
+    exit /b 0
 )
-
-if /I "%~1"=="--wizard" (
-    shift
-    "%PY_CONSOLE%" setup_wizard.py %*
-    exit /b %errorlevel%
-)
-
-if /I "%~1"=="--gui" (
-    shift
-    "%PY_GUI%" launcher_gui.py %*
-    exit /b %errorlevel%
-)
-
-if "%~1"=="" (
-    "%PY_GUI%" launcher_gui.py
-    exit /b %errorlevel%
-)
-
-:: Unrecognized arguments are treated as pass-through flags for the TUI runtime.
-"%PY_CONSOLE%" launcher.py %*
+"%VENV_PYTHON%" scripts\launch_installed.py
 exit /b %errorlevel%
 
-:resolve_console_python
-if exist "%MTGACOACH_RUNTIME_ROOT%\venv\Scripts\python.exe" (
-    set "PY_CONSOLE=%MTGACOACH_RUNTIME_ROOT%\venv\Scripts\python.exe"
-) else if exist "venv\Scripts\python.exe" (
-    set "PY_CONSOLE=venv\Scripts\python.exe"
-) else (
-    python --version >nul 2>&1
-    if errorlevel 1 (
-        echo ERROR: Python not found in PATH
-        echo Please run install.bat or the launcher setup flow first
-        pause
-        exit /b 1
-    )
-    set "PY_CONSOLE=python"
-)
-exit /b 0
+:launch_console
+"%VENV_PYTHON%" scripts\launch_installed.py
+exit /b %errorlevel%
 
-:resolve_gui_python
-if exist "%MTGACOACH_RUNTIME_ROOT%\venv\Scripts\pythonw.exe" (
-    set "PY_GUI=%MTGACOACH_RUNTIME_ROOT%\venv\Scripts\pythonw.exe"
-) else if exist "venv\Scripts\pythonw.exe" (
-    set "PY_GUI=venv\Scripts\pythonw.exe"
-) else (
-    pythonw --version >nul 2>&1
-    if not errorlevel 1 (
-        set "PY_GUI=pythonw"
-    ) else (
-        set "PY_GUI=%PY_CONSOLE%"
-    )
-)
-exit /b 0
+:resolve_system_python
+set "SYSTEM_PY="
+for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable)" 2^>nul`) do set "SYSTEM_PY=%%P"
+if defined SYSTEM_PY exit /b 0
+for /f "usebackq delims=" %%P in (`where python 2^>nul`) do if not defined SYSTEM_PY set "SYSTEM_PY=%%P"
+if defined SYSTEM_PY exit /b 0
+exit /b 1

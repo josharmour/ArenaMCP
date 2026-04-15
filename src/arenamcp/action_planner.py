@@ -695,6 +695,12 @@ class ActionPlanner:
         if lower.startswith("attack with:"):
             names = [n.strip() for n in act.split(":", 1)[1].split(",") if n.strip()]
             return GameAction(action_type=ActionType.DECLARE_ATTACKERS, attacker_names=names)
+        if lower.startswith("block with:"):
+            name = act.split(":", 1)[1].strip()
+            return GameAction(
+                action_type=ActionType.DECLARE_BLOCKERS,
+                blocker_assignments={name: ""} if name else {},
+            )
         if lower.startswith("select target:"):
             return GameAction(
                 action_type=ActionType.SELECT_TARGET,
@@ -706,6 +712,10 @@ class ActionPlanner:
             return GameAction(action_type=ActionType.CHOOSE_STARTING_PLAYER, play_or_draw="play")
         if "choose: draw" in lower:
             return GameAction(action_type=ActionType.CHOOSE_STARTING_PLAYER, play_or_draw="draw")
+        if lower.startswith("accept") or lower in ("allow", "yes"):
+            return GameAction(action_type=ActionType.CLICK_BUTTON, card_name="accept")
+        if lower.startswith("decline") or lower in ("cancel", "no"):
+            return GameAction(action_type=ActionType.CLICK_BUTTON, card_name="decline")
         if "done" in lower:
             return GameAction(action_type=ActionType.CLICK_BUTTON, card_name="done")
         if "resolve" in lower:
@@ -719,6 +729,46 @@ class ActionPlanner:
         """Require planner output to map to a current legal action."""
         if not legal_actions:
             return True
+
+        # Combat declarations come in as one "Attack with: X" / "Block with: X"
+        # string per creature, while the planner emits a full set in a single
+        # GameAction. Validate the plan against the union of legal creature
+        # names, not by exact-match on a single legal entry.
+        if action.action_type in (ActionType.DECLARE_ATTACKERS, ActionType.DECLARE_BLOCKERS):
+            legal_names: set[str] = set()
+            in_combat_context = False
+            for legal_action in legal_actions:
+                low = legal_action.lower().strip()
+                if action.action_type == ActionType.DECLARE_ATTACKERS:
+                    if low.startswith("attack with:") or low.startswith("declare attackers:"):
+                        tail = legal_action.split(":", 1)[1]
+                        for name in tail.split(","):
+                            clean = self._normalize_action_text(name).strip().lower()
+                            if clean:
+                                legal_names.add(clean)
+                        in_combat_context = True
+                    elif "confirm attackers" in low:
+                        in_combat_context = True
+                else:
+                    if low.startswith("block with:"):
+                        tail = legal_action.split(":", 1)[1]
+                        clean = self._normalize_action_text(tail).strip().lower()
+                        if clean:
+                            legal_names.add(clean)
+                        in_combat_context = True
+                    elif "confirm blockers" in low:
+                        in_combat_context = True
+
+            if not in_combat_context:
+                return False
+
+            if action.action_type == ActionType.DECLARE_ATTACKERS:
+                plan_names = {n.strip().lower() for n in action.attacker_names if n and n.strip()}
+            else:
+                plan_names = {
+                    k.strip().lower() for k in action.blocker_assignments.keys() if k and k.strip()
+                }
+            return plan_names.issubset(legal_names)
 
         normalized_card_name = self._normalize_action_text(action.card_name).lower()
 
@@ -740,13 +790,6 @@ class ActionPlanner:
                 if legal.target_names and action.target_names:
                     if legal.target_names[0].strip().lower() == action.target_names[0].strip().lower():
                         return True
-                continue
-
-            if action.action_type == ActionType.DECLARE_ATTACKERS:
-                if {n.strip().lower() for n in legal.attacker_names} == {
-                    n.strip().lower() for n in action.attacker_names
-                }:
-                    return True
                 continue
 
             if action.action_type == ActionType.CHOOSE_STARTING_PLAYER:

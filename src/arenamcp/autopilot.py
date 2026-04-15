@@ -831,24 +831,32 @@ class AutopilotEngine:
                 self._click_fixed("done")
                 return True
 
-            # Optional actions with no legal actions — auto-decline via pass
+            # Optional actions with no meaningful actions — auto-decline via
+            # submit_optional(False). submit_pass() would fail here because the
+            # pending request is OptionalActionMessageRequest, not an
+            # ActionsAvailableRequest, and the plugin rejects pass in that state.
             if (
-                bridge_request_type in ("OptionalAction", "OptionalActionReq", "OptionalActionRequest")
-                or bridge_request_class in ("OptionalAction", "OptionalActionReq", "OptionalActionRequest")
+                bridge_request_type in ("OptionalAction", "OptionalActionReq", "OptionalActionRequest", "OptionalActionMessage", "OptionalActionMessageRequest", "OptionalActionMessageReq")
+                or bridge_request_class in ("OptionalAction", "OptionalActionReq", "OptionalActionRequest", "OptionalActionMessage", "OptionalActionMessageRequest", "OptionalActionMessageReq")
                 or ((game_state.get("decision_context") or {}).get("type") == "optional_action")
             ):
                 legal = self._get_legal_actions(game_state)
-                meaningful = [a for a in legal if a.lower() not in {"pass", "action: activate_mana", "action: floatmana"} and "Wait" not in a]
+                # Accept / Decline are the actual meaningful choices and must
+                # flow through to the planner so the LLM decides — they are
+                # NOT filtered out here on purpose.
+                meaningful = [
+                    a for a in legal
+                    if a.lower() not in {"pass", "action: activate_mana", "action: floatmana"}
+                    and "Wait" not in a
+                ]
                 if not meaningful:
                     logger.info("Autopilot: auto-declining optional action (no meaningful actions)")
                     if not self._config.dry_run:
                         if self._gre_bridge.connected or self._gre_bridge.connect():
-                            if self._gre_bridge.submit_pass():
-                                self._log_execution_path(ExecutionPath.GRE_AWARE, "auto-decline optional via GRE bridge")
+                            if self._gre_bridge.submit_optional(False):
+                                self._log_execution_path(ExecutionPath.GRE_AWARE, "auto-decline optional via submit_optional(False)")
                                 return True
-                        self._controller.focus_mtga_window()
-                        time.sleep(0.06)
-                    self._exec_pass_priority()
+                            logger.warning("Autopilot: submit_optional(False) failed — cannot auto-decline")
                     return True
 
             # "Priority (Pass Only)" means only Pass is legal — auto-pass immediately
@@ -2437,6 +2445,23 @@ class AutopilotEngine:
     def _exec_click_button(self, action: GameAction) -> ClickResult:
         """Click a named button."""
         button_name = action.card_name.lower().replace(" ", "_")
+        # Optional-action dialogs (e.g. commander-to-command-zone prompt) are
+        # answered via the GRE bridge's submit_optional, not by clicking at a
+        # fixed coordinate — the dialog buttons have no deterministic location.
+        if button_name in ("accept", "allow", "yes", "decline", "cancel", "no"):
+            if self._gre_bridge.connected or self._gre_bridge.connect():
+                accept = button_name in ("accept", "allow", "yes")
+                if self._gre_bridge.submit_optional(accept):
+                    self._log_execution_path(
+                        ExecutionPath.GRE_AWARE,
+                        f"optional: submit_optional(accept={accept}) via GRE bridge",
+                    )
+                    return ClickResult(True, 0, 0, button_name, "GRE bridge")
+            logger.warning(
+                "optional %s could not be submitted via GRE bridge — no click fallback",
+                button_name,
+            )
+            return ClickResult(False, 0, 0, button_name, "submit_optional failed")
         self._log_execution_path(ExecutionPath.DETERMINISTIC_GEOMETRY, f"click_button: {button_name} (fixed coords)")
         # Fallback for common MTGA action buttons that might be named differently by the LLM
         if button_name in ("next", "attack", "all_attack", "done", "no_attacks", "no_blocks"):

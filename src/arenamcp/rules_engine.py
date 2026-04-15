@@ -641,6 +641,15 @@ class RulesEngine:
         if dec_type in ("select_n_group", "select_from_groups", "search_from_groups", "gather"):
             return ["Select from options", "Done"]
 
+        if dec_type == "optional_action":
+            # MTGA is presenting a yes/no prompt (e.g. "Send your commander to
+            # the command zone instead of the graveyard?"). Without these,
+            # get_legal_actions() falls through to the priority check and
+            # returns "Wait (Opponent has priority)" — which is wrong because
+            # the local player is the one being asked, and the planner ends up
+            # passing priority on a request type that doesn't accept a pass.
+            return ["Accept (yes)", "Decline (no)"]
+
         return []
 
     @staticmethod
