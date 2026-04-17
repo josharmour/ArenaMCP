@@ -97,6 +97,59 @@ class CoachProcess(QObject):
             process.kill()
             process.waitForFinished(2000)
 
+    def stop_async(self) -> None:
+        """Non-blocking stop — terminates the process and schedules a
+        background kill+cleanup so the Qt main thread never freezes.
+
+        The process may still be running briefly after this returns; the
+        `finished` signal handler will clean up once it exits. Safe to
+        start a new process immediately afterward.
+        """
+        process = self._process
+        if process is None:
+            return
+        # Detach the reference so any new `start()` creates a fresh
+        # QProcess — the old one lingers in the background until it
+        # finishes on its own.
+        self._process = None
+        if process.state() == QProcess.NotRunning:
+            process.deleteLater()
+            return
+
+        try:
+            process.closeWriteChannel()
+        except RuntimeError:
+            pass
+        try:
+            process.terminate()
+        except Exception:
+            pass
+
+        # Hard-kill after a grace period if the process hasn't died.
+        def _hard_kill():
+            try:
+                if process.state() != QProcess.NotRunning:
+                    process.kill()
+            except Exception:
+                pass
+
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(5000, _hard_kill)
+
+        # Clean up the QProcess object once it finishes
+        def _cleanup(*_args):
+            try:
+                process.deleteLater()
+            except Exception:
+                pass
+        try:
+            process.finished.connect(_cleanup)
+        except Exception:
+            # If connection fails for any reason, fall back to immediate
+            # delete — the process exit won't be tracked but at least we
+            # won't leak the QProcess object.
+            process.deleteLater()
+
     def send_command(self, command: str, text: Optional[str] = None) -> None:
         if self._process is None or self._process.state() == QProcess.NotRunning:
             return

@@ -685,6 +685,61 @@ class GREBridge:
             logger.debug(f"get_game_state error: {e}")
             return None
 
+    def get_draft_state(self) -> Optional[dict[str, Any]]:
+        """Get draft state directly from DraftContentController via MTGA bridge.
+
+        Returns draft mode, pack info, pick info, and picked cards.
+        Returns None if not connected or draft not active.
+        """
+        try:
+            resp = self._send_safe({"action": "get_draft_state"})
+            if resp.get("ok"):
+                return resp
+            else:
+                logger.debug(f"get_draft_state: {resp.get('error')}")
+                return None
+        except GREBridgeError as e:
+            logger.debug(f"get_draft_state error: {e}")
+            return None
+
+    def get_card_positions(self) -> Optional[dict[str, Any]]:
+        """Get on-screen rectangles for every visible card in the current match.
+
+        Queries the BepInEx plugin which walks Unity's DuelScene_CDC objects,
+        projects each card's collider bounds through MainCamera.WorldToScreenPoint,
+        and returns a per-card screen rectangle (top-left origin, matching
+        Windows/PySide convention).
+
+        Returns a dict like:
+            {
+                "ok": True,
+                "screen_w": 1920,
+                "screen_h": 1080,
+                "count": 22,
+                "cards": [
+                    {
+                        "instance_id": 12345,
+                        "grp_id": 87654,
+                        "zone": "Hand",
+                        "x": 820, "y": 920, "w": 120, "h": 168,
+                        "nx": 0.427, "ny": 0.852, "nw": 0.063, "nh": 0.156
+                    },
+                    ...
+                ]
+            }
+
+        Returns None if the bridge is not connected or a match is not active.
+        """
+        try:
+            resp = self._send_safe({"action": "get_card_positions"})
+            if resp.get("ok"):
+                return resp
+            logger.debug(f"get_card_positions: {resp.get('error')}")
+            return None
+        except GREBridgeError as e:
+            logger.debug(f"get_card_positions error: {e}")
+            return None
+
     def get_timer_state(self) -> Optional[dict[str, Any]]:
         """Get timer/chess clock state from the game.
 

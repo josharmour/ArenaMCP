@@ -76,6 +76,12 @@ class AutopilotConfig:
     dry_run: bool = False
     afk_mode: bool = False  # When True, auto-pass everything without LLM
     land_drop_mode: bool = False  # When True, auto-play one land per turn (no LLM)
+    # When True AND the GRE bridge is connected, refuse to fall back to
+    # mouse-click execution. The bridge submits actions directly without
+    # touching the mouse — falling back to clicks is the only reason the
+    # user's cursor gets pulled into MTGA mid-play. Actions that the bridge
+    # can't handle are reported as failures instead of simulated via mouse.
+    bridge_only_when_connected: bool = True
 
 
 class AutopilotEngine:
@@ -119,6 +125,7 @@ class AutopilotEngine:
         config: Optional[AutopilotConfig] = None,
         speak_fn: Optional[Callable[[str, bool], None]] = None,
         ui_advice_fn: Optional[Callable[[str, str], None]] = None,
+        bug_report_fn: Optional[Callable[[str, dict], None]] = None,
     ):
         """Initialize the autopilot engine.
 
@@ -130,6 +137,10 @@ class AutopilotEngine:
             config: Optional autopilot configuration.
             speak_fn: Optional TTS function (text, blocking) for previewing actions.
             ui_advice_fn: Optional UI callback (text, label) for displaying actions.
+            bug_report_fn: Optional callback (reason, extra_context) invoked
+                whenever the GRE bridge can't submit an action and autopilot
+                has to fall back. Used to auto-file a bug report so we have
+                telemetry on every bridge miss.
         """
         self._planner = planner
         self._mapper = mapper
@@ -138,6 +149,13 @@ class AutopilotEngine:
         self._config = config or AutopilotConfig()
         self._speak_fn = speak_fn
         self._ui_advice_fn = ui_advice_fn
+        self._bug_report_fn = bug_report_fn
+        # Buffer of fallback bug events collected during the current match.
+        # On match end, we sample up to `_max_fallback_bugs_per_match` at
+        # random and dispatch those. Rest are discarded — goal is
+        # representative telemetry without spam.
+        self._pending_fallback_bugs: list[tuple[str, dict]] = []
+        self._max_fallback_bugs_per_match: int = 5
 
         # State
         self._state = AutopilotState.IDLE
@@ -1749,6 +1767,100 @@ class AutopilotEngine:
             except Exception as e:
                 logger.debug(f"UI notification callback failed: {e}")
 
+    def _report_fallback_bug(
+        self,
+        action: GameAction,
+        game_state: dict[str, Any],
+        reason_tag: str,
+    ) -> None:
+        """Record a bridge-fallback event for end-of-match telemetry.
+
+        Events are buffered during the match; at match end we sample up to
+        `_max_fallback_bugs_per_match` at random and dispatch those to the
+        bug_report callback. The rest are discarded, giving representative
+        coverage without flooding GitHub with duplicates from stuck loops.
+        """
+        if self._bug_report_fn is None:
+            return
+
+        gre_ref = getattr(action, "gre_action_ref", None)
+        ref_info = None
+        if gre_ref is not None:
+            try:
+                ref_info = gre_ref.to_dict() if hasattr(gre_ref, "to_dict") else {
+                    "action_type": getattr(gre_ref, "action_type", ""),
+                    "grp_id": getattr(gre_ref, "grp_id", 0),
+                    "instance_id": getattr(gre_ref, "instance_id", 0),
+                }
+            except Exception:
+                ref_info = None
+
+        bridge_info = {
+            "connected": getattr(self._gre_bridge, "connected", False),
+            "failed_methods": sorted(self._gre_bridge_failed_methods),
+        }
+
+        extra = {
+            "auto_fallback_bug": {
+                "reason_tag": reason_tag,
+                "action_type": action.action_type.value,
+                "card_name": action.card_name or "",
+                "target_names": list(action.target_names or []),
+                "attacker_names": list(action.attacker_names or []),
+                "blocker_assignments": dict(action.blocker_assignments or {}),
+                "select_card_names": list(action.select_card_names or []),
+                "modal_index": action.modal_index,
+                "numeric_value": action.numeric_value,
+                "gre_action_ref": ref_info,
+                "bridge": bridge_info,
+                "bridge_request_type": game_state.get("_bridge_request_type"),
+                "bridge_request_class": game_state.get("_bridge_request_class"),
+                "decision_context": game_state.get("decision_context"),
+                "turn": (game_state.get("turn") or {}).get("turn_number"),
+                "phase": (game_state.get("turn") or {}).get("phase"),
+                "timestamp": time.time(),
+            }
+        }
+        reason = (
+            f"auto: bridge fallback ({reason_tag}) on "
+            f"{action.action_type.value} {action.card_name or ''}".strip()
+        )
+        # Buffer — the match-end flush will pick winners.
+        self._pending_fallback_bugs.append((reason, extra))
+
+    def flush_fallback_bugs_for_match(self) -> int:
+        """Dispatch up to N sampled fallback bugs from the current match.
+
+        Called at match end by the standalone coach. Clears the buffer
+        whether or not events are dispatched. Returns the number sent.
+        """
+        buf = self._pending_fallback_bugs
+        self._pending_fallback_bugs = []
+        if not buf or self._bug_report_fn is None:
+            return 0
+
+        import random
+        cap = max(1, int(self._max_fallback_bugs_per_match))
+        if len(buf) <= cap:
+            picked = list(buf)
+        else:
+            picked = random.sample(buf, cap)
+
+        logger.info(
+            f"Flushing {len(picked)}/{len(buf)} fallback bug(s) "
+            f"from this match (max {cap})"
+        )
+        for reason, extra in picked:
+            try:
+                threading.Thread(
+                    target=self._bug_report_fn,
+                    args=(reason, extra),
+                    daemon=True,
+                ).start()
+            except Exception as e:
+                logger.debug(f"fallback-bug dispatch failed: {e}")
+        return len(picked)
+
     def _get_vision_coord(self, card_name: str, zone: Optional[str] = None) -> Optional[ScreenCoord]:
         """Capture screenshot and use vision to find a card.
 
@@ -1906,6 +2018,19 @@ class AutopilotEngine:
         # SELECT TARGET — submit via bridge if target instance IDs are resolvable
         if action.action_type == ActionType.SELECT_TARGET:
             return self._try_gre_bridge_select_target(action)
+
+        # SELECT_N / SEARCH_LIBRARY / SELECT_COUNTERS — submit via bridge to
+        # avoid the mouse-click fallback which clicks by list index and
+        # frequently misses the actual option positions (causing stuck loops
+        # on things like Lluwen's ETB search).
+        if action.action_type in (
+            ActionType.SELECT_N,
+            ActionType.SEARCH_LIBRARY,
+            ActionType.SELECT_COUNTERS,
+        ):
+            result = self._try_gre_bridge_select_n(action, game_state)
+            if result is not None:
+                return result
 
         # MODAL CHOICE / CASTING OPTIONS — submit via bridge by matching
         # CastingTimeOption entries (actionType="CastingTimeOption").
@@ -2310,6 +2435,86 @@ class AutopilotEngine:
         self._gre_bridge_failed_methods.add("select_target")
         return None
 
+    def _try_gre_bridge_select_n(
+        self, action: GameAction, game_state: dict[str, Any]
+    ) -> Optional[ClickResult]:
+        """Submit SelectN / Search / SelectCounters via the GRE bridge.
+
+        The LLM gives us `select_card_names`; we resolve those names to
+        grp_ids by scanning the game state's known zones (library peek,
+        hand, battlefield, graveyard, exile, stack). If we can't find a
+        specific grp_id match, we submit an empty list which triggers
+        `SubmitArbitrary()` on the plugin side — the game will pick
+        automatically rather than leave the selection hanging.
+
+        This path exists specifically to avoid the mouse-click fallback
+        (`_exec_select_n`) which clicks by list index and often misses
+        the actual option positions, causing the autopilot to loop.
+        """
+        pending = self._gre_bridge.get_pending_actions()
+        if not pending or not pending.get("has_pending"):
+            return None
+
+        req_type = str(pending.get("request_type") or "")
+        req_class = str(pending.get("request_class") or "")
+
+        # Only handle SelectN and Search variants; other request types
+        # need dedicated paths.
+        is_select_n = (
+            "SelectN" in req_class or "Search" in req_class
+            or req_type in ("SelectN", "Search")
+        )
+        if not is_select_n:
+            return None
+
+        desired_names = [
+            (n or "").lower().strip()
+            for n in (action.select_card_names or [])
+            if n and (n or "").strip()
+        ]
+        if not desired_names and action.card_name:
+            desired_names = [action.card_name.lower().strip()]
+
+        # Collect candidate cards from every visible zone
+        matched_grp_ids: list[int] = []
+        zone_keys = (
+            "library", "library_top_revealed", "hand", "battlefield",
+            "battlefield_player", "battlefield_opponent",
+            "graveyard", "graveyard_player", "graveyard_opponent",
+            "exile", "stack",
+        )
+        for zone_key in zone_keys:
+            zone = game_state.get(zone_key)
+            if not isinstance(zone, list):
+                continue
+            for card in zone:
+                if not isinstance(card, dict):
+                    continue
+                name = str(card.get("name") or "").lower().strip()
+                grp = card.get("grp_id") or 0
+                if not (name and grp):
+                    continue
+                for want in desired_names:
+                    if want and (want == name or want in name or name in want):
+                        if int(grp) not in matched_grp_ids:
+                            matched_grp_ids.append(int(grp))
+                        break
+
+        # Submit — empty list → SubmitArbitrary (safe fallback when we can't
+        # resolve a specific option)
+        success = self._gre_bridge.submit_selection(matched_grp_ids)
+        if success:
+            method = f"{len(matched_grp_ids)} grp_ids" if matched_grp_ids else "arbitrary"
+            self._log_execution_path(
+                ExecutionPath.GRE_AWARE,
+                f"select_n: {method} (req={req_class or req_type}) via GRE bridge"
+            )
+            return ClickResult(True, 0, 0, "select_n", "GRE bridge")
+
+        logger.info("GRE bridge select_n failed, falling back to clicks")
+        self._gre_bridge_failed_methods.add("select_n")
+        return None
+
     def _execute_action(
         self, action: GameAction, game_state: dict[str, Any]
     ) -> ClickResult:
@@ -2332,7 +2537,44 @@ class AutopilotEngine:
             if gre_result is not None:
                 return gre_result
 
-        # GRE bridge not available — fall back to mouse-click execution
+        # The bridge couldn't submit this action. Whether we fall back to
+        # mouse or refuse, this counts as a "bridge miss" bug — auto-file
+        # a report so we collect telemetry on what action types need
+        # bridge coverage next.
+        bridge_connected = (
+            self._gre_bridge is not None
+            and getattr(self._gre_bridge, "connected", False)
+        )
+        if bridge_connected and not self._config.dry_run:
+            self._report_fallback_bug(
+                action, game_state,
+                reason_tag=(
+                    "bridge_only_suppressed"
+                    if self._config.bridge_only_when_connected
+                    else "falling_back_to_mouse"
+                ),
+            )
+
+        # Refuse mouse fallback when the bridge IS connected but couldn't
+        # handle this specific action (e.g. a CastingTimeOption flavor we
+        # don't support yet, like Offspring). Falling through to mouse
+        # clicks steals the cursor and is rarely what the user wants —
+        # surface the failure and let the user take over manually.
+        if (
+            self._config.bridge_only_when_connected
+            and not self._config.dry_run
+            and bridge_connected
+        ):
+            msg = (
+                f"Bridge couldn't handle {action.action_type.value} "
+                f"({action.card_name or '?'}) — mouse fallback suppressed. "
+                "Take this action manually."
+            )
+            logger.warning(msg)
+            self._notify("AUTOPILOT", f"MANUAL REQUIRED: {msg}")
+            return ClickResult(False, 0, 0, action.action_type.value, "bridge_only")
+
+        # Bridge unavailable or disabled — fall back to mouse-click execution.
         gre_ref = getattr(action, 'gre_action_ref', None)
         if gre_ref is not None:
             self._log_execution_path(

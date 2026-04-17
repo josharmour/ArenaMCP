@@ -15,7 +15,7 @@ import subprocess
 import sys
 import threading
 import webbrowser
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from arenamcp.standalone import StandaloneCoach
@@ -150,6 +150,22 @@ class PipeAdapter:
     def emit_game_state(self, snapshot: dict[str, Any]) -> None:
         """Emit a game state snapshot to the GUI."""
         self._emit({"type": "game_state", "data": snapshot})
+
+    def emit_draft_state(self, snapshot: dict[str, Any]) -> None:
+        """Emit a draft state snapshot to the GUI."""
+        self._emit({"type": "draft_state", "data": snapshot})
+
+    def emit_suggested_actions(self, actions: list[dict[str, Any]]) -> None:
+        """Emit an ordered list of suggested match actions.
+
+        Each action is a dict with keys:
+          action_type, instance_id, grp_id, card_name, reason,
+          target_instance_ids (optional list).
+
+        The match overlay uses this to draw sequenced highlights
+        (numbered rings) over the target cards in MTGA.
+        """
+        self._emit({"type": "suggested_actions", "actions": list(actions or [])})
 
     def emit_post_match_feedback_request(self, analysis: str, match_result: str) -> None:
         self._emit(
@@ -385,8 +401,12 @@ class PipeAdapter:
                     target=coach.take_screenshot_analysis, daemon=True
                 ).start()
             elif action == "debug_report":
+                # Optional screenshot paths provided by the UI (coach + MTGA window).
+                screenshots = cmd.get("screenshots") or {}
                 threading.Thread(
-                    target=self._handle_debug_report, daemon=True
+                    target=self._handle_debug_report,
+                    args=(screenshots,),
+                    daemon=True,
                 ).start()
             elif action == "read_win_plan":
                 coach._on_read_win_plan()
@@ -438,25 +458,90 @@ class PipeAdapter:
             elif action == "restart":
                 coach._restart_requested = True
                 coach._running = False
+            elif action == "toggle_fallback_mode":
+                self._handle_toggle_fallback_mode()
             else:
                 logger.warning("Unknown pipe command: %s", action)
         except Exception as e:
             logger.error("Command dispatch error (%s): %s", action, e)
             self.error(f"Command failed: {action}: {e}")
 
-    def _handle_debug_report(self) -> None:
-        """Save a bug report and notify the GUI of the path."""
+    def _handle_toggle_fallback_mode(self) -> None:
+        """Toggle autopilot's bridge-only-when-connected flag.
+
+        When on (default): if the bridge can't submit an action, autopilot
+        gives up and emits MANUAL REQUIRED advice.
+        When off (legacy): autopilot falls back to mouse-click execution.
+        """
         coach = self._coach
         if coach is None:
             return
         try:
-            bug_path = coach.save_bug_report("Launcher Debug Report", announce=False)
+            engine = getattr(coach._autopilot, "_engine", None) or getattr(coach._autopilot, "engine", None)
+            # Try common places the autopilot engine lives
+            cfg = None
+            for holder in (coach._autopilot, engine, coach):
+                if holder is None:
+                    continue
+                cfg = getattr(holder, "_config", None) or getattr(holder, "config", None)
+                if cfg is not None and hasattr(cfg, "bridge_only_when_connected"):
+                    break
+            if cfg is None or not hasattr(cfg, "bridge_only_when_connected"):
+                self.error("Autopilot config not available — fallback mode unchanged.")
+                return
+            cfg.bridge_only_when_connected = not cfg.bridge_only_when_connected
+            mode = "advice" if cfg.bridge_only_when_connected else "mouse"
+            self.status("FALLBACK_MODE", mode)
+            self.log(f"Fallback mode: {mode}")
+        except Exception as e:
+            self.error(f"Failed to toggle fallback mode: {e}")
+
+    def _handle_debug_report(self, screenshots: Optional[dict[str, str]] = None) -> None:
+        """Save a bug report and notify the GUI of the path.
+
+        Args:
+            screenshots: Optional dict {'coach': path, 'mtga': path} of PNGs
+                already saved by the UI. Embedded into the JSON report so
+                they can be referenced from the GitHub issue body and kept
+                alongside the local report.
+
+        Emits a structured `bug_report_saved` event so the UI can copy the
+        path to the clipboard and offer an upload dialog.
+        """
+        coach = self._coach
+        if coach is None:
+            return
+        try:
+            extra = {"screenshots": screenshots or {}}
+            bug_path = coach.save_bug_report(
+                "Launcher Debug Report",
+                announce=False,
+                extra_context=extra,
+            )
             if bug_path:
                 self.log(f"Bug report saved: {bug_path}")
+                if screenshots:
+                    for kind, p in screenshots.items():
+                        self.log(f"  Screenshot ({kind}): {p}")
+                self._emit({
+                    "type": "bug_report_saved",
+                    "path": str(bug_path),
+                    "screenshots": screenshots or {},
+                })
             else:
                 self.error("Failed to save bug report")
+                self._emit({
+                    "type": "bug_report_saved",
+                    "path": "",
+                    "error": "Failed to save bug report",
+                })
         except Exception as e:
             self.error(f"Bug report failed: {e}")
+            self._emit({
+                "type": "bug_report_saved",
+                "path": "",
+                "error": str(e),
+            })
 
     def _handle_chat(self, text: str) -> None:
         """Process a chat message from the GUI."""

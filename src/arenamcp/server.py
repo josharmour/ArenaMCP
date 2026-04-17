@@ -24,7 +24,7 @@ from arenamcp.gamestate import (
 from arenamcp.parser import LogParser
 from arenamcp.scryfall import ScryfallCache
 from arenamcp.draftstats import DraftStatsCache
-from arenamcp.draftstate import DraftState, create_draft_handler
+from arenamcp.draftstate import DraftState, create_draft_handler, extract_set_code
 from arenamcp.draft_eval import evaluate_pack, format_pick_recommendation
 from arenamcp.sealed_eval import analyze_sealed_pool, format_sealed_recommendation, format_sealed_detailed
 from arenamcp.mtgadb import MTGADatabase
@@ -434,6 +434,7 @@ def _draft_helper_loop() -> None:
                     evaluations,
                     _draft_helper_last_pack,
                     _draft_helper_last_pick,
+                    num_recommendations=draft_state.picks_per_pack,
                 )
 
                 try:
@@ -1614,25 +1615,95 @@ def get_draft_pack() -> dict[str, Any]:
     if _has_live_match_state():
         _deactivate_draft_state("live match state present")
 
-    if not draft_state.is_active or not draft_state.cards_in_pack:
+    try:
+        from arenamcp.gre_bridge import get_bridge
+        bridge = get_bridge()
+        bridge_draft = bridge.get_draft_state() if (bridge and getattr(bridge, "connected", False)) else None
+    except Exception as e:
+        logger.debug(f"Failed to get_draft_state from bridge: {e}")
+        bridge_draft = None
+
+    pack_cards = []
+    picked_cards = []
+    pack_number = draft_state.pack_number
+    pick_number = draft_state.pick_number
+    is_active = draft_state.is_active
+
+    if bridge_draft and bridge_draft.get("ok") and bridge_draft.get("pack_cards"):
+        pack_cards = bridge_draft.get("pack_cards", [])
+        picked_cards = bridge_draft.get("picked_cards", [])
+        pack_number = bridge_draft.get("pack_number", pack_number)
+        pick_number = bridge_draft.get("pick_number", pick_number)
+        is_active = True
+    else:
+        pack_cards = draft_state.cards_in_pack
+        picked_cards = draft_state.picked_cards
+
+    if not is_active or not pack_cards:
         return {
             "is_active": False,
             "message": "No active draft pack detected. Make sure you're in a draft and a pack is open."
         }
 
+    # Derive set_code from event_name if not yet set (race: CardsInPack
+    # arrives before EventName log line on the first pick)
+    set_code = draft_state.set_code
+    if not set_code and draft_state.event_name:
+        set_code = extract_set_code(draft_state.event_name)
+        if set_code:
+            draft_state.set_code = set_code
+            logger.info(f"Derived set_code from event_name: {set_code}")
+
     # Get draft stats cache
     draft_stats_cache = _get_draft_stats()
 
-    # Build card list with details and ratings
+    # Try composite scoring (on-color, synergy, card type + 17lands WR)
+    eval_map: dict[str, Any] = {}
+    try:
+        _scryfall = _get_scryfall()
+        _mtga = _get_mtgadb()
+        evaluations = evaluate_pack(
+            cards_in_pack=pack_cards,
+            picked_cards=picked_cards,
+            set_code=set_code,
+            scryfall=_scryfall,
+            draft_stats=draft_stats_cache,
+            mtgadb=_mtga,
+        )
+        for ev in evaluations:
+            eval_map[ev.grp_id] = ev
+    except Exception as e:
+        logger.debug(f"Composite draft eval failed, falling back to GIH WR: {e}")
+
+    # Build card list with details and ratings.
+    # Track the original MTGA pack order via a pack_index field; the HUD sorts
+    # cards by score but the card-position overlay needs the pack order to
+    # place badges on top of each card on-screen.
     cards = []
-    for grp_id in draft_state.cards_in_pack:
+    for pack_index, grp_id in enumerate(pack_cards):
         # Use robust enrichment (MTGJSON -> MTGADb -> Scryfall)
         card_info = enrich_with_oracle_text(grp_id)
+        card_info["pack_index"] = pack_index
 
-        # Get 17lands stats if we have a set code and valid name
-        if draft_state.set_code and "Unknown" not in card_info["name"]:
+        ev = eval_map.get(grp_id)
+        if ev:
+            card_info["gih_wr"] = ev.gih_wr
+            card_info["composite_score"] = ev.score
+            card_info["pick_reason"] = ev.reason
+            card_info["all_reasons"] = ev.all_reasons
+            card_info["tier"] = ev.tier
+            card_info["best_pair"] = ev.best_pair
+            card_info["per_pair_scores"] = ev.per_pair_scores
+            # Backfill alsa/iwd from 17lands
+            if set_code and "Unknown" not in card_info["name"]:
+                stats = draft_stats_cache.get_draft_rating(card_info["name"], set_code)
+                if stats:
+                    card_info["alsa"] = stats.alsa
+                    card_info["iwd"] = stats.iwd
+        elif set_code and "Unknown" not in card_info["name"]:
+            # Fallback: get 17lands stats directly if composite eval missed this card
             stats = draft_stats_cache.get_draft_rating(
-                card_info["name"], draft_state.set_code
+                card_info["name"], set_code
             )
             if stats:
                 card_info["gih_wr"] = stats.gih_wr
@@ -1641,12 +1712,15 @@ def get_draft_pack() -> dict[str, Any]:
 
         cards.append(card_info)
 
-    # Sort by GIH win rate (highest first)
-    cards.sort(key=lambda c: c.get("gih_wr") or 0, reverse=True)
+    # Sort by composite score if available, fall back to GIH WR
+    if eval_map:
+        cards.sort(key=lambda c: c.get("composite_score") or 0, reverse=True)
+    else:
+        cards.sort(key=lambda c: c.get("gih_wr") or 0, reverse=True)
 
     # Get picked card details
     picked = []
-    for grp_id in draft_state.picked_cards:
+    for grp_id in picked_cards:
         enriched = enrich_with_oracle_text(grp_id)
         picked.append(enriched)
 
@@ -1655,8 +1729,8 @@ def get_draft_pack() -> dict[str, Any]:
         "is_sealed": draft_state.is_sealed,
         "event_name": draft_state.event_name,
         "set_code": draft_state.set_code,
-        "pack_number": draft_state.pack_number,
-        "pick_number": draft_state.pick_number,
+        "pack_number": pack_number,
+        "pick_number": pick_number,
         "picks_per_pack": draft_state.picks_per_pack,
         "cards": cards,
         "picked_cards": picked,

@@ -167,6 +167,15 @@ class ActionPlanner:
         self._timeout = timeout
         # Recent planning diagnostics ring buffer for debug reports
         self._recent_diagnostics: list[dict[str, Any]] = []
+        # Turn-consistency memo: cache the last plan we produced for a turn
+        # so subsequent priority windows in the same turn see it and are
+        # nudged to stay committed to the same strategy instead of re-reasoning
+        # from scratch. Cleared on turn change.
+        self._turn_memo_turn: int = -1
+        self._turn_memo: Optional[ActionPlan] = None
+        # Executed actions this turn (by string repr); used to tell the LLM
+        # "you already did X" in subsequent priority windows.
+        self._turn_executed: list[str] = []
 
     def plan_actions(
         self,
@@ -192,10 +201,32 @@ class ActionPlanner:
         effective_legal_actions = self._filter_legal_actions_for_planning(
             game_state, legal_actions or []
         )
+
+        # Clear turn memo on turn change, and record what was executed in the
+        # previous window so the next prompt sees it.
+        current_turn = game_state.get("turn", {}).get("turn_number", 0)
+        if current_turn != self._turn_memo_turn:
+            if self._turn_memo:
+                logger.debug(
+                    f"Turn changed ({self._turn_memo_turn} -> {current_turn}), "
+                    "clearing planner memo"
+                )
+            self._turn_memo = None
+            self._turn_memo_turn = current_turn
+            self._turn_executed = []
+        # Mark the last-memoized action as executed if we're in a new priority
+        # window of the same turn (the action we proposed last time either
+        # fired or became irrelevant — either way, don't re-propose it).
+        elif self._turn_memo and self._turn_memo.actions:
+            last = self._turn_memo.actions[0]
+            last_repr = f"{last.action_type.value}({last.card_name})" if last.card_name else last.action_type.value
+            if last_repr not in self._turn_executed:
+                self._turn_executed.append(last_repr)
+
         diag: dict[str, Any] = {
             "timestamp": time.time(),
             "trigger": trigger,
-            "turn": game_state.get("turn", {}).get("turn_number", 0),
+            "turn": current_turn,
             "legal_actions": legal_actions,
             "effective_legal_actions": effective_legal_actions,
             "decision_context_type": (decision_context or {}).get("type"),
@@ -209,11 +240,24 @@ class ActionPlanner:
         )
         diag["prompt_len"] = len(user_message)
 
-        # Call LLM with enforced timeout
+        # Call LLM with enforced timeout.
+        # Use temperature=0 for deterministic planning — avoids different
+        # actions being proposed across priority windows in the same turn.
+        # Backends that don't accept the kwarg (older local backends) fall
+        # back to their default temperature.
         import concurrent.futures
+
+        def _complete() -> str:
+            try:
+                return self._backend.complete(
+                    system_prompt, user_message, 400, temperature=0.0
+                )
+            except TypeError:
+                return self._backend.complete(system_prompt, user_message)
+
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(self._backend.complete, system_prompt, user_message)
+                future = pool.submit(_complete)
                 response = future.result(timeout=self._timeout)
             elapsed = (time.perf_counter() - start) * 1000
             logger.info(f"Action planning took {elapsed:.0f}ms")
@@ -234,8 +278,15 @@ class ActionPlanner:
         diag["response_len"] = len(response) if response else 0
         diag["response_preview"] = (response or "")[:300]
 
-        # Parse response
-        plan = self._parse_response(response, effective_legal_actions)
+        # Parse response — pass bridge request + decision context so we can
+        # accept decision-type actions (select_n, search_library, etc.) even
+        # when legal_actions is stale.
+        plan = self._parse_response(
+            response,
+            effective_legal_actions,
+            decision_context=decision_context,
+            bridge_request=game_state.get("_bridge_request_type"),
+        )
         plan.trigger = trigger
         plan.turn_number = game_state.get("turn", {}).get("turn_number", 0)
 
@@ -267,6 +318,13 @@ class ActionPlanner:
         diag["planned_actions"] = len(plan.actions)
         diag["strategy"] = plan.overall_strategy
         self._record_diagnostic(diag)
+
+        # Cache the plan as the turn memo so subsequent priority windows see
+        # it and stay consistent. Skip caching for mulligan and pass-only
+        # plans (no commitment to preserve).
+        if plan.actions and plan.actions[0].action_type.value not in ("pass_priority", "mulligan_keep", "mulligan_mull"):
+            self._turn_memo = plan
+            self._turn_memo_turn = current_turn
 
         logger.info(f"Planned {len(plan.actions)} actions: {plan.overall_strategy}")
         return plan
@@ -455,6 +513,30 @@ class ActionPlanner:
             context,
         ]
 
+        # Turn-consistency context: if we already planned something this turn,
+        # show the LLM what we promised and what's been executed, so it stays
+        # committed to the same strategy instead of re-reasoning from scratch
+        # (avoids the "play Forest → then cast Giant instead of Ogre" flip).
+        current_turn = game_state.get("turn", {}).get("turn_number", 0)
+        if self._turn_memo and self._turn_memo_turn == current_turn:
+            consistency_lines = [
+                "\nTURN CONSISTENCY CONTEXT:",
+                f"- Earlier this turn you planned: {self._turn_memo.overall_strategy}",
+            ]
+            if self._turn_memo.voice_advice:
+                consistency_lines.append(f"- You told the player: \"{self._turn_memo.voice_advice}\"")
+            if self._turn_executed:
+                consistency_lines.append(
+                    f"- Already executed this turn: {', '.join(self._turn_executed)}"
+                )
+            consistency_lines.append(
+                "- STAY COMMITTED to the strategy above unless the board has "
+                "materially changed (opponent response, unexpected trigger, "
+                "lethal threat). Do NOT flip-flop to a different plan just "
+                "because you could."
+            )
+            parts.append("\n".join(consistency_lines))
+
         if legal_actions:
             parts.append(f"\nLegal: {', '.join(legal_actions)}")
 
@@ -555,7 +637,13 @@ class ActionPlanner:
 
         return "\n".join(parts)
 
-    def _parse_response(self, response: str, legal_actions: list[str]) -> ActionPlan:
+    def _parse_response(
+        self,
+        response: str,
+        legal_actions: list[str],
+        decision_context: Optional[dict[str, Any]] = None,
+        bridge_request: Optional[str] = None,
+    ) -> ActionPlan:
         """Parse LLM response into an ActionPlan.
 
         Handles markdown fences, trailing commas, missing fields, and
@@ -587,13 +675,18 @@ class ActionPlanner:
         # Parse actions
         for action_data in data.get("actions", []):
             action = self._parse_action(action_data)
-            if action and self._is_action_legal(action, legal_actions):
+            if action and self._is_action_legal(
+                action, legal_actions, decision_context, bridge_request
+            ):
                 plan.actions.append(action)
             elif action:
                 logger.warning(
-                    "Dropping illegal planner action: %s (%s) not in %s",
+                    "Dropping illegal planner action: %s (%s) bridge_request=%r "
+                    "decision=%r not in %s",
                     action.action_type.value,
                     action.card_name,
+                    bridge_request,
+                    (decision_context or {}).get("type"),
                     legal_actions,
                 )
 
@@ -633,8 +726,43 @@ class ActionPlanner:
             return plan
 
         plan.actions = [action]
-        plan.overall_strategy = f"Fallback from legal action: {selected}"
+        # Produce human-readable strategy AND voice advice so the TTS/overlay
+        # have natural output instead of the debug "Fallback from legal action: X"
+        # string. We also tag the strategy with [auto-pick] so bug reports can
+        # still distinguish fallback cases, but the user-facing advice is clean.
+        plan.overall_strategy = f"[auto-pick] {selected}"
+        plan.voice_advice = self._humanize_legal_action(selected)
         return plan
+
+    @staticmethod
+    def _humanize_legal_action(legal: str) -> str:
+        """Turn a legal-action string into a short speakable sentence."""
+        s = (legal or "").strip()
+        if not s:
+            return ""
+        low = s.lower()
+        if low.startswith("play land:"):
+            card = s.split(":", 1)[1].strip()
+            return f"Play {card}."
+        if low.startswith("cast "):
+            # strip trailing tags like "[OK]"
+            name = s[5:].strip()
+            name = re.sub(r"\s*\[[^\]]*\]\s*$", "", name)
+            return f"Cast {name}."
+        if low.startswith("attack with:"):
+            name = s.split(":", 1)[1].strip()
+            return f"Attack with {name}."
+        if low.startswith("declare attackers:"):
+            return f"Attack with {s.split(':', 1)[1].strip()}."
+        if low.startswith("block with:"):
+            return f"Block with {s.split(':', 1)[1].strip()}."
+        if low.startswith("activate "):
+            return f"Activate {s[9:].strip()}."
+        if "done" in low and "confirm" in low:
+            return "Confirm."
+        if low.startswith("pass"):
+            return "Pass."
+        return s
 
     @staticmethod
     def _match_legal_action_in_text(response: str, legal_actions: list[str]) -> Optional[str]:
@@ -725,8 +853,88 @@ class ActionPlanner:
 
         return None
 
-    def _is_action_legal(self, action: GameAction, legal_actions: list[str]) -> bool:
-        """Require planner output to map to a current legal action."""
+    # Action types that correspond to decision-specific GRE requests
+    # (SelectN, SearchRequest, DistributionReq, NumericInputReq, etc.).
+    # For these, the `legal_actions` list is often stale (it's from the
+    # prior ActionsAvailable window) because MTGA doesn't re-send an
+    # ActionsAvailable while the decision is pending. The bridge request
+    # type or decision_context.type is the authoritative signal.
+    _DECISION_ACTION_TYPES = frozenset({
+        ActionType.SELECT_N,
+        ActionType.SELECT_TARGET,
+        ActionType.SEARCH_LIBRARY,
+        ActionType.DISTRIBUTE,
+        ActionType.NUMERIC_INPUT,
+        ActionType.MODAL_CHOICE,
+        ActionType.CHOOSE_STARTING_PLAYER,
+        ActionType.ASSIGN_DAMAGE,
+        ActionType.ORDER_COMBAT_DAMAGE,
+        ActionType.ORDER_BLOCKERS,
+        ActionType.ORDER_TRIGGERS,
+        ActionType.PAY_COSTS,
+        ActionType.SELECT_REPLACEMENT,
+        ActionType.SELECT_COUNTERS,
+        ActionType.CASTING_OPTIONS,
+        ActionType.MULLIGAN_KEEP,
+        ActionType.MULLIGAN_MULL,
+    })
+
+    # Bridge request type → action type(s) that should be trusted for it
+    _BRIDGE_REQUEST_ACCEPTS: dict[str, set[ActionType]] = {
+        "SelectN":                 {ActionType.SELECT_N, ActionType.SELECT_TARGET, ActionType.SELECT_REPLACEMENT, ActionType.SELECT_COUNTERS},
+        "SelectTargets":           {ActionType.SELECT_TARGET, ActionType.SELECT_N},
+        "SelectReplacement":       {ActionType.SELECT_REPLACEMENT, ActionType.SELECT_N},
+        "Search":                  {ActionType.SEARCH_LIBRARY, ActionType.SELECT_N},
+        "SearchRequest":           {ActionType.SEARCH_LIBRARY, ActionType.SELECT_N},
+        "Distribution":            {ActionType.DISTRIBUTE},
+        "DistributionReq":         {ActionType.DISTRIBUTE},
+        "NumericInput":            {ActionType.NUMERIC_INPUT},
+        "NumericInputReq":         {ActionType.NUMERIC_INPUT},
+        "PayCosts":                {ActionType.PAY_COSTS},
+        "PayCostsReq":             {ActionType.PAY_COSTS},
+        "ChooseStartingPlayer":    {ActionType.CHOOSE_STARTING_PLAYER},
+        "Mulligan":                {ActionType.MULLIGAN_KEEP, ActionType.MULLIGAN_MULL},
+        "CastingTimeOption":       {ActionType.CASTING_OPTIONS, ActionType.MODAL_CHOICE, ActionType.NUMERIC_INPUT},
+        "CastingTimeOptions":      {ActionType.CASTING_OPTIONS, ActionType.MODAL_CHOICE},
+        "Group":                   {ActionType.ORDER_TRIGGERS, ActionType.ORDER_BLOCKERS},
+        "GroupReq":                {ActionType.ORDER_TRIGGERS, ActionType.ORDER_BLOCKERS},
+        "DeclareAttackers":        {ActionType.DECLARE_ATTACKERS},
+        "DeclareBlockers":         {ActionType.DECLARE_BLOCKERS},
+    }
+
+    def _is_action_legal(
+        self,
+        action: GameAction,
+        legal_actions: list[str],
+        decision_context: Optional[dict[str, Any]] = None,
+        bridge_request: Optional[str] = None,
+    ) -> bool:
+        """Require planner output to map to a current legal action.
+
+        For decision-specific actions (SelectN, Search, etc.) the bridge
+        request type is the authoritative signal — the legal_actions list
+        can be stale from the prior ActionsAvailable window.
+        """
+        # If this is a decision-type action and the bridge tells us a
+        # matching decision is pending, trust the planner's output.
+        if action.action_type in self._DECISION_ACTION_TYPES and bridge_request:
+            accepts = self._BRIDGE_REQUEST_ACCEPTS.get(bridge_request)
+            if accepts and action.action_type in accepts:
+                return True
+        # Similarly, if decision_context.type matches one of the decision
+        # family types, trust the planner.
+        if action.action_type in self._DECISION_ACTION_TYPES and decision_context:
+            ctx_type = str(decision_context.get("type") or "").lower()
+            # e.g. "selection_generic", "search_library", "distribute"
+            action_hint = action.action_type.value.lower()
+            if action_hint in ctx_type or ctx_type in action_hint:
+                return True
+            if ctx_type == "selection_generic" and action.action_type in (
+                ActionType.SELECT_N, ActionType.SELECT_TARGET,
+                ActionType.SELECT_REPLACEMENT, ActionType.SEARCH_LIBRARY,
+            ):
+                return True
+
         if not legal_actions:
             return True
 
@@ -737,16 +945,33 @@ class ActionPlanner:
         if action.action_type in (ActionType.DECLARE_ATTACKERS, ActionType.DECLARE_BLOCKERS):
             legal_names: set[str] = set()
             in_combat_context = False
+            # For the "Declare Attackers: A, B, C" summary line we can't
+            # safely comma-split because card names themselves may contain
+            # commas (e.g. "Lluwen, Imperfect Naturalist"). We prefer the
+            # individual "Attack with: X" lines, which are one-name-per-line.
+            has_individual_attack_lines = any(
+                la.lower().strip().startswith("attack with:") for la in legal_actions
+            )
             for legal_action in legal_actions:
                 low = legal_action.lower().strip()
                 if action.action_type == ActionType.DECLARE_ATTACKERS:
-                    if low.startswith("attack with:") or low.startswith("declare attackers:"):
+                    if low.startswith("attack with:"):
+                        # Exactly one creature per line; keep the full tail
+                        # (including any commas in the name).
                         tail = legal_action.split(":", 1)[1]
-                        for name in tail.split(","):
-                            clean = self._normalize_action_text(name).strip().lower()
-                            if clean:
-                                legal_names.add(clean)
+                        clean = self._normalize_action_text(tail).strip().lower()
+                        if clean:
+                            legal_names.add(clean)
                         in_combat_context = True
+                    elif low.startswith("declare attackers:"):
+                        in_combat_context = True
+                        if not has_individual_attack_lines:
+                            # Fallback comma-split only if no per-creature lines
+                            tail = legal_action.split(":", 1)[1]
+                            for name in tail.split(","):
+                                clean = self._normalize_action_text(name).strip().lower()
+                                if clean:
+                                    legal_names.add(clean)
                     elif "confirm attackers" in low:
                         in_combat_context = True
                 else:

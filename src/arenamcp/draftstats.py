@@ -16,6 +16,23 @@ logger = logging.getLogger(__name__)
 CACHE_DIR = Path.home() / ".arenamcp" / "cache" / "17lands"
 CACHE_MAX_AGE_HOURS = 24
 SEVENTEEN_LANDS_URL = "https://www.17lands.com/card_ratings/data"
+SEVENTEEN_LANDS_COLOR_URL = "https://www.17lands.com/color_ratings/data"
+
+# Mapping from color letter sets (sorted) to 17lands color_name keys.
+# 17lands formats names like "Mono-White (W)", "Azorius (WU)", "Bant (WUG)".
+# We parse on the parenthesized letters instead of the archetype name.
+COLOR_LETTERS = ("W", "U", "B", "R", "G")
+
+
+def _parse_color_key(color_name: str) -> Optional[str]:
+    """Extract parenthesized color letters from a 17lands color_name string."""
+    if "(" not in color_name or ")" not in color_name:
+        return None
+    letters = color_name[color_name.index("(") + 1 : color_name.index(")")].strip().upper()
+    if not letters or not all(c in COLOR_LETTERS for c in letters):
+        return None
+    # Normalize to WUBRG order
+    return "".join(c for c in COLOR_LETTERS if c in letters)
 
 
 @dataclass
@@ -28,6 +45,16 @@ class DraftStats:
     alsa: Optional[float]  # Average Last Seen At
     iwd: Optional[float]  # Improvement When Drawn
     games_in_hand: int  # Sample size for GIH WR
+
+
+@dataclass
+class ColorPairStats:
+    """17lands win rate and popularity for a color combination."""
+
+    color_key: str  # Normalized WUBRG-ordered letters, e.g. "WU", "BRG"
+    wins: int
+    games: int
+    win_rate: float  # wins/games (0.0-1.0), or overall baseline if games == 0
 
 
 class DraftStatsCache:
@@ -50,6 +77,8 @@ class DraftStatsCache:
 
         # In-memory cache: {set_code: {card_name_lower: DraftStats}}
         self._stats_cache: dict[str, dict[str, DraftStats]] = {}
+        # In-memory cache: {set_code: {color_key: ColorPairStats}}
+        self._color_cache: dict[str, dict[str, ColorPairStats]] = {}
 
     def _get_cache_path(self, set_code: str) -> Path:
         """Get path to the cached JSON file for a set."""
@@ -175,3 +204,80 @@ class DraftStatsCache:
             return None
 
         return set_data.get(card_name.lower())
+
+    # -- Color-pair win rates -----------------------------------------------
+
+    def _get_color_cache_path(self, set_code: str) -> Path:
+        return self._cache_dir / f"{set_code.upper()}_ColorRatings.json"
+
+    def _download_color_data(self, set_code: str) -> list[dict[str, Any]]:
+        """Download per-color-pair win rates from 17lands."""
+        url = (
+            f"{SEVENTEEN_LANDS_COLOR_URL}?expansion={set_code.upper()}"
+            f"&event_type=PremierDraft&start_date=2020-01-01&end_date=2099-12-31"
+        )
+        logger.info(f"Downloading 17lands color data from {url}...")
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        cache_path = self._get_color_cache_path(set_code)
+        cache_path.write_text(json.dumps(data), encoding="utf-8")
+        logger.info(f"Cached 17lands color data to {cache_path}")
+        return data
+
+    def _parse_color_data(self, raw: list[dict[str, Any]]) -> dict[str, ColorPairStats]:
+        result: dict[str, ColorPairStats] = {}
+        for row in raw:
+            name = row.get("color_name", "")
+            if row.get("is_summary"):
+                continue
+            key = _parse_color_key(name)
+            if key is None:
+                continue
+            wins = int(row.get("wins") or 0)
+            games = int(row.get("games") or 0)
+            if games <= 0:
+                continue
+            result[key] = ColorPairStats(
+                color_key=key,
+                wins=wins,
+                games=games,
+                win_rate=wins / games,
+            )
+        return result
+
+    def _load_color_data(self, set_code: str) -> dict[str, ColorPairStats]:
+        set_code = set_code.upper()
+        if set_code in self._color_cache:
+            return self._color_cache[set_code]
+
+        cache_path = self._get_color_cache_path(set_code)
+        if cache_path.exists() and self._file_cache.is_cache_valid(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to read cached color data for {set_code}: {e}")
+                raw = self._download_color_data(set_code)
+        else:
+            raw = self._download_color_data(set_code)
+
+        parsed = self._parse_color_data(raw)
+        self._color_cache[set_code] = parsed
+        logger.info(f"Loaded {len(parsed)} color-pair entries for {set_code}")
+        return parsed
+
+    def get_color_pair_stats(self, set_code: str) -> dict[str, ColorPairStats]:
+        """Return per-color-pair win rates for a set.
+
+        Keyed by normalized WUBRG-ordered color letters (e.g. "WU", "BRG").
+        Empty dict if the lookup fails.
+        """
+        try:
+            return self._load_color_data(set_code)
+        except requests.RequestException as e:
+            logger.warning(f"Failed to load 17lands color data for {set_code}: {e}")
+            return {}
+        except Exception as e:
+            logger.debug(f"Color data load failed for {set_code}: {e}")
+            return {}

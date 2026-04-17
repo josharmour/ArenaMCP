@@ -17,6 +17,13 @@ except ImportError:  # pragma: no cover - non-Windows
     winreg = None  # type: ignore[assignment]
 
 
+# Windows: suppress the console flash when we shell out from the GUI launcher.
+# Without this, every subprocess.run() below pops a brief cmd window which
+# makes the launcher appear to "flash" 6-8 times before the PySide window
+# becomes visible.
+_NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
 _SETTINGS_DIR = Path.home() / ".arenamcp"
 _SETTINGS_FILE = _SETTINGS_DIR / "settings.json"
 _COMMON_MTGA_PATHS = [
@@ -166,6 +173,7 @@ def _find_python_on_path() -> tuple[Optional[str], str]:
                 text=True,
                 timeout=3,
                 check=False,
+                creationflags=_NO_WINDOW_FLAGS,
             )
             if result.returncode == 0:
                 for line in result.stdout.splitlines():
@@ -182,6 +190,7 @@ def _find_python_on_path() -> tuple[Optional[str], str]:
                 text=True,
                 timeout=3,
                 check=False,
+                creationflags=_NO_WINDOW_FLAGS,
             )
             if result.returncode == 0:
                 for line in result.stdout.splitlines():
@@ -208,6 +217,7 @@ def _check_python_runtime(python_exe: Optional[str]) -> tuple[bool, str]:
             text=True,
             timeout=8,
             check=False,
+            creationflags=_NO_WINDOW_FLAGS,
         )
     except Exception as exc:
         return (False, str(exc))
@@ -339,6 +349,7 @@ def is_mtga_running() -> bool:
             text=True,
             timeout=3,
             check=False,
+            creationflags=_NO_WINDOW_FLAGS,
         )
         return "MTGA.exe" in result.stdout
     except Exception:
@@ -643,6 +654,7 @@ def close_mtga() -> bool:
         text=True,
         timeout=10,
         check=False,
+        creationflags=_NO_WINDOW_FLAGS,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip() or "taskkill failed"

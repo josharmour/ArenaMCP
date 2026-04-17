@@ -3,7 +3,7 @@ from __future__ import annotations
 import html
 from typing import Any, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -28,9 +28,17 @@ from .audio import AudioPlayback
 from .coach_process import CoachProcess
 from .theme import THEME_DARK, THEME_HIGH_CONTRAST, THEME_LIGHT, THEME_SYSTEM
 from .tts_manager import TtsManager
+from .card_overlay import CardOverlayWindow
+from .hud import DraftHudWindow
+from .match_overlay import MatchOverlayWindow
 
 
 class CoachTab(QWidget):
+    # Emitted when the Restart button is clicked — main_window handles the
+    # actual restart (stopping the old process + spawning a new one). Sending
+    # a pipe command to a dying process doesn't actually relaunch it.
+    restart_requested = Signal()
+
     _SUMMARY_FIELDS = [
         ("seat", "Seat"),
         ("coach", "Coach"),
@@ -41,7 +49,7 @@ class CoachTab(QWidget):
         super().__init__(parent)
         self._process: Optional[CoachProcess] = None
         self._tts = TtsManager(self)
-        self._all_log_lines: list[str] = []
+        self._all_log_lines: list[tuple[str, str]] = []  # (role, text)
         self._last_game_state = "Turn 0 waiting for MTGA..."
         self._last_game_state_payload: dict[str, Any] = {}
         self._status_labels: dict[str, QLabel] = {}
@@ -49,6 +57,17 @@ class CoachTab(QWidget):
         self._buttons: dict[str, QPushButton] = {}
         self._show_debug_logging = bool(get_settings().get("desktop_debug_logging", False))
         self._build_ui()
+        self._draft_hud = DraftHudWindow()
+        self._draft_hud.command_requested.connect(self._handle_hud_command)
+        self._draft_hud.debug_report_requested.connect(self._submit_debug_report)
+        self._card_overlay = CardOverlayWindow()
+        # Match overlay gets a bridge accessor so it can poll Unity for
+        # ground-truth card screen rects. The bridge lives in the coach
+        # child process, so we route via an IPC query; for now this is
+        # a no-op callable until we wire up that query path.
+        self._match_overlay = MatchOverlayWindow(bridge_getter=self._get_match_bridge)
+        self._draft_hud.card_overlay_toggled.connect(self._card_overlay.set_enabled)
+        self._draft_hud.calibration_toggled.connect(self._card_overlay.set_calibration)
         self._tts.log_line.connect(self._handle_tts_log)
         self._tts.status_line.connect(self._handle_tts_status)
         self._tts.error_line.connect(lambda text: self.append_log(f"TTS: {text}", role="error"))
@@ -69,6 +88,13 @@ class CoachTab(QWidget):
         self.append_log("Coach process started.", role="status")
 
     def detach_process(self) -> None:
+        self._draft_hud.hide_overlay()
+        self._card_overlay.hide_overlay()
+        try:
+            self._match_overlay.clear_actions()
+            self._match_overlay.on_match_active(False)
+        except Exception:
+            pass
         if self._process is None:
             return
 
@@ -82,32 +108,67 @@ class CoachTab(QWidget):
 
     def shutdown(self) -> None:
         self._tts.shutdown()
+        self._draft_hud.close()
+        self._card_overlay.close()
+        self._match_overlay.close()
 
     def set_debug_logging(self, enabled: bool) -> None:
         self._show_debug_logging = bool(enabled)
+        # Re-render the log view so previously hidden (or previously shown)
+        # lines match the new filter setting.
+        self._rerender_log()
+
+    # Roles always shown to the user, even when debug logging is off. These
+    # are the pertinent ones: coaching advice, coach headers, and errors.
+    # All other roles (status/dim/debug/default) are hidden unless the
+    # View → Show Debug Logging toggle is on.
+    _PERTINENT_LOG_ROLES = frozenset({"advice", "header", "error"})
+
+    _LOG_COLORS = {
+        "advice": "#69d46c",
+        "header": "#b48cff",
+        "error": "#ff6666",
+        "status": "#64c8dc",
+        "dim": "#8a8a8a",
+        "debug": "#6b7280",
+        "default": "#d7d7d7",
+    }
 
     def append_log(self, text: str, role: str = "default") -> None:
-        self._all_log_lines.append(text)
+        # Keep the full history (role + text) so we can re-render when the
+        # Show Debug Logging toggle flips.
+        self._all_log_lines.append((role, text))
         if len(self._all_log_lines) > 500:
             self._all_log_lines = self._all_log_lines[-500:]
 
-        if role == "debug" and not self._show_debug_logging:
+        if not self._is_role_visible(role):
             return
 
-        colors = {
-            "advice": "#69d46c",
-            "header": "#b48cff",
-            "error": "#ff6666",
-            "status": "#64c8dc",
-            "dim": "#8a8a8a",
-            "debug": "#6b7280",
-            "default": "#d7d7d7",
-        }
-        color = colors.get(role, colors["default"])
+        self._render_log_line(role, text)
+
+    def _is_role_visible(self, role: str) -> bool:
+        if self._show_debug_logging:
+            return True
+        return role in self._PERTINENT_LOG_ROLES
+
+    def _render_log_line(self, role: str, text: str) -> None:
+        color = self._LOG_COLORS.get(role, self._LOG_COLORS["default"])
         escaped = html.escape(text).replace("\n", "<br>")
-        self.log_view.append(f"<span style='color:{color}; font-family:Consolas;'>{escaped}</span>")
+        self.log_view.append(
+            f"<span style='color:{color}; font-family:Consolas;'>{escaped}</span>"
+        )
         scroll_bar = self.log_view.verticalScrollBar()
         scroll_bar.setValue(scroll_bar.maximum())
+
+    def _rerender_log(self) -> None:
+        """Rebuild the log view from history so the current filter takes effect
+        for historical lines as well as new ones.
+        """
+        self.log_view.clear()
+        for role, text in self._all_log_lines:
+            if not self._is_role_visible(role):
+                continue
+            self._render_log_line(role, text)
 
     def _handle_tts_log(self, text: str) -> None:
         self.append_log(text, role="debug")
@@ -122,16 +183,36 @@ class CoachTab(QWidget):
         root.setSpacing(10)
 
         top_panel = QWidget()
+        # Maximum vertical size policy — the top panel only takes the space
+        # it needs. When Status is collapsed, this reclaims the empty
+        # whitespace for the Game State / Coach Log panels below.
+        from PySide6.QtWidgets import QSizePolicy
+        top_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         top_layout = QVBoxLayout(top_panel)
         top_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.setSpacing(10)
+        top_layout.setSpacing(4)
 
-        status_box = QGroupBox("Status")
-        status_box.setCheckable(True)
-        status_box.setChecked(False)
-        status_layout = QVBoxLayout(status_box)
-        status_layout.setContentsMargins(8, 8, 8, 8)
-        status_layout.setSpacing(6)
+        # Status section: single collapse/expand toggle, no checkbox.
+        status_container = QWidget()
+        status_outer = QVBoxLayout(status_container)
+        status_outer.setContentsMargins(0, 0, 0, 0)
+        status_outer.setSpacing(4)
+
+        status_header = QHBoxLayout()
+        status_header.setContentsMargins(0, 0, 0, 0)
+        status_header.setSpacing(6)
+        self._status_toggle_btn = QPushButton("▶ Status")
+        self._status_toggle_btn.setFlat(True)
+        self._status_toggle_btn.setCursor(Qt.PointingHandCursor)
+        self._status_toggle_btn.setStyleSheet(
+            "QPushButton { text-align: left; padding: 4px 8px; "
+            "font-weight: 600; border: none; } "
+            "QPushButton:hover { background: rgba(255,255,255,0.05); }"
+        )
+        self._status_toggle_btn.clicked.connect(self._toggle_status_section)
+        status_header.addWidget(self._status_toggle_btn)
+        status_header.addStretch()
+        status_outer.addLayout(status_header)
 
         summary_row = QHBoxLayout()
         summary_row.setSpacing(18)
@@ -151,22 +232,19 @@ class CoachTab(QWidget):
             self._status_labels[key] = value
         self._status_content = QWidget()
         self._status_content.setLayout(summary_row)
-        status_layout.addWidget(self._status_content)
         self._status_content.setVisible(False)
-        status_box.toggled.connect(self._status_content.setVisible)
-        top_layout.addWidget(status_box)
+        status_outer.addWidget(self._status_content)
+        top_layout.addWidget(status_container)
 
         button_row = QHBoxLayout()
         commands = [
             ("Mode", "cycle_mode"),
             ("Model", "cycle_model"),
-            ("Style", "toggle_style"),
+            ("Quick", "toggle_style"),
             ("Voice", "cycle_voice"),
             ("Speed", "cycle_speed"),
             ("Mute", "toggle_mute"),
             ("AP", "toggle_autopilot"),
-            ("AFK", "toggle_afk"),
-            ("Land Only", "toggle_land_only"),
             ("Analyze Match", "analyze_match"),
             ("Screen", "analyze_screen"),
             ("Win Plan", "read_win_plan"),
@@ -180,6 +258,51 @@ class CoachTab(QWidget):
         debug_button = QPushButton("Debug Report")
         debug_button.clicked.connect(self._submit_debug_report)
         button_row.addWidget(debug_button)
+
+        # Match-overlay calibration: draws a thin outline around every card
+        # the plugin detects, so we can verify ground-truth positions align.
+        match_calib_button = QPushButton("Match Calib")
+        match_calib_button.setCheckable(True)
+        match_calib_button.setToolTip("Show outline around every card the BepInEx plugin reports")
+        match_calib_button.clicked.connect(
+            lambda checked: self._match_overlay.set_calibration(checked)
+        )
+        button_row.addWidget(match_calib_button)
+
+        # Overlay visibility toggle — hide the whole in-game overlay when
+        # it's covering MTGA content.
+        self._overlay_toggle_btn = QPushButton("Overlay")
+        self._overlay_toggle_btn.setCheckable(True)
+        self._overlay_toggle_btn.setChecked(True)  # default: on
+        self._overlay_toggle_btn.setToolTip("Show/hide the in-game overlay (pill + advice panel)")
+        self._overlay_toggle_btn.clicked.connect(
+            lambda checked: self._match_overlay.set_enabled(checked)
+        )
+        button_row.addWidget(self._overlay_toggle_btn)
+
+        # Advice panel corner cycle — click to move the panel between the
+        # four corners of MTGA.
+        self._advice_anchor_btn = QPushButton("Advice Corner")
+        self._advice_anchor_btn.setToolTip("Click to move the advice panel to a different corner")
+        self._advice_anchor_btn.clicked.connect(self._cycle_advice_anchor)
+        button_row.addWidget(self._advice_anchor_btn)
+
+        # Fallback mode — when the GRE bridge can't submit an action, either
+        # ask the user to act (advice) or let autopilot click the cards via
+        # mouse (mouse). "advice" is safer; "mouse" is what older versions
+        # did and can steal the cursor.
+        self._fallback_btn = QPushButton("Fallback: Advice")
+        self._fallback_btn.setToolTip(
+            "Toggle how autopilot handles actions the bridge can't submit:\n"
+            " Advice: warn the user to act manually (default, no mouse)\n"
+            " Mouse: fall back to clicking the cards (can grab your cursor)"
+        )
+        self._fallback_btn.clicked.connect(
+            lambda _checked=False: self._send_command("toggle_fallback_mode")
+        )
+        self._buttons["toggle_fallback_mode"] = self._fallback_btn
+        button_row.addWidget(self._fallback_btn)
+
         top_layout.addLayout(button_row)
 
         game_box = QGroupBox("Game State")
@@ -204,14 +327,12 @@ class CoachTab(QWidget):
         content_splitter.setStretchFactor(1, 2)
         content_splitter.setSizes([900, 700])
 
-        main_splitter = QSplitter(Qt.Vertical)
-        main_splitter.setChildrenCollapsible(True)
-        main_splitter.addWidget(top_panel)
-        main_splitter.addWidget(content_splitter)
-        main_splitter.setStretchFactor(0, 0)
-        main_splitter.setStretchFactor(1, 1)
-        main_splitter.setSizes([140, 860])
-        root.addWidget(main_splitter, stretch=1)
+        # Put the top panel directly above the content splitter so the top
+        # panel only takes its natural (minimum) height — no wasted space
+        # when Status is collapsed. The content splitter gets all remaining
+        # vertical room.
+        root.addWidget(top_panel)
+        root.addWidget(content_splitter, stretch=1)
 
         chat_row = QHBoxLayout()
         self.chat_input = QLineEdit()
@@ -233,6 +354,13 @@ class CoachTab(QWidget):
             self._process.send_command("chat", text)
 
     def _send_command(self, command: str) -> None:
+        # Restart is handled by the main window (stop + relaunch process).
+        # Sending a pipe command to a dying process doesn't relaunch it.
+        if command == "restart":
+            self.append_log("Restarting coach...", role="status")
+            self.restart_requested.emit()
+            return
+
         if self._process is None:
             return
 
@@ -245,19 +373,153 @@ class CoachTab(QWidget):
 
         self._process.send_command(command)
 
+    def _handle_hud_command(self, command: str) -> None:
+        """Route commands from the overlay HUD buttons."""
+        self._send_command(command)
+
+    def _cycle_advice_anchor(self) -> None:
+        """Move the match overlay's advice panel to the next corner."""
+        try:
+            new_anchor = self._match_overlay.cycle_advice_anchor()
+            self.append_log(f"Advice panel: {new_anchor}", role="status")
+        except Exception as exc:
+            self.append_log(f"Failed to move advice panel: {exc}", role="error")
+
+    def _toggle_status_section(self) -> None:
+        """Collapse/expand the Status section."""
+        expanded = not self._status_content.isVisible()
+        self._status_content.setVisible(expanded)
+        self._status_toggle_btn.setText("▼ Status" if expanded else "▶ Status")
+
+    def _get_match_bridge(self):
+        """Return a GREBridge instance for the match overlay to query card
+        positions directly from the BepInEx plugin.
+
+        The overlay runs in the UI process, which doesn't own the bridge
+        the coach process uses — but the bridge is a named-pipe server in
+        Python and the plugin is the client, so multiple Python readers
+        are fine. We lazily create our own bridge instance here.
+        """
+        bridge = getattr(self, "_overlay_bridge", None)
+        if bridge is not None:
+            return bridge
+        try:
+            from arenamcp.gre_bridge import get_bridge
+            bridge = get_bridge()
+            self._overlay_bridge = bridge
+            return bridge
+        except Exception as e:
+            self.append_log(f"Match overlay bridge unavailable: {e}", role="debug")
+            return None
+
     def _submit_debug_report(self) -> None:
+        """Debug Report flow:
+          0. Capture screenshots of both the coach window and MTGA window.
+          1. Save the local JSON report (referencing those screenshots).
+          2. Copy the JSON path to the clipboard.
+          3. Offer to upload to GitHub with an optional description.
+        """
         if self._process is None:
             self.append_log("Coach process is not running.", role="error")
             return
+        self.append_log("Saving local debug report...", role="status")
 
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            self._last_debug_screenshot_paths = self._capture_debug_screenshots(ts)
+            if self._last_debug_screenshot_paths:
+                self.append_log(
+                    f"Screenshots captured: {list(self._last_debug_screenshot_paths.keys())}",
+                    role="status",
+                )
+        except Exception as e:
+            self.append_log(f"Screenshot capture failed: {e}", role="error")
+            self._last_debug_screenshot_paths = {}
+
+        self._pending_bug_report_save = True
+        # Send screenshot paths so the child can embed them in the JSON report
+        self._process.send_payload({
+            "cmd": "debug_report",
+            "screenshots": self._last_debug_screenshot_paths,
+            "timestamp_hint": ts,
+        })
+
+    def _capture_debug_screenshots(self, timestamp: str) -> dict[str, str]:
+        """Grab the coach window + MTGA window as PNGs into the bug_reports
+        directory. Returns {'coach': path, 'mtga': path} with any that
+        succeeded. Missing entries mean the capture failed for that target.
+        """
+        from pathlib import Path
+        try:
+            from arenamcp.logging_config import LOG_DIR
+            bug_dir = Path(LOG_DIR) / "bug_reports"
+        except Exception:
+            bug_dir = Path.home() / ".arenamcp" / "logs" / "bug_reports"
+        bug_dir.mkdir(parents=True, exist_ok=True)
+
+        out: dict[str, str] = {}
+
+        # 1. Coach PySide window — Qt native grab (DPI-aware, no focus needed)
+        try:
+            win = self.window()
+            if win is not None:
+                pix = win.grab()
+                if not pix.isNull():
+                    coach_path = bug_dir / f"bug_{timestamp}_coach.png"
+                    if pix.save(str(coach_path), "PNG"):
+                        out["coach"] = str(coach_path)
+        except Exception as e:
+            self.append_log(f"Coach screenshot failed: {e}", role="debug")
+
+        # 2. MTGA window — bounds from pygetwindow, grab via PIL ImageGrab
+        try:
+            import pygetwindow as gw  # type: ignore
+            from PIL import ImageGrab
+            wins = [w for w in gw.getWindowsWithTitle("MTGA") if w.title == "MTGA"]
+            if wins:
+                w = wins[0]
+                if not w.isMinimized:
+                    bbox = (w.left, w.top, w.left + w.width, w.top + w.height)
+                    img = ImageGrab.grab(bbox=bbox, all_screens=True)
+                    mtga_path = bug_dir / f"bug_{timestamp}_mtga.png"
+                    img.save(str(mtga_path), "PNG")
+                    out["mtga"] = str(mtga_path)
+        except Exception as e:
+            self.append_log(f"MTGA screenshot failed: {e}", role="debug")
+
+        return out
+
+    def _on_bug_report_saved(self, path: str, error: str) -> None:
+        """Handler for `bug_report_saved` pipe event: copy path + offer upload."""
+        if not getattr(self, "_pending_bug_report_save", False):
+            return
+        self._pending_bug_report_save = False
+
+        if error or not path:
+            self.append_log(f"Failed to save debug report: {error or 'no path'}", role="error")
+            return
+
+        # Step 2: copy path to clipboard
+        try:
+            from PySide6.QtWidgets import QApplication
+            QApplication.clipboard().setText(path)
+            self.append_log(f"Debug report saved and copied to clipboard: {path}", role="status")
+        except Exception as exc:
+            self.append_log(f"Saved to {path} (clipboard copy failed: {exc})", role="status")
+
+        # Step 3: offer to upload to GitHub
         note, ok = QInputDialog.getText(
             self,
-            "Debug Report",
-            "What went wrong? This will save a local report and try to create a GitHub issue.",
+            "Upload Debug Report",
+            f"Report saved to:\n{path}\n\n"
+            "To upload to GitHub, enter a description (or cancel to skip):",
         )
         if not ok:
+            self.append_log("Debug report kept locally (upload skipped).", role="dim")
             return
-        self.append_log("Submitting debug report...", role="status")
+
+        self.append_log("Uploading debug report to GitHub...", role="status")
         self._process.send_command("bugreport", note.strip())
 
     def _handle_event(self, payload: Any) -> None:
@@ -270,10 +532,47 @@ class CoachTab(QWidget):
         elif event_type == "advice":
             seat_info = str(payload.get("seat_info", ""))
             text = str(payload.get("text", ""))
-            self.append_log(f"COACH ({seat_info})", role="header")
-            self.append_log(text, role="advice")
+            is_autopilot = seat_info.strip().upper() == "AUTOPILOT"
+            t = text.strip()
+            is_strategic = (
+                t.startswith("PLAN:")
+                or t.startswith("MANUAL REQUIRED")
+                or "MANUAL REQUIRED" in t[:80]
+            )
+            if is_autopilot and not is_strategic:
+                role_header = "debug"
+                role_body = "debug"
+            else:
+                role_header = "header"
+                role_body = "advice"
+            self.append_log(f"COACH ({seat_info})", role=role_header)
+            self.append_log(text, role=role_body)
+            if not is_autopilot:
+                try:
+                    self._draft_hud.add_advice(text)
+                except Exception:
+                    pass
+            # Also show on the in-match overlay so the user can keep eyes
+            # on MTGA. Skip operational autopilot noise (already demoted
+            # to debug above); show only strategic content and real coach
+            # advice. Strip common plan-summary prefix for readability.
+            if is_strategic or not is_autopilot:
+                overlay_text = text
+                if overlay_text.startswith("PLAN:"):
+                    overlay_text = overlay_text[5:].strip()
+                try:
+                    self._match_overlay.set_advice(overlay_text, seat_info)
+                except Exception:
+                    pass
         elif event_type == "status":
-            self._update_status(str(payload.get("key", "")), str(payload.get("value", "")))
+            key = str(payload.get("key", ""))
+            value = str(payload.get("value", ""))
+            self._update_status(key, value)
+            if key == "AUTOPILOT":
+                try:
+                    self._draft_hud.update_autopilot("ON" in value)
+                except Exception:
+                    pass
         elif event_type == "error":
             self.append_log(f"ERROR: {payload.get('message', '')}", role="error")
         elif event_type == "subtask":
@@ -284,6 +583,49 @@ class CoachTab(QWidget):
             data = payload.get("data")
             if isinstance(data, dict):
                 self._update_game_state(data)
+                # Tell the match overlay when we're in an active game so
+                # it can start polling for card positions.
+                try:
+                    turn = data.get("turn") or {}
+                    # Multiple possible signals: explicit match flag, turn
+                    # number, or the presence of any player/battlefield data.
+                    has_turn = bool(
+                        turn.get("turn_number")
+                        or turn.get("number")
+                        or data.get("turn_number")
+                    )
+                    has_players = bool(
+                        data.get("players") or data.get("battlefield")
+                        or data.get("hand")
+                    )
+                    in_match = (
+                        bool(data.get("match_in_progress"))
+                        or bool(data.get("match_id"))
+                        or has_turn
+                        or has_players
+                    )
+                    self._match_overlay.on_match_active(in_match)
+                except Exception:
+                    pass
+        elif event_type == "suggested_actions":
+            actions = payload.get("actions") or []
+            try:
+                self._match_overlay.set_suggested_actions(actions)
+            except Exception as exc:
+                self.append_log(f"Match overlay update failed: {exc}", role="error")
+        elif event_type == "bug_report_saved":
+            self._on_bug_report_saved(str(payload.get("path", "")), str(payload.get("error", "")))
+        elif event_type == "draft_state":
+            data = payload.get("data")
+            if isinstance(data, dict):
+                try:
+                    self._draft_hud.update_draft_state(data)
+                except Exception as exc:
+                    self.append_log(f"Draft HUD update failed: {exc}", role="error")
+                try:
+                    self._card_overlay.update_draft_state(data)
+                except Exception as exc:
+                    self.append_log(f"Card overlay update failed: {exc}", role="error")
         elif event_type == "speak_request":
             self._tts.request_speech(
                 text=str(payload.get("text", "")),
@@ -326,7 +668,10 @@ class CoachTab(QWidget):
         elif normalized in {"BRIDGE", "GRE"}:
             self._set_status_label("bridge", text)
         elif normalized == "STYLE":
-            self._set_button_text("toggle_style", "Style", self._compact_style_label(value))
+            # Button label IS the current mode (no "Style:" prefix).
+            button = self._buttons.get("toggle_style")
+            if button is not None:
+                button.setText(self._compact_style_label(value))
         elif normalized in {"VOICE", "VOICE_ID"}:
             self._set_button_text("cycle_voice", "Voice", self._compact_voice_label(value))
         elif normalized == "SPEED":
@@ -336,10 +681,15 @@ class CoachTab(QWidget):
         elif normalized == "AUTOPILOT":
             autopilot_text = self._normalize_autopilot(value)
             self._set_button_text("toggle_autopilot", "AP", autopilot_text)
-        elif normalized == "AFK":
-            self._set_button_text("toggle_afk", "AFK", value)
-        elif normalized == "LAND_ONLY":
-            self._set_button_text("toggle_land_only", "Land Only", value)
+        # AFK and Land Only buttons were removed from the UI — ignore the
+        # status emits so we don't try to update nonexistent buttons.
+        elif normalized in ("AFK", "LAND_ONLY"):
+            pass
+        elif normalized == "FALLBACK_MODE":
+            btn = self._buttons.get("toggle_fallback_mode")
+            if btn is not None:
+                mode = value.strip().lower() or "advice"
+                btn.setText(f"Fallback: {mode.capitalize()}")
 
     def _set_status_label(self, key: str, value: str) -> None:
         label = self._status_labels.get(key)
@@ -375,8 +725,13 @@ class CoachTab(QWidget):
         return clean
 
     def _compact_style_label(self, value: str) -> str:
-        clean = value.strip().upper()
-        return clean or "?"
+        """Map backend style value to the button label the user sees."""
+        clean = value.strip().lower()
+        if clean in ("quick", "concise"):
+            return "Quick"
+        if clean in ("chatty", "verbose"):
+            return "Chatty"
+        return value.strip().capitalize() or "?"
 
     def _compact_voice_label(self, value: str) -> str:
         clean = value.strip()

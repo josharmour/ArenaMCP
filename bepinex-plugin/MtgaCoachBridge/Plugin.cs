@@ -332,12 +332,20 @@ namespace MtgaCoachBridge
                     HandleGetGameState(cmd);
                     break;
 
+                case "get_draft_state":
+                    HandleGetDraftState(cmd);
+                    break;
+
                 case "get_timer_state":
                     HandleGetTimerState(cmd);
                     break;
 
                 case "get_match_info":
                     HandleGetMatchInfo(cmd);
+                    break;
+
+                case "get_card_positions":
+                    HandleGetCardPositions(cmd);
                     break;
 
                 case "enable_replay":
@@ -2027,6 +2035,95 @@ namespace MtgaCoachBridge
         // Phase 2: get_timer_state
         // -------------------------------------------------------------------
 
+        private void HandleGetDraftState(PipeCommand cmd)
+        {
+            var draftController = FindObjectOfType<Wotc.Mtga.Wrapper.Draft.DraftContentController>();
+            if (draftController == null)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = "DraftContentController not found" });
+                return;
+            }
+
+            var draftPod = draftController.DraftPod;
+            if (draftPod == null)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = "No active draft pod" });
+                return;
+            }
+
+            var resp = new JObject { ["ok"] = true };
+            try
+            {
+                resp["draft_mode"] = draftPod.DraftMode.ToString();
+                resp["pick_num_cards_to_take"] = draftPod.PickNumCardsToTake;
+
+                var packCardsObj = draftPod.GetType().GetProperty("CardsInPack", BindingFlags.Public | BindingFlags.Instance);
+                if (packCardsObj != null)
+                {
+                    var cardsList = packCardsObj.GetValue(draftPod) as System.Collections.IEnumerable;
+                    if (cardsList != null)
+                    {
+                        var cardsArr = new JArray();
+                        foreach (var cardGrpId in cardsList)
+                        {
+                            cardsArr.Add(Convert.ToInt32(cardGrpId));
+                        }
+                        resp["pack_cards"] = cardsArr;
+                    }
+                }
+
+                var packNumberObj = draftPod.GetType().GetProperty("PackNumber", BindingFlags.Public | BindingFlags.Instance);
+                if (packNumberObj != null) resp["pack_number"] = Convert.ToInt32(packNumberObj.GetValue(draftPod));
+                
+                var pickNumberObj = draftPod.GetType().GetProperty("PickNumber", BindingFlags.Public | BindingFlags.Instance);
+                if (pickNumberObj != null) resp["pick_number"] = Convert.ToInt32(pickNumberObj.GetValue(draftPod));
+
+                try
+                {
+                    var deckManagerField = draftController.GetType().GetField("_draftDeckManager", BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (deckManagerField != null)
+                    {
+                        var deckManager = deckManagerField.GetValue(draftController);
+                        if (deckManager != null)
+                        {
+                            var getDeckMethod = deckManager.GetType().GetMethod("GetDeck", BindingFlags.Public | BindingFlags.Instance);
+                            if (getDeckMethod != null)
+                            {
+                                var deck = getDeckMethod.Invoke(deckManager, null);
+                                if (deck != null)
+                                {
+                                    var mainDeckIdsProp = deck.GetType().GetProperty("MainDeckIds", BindingFlags.Public | BindingFlags.Instance);
+                                    var sideboardIdsProp = deck.GetType().GetProperty("SideboardIds", BindingFlags.Public | BindingFlags.Instance);
+                                    var pickedArr = new JArray();
+                                    
+                                    if (mainDeckIdsProp != null) {
+                                        var mainIds = mainDeckIdsProp.GetValue(deck) as System.Collections.IEnumerable;
+                                        if (mainIds != null) foreach(var id in mainIds) pickedArr.Add(Convert.ToInt32(id));
+                                    }
+                                    if (sideboardIdsProp != null) {
+                                        var sideboardIds = sideboardIdsProp.GetValue(deck) as System.Collections.IEnumerable;
+                                        if (sideboardIds != null) foreach(var id in sideboardIds) pickedArr.Add(Convert.ToInt32(id));
+                                    }
+                                    
+                                    resp["picked_cards"] = pickedArr;
+                                }
+                            }
+                        }
+                    }
+                }
+                catch(Exception ex)
+                {
+                    _log.LogWarning("Error getting drafted deck: " + ex.Message);
+                }
+
+                cmd.SetResponse(resp);
+            }
+            catch (Exception ex)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Error reading draft state: {ex.Message}" });
+            }
+        }
+
         private void HandleGetTimerState(PipeCommand cmd)
         {
             var gm = GetGameManager();
@@ -2811,6 +2908,171 @@ namespace MtgaCoachBridge
                 folder = System.IO.Path.Combine(Application.persistentDataPath, "Replays");
             }
             return folder;
+        }
+
+        // -------------------------------------------------------------------
+        // get_card_positions — return on-screen rectangles for every visible
+        // DuelScene_CDC (card GameObject) in the current match.
+        //
+        // Used by the Python desktop match overlay to highlight the suggested
+        // card or action directly on the game. This is the ground-truth
+        // replacement for screen_mapper heuristics.
+        // -------------------------------------------------------------------
+
+        private void HandleGetCardPositions(PipeCommand cmd)
+        {
+            try
+            {
+                var gm = GetGameManager();
+                if (gm == null)
+                {
+                    cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = "GameManager not found" });
+                    return;
+                }
+
+                var cam = gm.MainCamera;
+                if (cam == null)
+                {
+                    cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = "MainCamera not available" });
+                    return;
+                }
+
+                // Unity Screen.height is the game-render height (internal
+                // resolution). Python overlay uses MTGA window client-area
+                // bounds. Both should be the same in windowed mode.
+                int screenW = Screen.width;
+                int screenH = Screen.height;
+
+                var cards = new JArray();
+                // DuelScene_CDC extends BASE_CDC : MonoBehaviour — every
+                // visible in-match card inherits from it.
+                var cardObjs = UnityEngine.Object.FindObjectsOfType<DuelScene_CDC>();
+                foreach (var card in cardObjs)
+                {
+                    if (card == null) continue;
+
+                    bool visible = false;
+                    try { visible = card.IsVisible; } catch { }
+                    if (!visible) continue;
+
+                    uint instanceId = 0;
+                    string zone = "";
+                    uint grpId = 0;
+                    try
+                    {
+                        instanceId = card.InstanceId;
+                        if (card.Model != null)
+                        {
+                            zone = card.Model.ZoneType.ToString();
+                            try { grpId = (uint)card.Model.GrpId; } catch { }
+                        }
+                    }
+                    catch { }
+                    if (instanceId == 0) continue;
+
+                    // Project the card's bounds to screen space. Use the
+                    // 8 corners of the collider AABB and take min/max to
+                    // get a tight screen-space rectangle that accounts for
+                    // perspective foreshortening.
+                    float screenMinX = float.MaxValue;
+                    float screenMinY = float.MaxValue;
+                    float screenMaxX = float.MinValue;
+                    float screenMaxY = float.MinValue;
+                    bool anyFront = false;
+
+                    if (card.Collider != null)
+                    {
+                        var b = card.Collider.bounds;
+                        Vector3 ext = b.extents;
+                        for (int dx = -1; dx <= 1; dx += 2)
+                        for (int dy = -1; dy <= 1; dy += 2)
+                        for (int dz = -1; dz <= 1; dz += 2)
+                        {
+                            var corner = new Vector3(
+                                b.center.x + dx * ext.x,
+                                b.center.y + dy * ext.y,
+                                b.center.z + dz * ext.z);
+                            var sp = cam.WorldToScreenPoint(corner);
+                            if (sp.z < 0) continue; // behind camera
+                            anyFront = true;
+                            if (sp.x < screenMinX) screenMinX = sp.x;
+                            if (sp.y < screenMinY) screenMinY = sp.y;
+                            if (sp.x > screenMaxX) screenMaxX = sp.x;
+                            if (sp.y > screenMaxY) screenMaxY = sp.y;
+                        }
+                    }
+                    else if (card.Root != null)
+                    {
+                        var sp = cam.WorldToScreenPoint(card.Root.position);
+                        if (sp.z < 0) continue;
+                        anyFront = true;
+                        // Fallback: fixed-size rect around the card center
+                        float halfW = 60f;
+                        float halfH = 84f;
+                        screenMinX = sp.x - halfW;
+                        screenMinY = sp.y - halfH;
+                        screenMaxX = sp.x + halfW;
+                        screenMaxY = sp.y + halfH;
+                    }
+                    else
+                    {
+                        continue;
+                    }
+
+                    if (!anyFront) continue;
+
+                    // Unity uses BOTTOM-LEFT origin for screen coords.
+                    // Python overlays use TOP-LEFT origin (Windows convention),
+                    // so flip Y. Also clamp to [0, screenW/H] to avoid NaN.
+                    float pxLeft = Mathf.Clamp(screenMinX, 0f, screenW);
+                    float pxRight = Mathf.Clamp(screenMaxX, 0f, screenW);
+                    float pxBottom = Mathf.Clamp(screenMinY, 0f, screenH);
+                    float pxTop = Mathf.Clamp(screenMaxY, 0f, screenH);
+
+                    // Flip Y
+                    float flippedTop = screenH - pxTop;
+                    float flippedBottom = screenH - pxBottom;
+
+                    float rectX = pxLeft;
+                    float rectY = flippedTop;
+                    float rectW = Mathf.Max(0f, pxRight - pxLeft);
+                    float rectH = Mathf.Max(0f, flippedBottom - flippedTop);
+
+                    var entry = new JObject
+                    {
+                        ["instance_id"] = instanceId,
+                        ["grp_id"] = grpId,
+                        ["zone"] = zone,
+                        ["x"] = Mathf.RoundToInt(rectX),
+                        ["y"] = Mathf.RoundToInt(rectY),
+                        ["w"] = Mathf.RoundToInt(rectW),
+                        ["h"] = Mathf.RoundToInt(rectH),
+                        ["nx"] = screenW > 0 ? rectX / screenW : 0f,
+                        ["ny"] = screenH > 0 ? rectY / screenH : 0f,
+                        ["nw"] = screenW > 0 ? rectW / screenW : 0f,
+                        ["nh"] = screenH > 0 ? rectH / screenH : 0f,
+                    };
+                    cards.Add(entry);
+                }
+
+                cmd.SetResponse(new JObject
+                {
+                    ["ok"] = true,
+                    ["screen_w"] = screenW,
+                    ["screen_h"] = screenH,
+                    ["count"] = cards.Count,
+                    ["cards"] = cards,
+                });
+            }
+            catch (Exception e)
+            {
+                _log.LogError($"get_card_positions failed: {e}");
+                cmd.SetResponse(new JObject
+                {
+                    ["ok"] = false,
+                    ["error"] = $"Exception: {e.Message}"
+                });
+            }
         }
     }
 

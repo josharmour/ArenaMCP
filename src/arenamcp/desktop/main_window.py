@@ -36,6 +36,9 @@ class MainWindow(QMainWindow):
         self.repair_tab.restart_requested.connect(self.restart_coach)
         self.repair_tab.provisioning_changed.connect(self._handle_provisioning_changed)
         self.repair_tab.guided_setup_finished.connect(self._handle_guided_setup_finished)
+        # Restart button on the coach tab — reuses the repair tab's restart
+        # logic so state like autopilot/dry-run flags is preserved.
+        self.coach_tab.restart_requested.connect(self._restart_coach_keep_flags)
         tabs.addTab(self.coach_tab, "Coach")
         tabs.addTab(self.repair_tab, "Repair")
         self.tabs = tabs
@@ -61,10 +64,23 @@ class MainWindow(QMainWindow):
         self._launch_flags = (autopilot, dry_run, afk)
         if self._process is not None:
             self.coach_tab.detach_process()
-            self._process.stop()
-            self._process.deleteLater()
+            # Async stop — doesn't block the Qt main thread while the old
+            # process exits (old code did waitForFinished(3000) then a
+            # waitForFinished(2000) on kill, freezing the UI for up to 5s).
+            self._process.stop_async()
             self._process = None
-        self._start_coach(*self._launch_flags)
+        # Defer start slightly so the old process has a moment to release
+        # its stdio handles; this is non-blocking.
+        QTimer.singleShot(150, lambda: self._start_coach(*self._launch_flags))
+
+    def _restart_coach_keep_flags(self) -> None:
+        """Restart the coach with the most recent launch flags (autopilot, dry_run, afk).
+
+        Triggered by the coach tab's Restart button — avoids sending a pipe
+        command to a dying process (which wouldn't actually relaunch).
+        """
+        flags = getattr(self, "_launch_flags", (False, False, False))
+        self.restart_coach(*flags)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._closing = True

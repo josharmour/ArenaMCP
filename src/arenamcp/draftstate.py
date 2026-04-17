@@ -12,12 +12,60 @@ from typing import Any, Callable
 logger = logging.getLogger(__name__)
 
 
+# Draft type constants (matches MTGA event name prefixes)
+DRAFT_TYPE_UNKNOWN = "unknown"
+DRAFT_TYPE_PREMIER = "PremierDraft"
+DRAFT_TYPE_QUICK = "QuickDraft"
+DRAFT_TYPE_TRADITIONAL = "TradDraft"
+DRAFT_TYPE_PICK_TWO = "PickTwoDraft"
+DRAFT_TYPE_PICK_TWO_TRAD = "PickTwoTradDraft"
+DRAFT_TYPE_PICK_TWO_QUICK = "PickTwoQuickDraft"
+DRAFT_TYPE_SEALED = "Sealed"
+DRAFT_TYPE_SEALED_TRAD = "TradSealed"
+
+# Map event name prefixes → draft type.  Order matters: longer prefixes first
+# so "PickTwoTradDraft" matches before "PickTwoDraft" or "TradDraft".
+_DRAFT_TYPE_PREFIXES: list[tuple[str, str]] = [
+    ("PickTwoQuickDraft", DRAFT_TYPE_PICK_TWO_QUICK),
+    ("PickTwoTradDraft", DRAFT_TYPE_PICK_TWO_TRAD),
+    ("PickTwoDraft", DRAFT_TYPE_PICK_TWO),
+    ("PremierDraft", DRAFT_TYPE_PREMIER),
+    ("QuickDraft", DRAFT_TYPE_QUICK),
+    ("TradDraft", DRAFT_TYPE_TRADITIONAL),
+    ("TradSealed", DRAFT_TYPE_SEALED_TRAD),
+    ("Sealed", DRAFT_TYPE_SEALED),
+]
+
+_PICK_TWO_TYPES = {DRAFT_TYPE_PICK_TWO, DRAFT_TYPE_PICK_TWO_TRAD, DRAFT_TYPE_PICK_TWO_QUICK}
+
+
+def detect_draft_type(event_name: str) -> str:
+    """Detect draft type from an MTGA event name string.
+
+    Matches known prefix patterns (e.g. "PremierDraft_MH3_20240101").
+    Falls back to heuristic substring checks for special events
+    (Arena Open, Qualifier, MWM, etc.).
+    """
+    for prefix, dtype in _DRAFT_TYPE_PREFIXES:
+        if prefix in event_name:
+            return dtype
+
+    # Heuristic fallback for special/custom events
+    lower = event_name.lower()
+    if "sealed" in lower:
+        return DRAFT_TYPE_SEALED
+    if "draft" in lower:
+        return DRAFT_TYPE_PREMIER  # Safe default for unknown draft variants
+    return DRAFT_TYPE_UNKNOWN
+
+
 @dataclass
 class DraftState:
     """Tracks the current state of an active draft or sealed event.
 
     Attributes:
         event_name: The draft event name (e.g., "PremierDraft_MH3_20240101")
+        draft_type: Detected draft type constant (e.g., DRAFT_TYPE_PREMIER)
         set_code: The set being drafted (e.g., "MH3")
         pack_number: Current pack number (1-indexed)
         pick_number: Current pick number (1-indexed)
@@ -30,6 +78,7 @@ class DraftState:
         picks_per_pack: Number of cards picked per pack (1 for normal, 2 for PickTwo)
     """
     event_name: str = ""
+    draft_type: str = DRAFT_TYPE_UNKNOWN
     set_code: str = ""
     pack_number: int = 0
     pick_number: int = 0
@@ -44,6 +93,7 @@ class DraftState:
     def reset(self) -> None:
         """Reset draft state for a new draft."""
         self.event_name = ""
+        self.draft_type = DRAFT_TYPE_UNKNOWN
         self.set_code = ""
         self.pack_number = 0
         self.pick_number = 0
@@ -189,17 +239,21 @@ def _handle_event_start(draft_state: DraftState, payload: dict) -> None:
         if event_name == draft_state.event_name and draft_state.is_active:
             return
 
+        dtype = detect_draft_type(event_name)
         draft_state.event_name = event_name
+        draft_state.draft_type = dtype
         draft_state.set_code = extract_set_code(event_name)
         draft_state.is_active = True
-        draft_state.is_sealed = "Sealed" in event_name
-        draft_state.picks_per_pack = 2 if "PickTwo" in event_name else 1
+        draft_state.is_sealed = dtype in (DRAFT_TYPE_SEALED, DRAFT_TYPE_SEALED_TRAD)
+        draft_state.picks_per_pack = 2 if dtype in _PICK_TWO_TYPES else 1
         draft_state.cards_in_pack = []
         draft_state.picked_cards = []
         draft_state.sealed_pool = []
         draft_state.sealed_analyzed = False
-        event_type = "Sealed" if draft_state.is_sealed else "Draft"
-        logger.info(f"{event_type} started: {event_name} (set: {draft_state.set_code})")
+        logger.info(
+            f"{dtype} started: {event_name} "
+            f"(set: {draft_state.set_code}, picks_per_pack: {draft_state.picks_per_pack})"
+        )
 
 
 def _handle_sealed_pool(draft_state: DraftState, payload: dict) -> None:
@@ -311,7 +365,27 @@ def _handle_draft_pick(draft_state: DraftState, payload: dict) -> None:
     """Handle player pick events to track picked cards."""
     # Handle PickTwo drafts: GrpIds is an array of picked card IDs
     grp_ids = _find_nested_value(payload, "GrpIds")
+    if isinstance(grp_ids, list) and len(grp_ids) >= 2:
+        # Dynamic PickTwo detection: if the pick payload contains 2+ cards
+        # but we didn't detect PickTwo from the event name, upgrade now.
+        if draft_state.picks_per_pack < 2:
+            draft_state.picks_per_pack = 2
+            if draft_state.draft_type not in _PICK_TWO_TYPES:
+                draft_state.draft_type = DRAFT_TYPE_PICK_TWO
+            logger.info(
+                f"Detected PickTwo from multi-card pick payload "
+                f"(picks_per_pack upgraded to 2)"
+            )
+        for gid in grp_ids:
+            gid = int(gid)
+            if gid not in draft_state.picked_cards:
+                draft_state.picked_cards.append(gid)
+                logger.debug(f"Picked card: {gid}")
+            if gid in draft_state.cards_in_pack:
+                draft_state.cards_in_pack.remove(gid)
+        return
     if isinstance(grp_ids, list):
+        # Single-element GrpIds array — still a normal pick
         for gid in grp_ids:
             gid = int(gid)
             if gid not in draft_state.picked_cards:

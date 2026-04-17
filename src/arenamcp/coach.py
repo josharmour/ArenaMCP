@@ -2654,10 +2654,17 @@ class CoachEngine:
                 logger.debug(f"Injected decision prompt for type: {dec_type}")
 
         # Build user message
-        # Priority: explicit arg > object property > default
-        selected_style = style if style else getattr(self, "advice_style", "concise")
-        style_key = selected_style.lower()
-        is_verbose = style_key == "verbose"
+        # Priority: explicit arg > object property > default.
+        # Accept both new names (quick/chatty) and legacy (concise/verbose).
+        selected_style = style if style else getattr(self, "advice_style", "quick")
+        raw_key = selected_style.lower()
+        if raw_key in ("chatty", "verbose"):
+            style_key = "chatty"
+        elif raw_key in ("quick", "concise"):
+            style_key = "quick"
+        else:
+            style_key = raw_key
+        is_verbose = style_key == "chatty"  # retained name for legacy code below
 
         if question:
             if is_verbose:
@@ -2744,8 +2751,9 @@ class CoachEngine:
 
         # style_key and is_verbose were already computed above for trigger descriptions
 
-        # Build verbose prompt with ALL terse instructions replaced
-        _verbose_prompt = (
+        # ── QUICK prompt ──────────────────────────────────────────────────
+        # Single sentence, imperative, speakable in under 5 seconds.
+        _quick_prompt = (
             DEFAULT_SYSTEM_PROMPT
             .replace(
                 "Keep responses concise (2-3 sentences max) since they'll be spoken aloud.\n"
@@ -2755,21 +2763,55 @@ class CoachEngine:
                 "Do NOT second-guess yourself in the text (e.g., \"Wait, I need to check...\").\n"
                 "Be authoritative and decisive. Start your response immediately with the command.",
 
-                "Give your recommended play in 2-3 sentences, then add a one-sentence reason.\n"
-                "Be authoritative and decisive. Start with the action.\n"
-                "This is spoken aloud — keep it natural, under 50 words total.",
+                "QUICK MODE: respond in ONE short imperative sentence, under 15 words. "
+                "Just the action — no reasoning, no alternatives, no hedging. "
+                "Examples: \"Play Forest.\" \"Cast Lightning Bolt on the dragon.\" "
+                "\"Attack with all creatures.\" \"Pass priority.\" "
+                "If the play truly requires context, use 2 short sentences max — "
+                "but prefer one. Never exceed 20 words total.",
             )
             .replace(
                 "Output directly as the coach. No preamble, no meta-commentary.",
-                "Output as the coach. State the play, then briefly say why.",
+                "Output directly as the coach. No preamble. No meta-commentary. One sentence.",
             )
         )
 
-        # Define style prompts
+        # ── CHATTY prompt ─────────────────────────────────────────────────
+        # Multiple sentences, explain the WHY, mention alternatives/tradeoffs,
+        # feel conversational. Still capped so TTS doesn't run forever.
+        _chatty_prompt = (
+            DEFAULT_SYSTEM_PROMPT
+            .replace(
+                "Keep responses concise (2-3 sentences max) since they'll be spoken aloud.\n"
+                "Focus ONLY on the final strategic recommendation.\n"
+                "Do NOT show your thinking process, \"reasoning\", or \"corrections\".\n"
+                "Do NOT use internal monologue tags like [plan] or [thought].\n"
+                "Do NOT second-guess yourself in the text (e.g., \"Wait, I need to check...\").\n"
+                "Be authoritative and decisive. Start your response immediately with the command.",
+
+                "CHATTY MODE: give a conversational, natural-sounding recommendation "
+                "of 3 to 5 sentences. Lead with the recommended play, then explain "
+                "WHY it's right: the game state reasoning, combat math, or the "
+                "tradeoff vs the most obvious alternative. Mention any relevant "
+                "threat you're playing around. Speak like a friend watching over "
+                "your shoulder — warm but focused. Cap it at ~80 words so speech "
+                "stays under ~25 seconds. Still no internal monologue tags or "
+                "self-correction — just deliver the reasoning cleanly.",
+            )
+            .replace(
+                "Output directly as the coach. No preamble, no meta-commentary.",
+                "Output directly as the coach. No preamble or meta-commentary — "
+                "just lead with the play and explain the thinking.",
+            )
+        )
+
         prompts = {
-            "concise": CONCISE_SYSTEM_PROMPT,
-            "verbose": _verbose_prompt,
-            "normal": DEFAULT_SYSTEM_PROMPT,
+            "quick":   _quick_prompt,
+            "chatty":  _chatty_prompt,
+            # Legacy aliases still work
+            "concise": _quick_prompt,
+            "verbose": _chatty_prompt,
+            "normal":  DEFAULT_SYSTEM_PROMPT,
             "explain": DEFAULT_SYSTEM_PROMPT.replace(
                 "Keep responses concise (2-3 sentences max)",
                 "Explain your reasoning clearly but briefly.",
@@ -2778,7 +2820,7 @@ class CoachEngine:
             "pirate": "You are a ruthless pirate captain coaching a swabby! Speak like a pirate! Yarr! Keep it short!",
         }
 
-        effective_system_prompt = prompts.get(style_key, CONCISE_SYSTEM_PROMPT)
+        effective_system_prompt = prompts.get(style_key, _quick_prompt)
 
         # Inject deck strategy if available — instruct model to reference it
         if self._deck_strategy:
@@ -3175,7 +3217,7 @@ class CoachEngine:
         logger.info(f"[WIN-PROB] {response[:100]}")
         return response
 
-    def _postprocess_advice(self, advice: str, game_state: dict[str, Any], style: str = "concise") -> str:
+    def _postprocess_advice(self, advice: str, game_state: dict[str, Any], style: str = "quick") -> str:
         """Post-process LLM advice to fix common issues with smaller models.
 
         1. Strip markdown formatting (headers, bold, bullets) for spoken output
@@ -3202,22 +3244,30 @@ class CoachEngine:
         # Clean up resulting whitespace
         advice = re.sub(r"\s+", " ", advice).strip()
 
-        # 0b. Enforce length limit for concise style
-        # The prompt says "under 30 words" but models often ignore this.
-        # Hard-cap at ~3 sentences to keep it useful but not overwhelming.
-        if style == "concise" and len(advice.split()) > 60:
-            # Keep the first 2-3 sentences (up to ~50 words)
+        # 0b. Enforce style-specific length limits.
+        # Quick: under 20 words (LLM sometimes ignores the prompt).
+        # Chatty: under ~80 words so TTS stays under ~25 seconds.
+        # Legacy names accepted: concise==quick, verbose==chatty.
+        style_norm = (style or "").lower()
+        if style_norm in ("quick", "concise"):
+            word_cap, sent_cap = 22, 2
+        elif style_norm in ("chatty", "verbose"):
+            word_cap, sent_cap = 80, 5
+        else:
+            word_cap, sent_cap = 60, 4  # normal/default
+
+        words = advice.split()
+        if len(words) > word_cap + 5:  # small slack before truncating
             sentences = re.split(r'(?<=[.!?])\s+', advice)
             truncated = []
-            word_count = 0
-            for sent in sentences:
-                words = sent.split()
-                if word_count + len(words) > 50 and truncated:
+            count = 0
+            for sent in sentences[:sent_cap]:
+                sw = sent.split()
+                if count + len(sw) > word_cap and truncated:
                     break
                 truncated.append(sent)
-                word_count += len(words)
-            advice = " ".join(truncated)
-            # Ensure it ends with punctuation
+                count += len(sw)
+            advice = " ".join(truncated).strip()
             if advice and advice[-1] not in ".!?":
                 advice += "."
 

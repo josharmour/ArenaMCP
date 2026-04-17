@@ -110,8 +110,20 @@ class ProxyBackend:
         t = threading.Thread(target=_warmup, daemon=True)
         t.start()
 
-    def complete(self, system_prompt: str, user_message: str, max_tokens: int = 400) -> str:
-        """Get completion from the API endpoint."""
+    def complete(
+        self,
+        system_prompt: str,
+        user_message: str,
+        max_tokens: int = 400,
+        temperature: float = 0.3,
+    ) -> str:
+        """Get completion from the API endpoint.
+
+        Args:
+            temperature: Sampling temperature. Default 0.3 for flavorful
+                coach advice; pass 0.0 for deterministic planner calls
+                (avoids cross-priority-window flip-flops).
+        """
         import time
 
         try:
@@ -124,7 +136,7 @@ class ProxyBackend:
                     {"role": "user", "content": user_message},
                 ],
                 "max_completion_tokens": max_tokens,
-                "temperature": 0.3,
+                "temperature": temperature,
             }
 
             model_lower = self.model.lower()

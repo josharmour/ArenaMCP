@@ -55,6 +55,10 @@
       <HintPath>$(MtgaManagedDir)/UnityEngine.CoreModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="UnityEngine.PhysicsModule">
+      <HintPath>$(MtgaManagedDir)/UnityEngine.PhysicsModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="Newtonsoft.Json">
       <HintPath>$(MtgaManagedDir)/Newtonsoft.Json.dll</HintPath>
       <Private>false</Private>

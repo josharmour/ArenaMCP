@@ -34,6 +34,9 @@ class ScryfallCard:
     colors: list[str]
     arena_id: int
     scryfall_uri: str
+    rarity: str = ""  # "common", "uncommon", "rare", "mythic"
+    power: str = ""   # Creature power (string because of "*" values)
+    toughness: str = ""
 
 
 class ScryfallCache:
@@ -202,6 +205,9 @@ class ScryfallCache:
             colors=card.get("colors", []),
             arena_id=card.get("arena_id", 0),
             scryfall_uri=card.get("scryfall_uri", ""),
+            rarity=card.get("rarity", ""),
+            power=card.get("power", "") or (faces[0].get("power", "") if faces else ""),
+            toughness=card.get("toughness", "") or (faces[0].get("toughness", "") if faces else ""),
         )
 
     def _rate_limit_api(self) -> None:

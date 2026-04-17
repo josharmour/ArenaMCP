@@ -67,6 +67,16 @@ def build_issue_payload(
     if post_match_feedback.get("source"):
         lines.append(f"- Feedback source: `{post_match_feedback.get('source')}`")
 
+    # Screenshots — referenced by local path. Uploading to GitHub's asset CDN
+    # requires a separate API call we don't do today; reviewers can drag-drop
+    # these files into the issue if images are needed inline.
+    screenshots = report_data.get("screenshots") or {}
+    if screenshots:
+        lines.extend(["", "## Screenshots", ""])
+        for kind, path in screenshots.items():
+            if path:
+                lines.append(f"- {kind}: `{path}`")
+
     lines.extend(
         [
             "",

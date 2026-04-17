@@ -495,7 +495,9 @@ class StandaloneCoach:
         self._autopilot_backend: Optional[Any] = None  # Separate LLM backend for autopilot
 
         # State
-        self.advice_style = "concise"
+        # advice_style can be "quick" (terse, speakable) or "chatty" (longer,
+        # explanatory). Legacy values "concise"/"verbose" are still accepted.
+        self.advice_style = "quick"
         self._advice_frequency = self.settings.get("advice_frequency", "start_of_turn")
         self._auto_deck_strategy = bool(self.settings.get("auto_deck_strategy", False))
         self._auto_post_match_analysis = bool(
@@ -647,6 +649,70 @@ class StandaloneCoach:
             if player.get("is_local"):
                 return player.get("seat_id")
         return None
+
+    def _actions_to_event_payload(
+        self, plan: Any, game_state: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Convert an ActionPlan into a list of suggested_action dicts for
+        the match overlay. Each dict carries the instance_id the BepInEx
+        bridge uses to look up the on-screen rectangle.
+        """
+        payload: list[dict[str, Any]] = []
+        if not plan or not getattr(plan, "actions", None):
+            return payload
+
+        # Build a name → instance_id map from the battlefield + hand so we can
+        # resolve target creatures to their GRE instance IDs.
+        name_to_iid: dict[str, int] = {}
+        for zone_key in ("hand", "battlefield", "battlefield_player", "battlefield_opponent"):
+            zone = game_state.get(zone_key) or []
+            if not isinstance(zone, list):
+                continue
+            for card in zone:
+                if not isinstance(card, dict):
+                    continue
+                cname = card.get("name") or ""
+                iid = card.get("instance_id") or 0
+                if cname and iid and cname not in name_to_iid:
+                    name_to_iid[cname] = int(iid)
+
+        for action in plan.actions:
+            ref = getattr(action, "gre_action_ref", None)
+            primary_iid = 0
+            primary_grp = 0
+            if ref is not None:
+                primary_iid = int(getattr(ref, "instance_id", 0) or 0)
+                primary_grp = int(getattr(ref, "grp_id", 0) or 0)
+            if not primary_iid and action.card_name:
+                primary_iid = name_to_iid.get(action.card_name, 0)
+
+            # Collect target / attacker / blocker instance IDs
+            target_iids: list[int] = []
+            for name in getattr(action, "target_names", []) or []:
+                iid = name_to_iid.get(name, 0)
+                if iid:
+                    target_iids.append(iid)
+            for name in getattr(action, "attacker_names", []) or []:
+                iid = name_to_iid.get(name, 0)
+                if iid and iid != primary_iid:
+                    target_iids.append(iid)
+            for blocker_name, attacker_name in (getattr(action, "blocker_assignments", {}) or {}).items():
+                biid = name_to_iid.get(blocker_name, 0)
+                aiid = name_to_iid.get(attacker_name, 0)
+                if biid:
+                    target_iids.append(biid)
+                if aiid:
+                    target_iids.append(aiid)
+
+            payload.append({
+                "action_type": action.action_type.value,
+                "card_name": action.card_name or "",
+                "instance_id": primary_iid,
+                "grp_id": primary_grp,
+                "target_instance_ids": target_iids,
+                "reason": action.reasoning or "",
+            })
+        return payload
 
     @classmethod
     def _normalize_turn_snapshot(cls, game_state: dict[str, Any]) -> dict[str, Any]:
@@ -976,6 +1042,16 @@ class StandaloneCoach:
         auto_start: Optional[bool] = None,
     ) -> bool:
         """Persist completed-match data so analysis can be run later."""
+        # End-of-match telemetry: sample up to 5 bridge-fallback bugs
+        # collected during the match and file them on GitHub.
+        try:
+            if self._autopilot is not None and hasattr(self._autopilot, "flush_fallback_bugs_for_match"):
+                n = self._autopilot.flush_fallback_bugs_for_match()
+                if n:
+                    logger.info(f"Dispatched {n} sampled fallback bug(s) from match")
+        except Exception as e:
+            logger.debug(f"flush_fallback_bugs_for_match failed: {e}")
+
         staged_history = list(self._advice_history if advice_history is None else advice_history)
         if not staged_history:
             logger.info(f"Skipping post-match staging ({reason}): no advice history")
@@ -1258,6 +1334,7 @@ class StandaloneCoach:
                 config=config,
                 speak_fn=self.speak_advice,
                 ui_advice_fn=self.ui.advice if self.ui else None,
+                bug_report_fn=self._auto_bug_report_bridge_fallback,
             )
 
             mode = "DRY-RUN" if self._autopilot_dry_run else "LIVE"
@@ -1435,8 +1512,19 @@ class StandaloneCoach:
         """Emit the current control-state snapshot for GUI frontends."""
         model_value = actual_model or self.model_name or "default"
         self.ui.status("MODEL", str(model_value))
-        self.ui.status("STYLE", self.advice_style.upper())
+        self.ui.status("STYLE", self.advice_style)
         self.ui.status("AUTOPILOT", "AP:ON" if self._autopilot_enabled else "AP:OFF")
+        # Fallback mode: advice (default) or mouse.
+        try:
+            ap = self._autopilot
+            cfg = getattr(ap, "_config", None) or getattr(ap, "config", None)
+            if cfg is not None and hasattr(cfg, "bridge_only_when_connected"):
+                self.ui.status(
+                    "FALLBACK_MODE",
+                    "advice" if cfg.bridge_only_when_connected else "mouse",
+                )
+        except Exception:
+            pass
 
         afk_enabled = self._autopilot_afk
         if self._autopilot is not None:
@@ -1519,6 +1607,21 @@ class StandaloneCoach:
         # Default: opponent's turn or calm state
         return self._POLL_NORMAL
 
+    def _emit_pipe_snapshots(
+        self,
+        *,
+        game_state: Optional[dict[str, Any]] = None,
+        draft_state: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Forward pipe-mode snapshots to the desktop frontend when available."""
+        emit_game_state = getattr(self.ui, "emit_game_state", None)
+        if callable(emit_game_state) and isinstance(game_state, dict):
+            emit_game_state(game_state)
+
+        emit_draft_state = getattr(self.ui, "emit_draft_state", None)
+        if callable(emit_draft_state) and isinstance(draft_state, dict):
+            emit_draft_state(draft_state)
+
     def _coaching_loop(self) -> None:
         """Poll MCP for game state and provide coaching, with auto-draft detection."""
         logger.info("Coaching loop started")
@@ -1576,8 +1679,22 @@ class StandaloneCoach:
                 # Poll for new log content (watchdog backup - Windows often misses events)
                 self._mcp.poll_log()
 
+                # Emit a game_state heartbeat EVERY iteration so the UI panel
+                # stays in sync, even when the loop later `continue`s out
+                # (draft path, stale-advice retry, etc.) and skips the
+                # bottom-of-loop emit. Without this, the Game State panel
+                # gets stuck on its initial placeholder while advice still
+                # flows through the LLM-based events.
+                try:
+                    hb_state = self._mcp.get_game_state()
+                    if isinstance(hb_state, dict):
+                        self._emit_pipe_snapshots(game_state=hb_state)
+                except Exception:
+                    pass
+
                 # Check for active draft/sealed first
                 draft_pack = self._mcp.get_draft_pack()
+                self._emit_pipe_snapshots(draft_state=draft_pack)
 
                 if draft_pack.get("is_active"):
                     last_active_draft_at = time.time()
@@ -1708,9 +1825,7 @@ class StandaloneCoach:
 
                 curr_state = self._normalize_turn_snapshot(self._mcp.get_game_state())
 
-                # Emit game state to pipe adapter (native GUI)
-                if hasattr(self.ui, 'emit_game_state'):
-                    self.ui.emit_game_state(curr_state)
+                self._emit_pipe_snapshots(game_state=curr_state, draft_state=draft_pack)
 
                 turn = curr_state.get("turn", {})
                 turn_num = turn.get("turn_number", 0)
@@ -2538,6 +2653,15 @@ class StandaloneCoach:
                                     advice = str(plan.actions[0])
                                 if not advice:
                                     advice = "No actionable play right now."
+
+                                # Emit structured actions for the match overlay
+                                # to highlight directly on MTGA cards.
+                                try:
+                                    emit = getattr(self.ui, "emit_suggested_actions", None)
+                                    if callable(emit):
+                                        emit(self._actions_to_event_payload(plan, curr_state))
+                                except Exception as exc:
+                                    logger.debug(f"emit_suggested_actions failed: {exc}")
                             else:
                                 advice = self._coach.get_advice(
                                     curr_state,
@@ -2894,6 +3018,100 @@ class StandaloneCoach:
         if bug_path:
             self.ui.log("[BUG] Path copied to clipboard. Paste it anywhere.")
 
+    def _auto_bug_report_bridge_fallback(self, reason: str, extra: dict) -> None:
+        """Invoked by autopilot whenever the GRE bridge can't submit an action.
+
+        Every bridge miss = a bug. Always save a local report. Attempt a
+        silent GitHub upload using the configured token/gh CLI. Rate-limiting
+        is handled in autopilot so duplicate calls within a cooldown are
+        suppressed; here we just save + try to upload.
+        """
+        try:
+            bug_path = self.save_bug_report(
+                reason,
+                announce=False,
+                extra_context=extra,
+            )
+            if not bug_path:
+                return
+            # Quick user-visible log so they know telemetry fired
+            self.ui.log(f"[auto-bug] Saved: {bug_path}")
+            # Attempt GitHub upload in background (non-blocking).
+            import threading
+            threading.Thread(
+                target=self._auto_upload_bug_to_github,
+                args=(bug_path, reason),
+                daemon=True,
+            ).start()
+        except Exception as e:
+            logger.debug(f"auto-bug-report failed: {e}")
+
+    def _auto_upload_bug_to_github(self, bug_path, reason: str) -> None:
+        """Background GitHub upload for an auto-filed fallback bug report."""
+        try:
+            import json as _json
+            from arenamcp.bugreport import (
+                GITHUB_REPO, build_issue_payload, build_issue_url,
+            )
+            with open(bug_path, "r", encoding="utf-8") as f:
+                report_data = _json.loads(f.read())
+
+            title, body = build_issue_payload(report_data, bug_path, reason)
+            # Prefix title to flag these as auto-reports
+            if not title.startswith("[auto]"):
+                title = "[auto] " + title
+            if len(title) > 80:
+                title = title[:77].rstrip() + "..."
+
+            # Try GitHub API with gh token first
+            token = self._get_github_token_for_auto_bug()
+            if token:
+                import requests
+                resp = requests.post(
+                    f"https://api.github.com/repos/{GITHUB_REPO}/issues",
+                    headers={
+                        "Accept": "application/vnd.github+json",
+                        "Authorization": f"Bearer {token}",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                    json={"title": title, "body": body, "labels": ["bug", "auto-reported"]},
+                    timeout=12,
+                )
+                if resp.ok:
+                    url = str(resp.json().get("html_url", ""))
+                    self.ui.log(f"[auto-bug] Uploaded: {url}")
+                    return
+                logger.debug(f"auto-bug GitHub API failed: {resp.status_code}")
+            # No silent CLI fallback: we don't want to prompt the user.
+        except Exception as e:
+            logger.debug(f"auto-bug upload failed: {e}")
+
+    def _get_github_token_for_auto_bug(self) -> str:
+        """Return a GitHub token for silent auto-uploads, or empty string."""
+        import os
+        token = (
+            os.environ.get("MTGACOACH_GITHUB_TOKEN", "").strip()
+            or os.environ.get("GITHUB_TOKEN", "").strip()
+        )
+        if token:
+            return token
+        # Try gh CLI (synchronous, but short timeout)
+        import shutil
+        gh = shutil.which("gh")
+        if not gh:
+            return ""
+        try:
+            import subprocess
+            result = subprocess.run(
+                [gh, "auth", "token"],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+            if result.returncode == 0:
+                return (result.stdout or "").strip()
+        except Exception:
+            pass
+        return ""
+
     def take_screenshot_analysis(self) -> None:
         """Capture screen and request visual analysis (e.g. Mulligan).
 
@@ -3107,6 +3325,9 @@ class StandaloneCoach:
             "stt_enabled": self._voice_input is not None,
         }
         report["post_match_feedback"] = self._collect_post_match_feedback(extra_context=extra_context)
+        # Screenshots passed through from the UI (coach window + MTGA window).
+        if extra_context and isinstance(extra_context.get("screenshots"), dict):
+            report["screenshots"] = dict(extra_context.get("screenshots") or {})
         report["advice_history"] = (
             list(self._advice_history) if hasattr(self, '_advice_history') else []
         )
@@ -4657,10 +4878,16 @@ class StandaloneCoach:
 
 
     def _on_style_toggle_hotkey(self) -> None:
-        """F2 - Toggle advice style (Concise/Verbose)."""
-        self.advice_style = "verbose" if self.advice_style == "concise" else "concise"
-        self.ui.status("STYLE", self.advice_style.upper())
-        self.ui.log(f"\n[STYLE] Changed to {self.advice_style.upper()}\n")
+        """F2 - Toggle advice style between Quick and Chatty."""
+        # Normalize any legacy value ("concise"/"verbose") to the new names.
+        current = (self.advice_style or "").lower()
+        if current in ("concise", "quick"):
+            self.advice_style = "chatty"
+        else:
+            self.advice_style = "quick"
+        self.ui.status("STYLE", self.advice_style)
+        label = self.advice_style.capitalize()
+        self.ui.log(f"\n[STYLE] Changed to {label}\n")
 
     def _on_frequency_toggle_hotkey(self) -> None:
         """F3 - Toggle advice frequency."""
