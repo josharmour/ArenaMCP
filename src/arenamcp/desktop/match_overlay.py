@@ -384,16 +384,40 @@ class MatchOverlayWindow(QWidget):
 
     # -- Card position polling ----------------------------------------------
 
+    def update_card_positions(self, payload: dict[str, Any]) -> None:
+        """Receive card screen rects pushed from the coach process.
+
+        The UI process does NOT own a GRE bridge instance (two servers
+        would fight over the single-instance pipe). The coach polls the
+        bridge and forwards the result via the `card_positions` pipe
+        event, which calls this setter.
+        """
+        if not isinstance(payload, dict):
+            return
+        try:
+            self._screen_w = int(payload.get("screen_w") or 0)
+            self._screen_h = int(payload.get("screen_h") or 0)
+            new_positions: dict[int, dict[str, Any]] = {}
+            for card in payload.get("cards", []) or []:
+                if not isinstance(card, dict):
+                    continue
+                iid = int(card.get("instance_id") or 0)
+                if iid:
+                    new_positions[iid] = card
+            self._card_positions = new_positions
+        except Exception as e:
+            logger.debug(f"update_card_positions parse failed: {e}")
+
     def _refresh_card_positions(self) -> None:
-        """Query the BepInEx bridge for current card screen rects."""
+        """Legacy path — kept as a no-op for callers. The coach process
+        now pushes positions via `update_card_positions`.
+        """
         if not self._user_enabled:
             return
-        # Skip polls when MTGA isn't visible (avoids bridge chatter when the
-        # game is minimized). We still poll even if match_active is False
-        # because drafts and menus benefit from having positions ready.
         if self._get_mtga_rect() is None:
             return
         if self._bridge_getter is None:
+            # Coach-pushed mode; nothing to do.
             return
         try:
             bridge = self._bridge_getter()

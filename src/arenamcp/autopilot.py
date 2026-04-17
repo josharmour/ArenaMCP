@@ -2554,6 +2554,27 @@ class AutopilotEngine:
                             matched_grp_ids.append(int(grp))
                         break
 
+        # Fallback: some SelectN targets are library-top reveals (Lluwen ETB,
+        # Cultivate, etc.) that don't appear in hand/battlefield/graveyard.
+        # Resolve by card name lookup against the card DB so we can still
+        # submit the right grp_id.
+        if not matched_grp_ids and desired_names:
+            try:
+                from arenamcp.card_db import get_card_database
+                card_db = get_card_database()
+                for want in desired_names:
+                    card = card_db.get_card_by_name(want)
+                    if card and getattr(card, "arena_id", 0):
+                        grp = int(card.arena_id)
+                        if grp not in matched_grp_ids:
+                            matched_grp_ids.append(grp)
+                if matched_grp_ids:
+                    logger.info(
+                        f"select_n: resolved {desired_names} via card DB -> {matched_grp_ids}"
+                    )
+            except Exception as e:
+                logger.debug(f"select_n card DB lookup failed: {e}")
+
         # Submit — empty list → SubmitArbitrary (safe fallback when we can't
         # resolve a specific option)
         success = self._gre_bridge.submit_selection(matched_grp_ids)
