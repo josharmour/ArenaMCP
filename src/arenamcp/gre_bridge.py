@@ -127,8 +127,16 @@ class GREBridge:
     def __init__(self):
         self._pipe = None
         self._connected = False
+        # Keepalive thread — proactively reconnects after disconnect and
+        # pings periodically so we detect silently-broken pipes quickly.
+        self._keepalive_thread: Optional[threading.Thread] = None
+        self._keepalive_stop = threading.Event()
         self._last_connect_attempt = 0.0
-        self._reconnect_cooldown = 2.0  # seconds between reconnect attempts
+        self._reconnect_cooldown = 0.5  # seconds between reconnect attempts
+        # Last successful ping; if it's been longer than `_ping_max_age`,
+        # the keepalive will issue a ping to confirm the pipe is still alive.
+        self._last_ping_at = 0.0
+        self._ping_max_age = 5.0
         self._server_pipe_handle = None  # Raw HANDLE for the server pipe (created once)
         self._pipe_created = False  # Whether the server pipe exists
         self._pipe_lock = threading.Lock()  # Serialize pipe I/O across threads
@@ -281,6 +289,64 @@ class GREBridge:
         self._pipe_handle = None
         self._server_pipe_handle = None
 
+    # -------------------------------------------------------------------
+    # Keepalive: background thread that holds the pipe open and quickly
+    # reconnects after MTGA scene transitions or idle periods. Without
+    # this, the plugin client can silently disconnect (e.g. during match
+    # end → home) and Python only notices on the next command, leaving
+    # autopilot stranded in "bridge disconnected" mode during the gap.
+    # -------------------------------------------------------------------
+
+    def start_keepalive(self, interval: float = 1.0) -> None:
+        """Start a background thread that keeps the pipe connection alive.
+
+        - If not connected, attempts to reconnect every `interval` seconds.
+        - If connected, pings the plugin every `_ping_max_age` seconds to
+          verify the pipe is still healthy.
+        - If a ping fails, disconnects so the next tick recreates the pipe.
+
+        Safe to call multiple times; starts at most one thread.
+        """
+        if self._keepalive_thread is not None and self._keepalive_thread.is_alive():
+            return
+        self._keepalive_stop.clear()
+        t = threading.Thread(
+            target=self._keepalive_loop,
+            args=(interval,),
+            daemon=True,
+            name="gre-bridge-keepalive",
+        )
+        self._keepalive_thread = t
+        t.start()
+        logger.info(f"GRE bridge keepalive started (interval={interval}s)")
+
+    def stop_keepalive(self) -> None:
+        self._keepalive_stop.set()
+
+    def _keepalive_loop(self, interval: float) -> None:
+        while not self._keepalive_stop.is_set():
+            try:
+                if not self._connected:
+                    # Cheap reconnect attempt (respects _reconnect_cooldown)
+                    self.connect()
+                else:
+                    age = time.monotonic() - self._last_ping_at
+                    if age >= self._ping_max_age:
+                        try:
+                            resp = self._send_command({"action": "ping"})
+                            if resp.get("ok"):
+                                self._last_ping_at = time.monotonic()
+                            else:
+                                logger.info("GRE bridge keepalive: ping returned not-ok, disconnecting")
+                                self.disconnect()
+                        except Exception as e:
+                            logger.info(f"GRE bridge keepalive: ping failed ({e}), disconnecting")
+                            self.disconnect()
+            except Exception as e:
+                logger.debug(f"GRE bridge keepalive tick error: {e}")
+            # Use Event.wait so we can be interrupted
+            self._keepalive_stop.wait(interval)
+
     def _send_command(self, cmd: dict[str, Any]) -> dict[str, Any]:
         """Send a JSON command and read the JSON response.
 
@@ -310,7 +376,11 @@ class GREBridge:
 
                 # Strip UTF-8 BOM if present (C# StreamWriter may emit one)
                 text = response_bytes.decode("utf-8-sig")
-                return json.loads(text)
+                parsed = json.loads(text)
+                # Any successful round-trip counts as liveness evidence —
+                # no need for a keepalive ping right after normal traffic.
+                self._last_ping_at = time.monotonic()
+                return parsed
 
             except (BrokenPipeError, OSError, IOError) as e:
                 self.disconnect()
@@ -1447,10 +1517,19 @@ _poller: Optional[BridgeDecisionPoller] = None
 
 
 def get_bridge() -> GREBridge:
-    """Get or create the module-level GRE bridge singleton."""
+    """Get or create the module-level GRE bridge singleton.
+
+    Also starts the keepalive thread so the pipe stays connected across
+    MTGA scene transitions and idle periods without requiring callers to
+    remember to reconnect.
+    """
     global _bridge
     if _bridge is None:
         _bridge = GREBridge()
+        try:
+            _bridge.start_keepalive()
+        except Exception as e:
+            logger.debug(f"Could not start bridge keepalive: {e}")
     return _bridge
 
 

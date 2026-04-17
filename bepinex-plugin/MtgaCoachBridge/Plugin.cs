@@ -139,9 +139,22 @@ namespace MtgaCoachBridge
 
         private void PipeClientLoop()
         {
+            // Reconnect loop with adaptive backoff.
+            //   - Short connect timeout (1s) so we poll frequently when the
+            //     Python pipe server is momentarily down (scene transitions,
+            //     Python process restart).
+            //   - Successful connections reset the retry delay.
+            //   - Failed reconnects back off from 200ms up to 2s so we don't
+            //     spin on the CPU when Python is truly gone.
+            int retryMs = 200;
+            const int minRetryMs = 200;
+            const int maxRetryMs = 2000;
+            int consecutiveTimeouts = 0;
+
             while (true)
             {
                 NamedPipeClientStream pipe = null;
+                bool connectedThisIteration = false;
                 try
                 {
                     pipe = new NamedPipeClientStream(
@@ -150,27 +163,47 @@ namespace MtgaCoachBridge
                         PipeDirection.InOut
                     );
 
-                    _log.LogInfo("Pipe client connecting to \\\\.\\pipe\\mtgacoach_bridge_v2...");
-                    pipe.Connect(2000); // 2s timeout — retry if Python isn't up yet
+                    pipe.Connect(1000); // 1s timeout — retry if Python isn't up yet
+                    connectedThisIteration = true;
+                    consecutiveTimeouts = 0;
+                    retryMs = minRetryMs;
                     _log.LogInfo("Pipe client connected to Python server");
 
                     HandleClient(pipe);
-                    _log.LogInfo("HandleClient returned, will reconnect");
+                    _log.LogInfo("Pipe client lost connection (HandleClient returned), reconnecting...");
                 }
                 catch (TimeoutException)
                 {
-                    // Python server not ready yet — retry
+                    // Python server not up yet — usually means the Python
+                    // process is restarting or between pipe server recreations.
+                    consecutiveTimeouts++;
+                    if (consecutiveTimeouts == 1 || consecutiveTimeouts % 10 == 0)
+                    {
+                        _log.LogInfo(
+                            $"Pipe client: Python server not available " +
+                            $"(timeout {consecutiveTimeouts}), retrying in {retryMs}ms"
+                        );
+                    }
+                    // Back off on repeated timeouts so we don't spin.
+                    retryMs = System.Math.Min(maxRetryMs, retryMs * 2);
                 }
                 catch (Exception ex)
                 {
                     _log.LogWarning($"Pipe client error: {ex.GetType().Name}: {ex.Message}");
+                    // Reset retry after non-timeout errors — they're usually
+                    // transient (e.g. pipe state mismatch during race).
+                    retryMs = minRetryMs;
                 }
                 finally
                 {
                     try { pipe?.Dispose(); } catch { }
                 }
 
-                Thread.Sleep(1000); // Wait before reconnect attempt
+                // If we DID connect successfully and HandleClient returned,
+                // reconnect aggressively — the Python server should be ready
+                // to accept us again.
+                int sleepMs = connectedThisIteration ? minRetryMs : retryMs;
+                Thread.Sleep(sleepMs);
             }
         }
 
@@ -3114,6 +3147,6 @@ namespace MtgaCoachBridge
     {
         public const string GUID = "com.mtgacoach.grebridge";
         public const string Name = "MtgaCoach GRE Bridge";
-        public const string Version = "0.6.0";
+        public const string Version = "0.6.1";
     }
 }

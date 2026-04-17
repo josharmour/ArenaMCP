@@ -584,6 +584,13 @@ class MatchOverlayWindow(QWidget):
         secondary: bool = False,
     ) -> None:
         """Draw a rounded-rect outline around a card with a pulse effect."""
+        # CRITICAL: drawRoundedRect fills with the current brush and strokes
+        # with the current pen. `_draw_advice_panel` sets a solid green
+        # accent brush and leaves it active, so without clearing we'd fill
+        # the card area with opaque green. Always start with NoBrush for
+        # outline-only rings.
+        painter.setBrush(Qt.NoBrush)
+
         # Expand slightly outside the card for visibility
         expand = 4 + int(pulse * 4)
         outer = rect.adjusted(-expand, -expand, expand, expand)
@@ -648,20 +655,25 @@ class MatchOverlayWindow(QWidget):
         panel_w = max(body_w, title_metrics.horizontalAdvance(title)) + pad_x * 2
         panel_h = title_h + 6 + body_h + pad_y * 2
 
-        margin = 14
+        margin_x = 14
+        # Drop the top margin below the usual MTGA title/player banner row
+        # so the panel doesn't cover opponent name, mana icons, or the
+        # close button.
+        margin_top = 48
+        margin_bottom = 40  # leaves room for the pill
         anchor = self._advice_panel_anchor
         if anchor == "top-right":
-            panel_x = self.width() - panel_w - margin
-            panel_y = margin
+            panel_x = self.width() - panel_w - margin_x
+            panel_y = margin_top
         elif anchor == "top-left":
-            panel_x = margin
-            panel_y = margin
+            panel_x = margin_x
+            panel_y = margin_top
         elif anchor == "bottom-left":
-            panel_x = margin
-            panel_y = self.height() - panel_h - margin - 40  # avoid pill
+            panel_x = margin_x
+            panel_y = self.height() - panel_h - margin_bottom
         else:  # bottom-right (default fallback)
-            panel_x = self.width() - panel_w - margin
-            panel_y = self.height() - panel_h - margin - 40
+            panel_x = self.width() - panel_w - margin_x
+            panel_y = self.height() - panel_h - margin_bottom
 
         # Background + accent border
         bg = QColor(18, 22, 28, 225)
@@ -693,6 +705,10 @@ class MatchOverlayWindow(QWidget):
         painter.drawText(
             body_rect, int(Qt.TextFlag.TextWordWrap), self._advice_text
         )
+        # Reset brush so later paint calls (ring draws, badge) don't
+        # inherit the green accent fill.
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(Qt.NoPen)
 
     def _draw_armed_badge(self, painter: QPainter) -> None:
         """Small unobtrusive badge confirming the overlay is alive in a match.
