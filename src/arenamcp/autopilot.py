@@ -1137,6 +1137,10 @@ class AutopilotEngine:
 
                     if stale:
                         self._notify("AUTOPILOT", "Plan discarded (game moved on)")
+                        self._record_user_takeover(
+                            plan, fresh_state,
+                            reason="plan_went_stale_after_llm",
+                        )
                         self._state = AutopilotState.IDLE
                         return False
 
@@ -1203,6 +1207,10 @@ class AutopilotEngine:
                         or exec_turn.get("active_player", 0) != pre_active):
                     logger.warning("STALE at execution time — game moved on during countdown")
                     self._notify("AUTOPILOT", "Plan discarded (game moved during countdown)")
+                    self._record_user_takeover(
+                        plan, exec_state,
+                        reason="plan_went_stale_during_countdown",
+                    )
                     self._state = AutopilotState.IDLE
                     return False
                 game_state = exec_state  # Use freshest state
@@ -1827,6 +1835,52 @@ class AutopilotEngine:
         )
         # Buffer — the match-end flush will pick winners.
         self._pending_fallback_bugs.append((reason, extra))
+
+    def _record_user_takeover(
+        self,
+        plan: Any,
+        game_state: dict[str, Any],
+        reason: str,
+    ) -> None:
+        """Record a user-takeover event for end-of-match telemetry.
+
+        When autopilot's plan goes stale because the game state advanced
+        before we could execute (the user likely acted manually, OR the
+        game auto-resolved), we buffer a bug report. If autopilot was
+        supposed to handle this but the user had to step in, we want to
+        know what autopilot was going to propose so we can improve it.
+        """
+        if self._bug_report_fn is None:
+            return
+
+        actions = getattr(plan, "actions", None) or []
+        first = actions[0] if actions else None
+        action_type = getattr(first, "action_type", None)
+        action_type_str = action_type.value if action_type else "?"
+        card_name = getattr(first, "card_name", "") or ""
+
+        extra = {
+            "auto_user_takeover": {
+                "reason_tag": reason,
+                "planned_action": action_type_str,
+                "planned_card": card_name,
+                "planned_strategy": getattr(plan, "overall_strategy", ""),
+                "planned_voice_advice": getattr(plan, "voice_advice", ""),
+                "num_planned_actions": len(actions),
+                "bridge_connected": getattr(self._gre_bridge, "connected", False),
+                "bridge_request_type": game_state.get("_bridge_request_type"),
+                "bridge_request_class": game_state.get("_bridge_request_class"),
+                "decision_context": game_state.get("decision_context"),
+                "turn": (game_state.get("turn") or {}).get("turn_number"),
+                "phase": (game_state.get("turn") or {}).get("phase"),
+                "timestamp": time.time(),
+            }
+        }
+        reason_str = (
+            f"auto: user took over from autopilot ({reason}) — "
+            f"planned {action_type_str} {card_name}".strip()
+        )
+        self._pending_fallback_bugs.append((reason_str, extra))
 
     def flush_fallback_bugs_for_match(self) -> int:
         """Dispatch up to N sampled fallback bugs from the current match.

@@ -1047,19 +1047,23 @@ class CoachTab(QWidget):
             return ""
         turn_num = _int_value(turn.get("turn_number"))
         phase = _str_value(turn.get("phase")) or "?"
-        step = _str_value(turn.get("step"))
+        # Strip noisy "Phase_" prefix
+        phase_display = phase.replace("Phase_", "")
+        step = _str_value(turn.get("step")).replace("Step_", "")
         active_player = _int_value(turn.get("active_player"))
         active_label = ""
         if active_player and local_seat:
-            active_label = "Your turn" if active_player == local_seat else "Opponent turn"
-        line = f"Turn {turn_num} | {phase}"
-        if step:
-            line += f" | {step}"
+            active_label = "YOURS" if active_player == local_seat else "OPP"
+        bits = [f"T{turn_num}", phase_display]
+        if step and step != phase_display:
+            bits.append(step)
         if active_label:
-            line += f" | {active_label}"
+            bits.append(active_label)
+        line = "  ·  ".join(bits)
+        accent = tokens["player"] if active_label == "YOURS" else tokens["opponent"] if active_label == "OPP" else tokens["header"]
         return (
-            f"<div style='margin-bottom:8px; padding:8px 10px; border:1px solid {tokens['border']};"
-            f"border-radius:8px; background:{tokens['panel2']}; color:{tokens['header']}; font-size:15px; font-weight:700;'>"
+            f"<div style='margin:0 0 6px 0; padding:4px 8px; border-left:3px solid {accent};"
+            f" background:{tokens['panel2']}; color:{tokens['header']}; font-size:12px; font-weight:700;'>"
             f"{html.escape(line)}</div>"
         )
 
@@ -1089,9 +1093,9 @@ class CoachTab(QWidget):
                 f"{html.escape(detail_line)}</div>"
             )
         return (
-            f"<div style='margin-bottom:8px; padding:8px 10px; border:1px solid {tokens['warning_fg']};"
-            f"border-left:4px solid {tokens['warning_fg']}; border-radius:8px; background:{tokens['warning_bg']};'>"
-            f"<div style='color:{tokens['warning_fg']}; font-weight:700;'>Decision: {html.escape(text)}</div>"
+            f"<div style='margin:0 0 4px 0; padding:4px 8px; border-left:3px solid {tokens['warning_fg']};"
+            f" background:{tokens['warning_bg']}; font-size:11px;'>"
+            f"<span style='color:{tokens['warning_fg']}; font-weight:700;'>⚠ {html.escape(text)}</span>"
             f"{detail_html}"
             f"{option_chips}"
             f"</div>"
@@ -1156,40 +1160,55 @@ class CoachTab(QWidget):
         include_hand_count: bool = False,
         include_hand_cards: bool = False,
     ) -> str:
+        """Compact single-line header:  [OPP] 20❤ · 33📚 · 2🪦 · 0⬜ · 3✋"""
         accent = tokens["opponent"] if seat_label == "Opponent" else tokens["player"]
-        items = [
-            self._resource_chip("Life", str(_int_value(player.get("life_total")) if isinstance(player, dict) else "?"), accent, tokens),
-            self._resource_chip("Library", self._library_value(zones, seat_label == "Opponent"), tokens["spell"], tokens),
-            self._resource_chip("Graveyard", self._zone_summary(self._cards_for_zone_and_seat(zones.get("graveyard"), seat_id), 5), tokens["other"], tokens),
-            self._resource_chip("Exile", self._zone_summary(self._cards_for_zone_and_seat(zones.get("exile"), seat_id), 5), tokens["other"], tokens),
-        ]
-        hand_html = ""
+        life = str(_int_value(player.get("life_total"))) if isinstance(player, dict) else "?"
+        lib = self._library_value(zones, seat_label == "Opponent")
+        grave_cards = self._cards_for_zone_and_seat(zones.get("graveyard"), seat_id)
+        exile_cards = self._cards_for_zone_and_seat(zones.get("exile"), seat_id)
+        grave_count = str(len(grave_cards)) if grave_cards is not None else "?"
+        exile_count = str(len(exile_cards)) if exile_cards is not None else "?"
 
-        if include_hand_count:
-            hand_count = _int_value(zones.get("opponent_hand_count"))
-            items.append(self._resource_chip("Hand", str(hand_count), tokens["spell"], tokens))
-
-        if include_hand_cards:
-            hand_cards = self._cards_for_zone_and_seat(zones.get("my_hand") or zones.get("hand"), seat_id, allow_unknown_owner=True)
-            hand_html = self._resource_chip(
-                "Hand",
-                self._render_hand_summary(hand_cards, game_state, tokens),
-                tokens["spell"],
-                tokens,
-                allow_html=True,
-                wide=True,
+        # Compact pills, all on one row
+        def pill(icon: str, value: str, color: str, title: str = "") -> str:
+            title_attr = f" title='{html.escape(title)}'" if title else ""
+            return (
+                f"<span{title_attr} style='display:inline-block; margin-right:8px; color:{color};'>"
+                f"<span style='color:{tokens['muted']}; font-size:10px;'>{icon}</span> "
+                f"<span style='font-weight:600;'>{html.escape(value)}</span></span>"
             )
 
-        cells = "".join(
-            f"<td valign='top' style='padding:0 8px 6px 0;'>{item}</td>"
-            for item in items
-        )
+        pills = [
+            pill("LIFE", life, accent, "Life total"),
+            pill("LIB", lib, tokens["spell"], "Library count"),
+            pill("GY", grave_count, tokens["other"], f"Graveyard: {self._zone_summary(grave_cards, 8) if grave_cards else 'empty'}"),
+            pill("EX", exile_count, tokens["other"], f"Exile: {self._zone_summary(exile_cards, 8) if exile_cards else 'empty'}"),
+        ]
+        if include_hand_count:
+            hand_count = _int_value(zones.get("opponent_hand_count"))
+            pills.append(pill("HAND", str(hand_count), tokens["spell"], "Opponent hand size"))
 
+        hand_html = ""
+        if include_hand_cards:
+            hand_cards = self._cards_for_zone_and_seat(zones.get("my_hand") or zones.get("hand"), seat_id, allow_unknown_owner=True)
+            if hand_cards:
+                pills.append(pill("HAND", str(len(hand_cards)), tokens["spell"], "Your hand size"))
+                hand_html = (
+                    f"<div style='margin:2px 0 6px 0; padding:3px 6px;"
+                    f" border-left:2px solid {tokens['spell']}; font-size:11px; line-height:1.45;'>"
+                    f"{self._render_hand_summary(hand_cards, game_state, tokens)}"
+                    f"</div>"
+                )
+
+        label_style = (
+            f"display:inline-block; min-width:42px; color:{accent}; font-size:10px;"
+            f" font-weight:700; letter-spacing:0.06em;"
+        )
+        row = "".join(pills)
         return (
-            f"<div style='margin-bottom:8px;'>"
-            f"<div style='font-size:12px; color:{accent}; font-weight:700; margin-bottom:4px;'>{html.escape(seat_label)}</div>"
-            f"<table cellspacing='0' cellpadding='0' style='border-collapse:collapse; margin:0 0 6px 0;'><tr>{cells}</tr></table>"
-            f"{hand_html}</div>"
+            f"<div style='margin:0 0 4px 0; font-size:11px;'>"
+            f"<span style='{label_style}'>{'YOU' if seat_label == 'You' else 'OPP'}</span>"
+            f"{row}</div>{hand_html}"
         )
 
     def _resource_chip(
@@ -1202,16 +1221,15 @@ class CoachTab(QWidget):
         allow_html: bool = False,
         wide: bool = False,
     ) -> str:
+        # Kept for backward-compat in case other callers exist; new code uses
+        # the inline pill in _render_resource_row. This emits a compact span.
         rendered_value = value or "-"
         if not allow_html:
             rendered_value = html.escape(rendered_value)
-        min_width = "132px" if not wide else "420px"
         return (
-            f"<div style='padding:6px 8px; border:1px solid {tokens['border']}; border-left:4px solid {accent}; "
-            f"border-radius:7px; background:{tokens['panel']}; min-width:{min_width}; line-height:1.35;'>"
-            f"<div style='color:{tokens['muted']}; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;'>{html.escape(label)}</div>"
-            f"<div style='color:{tokens['text']}; margin-top:2px;'>{rendered_value}</div>"
-            f"</div>"
+            f"<span style='margin-right:8px; color:{accent};'>"
+            f"<span style='color:{tokens['muted']}; font-size:10px;'>{html.escape(label)}</span> "
+            f"<span style='font-weight:600;'>{rendered_value}</span></span>"
         )
 
     def _render_battlefield_section(
@@ -1226,36 +1244,43 @@ class CoachTab(QWidget):
         parts = [
             self._render_card_lane(label, grouped.get(key, []), key, tokens)
             for key, label in (
-                ("land", "Lands / Mana"),
+                ("land", "Lands"),
                 ("creature", "Creatures"),
-                ("planeswalker", "Planeswalkers"),
-                ("enchantment", "Enchantments"),
-                ("artifact", "Artifacts"),
-                ("battle", "Battles"),
+                ("planeswalker", "PW"),
+                ("enchantment", "Ench."),
+                ("artifact", "Artifact"),
+                ("battle", "Battle"),
                 ("other", "Other"),
             )
         ]
         body = "".join(part for part in parts if part)
         if not body:
-            body = f"<div style='color:{tokens['muted']}; padding:2px 0 6px 0;'>No permanents visible.</div>"
+            # Skip empty battlefield entirely — don't waste space on "no permanents visible"
+            return ""
+        # Use the title text as the seat tag ("Your Board" → "YOU", "Opponent Board" → "OPP")
+        tag = "YOU" if "Your" in title else "OPP"
         return (
-            f"<div style='margin-bottom:10px; padding:8px 10px; border:1px solid {tokens['border']}; border-radius:8px; background:{tokens['panel']}'>"
-            f"<div style='font-size:13px; color:{seat_color}; font-weight:700; margin-bottom:6px;'>{html.escape(title)}</div>"
-            f"{body}</div>"
+            f"<div style='margin:0 0 4px 0; padding:2px 0 0 0;'>"
+            f"<span style='display:inline-block; min-width:42px; color:{seat_color};"
+            f" font-size:10px; font-weight:700; letter-spacing:0.06em; vertical-align:top;'>{tag}</span>"
+            f"<span style='display:inline-block; width:calc(100% - 48px);'>{body}</span>"
+            f"</div>"
         )
 
     def _render_card_lane(self, label: str, cards: list[dict[str, Any]], type_key: str, tokens: dict[str, str]) -> str:
         if not cards:
             return ""
         accent = tokens.get(type_key, tokens["other"])
-        summaries = " • ".join(
+        summaries = " · ".join(
             html.escape(self._compact_card_summary(card))
             for card in cards
         )
+        # Inline label + summaries on a single row per lane
         return (
-            f"<div style='margin-bottom:7px;'>"
-            f"<div style='color:{tokens['muted']}; font-size:11px; text-transform:uppercase; margin-bottom:2px; letter-spacing:0.04em;'>{html.escape(label)}:</div>"
-            f"<div style='color:{accent}; line-height:1.4; word-wrap:break-word;'>{summaries}</div>"
+            f"<div style='font-size:11px; line-height:1.45;'>"
+            f"<span style='color:{tokens['muted']}; text-transform:uppercase;"
+            f" letter-spacing:0.04em; margin-right:6px;'>{html.escape(label)}:</span>"
+            f"<span style='color:{accent};'>{summaries}</span>"
             f"</div>"
         )
 
@@ -1396,15 +1421,22 @@ class CoachTab(QWidget):
                     fg = tokens["uncastable_fg"]
                     bg = tokens["uncastable_bg"]
                     label = f"{action} [MANUAL PAY / NOT CONFIRMED]"
+            # Compact inline chip instead of full-width padded row
             rendered_parts.append(
-                f"<div style='margin:0 0 6px 0; padding:5px 7px; border:1px solid {border};"
-                f"border-left:4px solid {border}; border-radius:6px; background:{bg}; color:{fg};'>{html.escape(label)}</div>"
+                f"<span style='display:inline-block; margin:0 4px 3px 0; padding:2px 6px;"
+                f" border:1px solid {border}; border-left:3px solid {border}; border-radius:4px;"
+                f" background:{bg}; color:{fg}; font-size:10px;'>{html.escape(label)}</span>"
             )
         rendered = "".join(rendered_parts)
+        # Collapsible — hidden by default since this is usually the biggest
+        # chunk of the game state view and MTGA already shows these on screen.
         return (
-            f"<div style='margin-top:6px;'>"
-            f"<div style='font-size:12px; color:{tokens['muted']}; text-transform:uppercase; margin-bottom:4px;'>Legal actions</div>"
-            f"{rendered}</div>"
+            f"<details style='margin-top:4px; font-size:11px;'>"
+            f"<summary style='cursor:pointer; color:{tokens['muted']};"
+            f" text-transform:uppercase; letter-spacing:0.04em;'>"
+            f"Legal actions ({len(actions)})</summary>"
+            f"<div style='margin-top:4px;'>{rendered}</div>"
+            f"</details>"
         )
 
     def _group_battlefield(self, cards: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
