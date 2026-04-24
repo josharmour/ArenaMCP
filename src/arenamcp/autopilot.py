@@ -32,6 +32,89 @@ from arenamcp.screen_mapper import ScreenCoord, ScreenMapper
 logger = logging.getLogger(__name__)
 
 
+def _match_target_in_battlefield(
+    target_names: list[str],
+    battlefield: list[dict[str, Any]],
+    eligible: Any,
+) -> tuple[Optional[int], Optional[str]]:
+    """Resolve a target-name hint to a battlefield instance_id.
+
+    Tries exact (case-insensitive) match first, then substring match
+    against either direction (helps when the LLM truncates "Wonderweave
+    Aerialist" to "Aerialist"), then token-overlap as a last resort.
+    `eligible(card)` filters the battlefield to only cards the bridge
+    has flagged as legal targets.
+    """
+    if not target_names:
+        return None, None
+
+    candidates = [c for c in (battlefield or []) if eligible(c)]
+
+    def _name(card: dict[str, Any]) -> str:
+        return str(card.get("name") or "").strip()
+
+    def _iid(card: dict[str, Any]) -> Optional[int]:
+        try:
+            v = int(card.get("instance_id") or 0)
+        except (TypeError, ValueError):
+            return None
+        return v or None
+
+    for name in target_names:
+        want = (name or "").strip().lower()
+        if not want:
+            continue
+        for card in candidates:
+            if _name(card).lower() == want:
+                iid = _iid(card)
+                if iid:
+                    return iid, _name(card)
+
+    # Substring match (either direction). Picks the longest matching
+    # candidate name to prefer "Wonderweave Aerialist" over "Aerialist".
+    for name in target_names:
+        want = (name or "").strip().lower()
+        if len(want) < 3:
+            continue
+        matches: list[tuple[int, str, int]] = []
+        for card in candidates:
+            cn = _name(card).lower()
+            iid = _iid(card)
+            if iid and cn and (want in cn or cn in want):
+                matches.append((iid, _name(card), len(cn)))
+        if matches:
+            matches.sort(key=lambda x: -x[2])
+            return matches[0][0], matches[0][1]
+
+    # Token-overlap fallback (≥2 shared tokens, ignoring short stopwords).
+    STOP = {"the", "of", "and", "a", "an", "in", "to", "on"}
+    for name in target_names:
+        tokens = {
+            t.strip(",.:;\"'()[]").lower()
+            for t in (name or "").split()
+            if t and t.lower() not in STOP
+        }
+        tokens = {t for t in tokens if len(t) >= 3}
+        if not tokens:
+            continue
+        best: Optional[tuple[int, int, str]] = None
+        for card in candidates:
+            cn_tokens = {
+                t.strip(",.:;\"'()[]").lower()
+                for t in _name(card).split()
+                if t and t.lower() not in STOP
+            }
+            cn_tokens = {t for t in cn_tokens if len(t) >= 3}
+            overlap = len(tokens & cn_tokens)
+            iid = _iid(card)
+            if iid and overlap >= 2 and (best is None or overlap > best[1]):
+                best = (iid, overlap, _name(card))
+        if best:
+            return best[0], best[2]
+
+    return None, None
+
+
 class ExecutionPath:
     """Tracks which execution path was used for an action.
 
@@ -150,6 +233,9 @@ class AutopilotEngine:
         self._speak_fn = speak_fn
         self._ui_advice_fn = ui_advice_fn
         self._bug_report_fn = bug_report_fn
+        # Optional callback to record autopilot-driven decisions into the
+        # app's advice_history. Set by standalone after construction.
+        self._advice_recorder: Optional[Any] = None
         # Buffer of fallback bug events collected during the current match.
         # On match end, we sample up to `_max_fallback_bugs_per_match` at
         # random and dispatch those. Rest are discarded — goal is
@@ -485,6 +571,75 @@ class AutopilotEngine:
         """Whether this action already failed to advance the current window."""
         return self._action_block_key(action, game_state) in self._blocked_action_keys
 
+    def _pick_single_target_candidate(
+        self,
+        game_state: dict[str, Any],
+    ) -> Optional[int]:
+        """Return the sole legal target instance_id if there's exactly one.
+
+        Prefers the bridge-reported `target_candidates` list (populated by
+        the plugin for SelectTargetsRequest). Falls back to querying the
+        bridge directly if the snapshot doesn't have them yet.
+        """
+        def _extract(resp: dict[str, Any]) -> Optional[int]:
+            if not resp or not resp.get("has_pending"):
+                return None
+            cands = resp.get("target_candidates") or []
+            # Collect unique instance ids — if exactly one, that's the pick.
+            ids = []
+            for c in cands:
+                try:
+                    iid = int(c.get("targetInstanceId") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if iid and iid not in ids:
+                    ids.append(iid)
+            if len(ids) == 1:
+                return ids[0]
+            return None
+
+        # Try snapshot first (avoid extra pipe round-trip).
+        snap_resp = game_state.get("_bridge_last_poll") or game_state.get("_bridge_trigger")
+        picked = _extract(snap_resp) if isinstance(snap_resp, dict) else None
+        if picked is not None:
+            return picked
+
+        # Snapshot didn't carry it — ask the bridge live.
+        try:
+            if not (self._gre_bridge.connected or self._gre_bridge.connect()):
+                return None
+            live = self._gre_bridge.get_pending_actions()
+        except Exception as e:
+            logger.debug(f"_pick_single_target_candidate bridge query failed: {e}")
+            return None
+        return _extract(live or {})
+
+    def _record_autopilot_decision(
+        self,
+        game_state: dict[str, Any],
+        trigger: str,
+        action_type: str,
+        summary: str,
+    ) -> None:
+        """Emit a synthetic advice-history entry for an autopilot decision.
+
+        Bug reports only show `advice_history`, so autopilot-handled
+        triggers (auto-target, auto-pay, auto-confirm, etc.) were
+        invisible there. Recording them makes post-match debugging
+        actually useful.
+        """
+        fn = getattr(self, "_advice_recorder", None)
+        if not callable(fn):
+            return
+        try:
+            fn(
+                advice=f"[autopilot] {action_type}: {summary}",
+                trigger=trigger,
+                game_state=game_state,
+            )
+        except Exception as e:
+            logger.debug(f"_record_autopilot_decision failed: {e}")
+
     def _pause_for_manual(self, reason: str, game_state: Optional[dict[str, Any]] = None) -> None:
         """Pause the autopilot and surface that manual input is required."""
         self._state = AutopilotState.PAUSED
@@ -802,6 +957,43 @@ class AutopilotEngine:
                 self._state = AutopilotState.IDLE
                 return True
 
+            # SelectTargets single-candidate auto-submit. When there's
+            # exactly one legal target (common: "Target a creature you
+            # control" with only one creature in play), skip the LLM
+            # and submit immediately — saves ~4s of latency and avoids
+            # the stale-plan race that leaves the request stuck.
+            if (
+                "SelectTargets" in bridge_request_class
+                or bridge_request_type in ("SelectTargets", "SelectTargetsReq")
+                or (game_state.get("decision_context") or {}).get("type") == "target_selection"
+            ):
+                auto_id = self._pick_single_target_candidate(game_state)
+                if auto_id is not None:
+                    logger.info(
+                        f"Autopilot: auto-submitting single-candidate target "
+                        f"(instance_id={auto_id})"
+                    )
+                    if not self._config.dry_run and (
+                        self._gre_bridge.connected or self._gre_bridge.connect()
+                    ):
+                        if self._gre_bridge.submit_targets(auto_id):
+                            self._log_execution_path(
+                                ExecutionPath.GRE_AWARE,
+                                f"auto-submit single target {auto_id}",
+                            )
+                            self._record_autopilot_decision(
+                                game_state,
+                                trigger,
+                                action_type="select_target",
+                                summary=f"auto-selected only legal target (instance_id={auto_id})",
+                            )
+                            self._state = AutopilotState.IDLE
+                            return True
+                        logger.warning(
+                            f"Autopilot: submit_targets({auto_id}) failed — "
+                            "falling through to LLM planning"
+                        )
+
             # Fetch legal actions once for all shortcut checks below
             legal = self._get_legal_actions(game_state)
 
@@ -818,8 +1010,18 @@ class AutopilotEngine:
                         if self._gre_bridge.connected or self._gre_bridge.connect():
                             if self._gre_bridge.submit_pass():
                                 self._log_execution_path(ExecutionPath.GRE_AWARE, "auto-pay via bridge")
+                                self._record_autopilot_decision(
+                                    game_state, trigger,
+                                    action_type="pay_costs",
+                                    summary="accepted autotap via bridge",
+                                )
                                 return True
                     self._exec_pass_priority()
+                    self._record_autopilot_decision(
+                        game_state, trigger,
+                        action_type="pay_costs",
+                        summary="auto-paid via pass (fallback)",
+                    )
                     return True
 
                 # MTGA usually auto-taps and just asks for confirmation.
@@ -851,6 +1053,11 @@ class AutopilotEngine:
             if has_done_confirm and not meaningful_non_done:
                 done_action = next(a for a in legal if a.lower().startswith("done (confirm"))
                 logger.info(f"Autopilot: auto-confirming '{done_action}'")
+                self._record_autopilot_decision(
+                    game_state, trigger,
+                    action_type="click_button",
+                    summary=f"auto-confirmed '{done_action}'",
+                )
                 if not self._config.dry_run and (self._gre_bridge.connected or self._gre_bridge.connect()):
                     # Use the right submit method based on request type
                     if "attacker" in done_action.lower():
@@ -900,6 +1107,11 @@ class AutopilotEngine:
             # without LLM planning. MTGA may also auto-pass these, so speed is key.
             if pending == "Priority (Pass Only)":
                 logger.info("Autopilot: auto-passing (pass-only priority)")
+                self._record_autopilot_decision(
+                    game_state, trigger,
+                    action_type="pass_priority",
+                    summary="pass-only priority, auto-passed",
+                )
                 if not self._config.dry_run:
                     # Try GRE bridge first (faster, no window focus needed)
                     if self._gre_bridge.connected or self._gre_bridge.connect():
@@ -2503,21 +2715,57 @@ class AutopilotEngine:
         game_state = self._get_game_state()
         battlefield = game_state.get("battlefield", [])
 
-        # Resolve target name to instance ID
+        # Restrict resolution to the bridge's legal-target set when present,
+        # so a fuzzy match can't accidentally pick a creature that isn't a
+        # valid choice for this particular spell/ability.
+        bridge_candidate_ids: set[int] = set()
+        for cand in pending.get("target_candidates") or []:
+            try:
+                iid = int(cand.get("targetInstanceId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if iid:
+                bridge_candidate_ids.add(iid)
+
+        def _eligible(card: dict[str, Any]) -> bool:
+            if not bridge_candidate_ids:
+                return True
+            try:
+                return int(card.get("instance_id") or 0) in bridge_candidate_ids
+            except (TypeError, ValueError):
+                return False
+
+        # Resolve target name to instance ID — exact first, then fuzzy.
         target_names = action.target_names or ([action.card_name] if action.card_name else [])
         target_id = None
-        for name in target_names:
-            for card in battlefield:
-                if card.get("name", "").lower() == name.lower():
-                    iid = card.get("instance_id")
-                    if iid:
-                        target_id = iid
-                        break
-            if target_id:
-                break
+        matched_name = None
+        target_id, matched_name = _match_target_in_battlefield(
+            target_names, battlefield, _eligible
+        )
+
+        # Last resort: if the bridge reports exactly one legal candidate,
+        # use it even when the name lookup failed. Catches common cases
+        # like "Target creature you control" with only one creature.
+        if target_id is None and len(bridge_candidate_ids) == 1:
+            target_id = next(iter(bridge_candidate_ids))
+            matched_name = f"<single-candidate id={target_id}>"
+            logger.info(
+                f"GRE bridge select_target: name lookup failed for {target_names}; "
+                f"using sole bridge candidate {target_id}"
+            )
 
         if target_id is None:
-            logger.info(f"GRE bridge select_target: can't resolve ID for {target_names}, falling back")
+            # Log candidate list so bug reports show what was available.
+            cand_summary = []
+            for card in battlefield:
+                if _eligible(card):
+                    cand_summary.append(
+                        f"{card.get('name')!r}#{card.get('instance_id')}"
+                    )
+            logger.info(
+                f"GRE bridge select_target: can't resolve ID for {target_names} "
+                f"(candidates: [{', '.join(cand_summary) or 'none'}]), falling back"
+            )
             return None
 
         # Use the right bridge method based on request type
@@ -2528,10 +2776,10 @@ class AutopilotEngine:
             success = self._gre_bridge.submit_selection([target_id])
 
         if success:
-            names = ", ".join(target_names)
+            display = matched_name or ", ".join(target_names)
             self._log_execution_path(
                 ExecutionPath.GRE_AWARE,
-                f"select_target: {names} (id={target_id}) via GRE bridge"
+                f"select_target: {display} (id={target_id}) via GRE bridge"
             )
             return ClickResult(True, 0, 0, "select_target", "GRE bridge")
 

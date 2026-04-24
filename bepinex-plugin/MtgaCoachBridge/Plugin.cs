@@ -603,6 +603,62 @@ namespace MtgaCoachBridge
                 resp["actions"] = actionsArr;
                 resp["decision_context"] = BuildCastingTimeOptionDecisionContext(entries);
             }
+            else if (request is SelectTargetsRequest targetsReqForCandidates)
+            {
+                // Flatten TargetSelections into a structured list so the
+                // Python side can see valid target instance IDs up front
+                // (useful for single-candidate auto-submit and for logging
+                // when a name-based lookup misses).
+                var gm = GetGameManager();
+                MtgGameState gsForTargets = null;
+                try { gsForTargets = gm?.CurrentGameState; } catch { gsForTargets = null; }
+
+                var selectionsArr = new JArray();
+                var flatCandidates = new JArray();
+                foreach (var ts in targetsReqForCandidates.TargetSelections)
+                {
+                    var slotTargets = new JArray();
+                    foreach (var t in ts.Targets)
+                    {
+                        int instanceId = (int)t.TargetInstanceId;
+                        uint grpId = 0;
+                        if (gsForTargets != null)
+                        {
+                            try
+                            {
+                                foreach (var card in gsForTargets.Battlefield?.VisibleCards ?? System.Linq.Enumerable.Empty<MtgCardInstance>())
+                                {
+                                    if (card != null && card.InstanceId == instanceId)
+                                    {
+                                        grpId = (uint)card.GrpId;
+                                        break;
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+                        var entry = new JObject
+                        {
+                            ["targetInstanceId"] = instanceId,
+                            ["targetIdx"] = (int)ts.TargetIdx,
+                            ["grpId"] = (int)grpId,
+                        };
+                        slotTargets.Add((JObject)entry.DeepClone());
+                        flatCandidates.Add(entry);
+                    }
+                    selectionsArr.Add(new JObject
+                    {
+                        ["targetIdx"] = (int)ts.TargetIdx,
+                        ["minTargets"] = (int)ts.MinTargets,
+                        ["maxTargets"] = (int)ts.MaxTargets,
+                        ["selectedTargets"] = (int)ts.SelectedTargets,
+                        ["targets"] = slotTargets,
+                    });
+                }
+                resp["target_selections"] = selectionsArr;
+                resp["target_candidates"] = flatCandidates;
+                resp["can_pass"] = false;
+            }
 
             var requestPayload = BuildPendingRequestPayload(request);
             if (requestPayload.Count > 0)

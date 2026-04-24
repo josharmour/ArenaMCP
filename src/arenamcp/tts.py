@@ -682,6 +682,22 @@ class VoiceOutput:
         text = re.sub(r"\[[A-Z][A-Za-z0-9_,:{}/ ]*\]", "", text)
         # Remove warning emoji that TTS might try to pronounce
         text = text.replace("\u26a0\ufe0f", "Warning:")
+        # Normalize short ALL-CAPS decision prefixes ("KEEP:", "MULLIGAN \u2014",
+        # "TOP:", "BOTTOM:", "GRAVEYARD:", "LIBRARY:") into a standalone
+        # sentence. Kokoro's ONNX model clips stop-consonants (K/M/T) at
+        # the head of an utterance on some voices even with leading silence;
+        # turning the prefix into its own sentence fixes the "KEEP" being
+        # swallowed in mulligan advice.
+        _DECISION_PREFIXES = (
+            "KEEP", "MULLIGAN", "TOP", "BOTTOM",
+            "GRAVEYARD", "LIBRARY", "SKIP", "ATTACK",
+            "BLOCK", "PASS", "DRAW", "DISCARD",
+        )
+        text = re.sub(
+            r"^\s*(" + "|".join(_DECISION_PREFIXES) + r")\s*[:\-\u2014]+\s+",
+            lambda m: m.group(1).capitalize() + ". ",
+            text,
+        )
         return text
 
     def speak(self, text: str, blocking: bool = True) -> None:

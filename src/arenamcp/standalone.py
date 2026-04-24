@@ -1336,6 +1336,10 @@ class StandaloneCoach:
                 ui_advice_fn=self.ui.advice if self.ui else None,
                 bug_report_fn=self._auto_bug_report_bridge_fallback,
             )
+            # Give the autopilot a way to write into advice_history so
+            # auto-handled decisions (auto-target, auto-pay, etc.) show
+            # up in bug reports alongside LLM advice.
+            self._autopilot._advice_recorder = self._record_advice
 
             mode = "DRY-RUN" if self._autopilot_dry_run else "LIVE"
             afk = " (AFK)" if self._autopilot_afk else ""
