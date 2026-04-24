@@ -1137,6 +1137,10 @@ _INTERMISSION_BRIDGE_REQUESTS = {
 
 _NON_ACTIONABLE_BRIDGE_REQUESTS = _INTERMISSION_BRIDGE_REQUESTS
 
+# Tracks the last logged (from, to) pair for pending_decision overrides
+# so the poll loop (~4 Hz) only emits one INFO line per transition.
+_LAST_OVERRIDE_LOG: Optional[tuple[str, str]] = None
+
 
 def _get_bridge_decision_type(
     request_type: Optional[str],
@@ -1232,10 +1236,24 @@ def enrich_snapshot_from_pending_response(
         snapshot["pending_decision"] = label
         logger.debug(f"Bridge set pending_decision: {label}")
     elif existing != label:
-        logger.info(
-            f"Bridge overriding stale pending_decision: "
-            f"{existing!r} → {label!r}"
-        )
+        # Bridge polls at ~4 Hz and each fresh snapshot carries the raw
+        # log-parsed pending_decision (often "Priority") even after we've
+        # overridden it, which produced hundreds of identical lines per
+        # priority window. Dedupe on (from, to) so we log once per
+        # transition and drop the rest to debug.
+        global _LAST_OVERRIDE_LOG
+        key = (existing, label)
+        if _LAST_OVERRIDE_LOG != key:
+            logger.info(
+                f"Bridge overriding stale pending_decision: "
+                f"{existing!r} → {label!r}"
+            )
+            _LAST_OVERRIDE_LOG = key
+        else:
+            logger.debug(
+                f"Bridge overriding stale pending_decision: "
+                f"{existing!r} → {label!r} (repeat)"
+            )
         snapshot["pending_decision"] = label
 
     decision_type = _get_bridge_decision_type(request_type, request_class)

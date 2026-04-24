@@ -488,7 +488,15 @@ class StandaloneCoach:
         self.set_code = set_code.upper() if set_code else None
 
         # Autopilot
-        self._autopilot_enabled = autopilot
+        # If the caller didn't explicitly opt in via --autopilot, restore
+        # the last saved state so a launcher restart doesn't silently
+        # leave autopilot off (previously caused long "pauses" where
+        # priority was on the user but nothing was acting on advice).
+        saved_autopilot = bool(self.settings.get("autopilot_enabled", False))
+        self._autopilot_enabled = bool(autopilot or saved_autopilot)
+        self._autopilot_restored_from_settings = (
+            bool(saved_autopilot) and not bool(autopilot)
+        )
         self._autopilot_dry_run = dry_run
         self._autopilot_afk = afk
         self._autopilot: Optional[Any] = None  # AutopilotEngine instance
@@ -1369,6 +1377,10 @@ class StandaloneCoach:
                         logger.debug(f"Autopilot backend close error: {e}")
                 self._autopilot_backend = None
             logger.info("Autopilot toggled OFF")
+            try:
+                self.settings.set("autopilot_enabled", False)
+            except Exception as e:
+                logger.debug(f"Failed to persist autopilot_enabled=False: {e}")
             return False
         else:
             # Turn ON: initialize if needed, then enable
@@ -1390,6 +1402,10 @@ class StandaloneCoach:
                 self._autopilot._clear_events()
                 self._autopilot_enabled = True
                 logger.info("Autopilot toggled ON")
+                try:
+                    self.settings.set("autopilot_enabled", True)
+                except Exception as e:
+                    logger.debug(f"Failed to persist autopilot_enabled=True: {e}")
                 return True
             else:
                 logger.warning("Autopilot toggle failed: init unsuccessful")
@@ -5099,9 +5115,23 @@ class StandaloneCoach:
             self.ui.log("Initializing vision mapper...")
             self._init_vision_mapper()
 
-            # Initialize autopilot if enabled
+            # Initialize autopilot if enabled. Restoring from a prior
+            # saved-on state surfaces a log/UI nudge so the user isn't
+            # surprised that it came up already armed.
             if self._autopilot_enabled:
                 self._init_autopilot()
+                if getattr(self, "_autopilot_restored_from_settings", False):
+                    logger.info(
+                        "Autopilot re-enabled automatically from last session"
+                    )
+                    try:
+                        self.ui.log(
+                            "[cyan]Autopilot re-enabled automatically "
+                            "(saved from previous session). Toggle off if "
+                            "you want to play manually.[/]"
+                        )
+                    except Exception:
+                        pass
 
             # Start coaching and voice threads
             logger.info(f"Starting threads for backend: {self.backend_name}")

@@ -175,6 +175,7 @@ class MatchOverlayWindow(QWidget):
         """
         if anchor in ("top-right", "top-left", "bottom-right", "bottom-left"):
             self._advice_panel_anchor = anchor
+            self._save_advice_anchor()
             self.update()
 
     def cycle_advice_anchor(self) -> str:
@@ -185,6 +186,7 @@ class MatchOverlayWindow(QWidget):
         except ValueError:
             idx = -1
         self._advice_panel_anchor = order[(idx + 1) % len(order)]
+        self._save_advice_anchor()
         self.update()
         return self._advice_panel_anchor
 
@@ -310,25 +312,58 @@ class MatchOverlayWindow(QWidget):
                 self._calib_scale_x = 1.0
             if self._calib_scale_y <= 0:
                 self._calib_scale_y = 1.0
+            saved_anchor = data.get("advice_anchor")
+            if saved_anchor in (
+                "top-right", "top-left", "bottom-right", "bottom-left"
+            ):
+                self._advice_panel_anchor = saved_anchor
         except Exception as e:
             logger.debug(f"load overlay_calibration failed: {e}")
 
-    def _save_calibration(self) -> None:
+    def _read_calibration_file(self) -> dict[str, Any]:
         try:
             p = self._calibration_path()
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f) or {}
+        except Exception as e:
+            logger.debug(f"read overlay_calibration failed: {e}")
+        return {}
+
+    def _write_calibration_file(self, data: dict[str, Any]) -> None:
+        p = self._calibration_path()
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    def _save_calibration(self) -> None:
+        try:
+            # Merge with any advice_anchor already on disk so hitting Ctrl+S
+            # in calibration doesn't wipe the user's corner preference.
+            existing = self._read_calibration_file()
             data = {
+                **existing,
                 "offset_x": round(self._calib_offset_x, 3),
                 "offset_y": round(self._calib_offset_y, 3),
                 "scale_x": round(self._calib_scale_x, 5),
                 "scale_y": round(self._calib_scale_y, 5),
+                "advice_anchor": self._advice_panel_anchor,
             }
-            with open(p, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            self._write_calibration_file(data)
             self._calib_saved_at = time.time()
             logger.info(f"overlay calibration saved: {data}")
         except Exception as e:
             logger.error(f"save overlay_calibration failed: {e}")
         self.update()
+
+    def _save_advice_anchor(self) -> None:
+        """Persist just the advice anchor without touching calibration."""
+        try:
+            existing = self._read_calibration_file()
+            existing["advice_anchor"] = self._advice_panel_anchor
+            self._write_calibration_file(existing)
+            logger.info(f"advice_anchor saved: {self._advice_panel_anchor}")
+        except Exception as e:
+            logger.debug(f"save advice_anchor failed: {e}")
 
     def _reset_calibration(self) -> None:
         """Revert in-memory calibration to identity. Does not delete the

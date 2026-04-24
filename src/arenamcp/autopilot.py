@@ -571,22 +571,50 @@ class AutopilotEngine:
         """Whether this action already failed to advance the current window."""
         return self._action_block_key(action, game_state) in self._blocked_action_keys
 
+    # Oracle-text keywords that indicate a spell would HARM whatever it
+    # targets. If the source spell has one of these and the sole target
+    # candidate is a permanent the local player controls, auto-submitting
+    # would hand the player's own card to the effect (classic Seam Rip
+    # self-destruction bug). Hitting one of these phrases routes the
+    # decision back to the LLM, which can cancel the cast or target
+    # intentionally. Positive-target spells (auras with "enchant creature
+    # you control", buffs with "target creature you control gets"...) do
+    # NOT contain these phrases, so they keep the fast-path.
+    _HARMFUL_SOURCE_ORACLE_PHRASES = (
+        "destroy target",
+        "exile target",
+        "sacrifice target",  # rare — most "sacrifice" is "sacrifice a X you control"
+        "counter target",
+        "return target",      # bounce spells
+        "opponent sacrifices target",
+        "damage to target",   # Shock-style
+        "gets -",             # "target creature gets -X/-X"
+        "gets −",             # unicode minus variant
+        "loses all abilities",
+        "loses flying",
+    )
+
     def _pick_single_target_candidate(
         self,
         game_state: dict[str, Any],
     ) -> Optional[int]:
-        """Return the sole legal target instance_id if there's exactly one.
+        """Return the sole legal target instance_id if there's exactly one
+        AND auto-submit would be a good thing.
 
-        Prefers the bridge-reported `target_candidates` list (populated by
-        the plugin for SelectTargetsRequest). Falls back to querying the
-        bridge directly if the snapshot doesn't have them yet.
+        Two gates:
+          1. The bridge has to report exactly one legal candidate.
+          2. If that candidate is a permanent the local player controls,
+             the source spell's oracle text must NOT contain a removal-
+             style keyword. This keeps Sheltered-by-Ghosts-on-your-own-
+             creature on the fast path, while pausing on Seam Rip when
+             the only legal target is your own enchantment.
+        Opponent-controlled candidates always pass.
         """
-        def _extract(resp: dict[str, Any]) -> Optional[int]:
+        def _extract_ids(resp: dict[str, Any]) -> list[int]:
             if not resp or not resp.get("has_pending"):
-                return None
+                return []
             cands = resp.get("target_candidates") or []
-            # Collect unique instance ids — if exactly one, that's the pick.
-            ids = []
+            ids: list[int] = []
             for c in cands:
                 try:
                     iid = int(c.get("targetInstanceId") or 0)
@@ -594,25 +622,131 @@ class AutopilotEngine:
                     continue
                 if iid and iid not in ids:
                     ids.append(iid)
-            if len(ids) == 1:
-                return ids[0]
-            return None
+            return ids
 
-        # Try snapshot first (avoid extra pipe round-trip).
+        # Snapshot first; fall back to live bridge poll.
         snap_resp = game_state.get("_bridge_last_poll") or game_state.get("_bridge_trigger")
-        picked = _extract(snap_resp) if isinstance(snap_resp, dict) else None
-        if picked is not None:
-            return picked
-
-        # Snapshot didn't carry it — ask the bridge live.
-        try:
-            if not (self._gre_bridge.connected or self._gre_bridge.connect()):
+        ids = _extract_ids(snap_resp) if isinstance(snap_resp, dict) else []
+        live_resp = None
+        if not ids:
+            try:
+                if self._gre_bridge.connected or self._gre_bridge.connect():
+                    live_resp = self._gre_bridge.get_pending_actions() or {}
+                    ids = _extract_ids(live_resp)
+            except Exception as e:
+                logger.debug(f"_pick_single_target_candidate bridge query failed: {e}")
                 return None
-            live = self._gre_bridge.get_pending_actions()
-        except Exception as e:
-            logger.debug(f"_pick_single_target_candidate bridge query failed: {e}")
+        if len(ids) != 1:
             return None
-        return _extract(live or {})
+
+        only_id = ids[0]
+
+        local_seat = None
+        for p in game_state.get("players", []) or []:
+            if p.get("is_local"):
+                local_seat = p.get("seat_id")
+                break
+
+        # Look up candidate ownership.
+        controller = None
+        for card in game_state.get("battlefield", []) or []:
+            try:
+                iid = int(card.get("instance_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if iid == only_id:
+                controller = card.get("controller_id") or card.get("owner_seat_id")
+                break
+
+        # Opponent-controlled sole target → always safe to auto-submit.
+        if local_seat is not None and controller is not None and controller != local_seat:
+            return only_id
+
+        # Self-controlled (or unknown controller): only auto-submit when
+        # the source spell's oracle text reads as a positive / beneficial
+        # targeting effect. Otherwise, pause so the LLM can cancel or
+        # target deliberately.
+        if self._source_spell_is_harmful_to_target(game_state, snap_resp, live_resp):
+            logger.info(
+                f"Autopilot: declining auto-submit for target {only_id} — "
+                "sole candidate is self-controlled and the source spell "
+                "looks removal-shaped. Letting the LLM decide."
+            )
+            return None
+
+        return only_id
+
+    def _source_spell_is_harmful_to_target(
+        self,
+        game_state: dict[str, Any],
+        snap_resp: Optional[dict[str, Any]],
+        live_resp: Optional[dict[str, Any]],
+    ) -> bool:
+        """Does the spell on the stack read like a removal / hurt effect?
+
+        We find the source card in this order:
+          1. decision_context (bridge-supplied sourceId → stack entry)
+          2. top of the stack (spell currently resolving targets)
+        Then we check its oracle text against known harmful phrases.
+        Unknown oracle text => False (err on the side of auto-submit).
+        """
+        oracle = ""
+        name = ""
+
+        stack = game_state.get("stack", []) or []
+        ctx = game_state.get("decision_context") or {}
+        source_id = None
+        for key in ("sourceId", "source_id", "source_instance_id"):
+            try:
+                v = ctx.get(key)
+                if v:
+                    source_id = int(v)
+                    break
+            except (TypeError, ValueError):
+                continue
+
+        picked = None
+        if source_id:
+            for entry in stack:
+                try:
+                    if int(entry.get("instance_id") or 0) == source_id:
+                        picked = entry
+                        break
+                except (TypeError, ValueError):
+                    continue
+        if picked is None and stack:
+            picked = stack[-1]  # top of stack
+
+        if picked:
+            oracle = str(picked.get("oracle_text") or "").lower()
+            name = str(picked.get("name") or "")
+
+        # Bridge may include oracle in target_candidates / request payload;
+        # use it as a backup.
+        for resp in (snap_resp, live_resp):
+            if oracle or not resp:
+                continue
+            rp = (resp.get("request_payload") or {})
+            for k in ("sourceOracleText", "oracleText", "oracle_text"):
+                if rp.get(k):
+                    oracle = str(rp[k]).lower()
+                    break
+
+        if not oracle:
+            logger.debug(
+                f"Autopilot: no oracle text found for source spell "
+                f"(name={name!r}); defaulting to auto-submit"
+            )
+            return False
+
+        for phrase in self._HARMFUL_SOURCE_ORACLE_PHRASES:
+            if phrase in oracle:
+                logger.info(
+                    f"Autopilot: source spell {name!r} oracle contains "
+                    f"{phrase!r} — treating as harmful-to-target"
+                )
+                return True
+        return False
 
     def _record_autopilot_decision(
         self,

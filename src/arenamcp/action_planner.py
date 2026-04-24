@@ -438,9 +438,11 @@ class ActionPlanner:
                 if mana_pool and rules_engine_cls is not None:
                     card_name = self._normalize_action_text(legal_action).replace("Cast ", "").strip()
                     card_cost = ""
+                    card_hand_entry = None
                     for card in game_state.get("hand", []):
                         if card.get("name", "").lower() == card_name.lower():
                             card_cost = card.get("mana_cost", "")
+                            card_hand_entry = card
                             break
                     if card_cost and not rules_engine_cls._can_afford(card_cost, mana_pool):
                         logger.info(
@@ -450,9 +452,105 @@ class ActionPlanner:
                         )
                         continue
 
+                    # Block removal spells that would only have friendly
+                    # targets. Casting them just forces the user to either
+                    # blow up their own permanent or cancel — neither is
+                    # worth the mana. See "Seam Rip with only my own
+                    # enchantment in play" self-destruct case.
+                    if card_hand_entry and self._removal_lacks_opponent_target(
+                        card_hand_entry, game_state
+                    ):
+                        logger.info(
+                            "Filtering self-harming removal: %s (no legal opponent target)",
+                            card_name,
+                        )
+                        continue
+
             filtered.append(legal_action)
 
         return filtered or legal_actions
+
+    # Oracle phrases that mark a spell as removal / hurts-its-target.
+    # Kept in sync with the autopilot bridge-side safety check.
+    _REMOVAL_ORACLE_PHRASES = (
+        "destroy target",
+        "exile target",
+        "counter target",
+        "return target",
+        "sacrifices target",
+        "sacrifice target",
+        "deals damage to target",
+        "damage to target creature",
+        "damage to any target",
+    )
+
+    def _removal_lacks_opponent_target(
+        self,
+        card: dict[str, Any],
+        game_state: dict[str, Any],
+    ) -> bool:
+        """Is this card removal whose only legal targets are friendly?
+
+        Returns True only when:
+          - Oracle text reads like removal / harmful targeting, AND
+          - The battlefield has no opponent permanent matching any
+            plausible target type mentioned in the oracle.
+        Conservative by design — returns False whenever we can't confirm
+        both conditions, so non-removal spells (auras, buffs, fight
+        spells with any viable target) keep the fast path.
+        """
+        oracle = (card.get("oracle_text") or "").lower()
+        if not oracle:
+            return False
+
+        is_removal = any(phrase in oracle for phrase in self._REMOVAL_ORACLE_PHRASES)
+        if not is_removal:
+            return False
+
+        # Bail on spells that can target players — "Shock target creature
+        # or player" has a player fallback, so it's never self-only.
+        if "any target" in oracle or "target player" in oracle or "target opponent" in oracle:
+            return False
+
+        local_seat = None
+        for p in game_state.get("players", []) or []:
+            if p.get("is_local"):
+                local_seat = p.get("seat_id")
+                break
+        if local_seat is None:
+            return False
+
+        battlefield = game_state.get("battlefield", []) or []
+        opp_permanents = [
+            c for c in battlefield
+            if (c.get("controller_id") or c.get("owner_seat_id")) != local_seat
+            and "land" not in str(c.get("type_line") or "").lower()
+        ]
+
+        def _opp_of_type(pred) -> bool:
+            return any(pred(c) for c in opp_permanents)
+
+        # Narrow by oracle target type. If the spell specifies
+        # enchantment/artifact/creature and no opponent has that type,
+        # the only legal target is friendly → self-harm.
+        if "target enchantment" in oracle:
+            if not _opp_of_type(lambda c: "enchantment" in str(c.get("type_line") or "").lower()):
+                return True
+        if "target artifact" in oracle and "enchantment" not in oracle:
+            if not _opp_of_type(lambda c: "artifact" in str(c.get("type_line") or "").lower()):
+                return True
+        if ("target creature" in oracle
+                and "or enchantment" not in oracle
+                and "or planeswalker" not in oracle):
+            if not _opp_of_type(lambda c: "creature" in str(c.get("type_line") or "").lower()):
+                return True
+        if "target nonland permanent" in oracle or "target permanent" in oracle:
+            if not opp_permanents:
+                return True
+        if "target planeswalker" in oracle:
+            if not _opp_of_type(lambda c: "planeswalker" in str(c.get("type_line") or "").lower()):
+                return True
+        return False
 
     def _build_action_prompt(
         self,
