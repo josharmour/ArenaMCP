@@ -50,8 +50,40 @@ if admin_password.startswith("${") and admin_password.endswith("}"):
 
 # Initialize
 db.init_db()
+
+
+def _resolved_provider_configs() -> list[dict]:
+    """Layer SQLite overrides on top of yaml provider list.
+
+    Override is whole-list replacement: if `proxy_config.providers` exists,
+    it replaces the yaml list entirely. Otherwise the yaml list wins.
+    """
+    raw = db.get_config_value("providers")
+    if raw:
+        try:
+            return json.loads(raw) or []
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("proxy_config.providers is not valid JSON; ignoring override")
+    return list(config.get("providers", []))
+
+
+def _resolved_default_model() -> str:
+    """Default model from SQLite override or yaml fallback."""
+    return (
+        db.get_config_value("default_model")
+        or config.get("default_model", "")
+        or ""
+    )
+
+
+def _reload_providers() -> None:
+    """Re-init the global ProviderRouter from current yaml + SQLite state."""
+    router.load_from_config(_resolved_provider_configs())
+    logger.info(f"Provider router reloaded ({len(router.providers)} active)")
+
+
 router = ProviderRouter()
-router.load_from_config(config.get("providers", []))
+router.load_from_config(_resolved_provider_configs())
 
 app = FastAPI(title="mtgacoach.com API", docs_url=None, redoc_url=None)
 templates = Jinja2Templates(directory="templates")
@@ -1503,6 +1535,227 @@ async def admin_logs(request: Request, _=Depends(_require_admin)):
     with open(log_file) as f:
         all_lines = f.readlines()
     return {"lines": [l.rstrip() for l in all_lines[-lines:]]}
+
+
+# --- Provider configuration ---
+
+def _is_env_ref(value: str) -> bool:
+    return isinstance(value, str) and value.startswith("${") and value.endswith("}")
+
+
+def _annotate_api_key(value: str) -> dict:
+    """Describe an api_key value without leaking its content.
+
+    Env-ref values report whether the underlying env var is set; literal
+    values report only their length and a 4-char prefix so the UI can hint
+    at which key is configured without revealing the secret.
+    """
+    if not value:
+        return {"type": "empty", "set": False, "display": ""}
+    if _is_env_ref(value):
+        env_name = value[2:-1]
+        present = bool(os.environ.get(env_name))
+        return {
+            "type": "env",
+            "set": present,
+            "env_name": env_name,
+            "display": value,
+        }
+    return {
+        "type": "literal",
+        "set": True,
+        "length": len(value),
+        "display": f"{value[:4]}…({len(value)} chars)",
+    }
+
+
+def _build_provider_state() -> dict:
+    """Snapshot of the live router + persisted config for the admin UI."""
+    cfgs = _resolved_provider_configs()
+    overridden = db.get_config_value("providers") is not None
+    default_model = _resolved_default_model()
+    yaml_default = config.get("default_model", "")
+
+    # Index live providers by name for runtime status.
+    live_by_name = {p.name: p for p in router.providers}
+
+    items: list[dict] = []
+    for cfg in cfgs:
+        name = cfg.get("name", "")
+        live = live_by_name.get(name)
+        items.append({
+            "name": name,
+            "base_url": cfg.get("base_url", ""),
+            "api_key": _annotate_api_key(cfg.get("api_key", "")),
+            "api_version": cfg.get("api_version", ""),
+            "models": list(cfg.get("models", [])),
+            "priority": cfg.get("priority", 10),
+            "enabled": bool(cfg.get("enabled", True)),
+            "live": {
+                "loaded": live is not None,
+                "available": live.available if live else False,
+                "consecutive_failures": live._consecutive_failures if live else 0,
+                "backoff_until": live._backoff_until if live else 0.0,
+            },
+        })
+
+    all_models: list[str] = []
+    seen_models: set[str] = set()
+    for cfg in cfgs:
+        for m in cfg.get("models") or []:
+            if m and m not in seen_models:
+                seen_models.add(m)
+                all_models.append(m)
+
+    return {
+        "providers": items,
+        "default_model": default_model,
+        "yaml_default_model": yaml_default,
+        "available_models": all_models,
+        "overridden": overridden,
+        "env_vars": _list_relevant_env_vars(items),
+    }
+
+
+def _list_relevant_env_vars(items: list[dict]) -> list[dict]:
+    """Return env vars referenced by current providers + their set/unset state."""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for p in items:
+        info = p.get("api_key") or {}
+        if info.get("type") == "env":
+            name = info.get("env_name", "")
+            if name and name not in seen:
+                seen.add(name)
+                out.append({"name": name, "set": bool(os.environ.get(name))})
+    return out
+
+
+def _validate_provider_dict(p: dict) -> tuple[bool, str]:
+    """Light validation; returns (ok, error_message)."""
+    if not isinstance(p, dict):
+        return False, "provider entry must be an object"
+    name = (p.get("name") or "").strip()
+    base_url = (p.get("base_url") or "").strip()
+    if not name:
+        return False, "name is required"
+    if not base_url:
+        return False, f"{name}: base_url is required"
+    if not (base_url.startswith("http://") or base_url.startswith("https://")):
+        return False, f"{name}: base_url must be http:// or https://"
+    models = p.get("models") or []
+    if not isinstance(models, list) or not all(isinstance(m, str) for m in models):
+        return False, f"{name}: models must be a list of strings"
+    return True, ""
+
+
+@app.get("/admin/api/providers")
+async def admin_get_providers(request: Request, _=Depends(_require_admin)):
+    return _build_provider_state()
+
+
+@app.put("/admin/api/providers")
+async def admin_update_providers(request: Request, _=Depends(_require_admin)):
+    """Replace the persisted provider list and (optionally) default_model.
+
+    Body: {"providers": [...], "default_model": "..."}.
+    Triggers a router reload on success.
+    """
+    body = await request.json()
+    providers = body.get("providers")
+    if not isinstance(providers, list):
+        raise HTTPException(400, "providers must be a list")
+
+    cleaned: list[dict] = []
+    for p in providers:
+        ok, err = _validate_provider_dict(p)
+        if not ok:
+            raise HTTPException(400, err)
+        cleaned.append({
+            "name": p["name"].strip(),
+            "base_url": p["base_url"].strip(),
+            "api_key": (p.get("api_key") or "").strip(),
+            "api_version": (p.get("api_version") or "").strip(),
+            "models": [m.strip() for m in (p.get("models") or []) if m and m.strip()],
+            "priority": int(p.get("priority", 10)),
+            "enabled": bool(p.get("enabled", True)),
+        })
+
+    db.set_config_value("providers", json.dumps(cleaned))
+
+    if "default_model" in body:
+        dm = (body.get("default_model") or "").strip()
+        db.set_config_value("default_model", dm)
+
+    _reload_providers()
+    return {"ok": True, "state": _build_provider_state()}
+
+
+@app.post("/admin/api/providers/reload")
+async def admin_reload_providers(request: Request, _=Depends(_require_admin)):
+    """Re-read overrides + yaml and rebuild the router."""
+    _reload_providers()
+    return {"ok": True, "state": _build_provider_state()}
+
+
+@app.post("/admin/api/providers/reset")
+async def admin_reset_providers(request: Request, _=Depends(_require_admin)):
+    """Drop SQLite overrides; revert to yaml-only config."""
+    with db.get_db() as conn:
+        conn.execute("DELETE FROM proxy_config WHERE key IN ('providers', 'default_model')")
+    _reload_providers()
+    return {"ok": True, "state": _build_provider_state()}
+
+
+@app.post("/admin/api/providers/test")
+async def admin_test_provider(request: Request, _=Depends(_require_admin)):
+    """Send a tiny chat completion to a named provider to verify connectivity."""
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    model = (body.get("model") or "").strip()
+    provider = next((p for p in router.providers if p.name == name), None)
+    if not provider:
+        raise HTTPException(404, f"provider '{name}' not loaded")
+
+    test_model = model or (provider.models[0] if provider.models else "")
+    if not test_model:
+        raise HTTPException(400, f"provider '{name}' has no models configured")
+
+    test_body = {
+        "model": test_model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 4,
+    }
+    started = time.time()
+    try:
+        resp = await provider.forward_chat(test_body, http_client)
+        elapsed_ms = (time.time() - started) * 1000
+        ok = 200 <= resp.status_code < 300
+        snippet = ""
+        try:
+            snippet = (resp.text or "")[:200]
+        except Exception:
+            snippet = ""
+        if ok:
+            provider.mark_success()
+        else:
+            provider.mark_failure()
+        return {
+            "ok": ok,
+            "status_code": resp.status_code,
+            "elapsed_ms": int(elapsed_ms),
+            "model": test_model,
+            "snippet": snippet,
+        }
+    except Exception as e:
+        provider.mark_failure()
+        return {
+            "ok": False,
+            "status_code": 0,
+            "elapsed_ms": int((time.time() - started) * 1000),
+            "model": test_model,
+            "error": str(e),
+        }
 
 
 # =========================================================================

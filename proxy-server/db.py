@@ -74,12 +74,40 @@ def init_db():
                 UNIQUE(license_key, install_id)
             );
 
+            CREATE TABLE IF NOT EXISTS proxy_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_subscribers_key ON subscribers(license_key);
             CREATE INDEX IF NOT EXISTS idx_usage_key ON usage_log(license_key);
             CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_log(timestamp);
             CREATE INDEX IF NOT EXISTS idx_client_installs_key ON client_installs(license_key);
             CREATE INDEX IF NOT EXISTS idx_client_installs_last_seen ON client_installs(last_seen);
         """)
+
+
+# --- Proxy config (provider overrides + default_model) ---
+
+def get_config_value(key: str) -> Optional[str]:
+    """Read a proxy_config entry. Returns None if absent."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT value FROM proxy_config WHERE key = ?", (key,)
+        ).fetchone()
+    return row["value"] if row else None
+
+
+def set_config_value(key: str, value: str) -> None:
+    """Upsert a proxy_config entry."""
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO proxy_config (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (key, value, time.time()),
+        )
 
 
 def generate_license_key() -> str:

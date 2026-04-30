@@ -97,6 +97,7 @@
             <div class="tab active" onclick="showTab('subscribers')">Subscribers</div>
             <div class="tab" onclick="showTab('messages')">Messages</div>
             <div class="tab" onclick="showTab('usage')">Usage</div>
+            <div class="tab" onclick="showTab('providers')">Providers</div>
             <div class="tab" onclick="showTab('logs')">Logs</div>
         </div>
 
@@ -148,6 +149,29 @@
             </table>
         </div>
 
+        <!-- Providers tab -->
+        <div id="tab-providers" class="panel">
+            <h2>Backend Providers
+                <span id="prov-override-pill" style="font-size:0.7rem;font-weight:500;padding:2px 8px;border-radius:10px;margin-left:8px;display:none"></span>
+            </h2>
+            <p style="color:var(--muted);font-size:0.9rem;margin-bottom:16px">
+                Live routing config. Edits are persisted in the proxy database and override the baked-in <code>config.yaml</code>. Click <b>Save</b> to apply (router reloads in-process — no container restart needed).
+            </p>
+
+            <div style="display:flex;gap:10px;align-items:center;margin-bottom:16px;flex-wrap:wrap">
+                <label style="font-size:0.9rem;color:var(--muted)">Default model:</label>
+                <select id="prov-default-model" style="padding:6px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);min-width:180px"></select>
+                <button class="btn btn-primary" onclick="saveProviders()">Save</button>
+                <button class="btn btn-sm" style="background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="reloadProviders()">Reload from disk</button>
+                <button class="btn btn-sm btn-warning" onclick="resetProviders()">Revert to yaml</button>
+                <button class="btn btn-sm" style="background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="addProvider()">+ Add provider</button>
+            </div>
+
+            <div id="prov-env-status" style="font-size:0.85rem;color:var(--muted);margin-bottom:16px"></div>
+
+            <div id="prov-list"></div>
+        </div>
+
         <!-- Logs tab -->
         <div id="tab-logs" class="panel">
             <h2>Server Logs</h2>
@@ -194,6 +218,8 @@
             document.querySelectorAll('#dashboard > .panel').forEach(p => p.classList.remove('active'));
             event.target.classList.add('active');
             document.getElementById('tab-' + name).classList.add('active');
+            if (name === 'logs' && typeof loadLogs === 'function') loadLogs();
+            if (name === 'providers') loadProviders();
         }
 
         async function loadAll() {
@@ -351,6 +377,262 @@
                     <td>${(u.total_prompt + u.total_completion).toLocaleString()}</td>
                 </tr>
             `).join('') || '<tr><td colspan="5" style="color:var(--muted)">No usage data yet.</td></tr>';
+        }
+
+        // ---------------- Providers ----------------
+
+        let provState = null; // current snapshot from server (last loaded/saved)
+        let provDraft = null; // mutable working copy used by the form
+
+        function escapeHtml(s) {
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        async function loadProviders() {
+            const resp = await api('/admin/api/providers');
+            if (!resp.ok) {
+                document.getElementById('prov-list').innerHTML =
+                    `<p style="color:var(--red)">Failed to load: ${resp.status}</p>`;
+                return;
+            }
+            provState = await resp.json();
+            // Deep copy state into draft
+            provDraft = JSON.parse(JSON.stringify(provState));
+            renderProviders();
+        }
+
+        function renderProviders() {
+            if (!provDraft) return;
+
+            // Override pill
+            const pill = document.getElementById('prov-override-pill');
+            if (provDraft.overridden) {
+                pill.textContent = 'using DB override';
+                pill.style.background = 'rgba(99,102,241,0.15)';
+                pill.style.color = 'var(--accent)';
+                pill.style.display = 'inline-block';
+            } else {
+                pill.textContent = 'yaml only';
+                pill.style.background = 'rgba(136,136,136,0.15)';
+                pill.style.color = 'var(--muted)';
+                pill.style.display = 'inline-block';
+            }
+
+            // Default model dropdown
+            const sel = document.getElementById('prov-default-model');
+            const curr = provDraft.default_model || '';
+            const opts = ['', ...provDraft.available_models];
+            sel.innerHTML = opts.map(m =>
+                `<option value="${escapeHtml(m)}" ${m === curr ? 'selected' : ''}>${m ? escapeHtml(m) : '(none)'}</option>`
+            ).join('');
+
+            // Env var status
+            const envStatus = document.getElementById('prov-env-status');
+            if ((provDraft.env_vars || []).length) {
+                envStatus.innerHTML = 'Env vars referenced: ' + provDraft.env_vars.map(v =>
+                    `<code style="padding:1px 6px;border-radius:4px;background:var(--surface);color:${v.set ? 'var(--green)' : 'var(--red)'}">${escapeHtml(v.name)} ${v.set ? '✓' : '✗'}</code>`
+                ).join(' ');
+            } else {
+                envStatus.innerHTML = '';
+            }
+
+            // Provider cards
+            const list = document.getElementById('prov-list');
+            list.innerHTML = provDraft.providers.map((p, i) => providerCardHtml(p, i)).join('') ||
+                '<p style="color:var(--muted)">No providers configured. Click <b>+ Add provider</b> to create one.</p>';
+        }
+
+        function providerCardHtml(p, i) {
+            const live = p.live || {};
+            let liveBadge = '';
+            if (!p.enabled) {
+                liveBadge = '<span class="badge" style="background:rgba(136,136,136,0.15);color:var(--muted)">disabled</span>';
+            } else if (!live.loaded) {
+                liveBadge = '<span class="badge" style="background:rgba(245,158,11,0.15);color:var(--yellow)">not loaded</span>';
+            } else if (live.available) {
+                liveBadge = '<span class="badge active">available</span>';
+            } else {
+                liveBadge = `<span class="badge expired">backoff (${live.consecutive_failures} fails)</span>`;
+            }
+
+            const apiKey = p.api_key || {};
+            let apiKeyHint = '';
+            if (apiKey.type === 'env') {
+                apiKeyHint = `<small style="color:${apiKey.set ? 'var(--green)' : 'var(--red)'}">env <code>${escapeHtml(apiKey.env_name)}</code> ${apiKey.set ? 'set' : 'NOT set'}</small>`;
+            } else if (apiKey.type === 'literal') {
+                apiKeyHint = `<small style="color:var(--muted)">literal: ${escapeHtml(apiKey.display)}</small>`;
+            } else {
+                apiKeyHint = `<small style="color:var(--red)">no API key</small>`;
+            }
+
+            return `
+                <div class="msg-card" data-idx="${i}">
+                    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+                        <input type="text" value="${escapeHtml(p.name)}" placeholder="provider name"
+                            style="font-size:1.1rem;font-weight:600;background:transparent;border:none;color:var(--text);outline:none;border-bottom:1px solid var(--border);padding:2px 4px;min-width:140px"
+                            onchange="provEdit(${i},'name',this.value)">
+                        ${liveBadge}
+                        <span style="margin-left:auto;display:flex;gap:6px">
+                            <button class="btn btn-sm" style="background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="provMove(${i},-1)" ${i === 0 ? 'disabled' : ''}>↑</button>
+                            <button class="btn btn-sm" style="background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="provMove(${i},1)" ${i === provDraft.providers.length - 1 ? 'disabled' : ''}>↓</button>
+                            <button class="btn btn-sm btn-primary" onclick="testProvider(${i})">Test</button>
+                            <button class="btn btn-sm btn-danger" onclick="provRemove(${i})">Remove</button>
+                        </span>
+                    </div>
+
+                    <div style="display:grid;grid-template-columns:140px 1fr;gap:8px 12px;align-items:center;font-size:0.9rem">
+                        <label style="color:var(--muted)">Enabled</label>
+                        <div><label style="display:inline-flex;align-items:center;gap:6px"><input type="checkbox" ${p.enabled ? 'checked' : ''} onchange="provEdit(${i},'enabled',this.checked)"> route requests to this provider</label></div>
+
+                        <label style="color:var(--muted)">Priority</label>
+                        <input type="number" value="${p.priority}" style="padding:6px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);width:90px" onchange="provEdit(${i},'priority',parseInt(this.value)||10)">
+
+                        <label style="color:var(--muted)">Base URL</label>
+                        <input type="text" value="${escapeHtml(p.base_url)}" placeholder="https://api.example.com/v1" style="padding:6px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text)" onchange="provEdit(${i},'base_url',this.value)">
+
+                        <label style="color:var(--muted)">API key</label>
+                        <div style="display:flex;flex-direction:column;gap:4px">
+                            <input type="text" value="${escapeHtml(apiKey.display || '')}" placeholder="\${ENV_VAR_NAME} or literal key"
+                                style="padding:6px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:monospace;font-size:0.85rem"
+                                onchange="provSetApiKey(${i},this.value)">
+                            ${apiKeyHint}
+                        </div>
+
+                        <label style="color:var(--muted)">API version</label>
+                        <input type="text" value="${escapeHtml(p.api_version || '')}" placeholder="(Azure only) e.g. 2025-04-01-preview" style="padding:6px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text)" onchange="provEdit(${i},'api_version',this.value)">
+
+                        <label style="color:var(--muted)">Models</label>
+                        <input type="text" value="${escapeHtml((p.models || []).join(', '))}" placeholder="comma-separated, e.g. gpt-5.5, gpt-5.4" style="padding:6px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text)" onchange="provSetModels(${i},this.value)">
+
+                        <label style="color:var(--muted)">Test result</label>
+                        <div id="prov-test-${i}" style="font-size:0.85rem;color:var(--muted)">—</div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function provEdit(i, field, value) {
+            provDraft.providers[i][field] = value;
+        }
+
+        function provSetApiKey(i, value) {
+            // Stored as raw string; backend tags it as env-ref or literal on save+reload.
+            provDraft.providers[i].api_key = { type: 'pending', display: value };
+            // Re-render this card only — preserves focus on other inputs.
+            const card = document.querySelector(`#prov-list [data-idx="${i}"]`);
+            if (card) card.outerHTML = providerCardHtml(provDraft.providers[i], i);
+        }
+
+        function provSetModels(i, value) {
+            provDraft.providers[i].models = value.split(',').map(s => s.trim()).filter(Boolean);
+        }
+
+        function provMove(i, delta) {
+            const j = i + delta;
+            if (j < 0 || j >= provDraft.providers.length) return;
+            const arr = provDraft.providers;
+            [arr[i], arr[j]] = [arr[j], arr[i]];
+            // Adjust priorities to match visual order, in steps of 10
+            arr.forEach((p, idx) => p.priority = (idx + 1) * 10);
+            renderProviders();
+        }
+
+        function provRemove(i) {
+            if (!confirm(`Remove provider "${provDraft.providers[i].name}"?`)) return;
+            provDraft.providers.splice(i, 1);
+            renderProviders();
+        }
+
+        function addProvider() {
+            const nextPri = provDraft.providers.length
+                ? Math.max(...provDraft.providers.map(p => p.priority || 0)) + 10
+                : 10;
+            provDraft.providers.push({
+                name: 'new-provider',
+                base_url: 'https://api.example.com/v1',
+                api_key: { type: 'pending', display: '' },
+                api_version: '',
+                models: [],
+                priority: nextPri,
+                enabled: false,
+                live: { loaded: false, available: false },
+            });
+            renderProviders();
+        }
+
+        async function saveProviders() {
+            // Flatten api_key back to a string. Whatever the user typed:
+            //   - Annotated env/literal objects keep their original .display.
+            //   - Pending edits use .display directly.
+            const payload = {
+                default_model: document.getElementById('prov-default-model').value || '',
+                providers: provDraft.providers.map(p => ({
+                    name: p.name,
+                    base_url: p.base_url,
+                    api_key: (p.api_key && typeof p.api_key === 'object' ? (p.api_key.display || '') : (p.api_key || '')),
+                    api_version: p.api_version || '',
+                    models: p.models || [],
+                    priority: p.priority,
+                    enabled: !!p.enabled,
+                })),
+            };
+            const resp = await api('/admin/api/providers', { method: 'PUT', body: JSON.stringify(payload) });
+            if (!resp.ok) {
+                let detail = '';
+                try { detail = (await resp.json()).detail || ''; } catch {}
+                alert(`Save failed (${resp.status}): ${detail}`);
+                return;
+            }
+            const data = await resp.json();
+            provState = data.state;
+            provDraft = JSON.parse(JSON.stringify(provState));
+            renderProviders();
+        }
+
+        async function reloadProviders() {
+            const resp = await api('/admin/api/providers/reload', { method: 'POST' });
+            if (!resp.ok) { alert('Reload failed: ' + resp.status); return; }
+            const data = await resp.json();
+            provState = data.state;
+            provDraft = JSON.parse(JSON.stringify(provState));
+            renderProviders();
+        }
+
+        async function resetProviders() {
+            if (!confirm('Drop DB overrides and revert to config.yaml? This cannot be undone.')) return;
+            const resp = await api('/admin/api/providers/reset', { method: 'POST' });
+            if (!resp.ok) { alert('Reset failed: ' + resp.status); return; }
+            const data = await resp.json();
+            provState = data.state;
+            provDraft = JSON.parse(JSON.stringify(provState));
+            renderProviders();
+        }
+
+        async function testProvider(i) {
+            const p = provDraft.providers[i];
+            const slot = document.getElementById('prov-test-' + i);
+            slot.textContent = 'Testing…';
+            slot.style.color = 'var(--muted)';
+            const resp = await api('/admin/api/providers/test', {
+                method: 'POST',
+                body: JSON.stringify({ name: p.name, model: (p.models || [])[0] || '' }),
+            });
+            if (!resp.ok) {
+                slot.textContent = `HTTP ${resp.status} — provider not loaded? Save & reload first.`;
+                slot.style.color = 'var(--red)';
+                return;
+            }
+            const data = await resp.json();
+            if (data.ok) {
+                slot.textContent = `✓ ${data.status_code} in ${data.elapsed_ms}ms (model=${data.model})`;
+                slot.style.color = 'var(--green)';
+            } else {
+                const reason = data.error || data.snippet || '';
+                slot.textContent = `✗ ${data.status_code || 'no response'} in ${data.elapsed_ms}ms — ${reason.substring(0, 200)}`;
+                slot.style.color = 'var(--red)';
+            }
         }
     </script>
 </body>
