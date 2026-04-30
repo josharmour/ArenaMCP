@@ -408,6 +408,36 @@ class TurnInfo:
         }
 
 
+def _parse_zone_type(value: Any) -> ZoneType:
+    """Best-effort ZoneType parser for persisted checkpoint data."""
+    if isinstance(value, ZoneType):
+        return value
+    if isinstance(value, str):
+        member = ZoneType.__members__.get(value)
+        if member is not None:
+            return member
+        try:
+            return ZoneType(value)
+        except ValueError:
+            pass
+    return ZoneType.UNKNOWN
+
+
+def _parse_object_kind(value: Any) -> GameObjectKind:
+    """Best-effort GameObjectKind parser for persisted checkpoint data."""
+    if isinstance(value, GameObjectKind):
+        return value
+    if isinstance(value, str):
+        member = GameObjectKind.__members__.get(value)
+        if member is not None:
+            return member
+        try:
+            return GameObjectKind(value)
+        except ValueError:
+            pass
+    return GameObjectKind.UNKNOWN
+
+
 class GameState:
     """Maintains complete game state from parsed MTGA log events.
 
@@ -614,6 +644,308 @@ class GameState:
 
         self.game_ended_event.clear()
         return result, snapshot
+
+    def export_checkpoint(self) -> dict[str, Any]:
+        """Export mutable game state needed to resume mid-match.
+
+        The checkpoint stores canonical parser state, not just the public
+        snapshot, so subsequent GRE diff messages have a coherent base to
+        apply against after a restart.
+        """
+        with self._state_lock:
+            return {
+                "schema_version": 1,
+                "match_id": self.match_id,
+                "local_seat_id": self.local_seat_id,
+                "seat_source": self._seat_source,
+                "turn_info": self.turn_info.to_dict(),
+                "players": [player.to_dict() for player in self.players.values()],
+                "zones": [zone.to_dict() for zone in self.zones.values()],
+                "game_objects": [obj.to_dict() for obj in self.game_objects.values()],
+                "played_cards": {
+                    str(seat_id): list(cards)
+                    for seat_id, cards in self.played_cards.items()
+                },
+                "seen_instances": sorted(int(instance_id) for instance_id in self._seen_instances),
+                "pending_combat_steps": copy.deepcopy(self._pending_combat_steps),
+                "last_combat_step_time": float(self._last_combat_step_time or 0.0),
+                "last_stack_update_time": float(self._last_stack_update_time or 0.0),
+                "untap_prevention": sorted(int(instance_id) for instance_id in self._untap_prevention),
+                "in_untap_step": bool(self._in_untap_step),
+                "pending_decision": self.pending_decision,
+                "decision_seat_id": self.decision_seat_id,
+                "decision_context": copy.deepcopy(self.decision_context),
+                "decision_timestamp": float(self.decision_timestamp or 0.0),
+                "last_cleared_decision": self.last_cleared_decision,
+                "legal_actions": list(self.legal_actions),
+                "legal_actions_raw": copy.deepcopy(self.legal_actions_raw),
+                "recent_events": copy.deepcopy(self.recent_events),
+                "raw_gre_events": copy.deepcopy(self.raw_gre_events),
+                "raw_gre_sequence": int(self._raw_gre_sequence),
+                "damage_taken": {
+                    str(seat_id): int(amount)
+                    for seat_id, amount in self.damage_taken.items()
+                },
+                "revealed_cards": {
+                    str(seat_id): sorted(int(grp_id) for grp_id in grp_ids)
+                    for seat_id, grp_ids in self.revealed_cards.items()
+                },
+                "deck_cards": list(self.deck_cards),
+                "designations": {
+                    str(seat_id): sorted(str(designation) for designation in desigs)
+                    for seat_id, desigs in self.designations.items()
+                },
+                "dungeon_status": {
+                    str(seat_id): copy.deepcopy(status)
+                    for seat_id, status in self.dungeon_status.items()
+                },
+                "timer_state": {
+                    str(player_id): copy.deepcopy(timer)
+                    for player_id, timer in self.timer_state.items()
+                },
+                "engine_busy_flags": copy.deepcopy(self.engine_busy_flags),
+                "engine_busy_until": float(self.engine_busy_until or 0.0),
+                "action_history": copy.deepcopy(self.action_history),
+                "sideboard_cards": list(self.sideboard_cards),
+                "last_game_result": self.last_game_result,
+            }
+
+    def restore_checkpoint(self, checkpoint: dict[str, Any]) -> bool:
+        """Restore mutable parser state from a saved checkpoint."""
+        if not isinstance(checkpoint, dict):
+            return False
+        schema_version = int(checkpoint.get("schema_version", 0) or 0)
+        if schema_version != 1:
+            logger.info("Skipping unsupported checkpoint schema version: %s", schema_version)
+            return False
+
+        try:
+            with self._state_lock:
+                self._apply_field_defaults()
+                self.turn_info = TurnInfo()
+                self._raw_gre_sequence = 0
+                self.last_game_result = checkpoint.get("last_game_result")
+
+                self.match_id = checkpoint.get("match_id")
+                self.local_seat_id = _coerce_optional_int(checkpoint.get("local_seat_id"))
+                self._seat_source = _coerce_int(checkpoint.get("seat_source", 0), 0)
+
+                turn_info = checkpoint.get("turn_info") or {}
+                if isinstance(turn_info, dict):
+                    self.turn_info = TurnInfo(
+                        turn_number=_coerce_int(turn_info.get("turn_number", 0), 0),
+                        active_player=_coerce_int(turn_info.get("active_player", 0), 0),
+                        priority_player=_coerce_int(turn_info.get("priority_player", 0), 0),
+                        phase=str(turn_info.get("phase", "") or ""),
+                        step=str(turn_info.get("step", "") or ""),
+                    )
+
+                self.players = {}
+                for player_data in checkpoint.get("players") or []:
+                    if not isinstance(player_data, dict):
+                        continue
+                    seat_id = _coerce_int(player_data.get("seat_id", 0), 0)
+                    if not seat_id:
+                        continue
+                    mana_pool_raw = player_data.get("mana_pool") or {}
+                    mana_pool = (
+                        {str(color): _coerce_int(count, 0) for color, count in mana_pool_raw.items()}
+                        if isinstance(mana_pool_raw, dict)
+                        else {}
+                    )
+                    self.players[seat_id] = Player(
+                        seat_id=seat_id,
+                        life_total=_coerce_int(player_data.get("life_total", 20), 20),
+                        lands_played=_coerce_int(player_data.get("lands_played", 0), 0),
+                        mana_pool=mana_pool,
+                        team_id=_coerce_optional_int(player_data.get("team_id")),
+                        status=str(player_data.get("status", "") or ""),
+                    )
+
+                self.game_objects = {}
+                for obj_data in checkpoint.get("game_objects") or []:
+                    if not isinstance(obj_data, dict):
+                        continue
+                    instance_id = _coerce_int(obj_data.get("instance_id", 0), 0)
+                    if not instance_id:
+                        continue
+                    game_object = GameObject(
+                        instance_id=instance_id,
+                        grp_id=_coerce_int(obj_data.get("grp_id", 0), 0),
+                        zone_id=_coerce_int(obj_data.get("zone_id", 0), 0),
+                        owner_seat_id=_coerce_int(obj_data.get("owner_seat_id", 0), 0),
+                        controller_seat_id=_coerce_optional_int(obj_data.get("controller_seat_id")),
+                        visibility=(
+                            None if obj_data.get("visibility") in (None, "")
+                            else str(obj_data.get("visibility"))
+                        ),
+                        card_types=[str(item) for item in obj_data.get("card_types", []) if item is not None],
+                        subtypes=[str(item) for item in obj_data.get("subtypes", []) if item is not None],
+                        power=_coerce_optional_int(obj_data.get("power")),
+                        toughness=_coerce_optional_int(obj_data.get("toughness")),
+                        is_tapped=bool(obj_data.get("is_tapped", False)),
+                        parent_instance_id=_coerce_optional_int(obj_data.get("parent_instance_id")),
+                        turn_entered_battlefield=_coerce_int(obj_data.get("turn_entered_battlefield", -1), -1),
+                        is_attacking=bool(obj_data.get("is_attacking", False)),
+                        is_blocking=bool(obj_data.get("is_blocking", False)),
+                        object_kind=_parse_object_kind(obj_data.get("object_kind")),
+                        counters=(
+                            {
+                                str(counter_type): _coerce_int(count, 0)
+                                for counter_type, count in (obj_data.get("counters") or {}).items()
+                            }
+                            if isinstance(obj_data.get("counters"), dict)
+                            else {}
+                        ),
+                        modified_power=_coerce_optional_int(obj_data.get("modified_power")),
+                        modified_toughness=_coerce_optional_int(obj_data.get("modified_toughness")),
+                        modified_cost=(
+                            None if obj_data.get("modified_cost") in (None, "")
+                            else str(obj_data.get("modified_cost"))
+                        ),
+                        modified_colors=[str(item) for item in obj_data.get("modified_colors", []) if item is not None] or None,
+                        modified_types=[str(item) for item in obj_data.get("modified_types", []) if item is not None] or None,
+                        modified_name=(
+                            None if obj_data.get("modified_name") in (None, "")
+                            else str(obj_data.get("modified_name"))
+                        ),
+                        granted_abilities=[str(item) for item in obj_data.get("granted_abilities", []) if item is not None],
+                        removed_abilities=[str(item) for item in obj_data.get("removed_abilities", []) if item is not None],
+                        damaged_this_turn=bool(obj_data.get("damaged_this_turn", False)),
+                        crewed_this_turn=bool(obj_data.get("crewed_this_turn", False)),
+                        saddled_this_turn=bool(obj_data.get("saddled_this_turn", False)),
+                        is_phased_out=bool(obj_data.get("is_phased_out", False)),
+                        class_level=_coerce_optional_int(obj_data.get("class_level")),
+                        copied_from_grp_id=_coerce_optional_int(obj_data.get("copied_from_grp_id")),
+                        targeting=[_coerce_int(item, 0) for item in obj_data.get("targeting", []) if _coerce_int(item, 0)],
+                        color_production=[str(item) for item in obj_data.get("color_production", []) if item is not None],
+                    )
+                    self.game_objects[instance_id] = game_object
+
+                self.zones = {}
+                for zone_data in checkpoint.get("zones") or []:
+                    if not isinstance(zone_data, dict):
+                        continue
+                    zone_id = _coerce_int(zone_data.get("zone_id", 0), 0)
+                    if not zone_id:
+                        continue
+                    self.zones[zone_id] = Zone(
+                        zone_id=zone_id,
+                        zone_type=_parse_zone_type(zone_data.get("zone_type")),
+                        owner_seat_id=_coerce_optional_int(zone_data.get("owner_seat_id")),
+                        object_instance_ids=[
+                            _coerce_int(item, 0)
+                            for item in zone_data.get("object_instance_ids", [])
+                            if _coerce_int(item, 0)
+                        ],
+                    )
+
+                played_cards = checkpoint.get("played_cards") or {}
+                if isinstance(played_cards, dict):
+                    self.played_cards = {
+                        _coerce_int(seat_id, 0): [_coerce_int(card, 0) for card in cards if _coerce_int(card, 0)]
+                        for seat_id, cards in played_cards.items()
+                        if _coerce_int(seat_id, 0)
+                    }
+
+                self._seen_instances = {
+                    _coerce_int(instance_id, 0)
+                    for instance_id in checkpoint.get("seen_instances", [])
+                    if _coerce_int(instance_id, 0)
+                }
+                self._pending_combat_steps = copy.deepcopy(checkpoint.get("pending_combat_steps") or [])
+                self._last_combat_step_time = float(checkpoint.get("last_combat_step_time", 0.0) or 0.0)
+                self._last_stack_update_time = float(checkpoint.get("last_stack_update_time", 0.0) or 0.0)
+                self._untap_prevention = {
+                    _coerce_int(instance_id, 0)
+                    for instance_id in checkpoint.get("untap_prevention", [])
+                    if _coerce_int(instance_id, 0)
+                }
+                self._in_untap_step = bool(checkpoint.get("in_untap_step", False))
+
+                self.pending_decision = checkpoint.get("pending_decision")
+                self.decision_seat_id = _coerce_optional_int(checkpoint.get("decision_seat_id"))
+                self.decision_context = copy.deepcopy(checkpoint.get("decision_context"))
+                self.decision_timestamp = float(checkpoint.get("decision_timestamp", 0.0) or 0.0)
+                self.last_cleared_decision = checkpoint.get("last_cleared_decision")
+                self.legal_actions = [str(item) for item in checkpoint.get("legal_actions", []) if item is not None]
+                self.legal_actions_raw = copy.deepcopy(checkpoint.get("legal_actions_raw") or [])
+                self.recent_events = copy.deepcopy(checkpoint.get("recent_events") or [])
+                self.raw_gre_events = copy.deepcopy(checkpoint.get("raw_gre_events") or [])
+                self._raw_gre_sequence = _coerce_int(
+                    checkpoint.get("raw_gre_sequence", len(self.raw_gre_events)),
+                    len(self.raw_gre_events),
+                )
+
+                damage_taken = checkpoint.get("damage_taken") or {}
+                if isinstance(damage_taken, dict):
+                    self.damage_taken = {
+                        _coerce_int(seat_id, 0): _coerce_int(amount, 0)
+                        for seat_id, amount in damage_taken.items()
+                        if _coerce_int(seat_id, 0)
+                    }
+
+                revealed_cards = checkpoint.get("revealed_cards") or {}
+                if isinstance(revealed_cards, dict):
+                    self.revealed_cards = {
+                        _coerce_int(seat_id, 0): {
+                            _coerce_int(grp_id, 0)
+                            for grp_id in grp_ids
+                            if _coerce_int(grp_id, 0)
+                        }
+                        for seat_id, grp_ids in revealed_cards.items()
+                        if _coerce_int(seat_id, 0)
+                    }
+
+                self.deck_cards = [_coerce_int(card, 0) for card in checkpoint.get("deck_cards", []) if _coerce_int(card, 0)]
+
+                designations = checkpoint.get("designations") or {}
+                if isinstance(designations, dict):
+                    self.designations = {
+                        _coerce_int(seat_id, 0): {str(designation) for designation in desigs if designation not in (None, "")}
+                        for seat_id, desigs in designations.items()
+                        if _coerce_int(seat_id, 0)
+                    }
+
+                dungeon_status = checkpoint.get("dungeon_status") or {}
+                if isinstance(dungeon_status, dict):
+                    self.dungeon_status = {
+                        _coerce_int(seat_id, 0): copy.deepcopy(status)
+                        for seat_id, status in dungeon_status.items()
+                        if _coerce_int(seat_id, 0) and isinstance(status, dict)
+                    }
+
+                timer_state = checkpoint.get("timer_state") or {}
+                if isinstance(timer_state, dict):
+                    self.timer_state = {
+                        _coerce_int(player_id, 0): copy.deepcopy(timer)
+                        for player_id, timer in timer_state.items()
+                        if _coerce_int(player_id, 0) and isinstance(timer, dict)
+                    }
+
+                self.engine_busy_flags = copy.deepcopy(checkpoint.get("engine_busy_flags") or {})
+                self.engine_busy_until = float(checkpoint.get("engine_busy_until", 0.0) or 0.0)
+                self.action_history = copy.deepcopy(checkpoint.get("action_history") or [])
+                self.sideboard_cards = [
+                    _coerce_int(card, 0)
+                    for card in checkpoint.get("sideboard_cards", [])
+                    if _coerce_int(card, 0)
+                ]
+
+                self.publish_snapshot()
+            logger.info(
+                "Restored GameState checkpoint: match=%s turn=%s objects=%s zones=%s players=%s",
+                self.match_id,
+                self.turn_info.turn_number,
+                len(self.game_objects),
+                len(self.zones),
+                len(self.players),
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to restore game-state checkpoint: {e}")
+            self.reset()
+            return False
 
     # Backward compatibility for _seat_manually_set
     @property
@@ -2765,6 +3097,7 @@ def _handle_decision_message(game_state: GameState, msg_type: str,
         if intermission_result:
             game_state.set_result_from_payload(intermission_result, "IntermissionReq")
         game_state.prepare_for_game_end()
+        mark_match_ended()
         game_state.reset()
         game_state.pending_decision = None
         game_state.decision_seat_id = None
@@ -3544,6 +3877,7 @@ def save_match_state(
         "phase": game_state.turn_info.phase,
         "timestamp": time.time(),
         "status": "active",
+        "checkpoint": game_state.export_checkpoint(),
     }
 
     # Attach log identity for session-aware resume validation

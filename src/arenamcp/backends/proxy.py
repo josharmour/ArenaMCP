@@ -30,7 +30,7 @@ class ProxyBackend:
 
     def __init__(
         self,
-        model: str = "gpt-5.4",
+        model: str = "gemini-3.1-flash-lite-preview",
         enable_thinking: bool = False,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
@@ -48,7 +48,7 @@ class ProxyBackend:
     def create_online(cls, model: Optional[str] = None, license_key: str = "") -> "ProxyBackend":
         """Create a backend configured for online mode (mtgacoach.com)."""
         return cls(
-            model=model or "gpt-5.4",
+            model=model or "gemini-3.1-flash-lite-preview",
             base_url=ONLINE_BASE_URL,
             api_key=license_key,
         )
@@ -142,20 +142,23 @@ class ProxyBackend:
             model_lower = self.model.lower()
             extra = {}
             is_gpt5 = "gpt-5" in model_lower or "gpt5" in model_lower
+            is_gemini = "gemini" in model_lower
             if self.enable_thinking:
                 if "claude" in model_lower:
                     extra["thinking"] = {"type": "enabled", "budget_tokens": 8000}
                     params["max_completion_tokens"] = max_tokens + 8000
-                elif "gemini" in model_lower:
-                    extra["thinking_config"] = {"thinking_budget": 4096}
+                elif is_gemini:
+                    # Gemini's OpenAI-compat endpoint rejects native fields
+                    # like thinking_config. Use reasoning_effort instead.
+                    params["reasoning_effort"] = "medium"
                 elif is_gpt5:
                     params["reasoning_effort"] = "medium"
                     params["verbosity"] = "medium"
             else:
                 if "claude" in model_lower:
                     extra["thinking"] = {"type": "disabled"}
-                if "gemini" in model_lower:
-                    extra["thinking_config"] = {"thinking_budget": 0}
+                if is_gemini:
+                    params["reasoning_effort"] = "none"
                 if is_gpt5:
                     params["reasoning_effort"] = "minimal"
                     params["verbosity"] = "low"
@@ -227,10 +230,12 @@ class ProxyBackend:
             model_lower = self.model.lower()
             extra = {}
             is_gpt5 = "gpt-5" in model_lower or "gpt5" in model_lower
+            is_gemini = "gemini" in model_lower
             if "claude" in model_lower:
                 extra["thinking"] = {"type": "disabled"}
-            if "gemini" in model_lower:
-                extra["thinking_config"] = {"thinking_budget": 0}
+            if is_gemini:
+                # OpenAI-compat path: use reasoning_effort, not thinking_config.
+                params["reasoning_effort"] = "none"
             if is_gpt5:
                 params["reasoning_effort"] = "minimal"
                 params["verbosity"] = "low"

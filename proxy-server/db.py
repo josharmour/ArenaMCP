@@ -39,7 +39,8 @@ def init_db():
                 status TEXT NOT NULL DEFAULT 'active',
                 created_at REAL NOT NULL,
                 expires_at REAL,
-                notes TEXT
+                notes TEXT,
+                assigned_model TEXT
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -81,6 +82,15 @@ def init_db():
             );
 
             CREATE INDEX IF NOT EXISTS idx_subscribers_key ON subscribers(license_key);
+        """)
+
+        # Idempotent migration for the assigned_model column on existing DBs
+        # that were created before it was part of the schema.
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(subscribers)").fetchall()]
+        if "assigned_model" not in cols:
+            conn.execute("ALTER TABLE subscribers ADD COLUMN assigned_model TEXT")
+
+        conn.executescript("""
             CREATE INDEX IF NOT EXISTS idx_usage_key ON usage_log(license_key);
             CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_log(timestamp);
             CREATE INDEX IF NOT EXISTS idx_client_installs_key ON client_installs(license_key);
@@ -170,7 +180,7 @@ def list_subscribers() -> list[dict]:
 
 def update_subscriber(key: str, **kwargs) -> bool:
     """Update subscriber fields."""
-    allowed = {"email", "name", "status", "expires_at", "notes"}
+    allowed = {"email", "name", "status", "expires_at", "notes", "assigned_model"}
     updates = {k: v for k, v in kwargs.items() if k in allowed}
     if not updates:
         return False

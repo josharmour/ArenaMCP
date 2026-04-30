@@ -238,6 +238,29 @@ async def chat_completions(request: Request, sub: dict = Depends(_require_licens
     model = body.get("model")
     stream = body.get("stream", False)
 
+    # Substitute the configured default when the client doesn't pin a model.
+    # Lets the admin UI's `default_model` setting actually drive routing for
+    # callers that send no model (or the sentinel "default").
+    if not model or model == "default":
+        substituted = _resolved_default_model()
+        if substituted:
+            body["model"] = substituted
+            model = substituted
+
+    # Per-subscriber pin: if an admin has assigned this license to a specific
+    # model, that wins over both the client's choice and the cluster default.
+    # Lets us force-route an individual user to (e.g.) gpt-5.4 for testing
+    # while everyone else stays on the gemini default.
+    assigned = (sub.get("assigned_model") or "").strip()
+    if assigned:
+        if assigned != model:
+            logger.info(
+                f"Subscriber {sub['license_key'][:12]}… pinned to {assigned!r} "
+                f"(client requested {model!r})"
+            )
+        body["model"] = assigned
+        model = assigned
+
     provider = router.select_provider(model)
     if not provider:
         raise HTTPException(503, "No AI provider available. Try again later.")
@@ -1459,7 +1482,22 @@ async def admin_list_subscribers(request: Request, _=Depends(_require_admin)):
         s["latest_version"] = c.get("latest_version", "")
         s["latest_install_id"] = c.get("latest_install_id", "")
         s["last_seen_at"] = c.get("last_seen_at", 0)
-    return subs
+
+    # Surface the union of provider models so the UI can render a model
+    # picker per subscriber. Plus the cluster default for the "(default)"
+    # placeholder hint.
+    models: list[str] = []
+    seen: set[str] = set()
+    for p in router.providers:
+        for m in p.models:
+            if m not in seen:
+                seen.add(m)
+                models.append(m)
+    return {
+        "subscribers": subs,
+        "available_models": models,
+        "default_model": _resolved_default_model(),
+    }
 
 
 @app.post("/admin/api/subscribers")

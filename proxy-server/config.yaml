@@ -1,0 +1,70 @@
+# mtgacoach.com Proxy Server Configuration
+# ==========================================
+
+# Server settings
+server:
+  host: "0.0.0.0"
+  port: 8443
+
+# Provider routing: requests are tried in order of priority (lowest first).
+# The proxy picks the first available provider and forwards the request.
+providers:
+  - name: azure
+    priority: 1
+    base_url: "https://bmfllm-resource.cognitiveservices.azure.com/openai"
+    api_key: "${AZURE_OPENAI_API_KEY}"
+    api_version: "2025-04-01-preview"
+    # Models exposed through this provider. Each name must match an Azure
+    # deployment in this resource (data plane uses deployment names, not
+    # model names). _build_url() routes per-model when a match exists, else
+    # falls back to models[0].
+    models:
+      - "gpt-5.5"
+      - "gpt-5.4"
+    enabled: true
+
+  - name: anthropic
+    priority: 2
+    base_url: "https://api.anthropic.com/v1"
+    api_key: "${ANTHROPIC_API_KEY}"
+    models:
+      - "claude-sonnet-4-5-20250929"
+      - "claude-haiku-4-5-20251001"
+    enabled: false
+
+  - name: openai
+    priority: 3
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"
+    models:
+      - "gpt-4o"
+      - "gpt-4o-mini"
+    enabled: false
+
+  - name: gemini
+    priority: 4
+    # Gemini's OpenAI-compatible endpoint accepts standard chat/completions
+    # requests with Authorization: Bearer <key>. No URL-side model routing
+    # needed — model name is passed in the request body like OpenAI.
+    base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+    api_key: "${GEMINI_API_KEY}"
+    models:
+      - "gemini-3.1-flash-lite-preview"
+      - "gemini-2.5-flash-lite"
+      - "gemini-2.5-flash"
+      - "gemini-2.5-pro"
+    enabled: true
+
+# Default model when client doesn't specify (or sends model="" / "default").
+# The /v1/chat/completions handler substitutes this in when no model is given.
+default_model: "gemini-3.1-flash-lite-preview"
+
+# Admin credentials for the management dashboard
+admin:
+  username: "admin"
+  # Change this! Use: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+  password: "${ADMIN_PASSWORD}"
+
+# Database
+database:
+  path: "./data/mtgacoach.db"

@@ -116,7 +116,7 @@
             <h2>Subscribers</h2>
             <table>
                 <thead>
-                    <tr><th>Key</th><th>Email</th><th>Name</th><th>Status</th><th>Latest Frontend</th><th>Latest Version</th><th>Installs (30d)</th><th>Last Seen</th><th>Requests (30d)</th><th>Tokens (30d)</th><th>Actions</th></tr>
+                    <tr><th>Key</th><th>Email</th><th>Name</th><th>Status</th><th>Pinned model</th><th>Latest Frontend</th><th>Latest Version</th><th>Installs (30d)</th><th>Last Seen</th><th>Requests (30d)</th><th>Tokens (30d)</th><th>Actions</th></tr>
                 </thead>
                 <tbody id="sub-table"></tbody>
             </table>
@@ -228,7 +228,12 @@
 
         async function loadSubscribers() {
             const resp = await api('/admin/api/subscribers');
-            const subs = await resp.json();
+            const data = await resp.json();
+            // Endpoint changed shape (now {subscribers, available_models, default_model});
+            // tolerate the old shape too just in case of stale caches.
+            const subs = Array.isArray(data) ? data : (data.subscribers || []);
+            const availableModels = Array.isArray(data) ? [] : (data.available_models || []);
+            const defaultModel = Array.isArray(data) ? '' : (data.default_model || '');
 
             const active = subs.filter(s => s.status === 'active').length;
             const total = subs.length;
@@ -244,6 +249,19 @@
                 <div class="stat"><div class="number">${pysideSeen}</div><div class="label">PySide Seen (30d)</div></div>
             `;
 
+            const modelOptions = (current) => {
+                const placeholder = `(default${defaultModel ? ` — ${escapeHtml(defaultModel)}` : ''})`;
+                const opts = [`<option value="">${placeholder}</option>`];
+                for (const m of availableModels) {
+                    opts.push(`<option value="${escapeHtml(m)}" ${current === m ? 'selected' : ''}>${escapeHtml(m)}</option>`);
+                }
+                // Preserve a custom-pinned model that's not in the available list (e.g. provider was disabled).
+                if (current && !availableModels.includes(current)) {
+                    opts.push(`<option value="${escapeHtml(current)}" selected>${escapeHtml(current)} (offline)</option>`);
+                }
+                return opts.join('');
+            };
+
             const tbody = document.getElementById('sub-table');
             tbody.innerHTML = subs.map(s => `
                 <tr>
@@ -251,6 +269,11 @@
                     <td>${s.email || '-'}</td>
                     <td>${s.name || '-'}</td>
                     <td><span class="badge ${s.status}">${s.status}</span></td>
+                    <td>
+                        <select onchange="setSubscriberModel('${s.license_key}', this.value)" style="padding:4px 8px;background:var(--surface);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:0.85rem;max-width:220px">
+                            ${modelOptions(s.assigned_model || '')}
+                        </select>
+                    </td>
                     <td>${s.latest_frontend || '-'}</td>
                     <td>${s.latest_version || '-'}</td>
                     <td title="${s.frontends_30d || ''}">${s.installs_30d || 0}</td>
@@ -264,6 +287,18 @@
                     </td>
                 </tr>
             `).join('');
+        }
+
+        async function setSubscriberModel(key, model) {
+            const resp = await api('/admin/api/subscribers/' + encodeURIComponent(key), {
+                method: 'PUT',
+                body: JSON.stringify({ assigned_model: model || '' }),
+            });
+            if (!resp.ok) {
+                let detail = '';
+                try { detail = (await resp.json()).detail || ''; } catch {}
+                alert(`Update failed (${resp.status}): ${detail}`);
+            }
         }
 
         function formatTimestamp(value) {
@@ -463,6 +498,15 @@
                 apiKeyHint = `<small style="color:${apiKey.set ? 'var(--green)' : 'var(--red)'}">env <code>${escapeHtml(apiKey.env_name)}</code> ${apiKey.set ? 'set' : 'NOT set'}</small>`;
             } else if (apiKey.type === 'literal') {
                 apiKeyHint = `<small style="color:var(--muted)">literal: ${escapeHtml(apiKey.display)}</small>`;
+            } else if (apiKey.type === 'pending') {
+                const v = (apiKey.display || '').trim();
+                if (!v) {
+                    apiKeyHint = `<small style="color:var(--red)">empty (won't load)</small>`;
+                } else if (v.startsWith('${') && v.endsWith('}')) {
+                    apiKeyHint = `<small style="color:var(--yellow)">unsaved env-ref — Save to apply</small>`;
+                } else {
+                    apiKeyHint = `<small style="color:var(--yellow)">unsaved literal (${v.length} chars) — Save to apply</small>`;
+                }
             } else {
                 apiKeyHint = `<small style="color:var(--red)">no API key</small>`;
             }

@@ -19,7 +19,7 @@ from arenamcp.coach import CoachEngine, GameStateTrigger, create_backend
 from arenamcp.gamestate import (
     GameState, create_game_state_handler,
     save_match_state, load_match_state,
-    validate_log_identity,
+    validate_log_identity, mark_match_ended,
 )
 from arenamcp.parser import LogParser
 from arenamcp.scryfall import ScryfallCache
@@ -215,6 +215,11 @@ def _get_voice_output() -> VoiceOutput:
 
 # Match state tracking
 _last_saved_turn: int = -1
+_last_saved_offset: int = -1
+_last_saved_match_id: Optional[str] = None
+_last_saved_pending_decision: Optional[str] = None
+_last_saved_at: float = 0.0
+_MATCH_STATE_SAVE_INTERVAL_S = 3.0
 
 
 def _get_edhrec():
@@ -260,14 +265,39 @@ def _get_synergy_graph():
 
 
 def _save_match_state_if_needed() -> None:
-    """Save match state on turn changes."""
-    global _last_saved_turn
+    """Persist a recent mid-match checkpoint without writing every poll."""
+    global _last_saved_turn, _last_saved_offset, _last_saved_match_id
+    global _last_saved_pending_decision, _last_saved_at
+
+    match_id = game_state.match_id
+    if not match_id:
+        return
+
     current_turn = game_state.turn_info.turn_number
-    if current_turn != _last_saved_turn and game_state.match_id:
-        _last_saved_turn = current_turn
-        offset = watcher.file_position if watcher else 0
-        log_path = str(watcher.log_path) if watcher else None
-        save_match_state(game_state, log_offset=offset, log_path=log_path)
+    current_pending_decision = game_state.pending_decision
+    offset = watcher.file_position if watcher else 0
+    log_path = str(watcher.log_path) if watcher else None
+    now = time.time()
+
+    should_save = False
+    if match_id != _last_saved_match_id:
+        should_save = True
+    elif current_turn != _last_saved_turn:
+        should_save = True
+    elif current_pending_decision != _last_saved_pending_decision:
+        should_save = True
+    elif offset != _last_saved_offset and now - _last_saved_at >= _MATCH_STATE_SAVE_INTERVAL_S:
+        should_save = True
+
+    if not should_save:
+        return
+
+    save_match_state(game_state, log_offset=offset, log_path=log_path)
+    _last_saved_turn = current_turn
+    _last_saved_offset = offset
+    _last_saved_match_id = match_id
+    _last_saved_pending_decision = current_pending_decision
+    _last_saved_at = now
 
 
 def _background_coaching_loop(
@@ -589,11 +619,15 @@ def _handle_match_created(payload: dict) -> None:
     if match_id:
         if game_state.match_id != match_id:
             if state_type == "MatchGameRoomStateType_MatchCompleted":
+                if game_state.match_id:
+                    mark_match_ended()
                 logger.info(
                     "Completed match event for unseen match %s. Recording metadata without reset.",
                     match_id,
                 )
             else:
+                if game_state.match_id:
+                    mark_match_ended()
                 logger.info(f"New match detected (ID: {match_id}). Resetting game state.")
                 game_state.reset()
                 _deactivate_draft_state(f"new live match {match_id}")
@@ -659,6 +693,11 @@ def _handle_match_created(payload: dict) -> None:
                 if not game_state.game_ended_event.is_set():
                     game_state.game_ended_event.set()
                     logger.info("Game-end event set from finalMatchResult")
+                if (
+                    state_type == "MatchGameRoomStateType_MatchCompleted"
+                    or scope == "MatchScope_Match"
+                ):
+                    mark_match_ended()
                 break
         else:
             logger.warning(
@@ -743,6 +782,7 @@ def start_watching() -> None:
     watcher = MTGALogWatcher(
         callback=parser.process_chunk,
         resume_offset=resume_offset,
+        resume_match_id=saved_state.get("match_id") if saved_state else None,
     )
     watcher.start()
     logger.info("Started MTGA log watcher")

@@ -52,6 +52,7 @@ INACTIVE_GAMEPLAY_TOKENS = (
 RESUME_OVERRIDE_SLACK_BYTES = 4096
 
 _WINDOWS_ABS_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_MATCH_ID_RE = re.compile(r'"matchid"\s*:\s*"([^"]+)"', re.IGNORECASE)
 
 
 def _contains_any(text: str, tokens: tuple[str, ...]) -> bool:
@@ -63,6 +64,17 @@ def _is_active_gameplay_line(line: str) -> bool:
         line,
         INACTIVE_GAMEPLAY_TOKENS,
     )
+
+
+def _latest_match_id_from_tail(content_bytes: bytes) -> Optional[str]:
+    """Return the most recent match ID mentioned in a tail chunk."""
+    if not content_bytes:
+        return None
+    content = content_bytes.decode("utf-8", errors="replace")
+    matches = _MATCH_ID_RE.findall(content)
+    if not matches:
+        return None
+    return matches[-1]
 
 
 def _startup_anchor_from_tail(
@@ -326,6 +338,7 @@ class MTGALogWatcher:
         log_path: Optional[str] = None,
         backfill: bool = True,
         resume_offset: Optional[int] = None,
+        resume_match_id: Optional[str] = None,
     ) -> None:
         """Initialize the log watcher.
 
@@ -339,6 +352,9 @@ class MTGALogWatcher:
             resume_offset: If provided, start reading from this byte offset
                           instead of the default position. Used for match
                           state recovery after restart.
+            resume_match_id: Match ID associated with ``resume_offset`` when
+                             available. Used to reject stale saved offsets
+                             when the log tail shows a different live match.
         """
         # Resolve log path
         if log_path is None:
@@ -348,8 +364,10 @@ class MTGALogWatcher:
         self.callback = callback
         self._backfill_enabled = backfill
         self._resume_offset = resume_offset
+        self._resume_match_id = resume_match_id
         self._observer: Optional[Observer] = None
         self._handler: Optional[MTGALogHandler] = None
+        self._last_relevant_match_id: Optional[str] = None
 
         # No-growth detection: track when we last saw the file grow
         self._last_known_size: int = 0
@@ -384,15 +402,17 @@ class MTGALogWatcher:
                 f.seek(start_offset)
                 content_bytes = f.read(read_size)
 
+            self._last_relevant_match_id = _latest_match_id_from_tail(content_bytes)
             start_pos, mode = _startup_anchor_from_tail(
                 content_bytes,
                 start_offset=start_offset,
                 file_size=file_size,
             )
             logger.info(
-                "Startup anchor: mode=%s offset=%s (scanned last %.1fMB)",
+                "Startup anchor: mode=%s offset=%s match=%s (scanned last %.1fMB)",
                 mode,
                 start_pos,
+                self._last_relevant_match_id,
                 read_size / 1024 / 1024,
             )
             return start_pos, mode
@@ -400,6 +420,11 @@ class MTGALogWatcher:
         except OSError as e:
             logger.warning(f"Error scanning log for startup anchor: {e}")
             return 0, "scan_error"
+
+    @property
+    def last_relevant_match_id(self) -> Optional[str]:
+        """Most recent match ID observed during the last tail scan."""
+        return self._last_relevant_match_id
 
     def _is_fresh_log(self) -> bool:
         """Detect if the log file is freshly created (MTGA just launched).
@@ -457,7 +482,21 @@ class MTGALogWatcher:
         if self._resume_offset is not None and self.log_path.exists():
             file_size = self.log_path.stat().st_size
             if self._resume_offset <= file_size:
-                if relevant_start > self._resume_offset + RESUME_OVERRIDE_SLACK_BYTES:
+                tail_match_mismatch = (
+                    bool(self._resume_match_id)
+                    and bool(self._last_relevant_match_id)
+                    and self._last_relevant_match_id != self._resume_match_id
+                )
+                if tail_match_mismatch:
+                    logger.info(
+                        "Startup mode: readahead_override (%s at %s, live tail match %s supersedes saved match %s)",
+                        relevant_mode,
+                        relevant_start,
+                        self._last_relevant_match_id,
+                        self._resume_match_id,
+                    )
+                    self._handler.read_from_position(relevant_start)
+                elif relevant_start > self._resume_offset + RESUME_OVERRIDE_SLACK_BYTES:
                     logger.info(
                         "Startup mode: readahead_override (%s at %s supersedes saved offset %s)",
                         relevant_mode,
