@@ -3097,7 +3097,14 @@ def _handle_decision_message(game_state: GameState, msg_type: str,
         if intermission_result:
             game_state.set_result_from_payload(intermission_result, "IntermissionReq")
         game_state.prepare_for_game_end()
-        mark_match_ended()
+        # Only mark the saved match ended for actual match-end intermissions.
+        # In BO3, IntermissionReq also fires between games (scope=MatchScope_Game)
+        # and we want resume to keep working through sideboard. Match-end is
+        # authoritatively confirmed in server.py's finalMatchResult handler;
+        # gate here on scope when present, otherwise treat as match-end (BO1).
+        intermission_scope = (intermission_result or {}).get("scope")
+        if intermission_scope in (None, "", "MatchScope_Match"):
+            mark_match_ended()
         game_state.reset()
         game_state.pending_decision = None
         game_state.decision_seat_id = None
