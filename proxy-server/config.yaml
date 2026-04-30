@@ -57,7 +57,7 @@ providers:
 
 # Default model when client doesn't specify (or sends model="" / "default").
 # The /v1/chat/completions handler substitutes this in when no model is given.
-default_model: "gemini-3.1-flash-lite-preview"
+default_model: "gpt-5.4"
 
 # Admin credentials for the management dashboard
 admin:
