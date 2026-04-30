@@ -62,12 +62,17 @@ class MainWindow(QMainWindow):
 
     def restart_coach(self, autopilot: bool, dry_run: bool, afk: bool) -> None:
         self._launch_flags = (autopilot, dry_run, afk)
-        if self._process is not None:
+        old_process = self._process
+        if old_process is not None:
             self.coach_tab.detach_process()
+            try:
+                old_process.exited.disconnect(self._on_process_exited)
+            except (RuntimeError, TypeError):
+                pass
             # Async stop — doesn't block the Qt main thread while the old
             # process exits (old code did waitForFinished(3000) then a
             # waitForFinished(2000) on kill, freezing the UI for up to 5s).
-            self._process.stop_async()
+            old_process.stop_async()
             self._process = None
         # Defer start slightly so the old process has a moment to release
         # its stdio handles; this is non-blocking.
@@ -110,6 +115,11 @@ class MainWindow(QMainWindow):
         self._start_coach(False, False, False)
 
     def _start_coach(self, autopilot: bool, dry_run: bool, afk: bool) -> None:
+        if self._process is not None and self._process.is_running:
+            self._status_bar.showMessage("Coach is already running.")
+            self.tabs.setCurrentIndex(0)
+            return
+
         state = self.refresh_state()
         if not state.is_fully_provisioned:
             self._status_bar.showMessage("Setup is incomplete. Finish Repair before starting the coach.")
@@ -139,6 +149,9 @@ class MainWindow(QMainWindow):
 
     def _on_process_exited(self, exit_code: int) -> None:
         if self._closing:
+            return
+        sender = self.sender()
+        if sender is not None and sender is not self._process:
             return
 
         self._status_bar.showMessage(f"Coach exited ({exit_code}). Restarting...")

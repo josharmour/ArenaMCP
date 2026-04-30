@@ -624,6 +624,55 @@ class StandaloneCoach:
         ]
         return "||".join(parts)
 
+    def _queue_screenshot_analysis(self) -> None:
+        """Run screenshot analysis in the background."""
+        threading.Thread(
+            target=self.take_screenshot_analysis,
+            daemon=True,
+        ).start()
+
+    def _handle_unresolved_generic_selection(
+        self,
+        curr_state: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Refresh a generic selection prompt and kick off vision if needed.
+
+        Returns the refreshed state plus a boolean indicating whether the
+        current trigger batch should stop so the selection can be resolved
+        before lower-priority triggers fire.
+        """
+        pending = curr_state.get("pending_decision") or ""
+        decision_context = curr_state.get("decision_context") or {}
+        decision_type = str(decision_context.get("type") or "").lower()
+        if pending not in ("Group Selection", "Order Cards", "Select Cards"):
+            return curr_state, False
+
+        time.sleep(0.2)
+        try:
+            self._mcp.poll_log()
+        except Exception as e:
+            logger.debug(f"poll_log failed before generic selection refresh: {e}")
+        try:
+            curr_state = self._normalize_turn_snapshot(self._mcp.get_game_state())
+        except Exception as e:
+            logger.debug(f"Failed to refresh generic selection state: {e}")
+
+        pending = curr_state.get("pending_decision") or pending
+        decision_context = curr_state.get("decision_context") or {}
+        decision_type = str(decision_context.get("type") or "").lower()
+        if decision_type in ("scry", "surveil"):
+            logger.info(
+                "Resolved generic selection to %s without vision",
+                decision_type,
+            )
+            return curr_state, False
+
+        logger.info(
+            f"Generic selection still unresolved ({pending}/{decision_type or 'unknown'}) — triggering screenshot analysis"
+        )
+        self._queue_screenshot_analysis()
+        return curr_state, True
+
     def _set_backend_status(self, status: str) -> None:
         """Update backend status in UI only when the value actually changes."""
         if status == self._last_backend_status:
@@ -1534,17 +1583,6 @@ class StandaloneCoach:
         self.ui.status("MODEL", str(model_value))
         self.ui.status("STYLE", self.advice_style)
         self.ui.status("AUTOPILOT", "AP:ON" if self._autopilot_enabled else "AP:OFF")
-        # Fallback mode: advice (default) or mouse.
-        try:
-            ap = self._autopilot
-            cfg = getattr(ap, "_config", None) or getattr(ap, "config", None)
-            if cfg is not None and hasattr(cfg, "bridge_only_when_connected"):
-                self.ui.status(
-                    "FALLBACK_MODE",
-                    "advice" if cfg.bridge_only_when_connected else "mouse",
-                )
-        except Exception:
-            pass
 
         afk_enabled = self._autopilot_afk
         if self._autopilot is not None:
@@ -2429,39 +2467,14 @@ class StandaloneCoach:
                         # need a screenshot because the card identity isn't in the
                         # game state — only visible on screen.
                         if trigger == "decision_required":
-                            pending = curr_state.get("pending_decision") or ""
-                            decision_context = curr_state.get("decision_context") or {}
-                            decision_type = str(decision_context.get("type") or "").lower()
-                            if pending in ("Group Selection", "Order Cards", "Select Cards"):
-                                # Give log/GRE state a brief chance to resolve the generic
-                                # bridge request into a concrete scry/surveil decision first.
-                                time.sleep(0.2)
-                                try:
-                                    self._mcp.poll_log()
-                                except Exception as e:
-                                    logger.debug(f"poll_log failed before generic selection refresh: {e}")
-                                try:
-                                    curr_state = self._normalize_turn_snapshot(self._mcp.get_game_state())
-                                except Exception as e:
-                                    logger.debug(f"Failed to refresh generic selection state: {e}")
-
-                                pending = curr_state.get("pending_decision") or pending
-                                decision_context = curr_state.get("decision_context") or {}
-                                decision_type = str(decision_context.get("type") or "").lower()
-                                if decision_type in ("scry", "surveil"):
-                                    logger.info(
-                                        "Resolved generic selection to %s without vision",
-                                        decision_type,
-                                    )
-                                else:
-                                    logger.info(
-                                        f"Generic selection still unresolved ({pending}/{decision_type or 'unknown'}) — triggering screenshot analysis"
-                                    )
-                                    threading.Thread(
-                                        target=self.take_screenshot_analysis,
-                                        daemon=True,
-                                    ).start()
-                                    continue  # Skip text-only coaching for this trigger
+                            curr_state, waiting_on_vision = self._handle_unresolved_generic_selection(
+                                curr_state
+                            )
+                            if waiting_on_vision:
+                                # Do not immediately burn time on another critical
+                                # trigger from the same batch while a real decision
+                                # is still unresolved on screen.
+                                break
 
                         # DELAY BUFFER: For mulligan decisions, wait for hand zone to populate.
                         # SubmitDeckReq arrives before the GameStateMessage with hand cards.
@@ -3438,6 +3451,20 @@ class StandaloneCoach:
         # Screenshots passed through from the UI (coach window + MTGA window).
         if extra_context and isinstance(extra_context.get("screenshots"), dict):
             report["screenshots"] = dict(extra_context.get("screenshots") or {})
+        if extra_context:
+            event_context = {
+                key: value
+                for key, value in dict(extra_context).items()
+                if key != "screenshots"
+            }
+            if event_context:
+                report["event_context"] = event_context
+                auto_bug = event_context.get("auto_fallback_bug")
+                if isinstance(auto_bug, dict):
+                    report["auto_fallback_bug"] = dict(auto_bug)
+                auto_takeover = event_context.get("auto_user_takeover")
+                if isinstance(auto_takeover, dict):
+                    report["auto_user_takeover"] = dict(auto_takeover)
         report["advice_history"] = (
             list(self._advice_history) if hasattr(self, '_advice_history') else []
         )
@@ -5371,7 +5398,7 @@ Examples:
     parser.add_argument("--set", "-s", dest="set_code",
                         help="Set code for draft (e.g., MH3, BLB)")
     parser.add_argument("--autopilot", action="store_true",
-                        help="Enable autopilot mode (AI plays via mouse clicks)")
+                        help="Enable autopilot mode (AI plays via the GRE bridge)")
     parser.add_argument("--afk", action="store_true",
                         help="Start in AFK mode (auto-pass all priority without LLM)")
     parser.add_argument("--dry-run", action="store_true",

@@ -27,6 +27,9 @@ def build_issue_payload(
     reporter = report_data.get("reporter", {}) or {}
     settings = report_data.get("settings", {}) or {}
     post_match_feedback = report_data.get("post_match_feedback", {}) or {}
+    auto_fallback_bug = report_data.get("auto_fallback_bug", {}) or {}
+    auto_user_takeover = report_data.get("auto_user_takeover", {}) or {}
+    replay = report_data.get("replay", {}) or {}
     install_id = reporter.get("install_id") or settings.get("install_id")
 
     note = user_message.strip()
@@ -43,6 +46,8 @@ def build_issue_payload(
         "bridge_state": report_data.get("bridge_state"),
         "autopilot": report_data.get("autopilot"),
         "replay": report_data.get("replay"),
+        "auto_fallback_bug": auto_fallback_bug,
+        "auto_user_takeover": auto_user_takeover,
         "recent_errors": errors[-5:],
     }
     excerpt_json = json.dumps(excerpt, indent=2, default=str)
@@ -76,6 +81,38 @@ def build_issue_payload(
         for kind, path in screenshots.items():
             if path:
                 lines.append(f"- {kind}: `{path}`")
+
+    if auto_fallback_bug:
+        lines.extend(["", "## Bridge Miss", ""])
+        lines.append(f"- Reason tag: `{auto_fallback_bug.get('reason_tag')}`")
+        lines.append(f"- Action type: `{auto_fallback_bug.get('action_type')}`")
+        if auto_fallback_bug.get("card_name"):
+            lines.append(f"- Card: `{auto_fallback_bug.get('card_name')}`")
+        if auto_fallback_bug.get("target_names"):
+            lines.append(f"- Targets: `{auto_fallback_bug.get('target_names')}`")
+        if auto_fallback_bug.get("select_card_names"):
+            lines.append(f"- Selection: `{auto_fallback_bug.get('select_card_names')}`")
+        lines.append(
+            f"- Bridge request: `{auto_fallback_bug.get('bridge_request_type')}` / "
+            f"`{auto_fallback_bug.get('bridge_request_class')}`"
+        )
+        bridge_info = auto_fallback_bug.get("bridge", {}) or {}
+        lines.append(f"- Bridge connected: `{bridge_info.get('connected')}`")
+        failed_methods = bridge_info.get("failed_methods") or []
+        if failed_methods:
+            lines.append(f"- Bridge failed methods: `{failed_methods}`")
+        latest_replay_path = replay.get("latest_replay_path") or replay.get("replay_file")
+        if latest_replay_path:
+            lines.append(f"- Latest replay: `{latest_replay_path}`")
+
+    if auto_user_takeover:
+        lines.extend(["", "## User Takeover", ""])
+        lines.append(f"- Reason tag: `{auto_user_takeover.get('reason_tag')}`")
+        lines.append(f"- Planned action: `{auto_user_takeover.get('planned_action')}`")
+        if auto_user_takeover.get("planned_card"):
+            lines.append(f"- Planned card: `{auto_user_takeover.get('planned_card')}`")
+        if auto_user_takeover.get("planned_strategy"):
+            lines.append(f"- Planned strategy: {auto_user_takeover.get('planned_strategy')}")
 
     lines.extend(
         [

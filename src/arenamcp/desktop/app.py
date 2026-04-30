@@ -9,6 +9,7 @@ import traceback
 from pathlib import Path
 
 _LOG_HANDLE = None
+_INSTANCE_MUTEX = None
 
 
 def _log_path() -> Path:
@@ -64,19 +65,65 @@ def _configure_logging() -> None:
     threading.excepthook = handle_thread_exception
 
 
+def _acquire_single_instance_lock() -> bool:
+    """Prevent duplicate desktop instances from spawning competing overlays."""
+    global _INSTANCE_MUTEX
+
+    if os.name != "nt":
+        return True
+
+    try:
+        import ctypes
+
+        ERROR_ALREADY_EXISTS = 183
+        mutex_name = "Local\\mtgacoach.desktop"
+        handle = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+        if not handle:
+            return True
+        if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return False
+        _INSTANCE_MUTEX = handle
+        return True
+    except Exception:
+        return True
+
+
+def _release_single_instance_lock() -> None:
+    global _INSTANCE_MUTEX
+
+    if _INSTANCE_MUTEX is None or os.name != "nt":
+        return
+
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.CloseHandle(_INSTANCE_MUTEX)
+    except Exception:
+        pass
+    _INSTANCE_MUTEX = None
+
+
 def main() -> int:
     try:
-        from PySide6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication, QMessageBox
     except ImportError as exc:  # pragma: no cover - runtime dependency
         raise SystemExit(
             "PySide6 is not installed. Install it with `pip install -e .[desktop]`."
         ) from exc
 
     _configure_logging()
+
+    app = QApplication(sys.argv)
+    if not _acquire_single_instance_lock():
+        _write_log("desktop start skipped: another instance is already running")
+        QMessageBox.information(None, "mtgacoach", "mtgacoach is already running.")
+        return 0
+    app.aboutToQuit.connect(_release_single_instance_lock)
+
     from .main_window import MainWindow
     from .theme import apply_theme, load_saved_theme
 
-    app = QApplication(sys.argv)
     app.setApplicationName("mtgacoach")
     app.setOrganizationName("mtgacoach")
     apply_theme(app, load_saved_theme())

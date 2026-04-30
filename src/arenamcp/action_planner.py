@@ -124,29 +124,31 @@ ACTION_SCHEMA = """{
 }"""
 
 
-AUTOPILOT_SYSTEM_PROMPT = """You are an expert MTG Arena autopilot. Given the current game state and trigger,
-output a JSON action plan that the autopilot will execute by clicking in the MTGA client.
+AUTOPILOT_SYSTEM_PROMPT = """You are an MTG Arena autopilot. Given the game state and trigger, output a JSON action plan to execute.
 
-CRITICAL RULES:
-- ONLY suggest actions that appear in the "Legal:" line. Never hallucinate actions.
-- If a pending decision is active, resolve that decision instead of proposing a new cast/play from hand.
-- ONE ACTION PER PLAN: You must suggest only ONE card to play or ONE button to click per JSON response.
-- EXCEPTION: For "declare_attackers" or "declare_blockers", provide the full attacker/blocker set in one action. Do NOT add a separate "done" click action (the executor handles confirmation).
-- DO NOT sequence plays (e.g. do not suggest "play land" AND "cast spell"). Suggest the land, wait for the next trigger, then suggest the spell.
-- Creatures tagged [SS] have SUMMONING SICKNESS — they CANNOT attack.
-- Tokens are prefixed with * (e.g. "*Soldier"). Counters shown as [3P1P] = 3 +1/+1 counters.
-- Output ONLY valid JSON matching the schema below. No markdown, no commentary outside JSON.
-- Be decisive. Pick the best line of play.
+RULES:
+- ONLY pick actions from the "Legal:" line. Never invent actions.
+- If a pending decision is shown, resolve that decision (not a new cast/play).
+- ONE action per plan. Don't sequence (no "play land" + "cast spell").
+- EXCEPTION: declare_attackers/declare_blockers carry the full set in one action — do NOT add a "done" click.
+- [SS] = summoning sick (can't attack). * prefix = token. [3P1P] = 3 +1/+1 counters.
+- Output ONLY JSON matching the schema. No prose, no markdown, no commentary.
 
-DECISION-SPECIFIC RULES:
-- choose_starting_player: Set play_or_draw to "play" (aggro) or "draw" (control).
-- numeric_input: Set numeric_value (e.g. X for X spells). Check min/max in context.
-- distribute: Set distribution dict mapping target names to amounts. Total must match.
-- assign_damage: Order targets by priority (kill most important first).
-- search_library: Use select_card_names for what to find. Consider mana curve and game plan.
-- select_counters: Use select_card_names for which counters to select.
+ACTION_TYPE MAPPING (match Legal text → action_type):
+- "Play Land: X"       → action_type=play_land,    card_name="X"
+- "Cast X"             → action_type=cast_spell,   card_name="X"
+- "Activate Ability: X"→ action_type=activate_ability, card_name="X"
+- "Pass"               → action_type=pass_priority
+NEVER use action_type=click_button for a card play — that's only for explicit UI buttons (Done, Skip, OK).
 
-JSON SCHEMA:
+PER-DECISION FIELDS:
+- choose_starting_player: play_or_draw = "play" or "draw".
+- numeric_input: numeric_value within shown min/max.
+- distribute: distribution dict; totals must match.
+- assign_damage: order by priority (kill key targets first).
+- search_library / select_counters: use select_card_names.
+
+SCHEMA:
 """ + ACTION_SCHEMA
 
 
@@ -563,21 +565,16 @@ class ActionPlanner:
 
         Reuses the compact format from CoachEngine._format_game_context().
         """
-        # Import and use CoachEngine's formatter for consistency
+        # Import and use CoachEngine's formatter for consistency. The planner
+        # variant drops heavy GRE JSON dumps and trims oracle text on
+        # long-resident permanents — see _format_game_context(for_planner).
         try:
-            from arenamcp.coach import (
-                CoachEngine,
-                _format_bounded_json_for_prompt,
-                _format_raw_gre_events_for_prompt,
-            )
-            # Create a temporary instance just for formatting
+            from arenamcp.coach import CoachEngine
             formatter = CoachEngine.__new__(CoachEngine)
-            context = formatter._format_game_context(game_state)
+            context = formatter._format_game_context(game_state, for_planner=True)
         except Exception as e:
             logger.warning(f"Failed to use CoachEngine formatter: {e}")
             context = self._fallback_format(game_state)
-            _format_bounded_json_for_prompt = None
-            _format_raw_gre_events_for_prompt = None
 
         # Build trigger description
         trigger_descriptions = {
@@ -635,33 +632,12 @@ class ActionPlanner:
             )
             parts.append("\n".join(consistency_lines))
 
-        if legal_actions:
-            parts.append(f"\nLegal: {', '.join(legal_actions)}")
-
+        # NOTE: legal_actions, GRE request type/class, and recent-GRE context
+        # are already emitted by _format_game_context(for_planner=True) above.
+        # We deliberately do NOT re-append them here — duplicating those
+        # blocks ~doubled the prompt size in earlier versions.
         if decision_context:
             parts.append(f"\nDecision: {json.dumps(decision_context, indent=2)}")
-
-        # Bridge request type helps the LLM understand the exact GRE request
-        bridge_req = game_state.get("_bridge_request_type")
-        if bridge_req:
-            parts.append(f"\nGRE Request Type: {bridge_req}")
-        bridge_request_class = game_state.get("_bridge_request_class")
-        if bridge_request_class and bridge_request_class != bridge_req:
-            parts.append(f"\nGRE Request Class: {bridge_request_class}")
-        bridge_request_payload = game_state.get("_bridge_request_payload")
-        if bridge_request_payload:
-            if _format_bounded_json_for_prompt is not None:
-                payload_text = _format_bounded_json_for_prompt(bridge_request_payload)
-            else:
-                payload_text = json.dumps(bridge_request_payload, separators=(",", ":"))
-            parts.append(f"\nGRE Request Payload: {payload_text}")
-        raw_gre_events = game_state.get("raw_gre_events") or []
-        if raw_gre_events:
-            if _format_raw_gre_events_for_prompt is not None:
-                raw_events_text = _format_raw_gre_events_for_prompt(raw_gre_events)
-            else:
-                raw_events_text = json.dumps(raw_gre_events[-3:], separators=(",", ":"))
-            parts.append(f"\nRecent GRE: {raw_events_text}")
 
         parts.append("\nRespond with ONLY a JSON action plan matching the schema.")
 

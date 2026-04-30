@@ -185,23 +185,32 @@ def _format_raw_gre_events_for_prompt(
 def _build_bridge_context_lines(
     game_state: dict[str, Any],
     raw_legal_actions: list[dict[str, Any]],
+    *,
+    for_planner: bool = False,
 ) -> list[str]:
-    """Render bounded bridge/GRE context into prompt lines."""
+    """Render bounded bridge/GRE context into prompt lines.
+
+    Args:
+        for_planner: If True, omit heavy raw GRE JSON dumps (LegalGRE,
+            GRE_RequestPayload, GRE_Recent). The planner only needs the
+            request type to route decisions; the bridge action matcher
+            consumes raw legal actions out-of-band, not via the prompt.
+    """
     lines: list[str] = []
     bridge_req = game_state.get("_bridge_request_type")
     bridge_request_class = game_state.get("_bridge_request_class")
     bridge_request_payload = game_state.get("_bridge_request_payload")
     raw_gre_events = game_state.get("raw_gre_events") or []
 
-    if raw_legal_actions:
+    if raw_legal_actions and not for_planner:
         lines.append("LegalGRE: " + _format_legal_actions_raw_for_prompt(raw_legal_actions))
     if bridge_req:
         lines.append(f"GRE_Request: {bridge_req}")
     if bridge_request_class and bridge_request_class != bridge_req:
         lines.append(f"GRE_RequestClass: {bridge_request_class}")
-    if bridge_request_payload:
+    if bridge_request_payload and not for_planner:
         lines.append("GRE_RequestPayload: " + _format_bounded_json_for_prompt(bridge_request_payload))
-    if raw_gre_events:
+    if raw_gre_events and not for_planner:
         lines.append("GRE_Recent: " + _format_raw_gre_events_for_prompt(raw_gre_events))
 
     return lines
@@ -1877,8 +1886,16 @@ class CoachEngine:
     def _format_board_card(self, card: dict, local_seat: int, turn_num: int,
                            attachments: dict[int, list[dict]],
                            name_counts: Counter, name_seen: dict[str, int],
-                           is_local: bool) -> list[str]:
-        """Format a single battlefield card into display lines."""
+                           is_local: bool, *, for_planner: bool = False) -> list[str]:
+        """Format a single battlefield card into display lines.
+
+        Args:
+            for_planner: If True, omit full oracle text for permanents that
+                have been on the battlefield for more than one turn — the
+                ability flags (FLY, RCH, DTH, etc.) already summarize what
+                the planner needs. Cards that just entered keep oracle text
+                so ETB triggers stay visible.
+        """
         lines: list[str] = []
         name = card.get("name", "Unknown")
         type_line = card.get("type_line", "").lower()
@@ -1942,7 +1959,13 @@ class CoachEngine:
                       "indestructible", "defender"}
                 for w in stripped.lower().replace(",", " ").replace("\n", " ").split() if w
             )
-            if not keyword_only and len(stripped) > 0:
+            # Planner skips full oracle text on long-resident permanents — the
+            # flags already summarize relevant abilities. Recent ETBs keep
+            # oracle text so triggered abilities stay visible.
+            entered_recently = (turn_num - (card.get("turn_entered_battlefield") or 0)) <= 1
+            if for_planner and not entered_recently:
+                pass
+            elif not keyword_only and len(stripped) > 0:
                 lines.append(f"    {stripped}")
 
         if attached:
@@ -2381,11 +2404,19 @@ class CoachEngine:
         return lines
 
     def _format_game_context(
-        self, game_state: dict[str, Any], question: str = ""
+        self, game_state: dict[str, Any], question: str = "",
+        *, for_planner: bool = False,
     ) -> str:
         """Format the game state into a COMPACT context for the LLM.
 
         Orchestrator that delegates to focused helper methods for each section.
+
+        Args:
+            for_planner: If True, produce a leaner context for the autopilot
+                action planner — drops heavy GRE JSON dumps and trims oracle
+                text on long-resident permanents (the flags already summarize
+                their relevant abilities). Coach advice path keeps full
+                fidelity by default.
         """
 
         # Determine local player seat and active turn
@@ -2430,7 +2461,7 @@ class CoachEngine:
             raw_legal_actions = bridge_actions or []
         else:
             raw_legal_actions = bridge_actions or game_state.get("legal_actions_raw") or []
-        lines.extend(_build_bridge_context_lines(game_state, raw_legal_actions))
+        lines.extend(_build_bridge_context_lines(game_state, raw_legal_actions, for_planner=for_planner))
 
         # Post-land planning
         lines.extend(self._format_post_land_planning(game_state, local_seat, valid_moves, is_my_turn, phase))
@@ -2520,7 +2551,8 @@ class CoachEngine:
                 for card in your_cards:
                     lines.extend(self._format_board_card(
                         card, local_seat, turn_num, _attachments,
-                        your_name_counts, your_name_seen, is_local=True
+                        your_name_counts, your_name_seen, is_local=True,
+                        for_planner=for_planner,
                     ))
             else:
                 lines.append("  (empty)")
@@ -2548,7 +2580,8 @@ class CoachEngine:
                         card["is_attacking"] = True
                     lines.extend(self._format_board_card(
                         card, local_seat, turn_num, _attachments,
-                        opp_name_counts, opp_name_seen, is_local=False
+                        opp_name_counts, opp_name_seen, is_local=False,
+                        for_planner=for_planner,
                     ))
             else:
                 lines.append("  (empty)")
@@ -2649,61 +2682,40 @@ class CoachEngine:
     def _filter_legal_attacker_names(
         self, game_state: dict[str, Any], legal_attackers: list[str]
     ) -> list[str]:
-        """Filter declared attackers against visible battlefield legality."""
+        """Filter declared attacker names against the GRE-authoritative list.
+
+        The GRE protocol's ``qualifiedAttackers`` already enforces summoning
+        sickness, tap state, defender, etc. Trusting it avoids false negatives
+        when our local ``turn_entered_battlefield`` is stale (e.g. instance ID
+        changes after ETB triggers reset the entered-turn tracker).
+
+        Falls through to the input list if no GRE-authoritative declare-
+        attackers context is available — that path only runs as a fallback-
+        advice sanity check on hallucinated LLM names, where letting the names
+        through unchanged is safer than incorrectly filtering them out.
+        """
         if not legal_attackers:
             return []
 
-        players = game_state.get("players", [])
-        local_player = next((p for p in players if p.get("is_local")), None)
-        if not local_player:
-            return legal_attackers
+        decision_ctx = game_state.get("decision_context") or {}
+        if str(decision_ctx.get("type", "") or "").lower() == "declare_attackers":
+            gre_names = decision_ctx.get("legal_attackers") or []
+            if gre_names:
+                valid = Counter(gre_names)
+                filtered: list[str] = []
+                for name in legal_attackers:
+                    if valid[name] > 0:
+                        filtered.append(name)
+                        valid[name] -= 1
+                if len(filtered) != len(legal_attackers):
+                    logger.info(
+                        "Filtered declare attackers vs GRE qualifiedAttackers: %s -> %s",
+                        legal_attackers,
+                        filtered,
+                    )
+                return filtered
 
-        local_seat = local_player.get("seat_id")
-        turn_num = game_state.get("turn", {}).get("turn_number", 0)
-        valid_name_counts: Counter[str] = Counter()
-        saw_local_creature = False
-
-        for card in game_state.get("battlefield", []):
-            controller = card.get("controller_seat_id")
-            owner = card.get("owner_seat_id")
-            if controller not in (None, local_seat) and owner != local_seat:
-                continue
-
-            type_line = (card.get("type_line") or "").lower()
-            if "creature" not in type_line or self._is_impending(card):
-                continue
-            saw_local_creature = True
-            if card.get("is_tapped"):
-                continue
-
-            oracle = self._remove_reminder_text(card.get("oracle_text", "")).lower()
-            if (
-                card.get("turn_entered_battlefield", -1) == turn_num
-                and "haste" not in oracle
-            ):
-                continue
-
-            name = card.get("name")
-            if name:
-                valid_name_counts[name] += 1
-
-        if not saw_local_creature:
-            return legal_attackers
-
-        filtered: list[str] = []
-        for name in legal_attackers:
-            if valid_name_counts[name] > 0:
-                filtered.append(name)
-                valid_name_counts[name] -= 1
-
-        if len(filtered) != len(legal_attackers):
-            logger.info(
-                "Filtered declare attackers by board state: %s -> %s",
-                legal_attackers,
-                filtered,
-            )
-
-        return filtered
+        return list(legal_attackers)
 
     def _extract_card_name_words(self, game_state: dict[str, Any]) -> set[str]:
         """Extract all words from card names in the current game state.

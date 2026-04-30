@@ -66,3 +66,33 @@ def test_build_issue_payload_includes_post_match_feedback(tmp_path: Path) -> Non
     assert "Match result: `win`" in body
     assert "crack-back risk" in body
     assert "Post-match analysis attached" in body
+
+
+def test_build_issue_payload_includes_bridge_miss_and_replay(tmp_path: Path) -> None:
+    report_path = tmp_path / "bug.json"
+    report = _sample_report()
+    report["auto_fallback_bug"] = {
+        "reason_tag": "bridge_submit_failed",
+        "action_type": "cast_spell",
+        "card_name": "Llanowar Elves",
+        "target_names": [],
+        "select_card_names": [],
+        "bridge_request_type": "ActionsAvailableReq",
+        "bridge_request_class": "ActionsAvailableRequest",
+        "bridge": {"connected": True, "failed_methods": ["cast_spell"]},
+    }
+    report["replay"] = {
+        "available": True,
+        "latest_replay_path": "/tmp/replays/match_abc123.gretrace",
+    }
+
+    _title, body = build_issue_payload(report, report_path, "")
+
+    assert "## Bridge Miss" in body
+    assert "Reason tag: `bridge_submit_failed`" in body
+    assert "Action type: `cast_spell`" in body
+    assert "Card: `Llanowar Elves`" in body
+    assert "Bridge request: `ActionsAvailableReq` / `ActionsAvailableRequest`" in body
+    assert "Bridge connected: `True`" in body
+    assert "Bridge failed methods: `['cast_spell']`" in body
+    assert "Latest replay: `/tmp/replays/match_abc123.gretrace`" in body

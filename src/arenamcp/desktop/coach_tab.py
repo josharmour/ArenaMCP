@@ -292,22 +292,6 @@ class CoachTab(QWidget):
         self._advice_anchor_btn.clicked.connect(self._cycle_advice_anchor)
         button_row.addWidget(self._advice_anchor_btn)
 
-        # Fallback mode — when the GRE bridge can't submit an action, either
-        # ask the user to act (advice) or let autopilot click the cards via
-        # mouse (mouse). "advice" is safer; "mouse" is what older versions
-        # did and can steal the cursor.
-        self._fallback_btn = QPushButton("Fallback: Advice")
-        self._fallback_btn.setToolTip(
-            "Toggle how autopilot handles actions the bridge can't submit:\n"
-            " Advice: warn the user to act manually (default, no mouse)\n"
-            " Mouse: fall back to clicking the cards (can grab your cursor)"
-        )
-        self._fallback_btn.clicked.connect(
-            lambda _checked=False: self._send_command("toggle_fallback_mode")
-        )
-        self._buttons["toggle_fallback_mode"] = self._fallback_btn
-        button_row.addWidget(self._fallback_btn)
-
         top_layout.addLayout(button_row)
 
         game_box = QGroupBox("Game State")
@@ -702,11 +686,6 @@ class CoachTab(QWidget):
         # status emits so we don't try to update nonexistent buttons.
         elif normalized in ("AFK", "LAND_ONLY"):
             pass
-        elif normalized == "FALLBACK_MODE":
-            btn = self._buttons.get("toggle_fallback_mode")
-            if btn is not None:
-                mode = value.strip().lower() or "advice"
-                btn.setText(f"Fallback: {mode.capitalize()}")
 
     def _set_status_label(self, key: str, value: str) -> None:
         label = self._status_labels.get(key)

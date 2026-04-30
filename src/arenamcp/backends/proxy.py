@@ -141,17 +141,28 @@ class ProxyBackend:
 
             model_lower = self.model.lower()
             extra = {}
+            is_gpt5 = "gpt-5" in model_lower or "gpt5" in model_lower
             if self.enable_thinking:
                 if "claude" in model_lower:
                     extra["thinking"] = {"type": "enabled", "budget_tokens": 8000}
                     params["max_completion_tokens"] = max_tokens + 8000
                 elif "gemini" in model_lower:
                     extra["thinking_config"] = {"thinking_budget": 4096}
+                elif is_gpt5:
+                    params["reasoning_effort"] = "medium"
+                    params["verbosity"] = "medium"
             else:
                 if "claude" in model_lower:
                     extra["thinking"] = {"type": "disabled"}
                 if "gemini" in model_lower:
                     extra["thinking_config"] = {"thinking_budget": 0}
+                if is_gpt5:
+                    params["reasoning_effort"] = "minimal"
+                    params["verbosity"] = "low"
+            # GPT-5 reasoning models reject any temperature other than 1.0 when
+            # reasoning_effort is set. Drop the param so Azure uses the default.
+            if is_gpt5:
+                params.pop("temperature", None)
             if extra:
                 params["extra_body"] = extra
 
@@ -215,10 +226,17 @@ class ProxyBackend:
 
             model_lower = self.model.lower()
             extra = {}
+            is_gpt5 = "gpt-5" in model_lower or "gpt5" in model_lower
             if "claude" in model_lower:
                 extra["thinking"] = {"type": "disabled"}
             if "gemini" in model_lower:
                 extra["thinking_config"] = {"thinking_budget": 0}
+            if is_gpt5:
+                params["reasoning_effort"] = "minimal"
+                params["verbosity"] = "low"
+                # GPT-5 reasoning models reject temperature != 1.0 when
+                # reasoning_effort is set. Drop it so Azure uses the default.
+                params.pop("temperature", None)
             if extra:
                 params["extra_body"] = extra
 

@@ -213,6 +213,253 @@ def test_process_trigger_pauses_for_unmapped_bridge_interaction(monkeypatch):
     assert any("MANUAL REQUIRED" in item for item in notifications)
 
 
+class _RecordingController:
+    """Spy controller that records every input call so we can assert no mouse use."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def focus_mtga_window(self) -> None:
+        self.calls.append("focus_mtga_window")
+        return None
+
+    def wait(self, *args, **kwargs) -> None:
+        return None
+
+    def press_key(self, key: str, description: str) -> ClickResult:
+        self.calls.append(f"press_key:{key}")
+        return ClickResult(True, 0, 0, description or key)
+
+    def click(self, x: int, y: int, description: str, window_rect) -> ClickResult:
+        self.calls.append(f"click:{description}")
+        return ClickResult(True, x, y, description)
+
+    def double_click(self, x: int, y: int, description: str, window_rect) -> ClickResult:
+        self.calls.append(f"double_click:{description}")
+        return ClickResult(True, x, y, description)
+
+    def click_card_in_hand(self, *args, **kwargs) -> ClickResult:
+        self.calls.append("click_card_in_hand")
+        return ClickResult(True, 0, 0, "card")
+
+
+def _make_bridge_only_engine(monkeypatch, bridge: _DummyBridge):
+    """Build an engine in real bridge-only mode (dry_run=False)."""
+    planner = _DummyPlanner()
+    mapper = _DummyMapper()
+    controller = _RecordingController()
+    notifications: list[str] = []
+    bug_calls: list[tuple[str, dict]] = []
+
+    monkeypatch.setattr(autopilot_module, "get_bridge", lambda: bridge)
+
+    # Run the dispatched bug-report thread synchronously so assertions are
+    # deterministic. The autopilot dispatches via threading.Thread(...).start().
+    class _SyncThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self) -> None:
+            if self._target is not None:
+                self._target(*self._args, **self._kwargs)
+
+    monkeypatch.setattr(autopilot_module.threading, "Thread", _SyncThread)
+
+    engine = AutopilotEngine(
+        planner=planner,
+        mapper=mapper,
+        controller=controller,
+        get_game_state=lambda: {},
+        config=AutopilotConfig(
+            dry_run=False,
+            bridge_only_when_connected=True,
+            verify_after_action=False,
+            verification_timeout=0.01,
+            post_action_delay=0.0,
+        ),
+        ui_advice_fn=lambda text, label: notifications.append(f"{label}:{text}"),
+        bug_report_fn=lambda reason, extra: bug_calls.append((reason, extra)),
+    )
+    return engine, controller, notifications, bug_calls
+
+
+def test_execute_action_no_mouse_when_bridge_unavailable(monkeypatch):
+    """Bridge disconnected → manual required + bug report, no mouse fallback."""
+    bridge = _DummyBridge(connected=False)
+    engine, controller, notifications, bug_calls = _make_bridge_only_engine(
+        monkeypatch, bridge
+    )
+
+    state = {
+        "turn": {"turn_number": 3, "phase": "Phase_Main1", "step": "Step_PreCombatMain"},
+        "players": [{"seat_id": 1, "is_local": True}],
+        "_bridge_connected": False,
+    }
+    action = GameAction(
+        action_type=ActionType.PLAY_LAND,
+        card_name="Forest",
+    )
+
+    result = engine._execute_action(action, state)
+
+    assert result.success is False
+    assert controller.calls == [], f"expected zero mouse calls, got {controller.calls}"
+    assert any("MANUAL REQUIRED" in n for n in notifications)
+    assert len(bug_calls) == 1
+    reason, extra = bug_calls[0]
+    assert "bridge_unavailable" in reason
+    assert extra["auto_fallback_bug"]["reason_tag"] == "bridge_unavailable"
+    assert extra["auto_fallback_bug"]["card_name"] == "Forest"
+
+
+def test_execute_action_no_mouse_when_bridge_submit_fails(monkeypatch):
+    """Bridge connected but submit returns False → manual required + bug report."""
+    bridge = _DummyBridge(
+        {
+            "ok": True,
+            "has_pending": True,
+            "request_type": "ActionsAvailableReq",
+            "request_class": "ActionsAvailableRequest",
+        },
+        connected=True,
+    )
+    engine, controller, notifications, bug_calls = _make_bridge_only_engine(
+        monkeypatch, bridge
+    )
+
+    state = {
+        "turn": {"turn_number": 3, "phase": "Phase_Main1", "step": "Step_PreCombatMain"},
+        "players": [{"seat_id": 1, "is_local": True}],
+        "_bridge_connected": True,
+        "_bridge_request_type": "ActionsAvailableReq",
+        "_bridge_request_class": "ActionsAvailableRequest",
+        "_bridge_has_pending": True,
+    }
+    action = GameAction(
+        action_type=ActionType.CAST_SPELL,
+        card_name="Shock",
+        gre_action_ref=SimpleNamespace(
+            instance_id=9001, grp_id=1003, ability_grp_id=0, action_type="ActionType_Cast"
+        ),
+    )
+
+    result = engine._execute_action(action, state)
+
+    assert result.success is False
+    assert controller.calls == [], f"expected zero mouse calls, got {controller.calls}"
+    assert any("MANUAL REQUIRED" in n for n in notifications)
+    assert len(bug_calls) == 1
+    reason, extra = bug_calls[0]
+    assert "bridge_submit_failed" in reason
+    assert extra["auto_fallback_bug"]["reason_tag"] == "bridge_submit_failed"
+    assert extra["auto_fallback_bug"]["card_name"] == "Shock"
+    assert extra["auto_fallback_bug"]["bridge"]["connected"] is True
+
+
+def test_execute_action_classifies_stale_play_land_as_planner_action_stale(monkeypatch):
+    """Planner picks play_land but bridge has no Play action → stale state.
+
+    Should still surface MANUAL REQUIRED, but must NOT auto-file a bug —
+    this is a self-inflicted state mismatch (lands_played already 1, etc.),
+    not a real bridge failure. See issues #136 #137 #139 #140.
+    """
+    bridge = _DummyBridge(
+        {
+            "ok": True,
+            "has_pending": True,
+            "request_type": "ActionsAvailableReq",
+            "request_class": "ActionsAvailableRequest",
+        },
+        connected=True,
+    )
+    engine, controller, notifications, bug_calls = _make_bridge_only_engine(
+        monkeypatch, bridge
+    )
+
+    # Bridge has 6 actions — none of type "Play". This is the post-land-drop
+    # state where the user already played their land for the turn.
+    state = {
+        "turn": {"turn_number": 3, "phase": "Phase_Main1", "step": "Step_PreCombatMain"},
+        "players": [{"seat_id": 1, "is_local": True}],
+        "_bridge_connected": True,
+        "_bridge_request_type": "ActionsAvailable",
+        "_bridge_request_class": "ActionsAvailableRequest",
+        "_bridge_has_pending": True,
+        "_bridge_actions": [
+            {"actionType": "Cast", "grpId": 1001, "instanceId": 100},
+            {"actionType": "Activate_Mana", "instanceId": 200},
+            {"actionType": "Activate_Mana", "instanceId": 201},
+            {"actionType": "Pass"},
+            {"actionType": "FloatMana"},
+            {"actionType": "Activate", "grpId": 2002, "instanceId": 300},
+        ],
+    }
+    action = GameAction(
+        action_type=ActionType.PLAY_LAND,
+        card_name="Forest",
+    )
+
+    result = engine._execute_action(action, state)
+
+    assert result.success is False
+    assert controller.calls == [], f"expected zero mouse calls, got {controller.calls}"
+    assert any("MANUAL REQUIRED" in n for n in notifications)
+    # Critical: no auto-bug filed for stale state mismatches
+    assert bug_calls == [], (
+        f"expected no auto-bug for planner_action_stale, got {bug_calls}"
+    )
+
+
+def test_execute_action_files_bug_for_real_submit_failure_with_play_action_present(monkeypatch):
+    """Same shape as above but bridge HAS a Play action → real submit failure.
+
+    Confirms the stale-vs-real classifier doesn't accidentally suppress
+    legitimate bridge bugs.
+    """
+    bridge = _DummyBridge(
+        {
+            "ok": True,
+            "has_pending": True,
+            "request_type": "ActionsAvailableReq",
+            "request_class": "ActionsAvailableRequest",
+        },
+        connected=True,
+    )
+    engine, controller, notifications, bug_calls = _make_bridge_only_engine(
+        monkeypatch, bridge
+    )
+
+    state = {
+        "turn": {"turn_number": 3, "phase": "Phase_Main1", "step": "Step_PreCombatMain"},
+        "players": [{"seat_id": 1, "is_local": True}],
+        "_bridge_connected": True,
+        "_bridge_request_type": "ActionsAvailable",
+        "_bridge_request_class": "ActionsAvailableRequest",
+        "_bridge_has_pending": True,
+        # Bridge HAS a Play action — so a play_land miss here is a real
+        # bridge problem, not a stale-state mismatch.
+        "_bridge_actions": [
+            {"actionType": "Play", "grpId": 100652, "instanceId": 165},
+            {"actionType": "Pass"},
+        ],
+    }
+    action = GameAction(
+        action_type=ActionType.PLAY_LAND,
+        card_name="Forest",
+    )
+
+    result = engine._execute_action(action, state)
+
+    assert result.success is False
+    assert any("MANUAL REQUIRED" in n for n in notifications)
+    assert len(bug_calls) == 1
+    reason, extra = bug_calls[0]
+    assert "bridge_submit_failed" in reason
+    assert extra["auto_fallback_bug"]["reason_tag"] == "bridge_submit_failed"
+
+
 def test_verify_action_blocks_repeated_bridge_action_when_state_id_stalls(monkeypatch):
     bridge = _DummyBridge(
         {

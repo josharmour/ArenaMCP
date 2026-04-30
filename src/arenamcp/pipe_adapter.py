@@ -476,34 +476,8 @@ class PipeAdapter:
             self.error(f"Command failed: {action}: {e}")
 
     def _handle_toggle_fallback_mode(self) -> None:
-        """Toggle autopilot's bridge-only-when-connected flag.
-
-        When on (default): if the bridge can't submit an action, autopilot
-        gives up and emits MANUAL REQUIRED advice.
-        When off (legacy): autopilot falls back to mouse-click execution.
-        """
-        coach = self._coach
-        if coach is None:
-            return
-        try:
-            engine = getattr(coach._autopilot, "_engine", None) or getattr(coach._autopilot, "engine", None)
-            # Try common places the autopilot engine lives
-            cfg = None
-            for holder in (coach._autopilot, engine, coach):
-                if holder is None:
-                    continue
-                cfg = getattr(holder, "_config", None) or getattr(holder, "config", None)
-                if cfg is not None and hasattr(cfg, "bridge_only_when_connected"):
-                    break
-            if cfg is None or not hasattr(cfg, "bridge_only_when_connected"):
-                self.error("Autopilot config not available — fallback mode unchanged.")
-                return
-            cfg.bridge_only_when_connected = not cfg.bridge_only_when_connected
-            mode = "advice" if cfg.bridge_only_when_connected else "mouse"
-            self.status("FALLBACK_MODE", mode)
-            self.log(f"Fallback mode: {mode}")
-        except Exception as e:
-            self.error(f"Failed to toggle fallback mode: {e}")
+        """Bridge-only mode is fixed on; legacy fallback toggles do nothing."""
+        self.log("Bridge-only autopilot is always on. Mouse fallback has been removed.")
 
     def _handle_debug_report(self, screenshots: Optional[dict[str, str]] = None) -> None:
         """Save a bug report and notify the GUI of the path.

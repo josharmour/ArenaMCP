@@ -160,6 +160,7 @@ if _IS_WINDOWS:
     MOUSEEVENTF_MOVE = 0x0001
     MOUSEEVENTF_LEFTDOWN = 0x0002
     MOUSEEVENTF_LEFTUP = 0x0004
+    MOUSEEVENTF_VIRTUALDESK = 0x4000
     MOUSEEVENTF_ABSOLUTE = 0x8000
 
     KEYEVENTF_SCANCODE = 0x0008
@@ -284,18 +285,34 @@ class SendInputBackend(InputBackend):
     def __init__(self):
         if not _IS_WINDOWS:
             raise RuntimeError("SendInputBackend requires Windows")
-        # Get screen dimensions for absolute coordinate normalization
-        self._screen_w = user32.GetSystemMetrics(0)
-        self._screen_h = user32.GetSystemMetrics(1)
+        # Normalize SendInput against the full virtual desktop rather than
+        # only the primary monitor so clicks still land on secondary displays
+        # with negative coordinates.
+        self._virtual_left = user32.GetSystemMetrics(76)
+        self._virtual_top = user32.GetSystemMetrics(77)
+        self._screen_w = user32.GetSystemMetrics(78) or user32.GetSystemMetrics(0)
+        self._screen_h = user32.GetSystemMetrics(79) or user32.GetSystemMetrics(1)
         logger.info(
-            f"SendInputBackend initialized (screen: {self._screen_w}x{self._screen_h})"
+            "SendInputBackend initialized "
+            f"(virtual_screen: origin=({self._virtual_left}, {self._virtual_top}), "
+            f"size={self._screen_w}x{self._screen_h})"
         )
 
     def _abs_coords(self, x: int, y: int) -> tuple[int, int]:
         """Convert screen pixels to normalized 0-65535 range for MOUSEEVENTF_ABSOLUTE."""
-        nx = int(x * 65535 / self._screen_w)
-        ny = int(y * 65535 / self._screen_h)
-        return nx, ny
+        width = max(1, self._screen_w - 1)
+        height = max(1, self._screen_h - 1)
+        rel_x = x - self._virtual_left
+        rel_y = y - self._virtual_top
+        nx = int(rel_x * 65535 / width)
+        ny = int(rel_y * 65535 / height)
+        return max(0, min(65535, nx)), max(0, min(65535, ny))
+
+    def _absolute_flags(self, flags: int) -> int:
+        """Absolute mouse input must target the virtual desktop on multi-monitor setups."""
+        if flags & MOUSEEVENTF_ABSOLUTE:
+            return flags | MOUSEEVENTF_VIRTUALDESK
+        return flags
 
     def _send_mouse(self, dx: int, dy: int, flags: int) -> bool:
         inp = INPUT()
@@ -303,7 +320,7 @@ class SendInputBackend(InputBackend):
         inp.union.mi.dx = dx
         inp.union.mi.dy = dy
         inp.union.mi.mouseData = 0
-        inp.union.mi.dwFlags = flags
+        inp.union.mi.dwFlags = self._absolute_flags(flags)
         inp.union.mi.time = 0
         inp.union.mi.dwExtraInfo = None
         return user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp)) == 1
