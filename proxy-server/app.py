@@ -233,33 +233,30 @@ async def list_models(request: Request):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, sub: dict = Depends(_require_license)):
-    """Proxy chat completions to the best available provider."""
+    """Proxy chat completions to the best available provider.
+
+    Routing is admin-controlled: the client's `model` field is intentionally
+    ignored. Either the subscriber has an admin-assigned model (set in the
+    Subscribers admin tab), or the cluster `default_model` is used. This
+    lets the operator centrally control cost/capability per user without
+    trusting whatever the desktop client happens to send.
+    """
     body = await request.json()
-    model = body.get("model")
     stream = body.get("stream", False)
+    requested = body.get("model")
 
-    # Substitute the configured default when the client doesn't pin a model.
-    # Lets the admin UI's `default_model` setting actually drive routing for
-    # callers that send no model (or the sentinel "default").
-    if not model or model == "default":
-        substituted = _resolved_default_model()
-        if substituted:
-            body["model"] = substituted
-            model = substituted
-
-    # Per-subscriber pin: if an admin has assigned this license to a specific
-    # model, that wins over both the client's choice and the cluster default.
-    # Lets us force-route an individual user to (e.g.) gpt-5.4 for testing
-    # while everyone else stays on the gemini default.
     assigned = (sub.get("assigned_model") or "").strip()
-    if assigned:
-        if assigned != model:
-            logger.info(
-                f"Subscriber {sub['license_key'][:12]}… pinned to {assigned!r} "
-                f"(client requested {model!r})"
-            )
-        body["model"] = assigned
-        model = assigned
+    default = _resolved_default_model()
+    model = assigned or default or None
+
+    if model:
+        body["model"] = model
+    if requested and requested != model:
+        logger.info(
+            f"Subscriber {sub['license_key'][:12]}… routed to {model!r} "
+            f"(client asked for {requested!r}; "
+            f"{'admin pin' if assigned else 'cluster default'})"
+        )
 
     provider = router.select_provider(model)
     if not provider:
