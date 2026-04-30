@@ -2476,20 +2476,32 @@ class StandaloneCoach:
                                 # is still unresolved on screen.
                                 break
 
-                        # DELAY BUFFER: For mulligan decisions, wait for hand zone to populate.
-                        # SubmitDeckReq arrives before the GameStateMessage with hand cards.
-                        # Skip when bridge detected the decision — bridge data is already live.
+                        # Best-effort mulligan refresh: SubmitDeckReq arrives just
+                        # before the GameStateMessage with hand cards, so a snapshot
+                        # taken on the same poll tick can briefly miss the opening
+                        # hand. Skip when bridge detected the decision — bridge data
+                        # is already live. Otherwise poll-and-refetch up to ~150ms,
+                        # exiting as soon as the hand has cards.
                         bridge_detected = curr_state.get("_bridge_trigger") is not None
-                        if trigger == "decision_required" and curr_state.get("pending_decision") == "Mulligan" and not bridge_detected:
-                            time.sleep(0.5)  # 500ms to allow hand zone update
-                            try:
-                                self._mcp.poll_log()
-                            except Exception as e:
-                                logger.debug(f"poll_log failed after mulligan delay: {e}")
-                            try:
-                                curr_state = self._normalize_turn_snapshot(self._mcp.get_game_state())
-                            except Exception as e:
-                                logger.debug(f"Failed to re-fetch state after mulligan delay: {e}")
+                        if (
+                            trigger == "decision_required"
+                            and curr_state.get("pending_decision") == "Mulligan"
+                            and not bridge_detected
+                        ):
+                            for _ in range(3):
+                                try:
+                                    self._mcp.poll_log()
+                                except Exception as e:
+                                    logger.debug(f"poll_log failed during mulligan refresh: {e}")
+                                try:
+                                    curr_state = self._normalize_turn_snapshot(self._mcp.get_game_state())
+                                except Exception as e:
+                                    logger.debug(f"Failed to re-fetch state during mulligan refresh: {e}")
+                                    break
+                                hand = curr_state.get("hand") or []
+                                if hand:
+                                    break
+                                time.sleep(0.05)
 
                         # DELAY BUFFER: For spell_resolved, wait briefly for ETB triggers to resolve.
                         # When spells like Sheltered by Ghosts resolve, the exile/removal happens

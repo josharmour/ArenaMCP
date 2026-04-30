@@ -741,32 +741,77 @@ def start_watching() -> None:
         # Validate log identity before trusting the saved offset
         # Use the watcher's resolved log path for comparison
         import os
-        from arenamcp.watcher import _normalize_log_path, DEFAULT_LOG_PATH
+        from arenamcp.watcher import (
+            _normalize_log_path,
+            DEFAULT_LOG_PATH,
+            _latest_match_id_from_tail,
+        )
         raw_log_path = os.environ.get("MTGA_LOG_PATH", DEFAULT_LOG_PATH)
         current_log_path = str(_normalize_log_path(raw_log_path))
 
         resume_decision = validate_log_identity(saved_state, current_log_path)
         logger.info(f"Resume decision: {resume_decision}")
 
-        if resume_decision in ("resume_same_session", "resume_no_identity"):
+        # Cross-check the saved match_id against the live log tail. If the
+        # current Player.log already has a different match_id near the end,
+        # the saved offset points into an older game we should not replay.
+        saved_match_id = saved_state.get("match_id")
+        live_tail_match_id: Optional[str] = None
+        if saved_match_id:
+            try:
+                from pathlib import Path
+                log_p = Path(current_log_path)
+                if log_p.exists():
+                    file_size = log_p.stat().st_size
+                    read_size = min(file_size, 1 * 1024 * 1024)
+                    with open(log_p, "rb") as fh:
+                        fh.seek(max(0, file_size - read_size))
+                        tail_bytes = fh.read(read_size)
+                    live_tail_match_id = _latest_match_id_from_tail(tail_bytes)
+            except OSError as e:
+                logger.debug(f"Tail match scan failed (non-fatal): {e}")
+
+        if (
+            saved_match_id
+            and live_tail_match_id
+            and live_tail_match_id != saved_match_id
+        ):
+            logger.info(
+                f"Discarding saved resume state: live tail match {live_tail_match_id} "
+                f"differs from saved match {saved_match_id} "
+                f"(saved offset would replay an older game)"
+            )
+            saved_state = None
+        elif resume_decision in ("resume_same_session", "resume_no_identity"):
             resume_offset = saved_state.get("log_offset")
             if saved_state.get("local_seat_id") is not None:
                 game_state.set_local_seat_id(saved_state["local_seat_id"], source=2)
-            if saved_state.get("match_id"):
-                game_state.match_id = saved_state["match_id"]
-            logger.info(
-                f"Resuming match {saved_state.get('match_id')} "
-                f"from offset {resume_offset} ({resume_decision})"
-            )
+            if saved_match_id:
+                game_state.match_id = saved_match_id
+            checkpoint = saved_state.get("checkpoint")
+            if checkpoint and game_state.restore_checkpoint(checkpoint):
+                logger.info(
+                    f"Resuming match {saved_match_id} from offset {resume_offset} "
+                    f"with restored checkpoint (turn {game_state.turn_info.turn_number}, "
+                    f"{len(game_state.game_objects)} objects)"
+                )
+            else:
+                logger.info(
+                    f"Resuming match {saved_match_id} from offset {resume_offset} "
+                    f"({resume_decision}, no checkpoint)"
+                )
         elif resume_decision == "resume_append_mode_ambiguous":
             # Appendlog mode: allow resume but log a warning
             resume_offset = saved_state.get("log_offset")
             if saved_state.get("local_seat_id") is not None:
                 game_state.set_local_seat_id(saved_state["local_seat_id"], source=2)
-            if saved_state.get("match_id"):
-                game_state.match_id = saved_state["match_id"]
+            if saved_match_id:
+                game_state.match_id = saved_match_id
+            checkpoint = saved_state.get("checkpoint")
+            if checkpoint:
+                game_state.restore_checkpoint(checkpoint)
             logger.warning(
-                f"Resuming match {saved_state.get('match_id')} "
+                f"Resuming match {saved_match_id} "
                 f"from offset {resume_offset} — appendlog mode suspected, "
                 "offset may be stale"
             )
@@ -774,9 +819,10 @@ def start_watching() -> None:
             # fresh_log_after_restart, resume_invalid_path, etc.
             logger.info(
                 f"Discarding saved resume state: {resume_decision} "
-                f"(match={saved_state.get('match_id')}, "
+                f"(match={saved_match_id}, "
                 f"offset={saved_state.get('log_offset')})"
             )
+            saved_state = None
 
     # Create and start the watcher
     watcher = MTGALogWatcher(
