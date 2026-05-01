@@ -52,6 +52,27 @@ namespace MtgaCoachBridge
             }
         }
 
+        // Cap on enumerated entries for variable-X CastingTimeOption requests
+        // (NumericInput / Replicate). Most spells with X have a small range,
+        // and the bridge protocol is per-entry-index — too many entries make
+        // the planner choice noisy.
+        private const int MaxNumericInputEntries = 20;
+
+        private static IEnumerable<uint> EnumerateNumericInputValues(CastingTimeOption_NumericInputRequest req)
+        {
+            var disallowed = req.DisallowedValues != null ? new HashSet<uint>(req.DisallowedValues) : new HashSet<uint>();
+            uint step = req.StepSize > 0 ? req.StepSize : 1;
+            int yielded = 0;
+            for (uint v = req.Min; v <= req.Max && yielded < MaxNumericInputEntries; v += step)
+            {
+                if (disallowed.Contains(v)) continue;
+                if (req.DisallowEven && v % 2 == 0) continue;
+                if (req.DisallowOdd && v % 2 == 1) continue;
+                yield return v;
+                yielded++;
+            }
+        }
+
         private void Awake()
         {
             _log = Logger;
@@ -351,6 +372,58 @@ namespace MtgaCoachBridge
 
                 case "submit_targets":
                     HandleSubmitTargets(cmd);
+                    break;
+
+                case "submit_assign_damage":
+                    HandleSubmitAssignDamage(cmd);
+                    break;
+
+                case "submit_distribution":
+                    HandleSubmitDistribution(cmd);
+                    break;
+
+                case "submit_order":
+                    HandleSubmitOrder(cmd);
+                    break;
+
+                case "submit_select_replacement":
+                    HandleSubmitSelectReplacement(cmd);
+                    break;
+
+                case "submit_select_counters":
+                    HandleSubmitSelectCounters(cmd);
+                    break;
+
+                case "submit_string_input":
+                    HandleSubmitStringInput(cmd);
+                    break;
+
+                case "submit_intermission":
+                    HandleSubmitIntermission(cmd);
+                    break;
+
+                case "submit_gather":
+                    HandleSubmitGather(cmd);
+                    break;
+
+                case "submit_auto_tap":
+                    HandleSubmitAutoTap(cmd);
+                    break;
+
+                case "submit_select_from_groups":
+                    HandleSubmitSelectFromGroups(cmd);
+                    break;
+
+                case "submit_select_n_group":
+                    HandleSubmitSelectNGroup(cmd);
+                    break;
+
+                case "submit_search_from_groups":
+                    HandleSubmitSearchFromGroups(cmd);
+                    break;
+
+                case "submit_casting_mana_type":
+                    HandleSubmitCastingManaType(cmd);
                     break;
 
                 case "auto_respond":
@@ -657,6 +730,66 @@ namespace MtgaCoachBridge
                 }
                 resp["target_selections"] = selectionsArr;
                 resp["target_candidates"] = flatCandidates;
+                resp["can_pass"] = false;
+            }
+            else if (request is AssignDamageRequest dmgReqExpose)
+            {
+                // Surface the bridge-side assigner template so Python can
+                // build a structured submit_assign_damage payload by index/id
+                // without re-reflecting the request shape at submit time.
+                var assignersArr = new JArray();
+                foreach (var assigner in dmgReqExpose.Assigners)
+                {
+                    var assignmentsArr = new JArray();
+                    foreach (var a in assigner.Assignments)
+                    {
+                        assignmentsArr.Add(new JObject
+                        {
+                            ["instanceId"] = (int)a.InstanceId,
+                            ["minDamage"] = (int)a.MinDamage,
+                            ["maxDamage"] = (int)a.MaxDamage,
+                            ["assignedDamage"] = (int)a.AssignedDamage,
+                        });
+                    }
+                    assignersArr.Add(new JObject
+                    {
+                        ["instanceId"] = (int)assigner.InstanceId,
+                        ["totalDamage"] = (int)assigner.TotalDamage,
+                        ["assignments"] = assignmentsArr,
+                    });
+                }
+                resp["assigners"] = assignersArr;
+                resp["can_pass"] = false;
+            }
+            else if (request is SelectReplacementRequest replReqExpose)
+            {
+                var replacementsArr = new JArray();
+                int idx = 0;
+                foreach (var repl in replReqExpose.Replacements)
+                {
+                    replacementsArr.Add(new JObject
+                    {
+                        ["index"] = idx,
+                        ["display"] = repl?.ToString() ?? "",
+                    });
+                    idx++;
+                }
+                resp["replacements"] = replacementsArr;
+                resp["is_optional"] = replReqExpose.IsOptional;
+                resp["can_pass"] = false;
+            }
+            else if (request is DistributionRequest distReqExpose)
+            {
+                var legalArr = new JArray();
+                foreach (var t in distReqExpose.LegalTargetIds) legalArr.Add((int)t);
+                var allArr = new JArray();
+                foreach (var t in distReqExpose.TargetIds) allArr.Add((int)t);
+                resp["distribution_target_ids"] = allArr;
+                resp["distribution_legal_ids"] = legalArr;
+                resp["distribution_min"] = (int)distReqExpose.Min;
+                resp["distribution_max"] = (int)distReqExpose.Max;
+                resp["distribution_min_per"] = (int)distReqExpose.MinPer;
+                resp["distribution_max_per"] = (int)distReqExpose.MaxPer;
                 resp["can_pass"] = false;
             }
 
@@ -1221,6 +1354,457 @@ namespace MtgaCoachBridge
             {
                 cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not SelectTargetsRequest" });
             }
+        }
+
+        // -------------------------------------------------------------------
+        // Phase 2/3/4 handlers: full BaseUserRequest coverage so autopilot
+        // never has to fall back to vision/manual for a request type the
+        // bridge can authoritatively submit.
+        // -------------------------------------------------------------------
+
+        private void HandleSubmitAssignDamage(PipeCommand cmd)
+        {
+            var request = FindPendingInteraction();
+            if (!(request is AssignDamageRequest dmgReq))
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not AssignDamageRequest" });
+                return;
+            }
+
+            // Expected payload: {"assigners": [{"instanceId": <attacker>, "assignments": [{"instanceId": <receiver>, "damage": <int>}, ...]}, ...]}
+            var assignersJson = cmd.Json["assigners"] as JArray;
+            if (assignersJson == null)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = "Missing 'assigners' array" });
+                return;
+            }
+
+            var built = new List<DamageAssigner>();
+            foreach (var aJson in assignersJson)
+            {
+                uint attackerId = (uint)(int)aJson["instanceId"];
+                var existing = dmgReq.Assigners.Find(x => x.InstanceId == attackerId);
+                if (existing == null)
+                {
+                    _log.LogWarning($"submit_assign_damage: attacker {attackerId} not in request");
+                    continue;
+                }
+                // Clone existing assigner and overwrite assignments with caller-supplied damage.
+                var newAssigner = new DamageAssigner
+                {
+                    InstanceId = existing.InstanceId,
+                    TotalDamage = existing.TotalDamage,
+                };
+                var assignmentsArr = aJson["assignments"] as JArray;
+                if (assignmentsArr != null)
+                {
+                    foreach (var asJson in assignmentsArr)
+                    {
+                        uint receiverId = (uint)(int)asJson["instanceId"];
+                        uint damage = (uint)(int)asJson["damage"];
+                        DamageAssignment template = null;
+                        foreach (var a in existing.Assignments)
+                        {
+                            if (a.InstanceId == receiverId) { template = a; break; }
+                        }
+                        var newAssignment = new DamageAssignment
+                        {
+                            InstanceId = receiverId,
+                            MinDamage = template?.MinDamage ?? 0,
+                            MaxDamage = template?.MaxDamage ?? damage,
+                            AssignedDamage = damage,
+                        };
+                        newAssigner.Assignments.Add(newAssignment);
+                    }
+                }
+                built.Add(newAssigner);
+            }
+
+            _log.LogInfo($"Submitting AssignDamage: {built.Count} assigners");
+            dmgReq.SubmitAssignment(built);
+            lock (_interactionLock) { _lastKnownRequest = null; }
+            cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "AssignDamage", ["assigner_count"] = built.Count });
+        }
+
+        private void HandleSubmitDistribution(PipeCommand cmd)
+        {
+            var request = FindPendingInteraction();
+            if (!(request is DistributionRequest distReq))
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not DistributionRequest" });
+                return;
+            }
+
+            // Payload: {"distributions": {"<targetInstanceId>": <amount>, ...}}
+            var distJson = cmd.Json["distributions"] as JObject;
+            if (distJson == null)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = "Missing 'distributions' object" });
+                return;
+            }
+
+            var dict = new Dictionary<uint, uint>();
+            foreach (var prop in distJson.Properties())
+            {
+                if (uint.TryParse(prop.Name, out uint targetId))
+                {
+                    dict[targetId] = (uint)(int)prop.Value;
+                }
+            }
+
+            _log.LogInfo($"Submitting Distribution: {string.Join(",", dict)}");
+            distReq.SubmitDistribution(dict);
+            lock (_interactionLock) { _lastKnownRequest = null; }
+            cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "Distribution", ["target_count"] = dict.Count });
+        }
+
+        private void HandleSubmitOrder(PipeCommand cmd)
+        {
+            var request = FindPendingInteraction();
+            if (!(request is OrderRequest orderReq))
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not OrderRequest" });
+                return;
+            }
+            var idsJson = cmd.Json["ids"] as JArray;
+            var ordered = new List<uint>();
+            if (idsJson != null)
+            {
+                foreach (var idTok in idsJson) ordered.Add((uint)(int)idTok);
+            }
+            else
+            {
+                // Default: submit current Ids order as-is
+                ordered.AddRange(orderReq.Ids);
+            }
+            _log.LogInfo($"Submitting Order: [{string.Join(",", ordered)}]");
+            orderReq.SubmitOrder(ordered);
+            lock (_interactionLock) { _lastKnownRequest = null; }
+            cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "Order", ["count"] = ordered.Count });
+        }
+
+        private void HandleSubmitSelectReplacement(PipeCommand cmd)
+        {
+            var request = FindPendingInteraction();
+            if (!(request is SelectReplacementRequest replReq))
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not SelectReplacementRequest" });
+                return;
+            }
+            // Payload: {"index": <int>}  — index into Replacements list.
+            // Optional: {"decline": true} when the request is optional.
+            bool decline = cmd.Json.Value<bool?>("decline") ?? false;
+            if (decline)
+            {
+                if (replReq.IsOptional)
+                {
+                    _log.LogInfo("SelectReplacement: declining (optional)");
+                    replReq.Decline();
+                    lock (_interactionLock) { _lastKnownRequest = null; }
+                    cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "SelectReplacement", ["declined"] = true });
+                    return;
+                }
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = "SelectReplacementRequest is not optional" });
+                return;
+            }
+            int idx = cmd.Json.Value<int?>("index") ?? 0;
+            if (idx < 0 || idx >= replReq.Replacements.Count)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Index {idx} out of range (0-{replReq.Replacements.Count - 1})" });
+                return;
+            }
+            _log.LogInfo($"Submitting SelectReplacement: index {idx}");
+            replReq.SubmitReplacement(replReq.Replacements[idx]);
+            lock (_interactionLock) { _lastKnownRequest = null; }
+            cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "SelectReplacement", ["index"] = idx });
+        }
+
+        private void HandleSubmitSelectCounters(PipeCommand cmd)
+        {
+            var request = FindPendingInteraction();
+            if (!(request is SelectCountersRequest countersReq))
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not SelectCountersRequest" });
+                return;
+            }
+            // Payload: {"pairs": [{"counterType": "<CounterType name>", "amount": <int>}, ...]}
+            var pairsJson = cmd.Json["pairs"] as JArray;
+            var pairs = new List<CounterPair>();
+            if (pairsJson != null)
+            {
+                foreach (var p in pairsJson)
+                {
+                    var pair = new CounterPair();
+                    var ctName = p.Value<string>("counterType");
+                    int amount = p.Value<int?>("amount") ?? p.Value<int?>("count") ?? 0;
+                    int instanceId = p.Value<int?>("instanceId") ?? 0;
+                    if (!string.IsNullOrEmpty(ctName) && System.Enum.TryParse<CounterType>(ctName, out var ct))
+                    {
+                        pair.CounterType = ct;
+                    }
+                    pair.Count = (uint)amount;
+                    if (instanceId != 0) pair.InstanceId = (uint)instanceId;
+                    pairs.Add(pair);
+                }
+            }
+            _log.LogInfo($"Submitting SelectCounters: {pairs.Count} pairs");
+            countersReq.SubmitCountersResponse(pairs);
+            lock (_interactionLock) { _lastKnownRequest = null; }
+            cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "SelectCounters", ["pair_count"] = pairs.Count });
+        }
+
+        private void HandleSubmitStringInput(PipeCommand cmd)
+        {
+            var request = FindPendingInteraction();
+            if (!(request is StringInputRequest strReq))
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not StringInputRequest" });
+                return;
+            }
+            string value = cmd.Json.Value<string>("value") ?? "";
+            _log.LogInfo($"Submitting StringInput: '{value}'");
+            strReq.SubmitValue(value);
+            lock (_interactionLock) { _lastKnownRequest = null; }
+            cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "StringInput", ["value"] = value });
+        }
+
+        private void HandleSubmitIntermission(PipeCommand cmd)
+        {
+            var request = FindPendingInteraction();
+            if (!(request is IntermissionRequest intReq))
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not IntermissionRequest" });
+                return;
+            }
+            // Payload: {"option": "<ClientMessageType name>"} e.g. "ConcedeReq", "NextGameReq"
+            string optionName = cmd.Json.Value<string>("option") ?? "";
+            if (!System.Enum.TryParse<ClientMessageType>(optionName, out var option))
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Unknown ClientMessageType '{optionName}'" });
+                return;
+            }
+            _log.LogInfo($"Submitting Intermission: {option}");
+            intReq.SubmitOption(option);
+            lock (_interactionLock) { _lastKnownRequest = null; }
+            cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "Intermission", ["option"] = optionName });
+        }
+
+        private void HandleSubmitGather(PipeCommand cmd)
+        {
+            var request = FindPendingInteraction();
+            if (!(request is GatherRequest gatherReq))
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not GatherRequest" });
+                return;
+            }
+            // Payload: {"gatherings": [{"instanceId": <int>, "amount": <int>}, ...]}
+            // Each Gathering submission is a (target instance, amount) pair —
+            // typically used for distributing counters/effects.
+            var gatheringsJson = cmd.Json["gatherings"] as JArray;
+            var gatherings = new List<Gathering>();
+            if (gatheringsJson != null)
+            {
+                foreach (var g in gatheringsJson)
+                {
+                    int instanceId = g.Value<int?>("instanceId") ?? 0;
+                    int amount = g.Value<int?>("amount") ?? 0;
+                    var gathering = new Gathering
+                    {
+                        InstanceId = (uint)instanceId,
+                        Amount = (uint)amount,
+                    };
+                    gatherings.Add(gathering);
+                }
+            }
+            _log.LogInfo($"Submitting Gather: {gatherings.Count} gatherings");
+            gatherReq.SubmitGathering(gatherings);
+            lock (_interactionLock) { _lastKnownRequest = null; }
+            cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "Gather", ["count"] = gatherings.Count });
+        }
+
+        private void HandleSubmitAutoTap(PipeCommand cmd)
+        {
+            var request = FindPendingInteraction();
+            if (!(request is AutoTapActionsRequest autoTapReq))
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not AutoTapActionsRequest" });
+                return;
+            }
+            // Payload: optional {"solution_index": <int>} to pick from candidates;
+            // default: submit the first available solution.
+            int solutionIndex = cmd.Json.Value<int?>("solution_index") ?? 0;
+            // AutoTapActionsRequest exposes Solutions — pick by index.
+            var solutionsProp = autoTapReq.GetType().GetProperty("Solutions");
+            object solutionsObj = solutionsProp?.GetValue(autoTapReq);
+            var enumerable = solutionsObj as System.Collections.IEnumerable;
+            AutoTapSolution chosen = null;
+            if (enumerable != null)
+            {
+                int i = 0;
+                foreach (var s in enumerable)
+                {
+                    if (i == solutionIndex) { chosen = s as AutoTapSolution; break; }
+                    i++;
+                }
+            }
+            if (chosen == null)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"No AutoTap solution at index {solutionIndex}" });
+                return;
+            }
+            _log.LogInfo($"Submitting AutoTap solution {solutionIndex}");
+            autoTapReq.SubmitSolution(chosen);
+            lock (_interactionLock) { _lastKnownRequest = null; }
+            cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "AutoTap", ["solution_index"] = solutionIndex });
+        }
+
+        private void HandleSubmitSelectFromGroups(PipeCommand cmd)
+        {
+            var request = FindPendingInteraction();
+            if (!(request is SelectFromGroupsRequest sfgReq))
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not SelectFromGroupsRequest" });
+                return;
+            }
+            // Payload: {"groups": [{"ids": [<int>...], "groupId": <int?>}, ...]}
+            var groupsJson = cmd.Json["groups"] as JArray;
+            var groups = new List<Group>();
+            if (groupsJson != null)
+            {
+                foreach (var g in groupsJson)
+                {
+                    var grp = new Group();
+                    var idsArr = g["ids"] as JArray;
+                    if (idsArr != null)
+                    {
+                        foreach (var idTok in idsArr) grp.Ids.Add((uint)(int)idTok);
+                    }
+                    int groupId = g.Value<int?>("groupId") ?? 0;
+                    if (groupId > 0) grp.GroupId = groupId;
+                    groups.Add(grp);
+                }
+            }
+            _log.LogInfo($"Submitting SelectFromGroups: {groups.Count} groups");
+            sfgReq.Submit(groups);
+            lock (_interactionLock) { _lastKnownRequest = null; }
+            cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "SelectFromGroups", ["group_count"] = groups.Count });
+        }
+
+        private void HandleSubmitSelectNGroup(PipeCommand cmd)
+        {
+            var request = FindPendingInteraction();
+            if (!(request is SelectNGroupRequest sngReq))
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not SelectNGroupRequest" });
+                return;
+            }
+            // Payload: {"ids": [<int>, ...]} or {"id": <int>}
+            var idsJson = cmd.Json["ids"] as JArray;
+            if (idsJson != null)
+            {
+                var ids = new List<uint>();
+                foreach (var idTok in idsJson) ids.Add((uint)(int)idTok);
+                _log.LogInfo($"Submitting SelectNGroup: ids={string.Join(",", ids)}");
+                sngReq.SubmitGroupSelection(ids);
+                lock (_interactionLock) { _lastKnownRequest = null; }
+                cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "SelectNGroup", ["count"] = ids.Count });
+                return;
+            }
+            int singleId = cmd.Json.Value<int?>("id") ?? 0;
+            _log.LogInfo($"Submitting SelectNGroup: id={singleId}");
+            sngReq.SubmitGroupSelection((uint)singleId);
+            lock (_interactionLock) { _lastKnownRequest = null; }
+            cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "SelectNGroup", ["id"] = singleId });
+        }
+
+        private void HandleSubmitSearchFromGroups(PipeCommand cmd)
+        {
+            var request = FindPendingInteraction();
+            if (!(request is SearchFromGroupsRequest sfgReq))
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not SearchFromGroupsRequest" });
+                return;
+            }
+            // Payload: either {"zone": <int>} to pick a search zone,
+            // or {"groups": [...]} to submit a selection (same shape as SelectFromGroups).
+            var zoneTok = cmd.Json["zone"];
+            if (zoneTok != null && zoneTok.Type != JTokenType.Null)
+            {
+                uint zone = (uint)(int)zoneTok;
+                _log.LogInfo($"SubmitSearchFromGroups: zone {zone}");
+                sfgReq.SubmitZone(zone);
+                lock (_interactionLock) { _lastKnownRequest = null; }
+                cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "SearchFromGroups", ["zone"] = (int)zone });
+                return;
+            }
+            var groupsJson = cmd.Json["groups"] as JArray;
+            var groups = new List<Group>();
+            if (groupsJson != null)
+            {
+                foreach (var g in groupsJson)
+                {
+                    var grp = new Group();
+                    var idsArr = g["ids"] as JArray;
+                    if (idsArr != null)
+                    {
+                        foreach (var idTok in idsArr) grp.Ids.Add((uint)(int)idTok);
+                    }
+                    int groupId = g.Value<int?>("groupId") ?? 0;
+                    if (groupId > 0) grp.GroupId = groupId;
+                    groups.Add(grp);
+                }
+            }
+            _log.LogInfo($"SubmitSearchFromGroups: {groups.Count} groups");
+            sfgReq.SubmitSelection(groups);
+            lock (_interactionLock) { _lastKnownRequest = null; }
+            cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "SearchFromGroups", ["group_count"] = groups.Count });
+        }
+
+        private void HandleSubmitCastingManaType(PipeCommand cmd)
+        {
+            // CastingTimeOption_ManaTypeRequest may appear as a child of
+            // CastingTimeOptionRequest. Walk children to find the mana-type
+            // child request and submit the user-supplied list of colors.
+            var request = FindPendingInteraction();
+            CastingTimeOption_ManaTypeRequest manaReq = null;
+            if (request is CastingTimeOption_ManaTypeRequest direct)
+            {
+                manaReq = direct;
+            }
+            else if (request is CastingTimeOptionRequest parent)
+            {
+                foreach (var child in parent.ChildRequests)
+                {
+                    if (child is CastingTimeOption_ManaTypeRequest m) { manaReq = m; break; }
+                }
+            }
+            if (manaReq == null)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, no CastingTimeOption_ManaTypeRequest child" });
+                return;
+            }
+            // Payload: {"colors": ["White", "Blue", ...]} matching InnerRequests count.
+            var colorsJson = cmd.Json["colors"] as JArray;
+            var colors = new List<ManaColor>();
+            if (colorsJson != null)
+            {
+                foreach (var cTok in colorsJson)
+                {
+                    if (System.Enum.TryParse<ManaColor>((string)cTok, out var color))
+                        colors.Add(color);
+                    else
+                        colors.Add(ManaColor.None);
+                }
+            }
+            if (colors.Count != manaReq.InnerRequests.Count)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Need {manaReq.InnerRequests.Count} colors, got {colors.Count}" });
+                return;
+            }
+            _log.LogInfo($"SubmitCastingManaType: {string.Join(",", colors)}");
+            manaReq.SubmitSelection(colors);
+            lock (_interactionLock) { _lastKnownRequest = null; }
+            cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "CastingManaType", ["colors"] = string.Join(",", colors) });
         }
 
         private void HandleAutoRespond(PipeCommand cmd)
@@ -1797,6 +2381,28 @@ namespace MtgaCoachBridge
                             () => numericReq.SubmitX(numericValue)));
                         break;
 
+                    case CastingTimeOption_NumericInputRequest variableNumericReq:
+                        // Min != Max — enumerate up to MaxNumericInputEntries values so
+                        // the existing entry-index protocol can pick one. Honor
+                        // disallowed/even/odd filters and suggested values.
+                        foreach (uint value in EnumerateNumericInputValues(variableNumericReq))
+                        {
+                            uint capturedValue = value;
+                            var entryPayload = CreateCastingTimeOptionPayload(
+                                "numeric_input",
+                                variableNumericReq,
+                                childIndex,
+                                $"X = {capturedValue}",
+                                grpId: variableNumericReq.GrpId);
+                            entryPayload["numericValue"] = (int)capturedValue;
+                            entryPayload["min"] = (int)variableNumericReq.Min;
+                            entryPayload["max"] = (int)variableNumericReq.Max;
+                            entries.Add(new CastingTimeOptionEntry(
+                                entryPayload,
+                                () => variableNumericReq.SubmitX(capturedValue)));
+                        }
+                        break;
+
                     case CastingTimeOption_Replicate replicateReq when replicateReq.Min == replicateReq.Max:
                         uint replicateValue = replicateReq.Min;
                         var replicatePayload = CreateCastingTimeOptionPayload(
@@ -1808,6 +2414,67 @@ namespace MtgaCoachBridge
                         entries.Add(new CastingTimeOptionEntry(
                             replicatePayload,
                             () => replicateReq.SubmitValue(replicateValue)));
+                        break;
+
+                    case CastingTimeOption_Replicate variableReplicateReq:
+                        // Min != Max — enumerate replicate counts.
+                        for (uint v = variableReplicateReq.Min; v <= variableReplicateReq.Max && v - variableReplicateReq.Min < MaxNumericInputEntries; v++)
+                        {
+                            uint capturedReplicate = v;
+                            var rPayload = CreateCastingTimeOptionPayload(
+                                "replicate",
+                                variableReplicateReq,
+                                childIndex,
+                                $"Replicate {capturedReplicate}");
+                            rPayload["numericValue"] = (int)capturedReplicate;
+                            rPayload["min"] = (int)variableReplicateReq.Min;
+                            rPayload["max"] = (int)variableReplicateReq.Max;
+                            entries.Add(new CastingTimeOptionEntry(
+                                rPayload,
+                                () => variableReplicateReq.SubmitValue(capturedReplicate)));
+                        }
+                        break;
+
+                    case CastingTimeOption_SpecializeRequest specializeReq:
+                        foreach (CardColor color in specializeReq.SelectableColors)
+                        {
+                            CardColor capturedColor = color;
+                            var sPayload = CreateCastingTimeOptionPayload(
+                                "specialize",
+                                specializeReq,
+                                childIndex,
+                                $"Specialize: {capturedColor}",
+                                grpId: specializeReq.SourceAbilityId);
+                            sPayload["colorName"] = capturedColor.ToString();
+                            sPayload["colorValue"] = (int)capturedColor;
+                            entries.Add(new CastingTimeOptionEntry(
+                                sPayload,
+                                () => specializeReq.SubmitSpecialization(capturedColor)));
+                        }
+                        break;
+
+                    case CastingTimeOption_ManaTypeRequest manaTypeReq:
+                        // Each InnerRequest picks one ManaColor. The default
+                        // payload submits the per-inner DefaultIndex choice;
+                        // a full multi-color picker would need a separate
+                        // explicit submit handler with a Python-supplied list.
+                        var defaultColors = new List<ManaColor>();
+                        foreach (var inner in manaTypeReq.InnerRequests)
+                        {
+                            int idx = Math.Min(inner.DefaultIndex, inner.ManaColorOptions.Count - 1);
+                            defaultColors.Add(inner.ManaColorOptions[Math.Max(0, idx)]);
+                        }
+                        var mPayload = CreateCastingTimeOptionPayload(
+                            "mana_type",
+                            manaTypeReq,
+                            childIndex,
+                            $"Mana types: {string.Join(",", defaultColors)}");
+                        var colorList = new JArray();
+                        foreach (var c in defaultColors) colorList.Add(c.ToString());
+                        mPayload["colors"] = colorList;
+                        entries.Add(new CastingTimeOptionEntry(
+                            mPayload,
+                            () => manaTypeReq.SubmitSelection(defaultColors)));
                         break;
                 }
             }

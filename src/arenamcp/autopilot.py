@@ -2585,7 +2585,45 @@ class AutopilotEngine:
 
         gre_ref = getattr(action, 'gre_action_ref', None)
 
-        # PASS / RESOLVE — use bridge submit_pass
+        # CLICK_BUTTON on an OptionalActionMessageRequest must go through
+        # submit_optional, NOT submit_pass — the latter is rejected by MTGA
+        # ("Cannot pass on current interaction"). Issue #161 was filed because
+        # this branch lumped CLICK_BUTTON with pass/resolve and surfaced
+        # bridge_submit_failed when the LLM tried to accept an ETB trigger.
+        if action.action_type == ActionType.CLICK_BUTTON:
+            bridge_request_class = (
+                game_state.get("_bridge_request_class")
+                or game_state.get("_bridge_request_type")
+                or ""
+            )
+            decision_type = (
+                (game_state.get("decision_context") or {}).get("type") or ""
+            )
+            if "Optional" in str(bridge_request_class) or decision_type == "optional_action":
+                button_name = (action.card_name or "").lower().strip()
+                # The LLM occasionally leaves card_name empty when the prompt
+                # is a yes/no benefit (e.g. "Search your library?"). Default
+                # to accept when the name doesn't explicitly decline — the
+                # earlier auto-decline path already handled the "no
+                # meaningful actions" case, so reaching here means the LLM
+                # actively chose a side.
+                if button_name in ("decline", "cancel", "no", "skip"):
+                    accept = False
+                else:
+                    accept = True
+                if self._gre_bridge.submit_optional(accept):
+                    self._log_execution_path(
+                        ExecutionPath.GRE_AWARE,
+                        f"click_button: submit_optional(accept={accept}) via GRE bridge"
+                    )
+                    return ClickResult(
+                        True, 0, 0, button_name or ("accept" if accept else "decline"), "GRE bridge"
+                    )
+                logger.info("GRE bridge submit_optional failed; surfacing manual-required to caller")
+                self._gre_bridge_failed_methods.add(method)
+                return None
+
+        # PASS / RESOLVE / generic CLICK_BUTTON — use bridge submit_pass
         if action.action_type in (ActionType.PASS_PRIORITY, ActionType.RESOLVE, ActionType.CLICK_BUTTON):
             if self._gre_bridge.submit_pass():
                 self._log_execution_path(
@@ -2634,6 +2672,32 @@ class AutopilotEngine:
         # SELECT TARGET — submit via bridge if target instance IDs are resolvable
         if action.action_type == ActionType.SELECT_TARGET:
             return self._try_gre_bridge_select_target(action)
+
+        # ASSIGN_DAMAGE — submit combat damage assignments via bridge.
+        if action.action_type == ActionType.ASSIGN_DAMAGE:
+            result = self._try_gre_bridge_assign_damage(action, game_state)
+            if result is not None:
+                return result
+
+        # DISTRIBUTE — submit a distribution decision via bridge.
+        if action.action_type == ActionType.DISTRIBUTE:
+            result = self._try_gre_bridge_distribute(action, game_state)
+            if result is not None:
+                return result
+
+        # ORDER_TRIGGERS / ORDER_BLOCKERS — submit ordering via bridge.
+        # Routed by inspecting the bridge request class: OrderRequest →
+        # submit_order; SelectFromGroupsRequest / GroupRequest → submit_group.
+        if action.action_type in (ActionType.ORDER_TRIGGERS, ActionType.ORDER_BLOCKERS, ActionType.ORDER_COMBAT_DAMAGE):
+            result = self._try_gre_bridge_order(action, game_state)
+            if result is not None:
+                return result
+
+        # SELECT_REPLACEMENT — choose a replacement effect (or decline if optional).
+        if action.action_type == ActionType.SELECT_REPLACEMENT:
+            result = self._try_gre_bridge_select_replacement(action, game_state)
+            if result is not None:
+                return result
 
         # SELECT_N / SEARCH_LIBRARY / SELECT_COUNTERS — submit via bridge.
         # The legacy mouse path (kept only when bridge-only mode is off) clicks
@@ -3179,6 +3243,225 @@ class AutopilotEngine:
 
         logger.info("GRE bridge select_target failed, surfacing manual-required to caller")
         self._gre_bridge_failed_methods.add("select_target")
+        return None
+
+    def _try_gre_bridge_assign_damage(
+        self, action: GameAction, game_state: dict[str, Any]
+    ) -> Optional[ClickResult]:
+        """Submit combat damage assignments via the GRE bridge.
+
+        The planner's GameAction carries `distribution` as a name → damage
+        map per attacker, but for AssignDamage we expect a richer structure:
+        the LLM ideally emits `target_names` listing the receivers in
+        order with `distribution` keyed by receiver name. When only one
+        attacker has damage to assign, we accept the simple form and
+        treat `distribution` as receiver_name → damage. Otherwise we
+        fall back to the bridge's existing assigner template.
+        """
+        pending = self._gre_bridge.get_pending_actions()
+        if not pending or not pending.get("has_pending"):
+            return None
+        req_class = pending.get("request_class") or pending.get("request_type") or ""
+        if "AssignDamage" not in str(req_class):
+            return None
+
+        battlefield = game_state.get("battlefield", []) or []
+
+        bridge_assigners = pending.get("assigners") or []
+        if not bridge_assigners:
+            # Without bridge-side assigner shape we can't safely synthesize a
+            # full AssignDamage submission. Surface manual-required.
+            logger.info("GRE bridge assign_damage: bridge did not surface assigners; surfacing manual-required")
+            return None
+
+        assigners: list[dict[str, Any]] = []
+        dist_map = {k.lower(): v for k, v in (action.distribution or {}).items()}
+        for assigner in bridge_assigners:
+            try:
+                attacker_id = int(assigner.get("instanceId") or 0)
+                total = int(assigner.get("totalDamage") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not attacker_id or total <= 0:
+                continue
+            assignments_in = assigner.get("assignments") or []
+            built: list[dict[str, int]] = []
+            remaining = total
+            # If the LLM gave us a per-receiver distribution, use that;
+            # otherwise dump everything onto the first legal receiver
+            # (typically the defending player or the only blocker).
+            if dist_map:
+                for entry in assignments_in:
+                    try:
+                        receiver_id = int(entry.get("instanceId") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    rname = ""
+                    for c in battlefield:
+                        try:
+                            if int(c.get("instance_id") or 0) == receiver_id:
+                                rname = str(c.get("name") or "").lower()
+                                break
+                        except (TypeError, ValueError):
+                            continue
+                    dmg = int(dist_map.get(rname, 0))
+                    if dmg <= 0:
+                        continue
+                    built.append({"instanceId": receiver_id, "damage": min(dmg, remaining)})
+                    remaining -= dmg
+                    if remaining <= 0:
+                        break
+            if not built:
+                # Default: dump all damage on the first listed assignment
+                # (bridge-supplied default order matches MTGA's blocker ordering).
+                if assignments_in:
+                    try:
+                        first_id = int(assignments_in[0].get("instanceId") or 0)
+                    except (TypeError, ValueError):
+                        first_id = 0
+                    if first_id:
+                        built.append({"instanceId": first_id, "damage": total})
+                        remaining = 0
+            # Spill any leftover damage to the last assignment slot.
+            if remaining > 0 and built:
+                built[-1]["damage"] = int(built[-1]["damage"]) + remaining
+            assigners.append({"instanceId": attacker_id, "assignments": built})
+
+        if not assigners:
+            logger.info("GRE bridge assign_damage: no assignments built; surfacing manual-required")
+            return None
+
+        if self._gre_bridge.submit_assign_damage(assigners):
+            self._log_execution_path(
+                ExecutionPath.GRE_AWARE,
+                f"assign_damage: {len(assigners)} assigners via GRE bridge"
+            )
+            return ClickResult(True, 0, 0, "assign_damage", "GRE bridge")
+        self._gre_bridge_failed_methods.add("assign_damage")
+        return None
+
+    def _try_gre_bridge_distribute(
+        self, action: GameAction, game_state: dict[str, Any]
+    ) -> Optional[ClickResult]:
+        """Submit a Distribution decision via GRE bridge."""
+        pending = self._gre_bridge.get_pending_actions()
+        if not pending or not pending.get("has_pending"):
+            return None
+        req_class = pending.get("request_class") or pending.get("request_type") or ""
+        if "Distribution" not in str(req_class):
+            return None
+
+        battlefield = game_state.get("battlefield", []) or []
+
+        # The LLM expresses distribution as name → amount. Resolve names
+        # to instance_ids before sending. If we can't resolve everything
+        # we surface manual-required so vision/manual can take over.
+        distributions: dict[int, int] = {}
+        for name, amount in (action.distribution or {}).items():
+            try:
+                amount = int(amount)
+            except (TypeError, ValueError):
+                continue
+            if amount <= 0:
+                continue
+            iid, _ = _match_target_in_battlefield([name], battlefield, lambda _c: True)
+            if not iid:
+                logger.info(f"GRE bridge distribute: can't resolve {name!r}; surfacing manual-required")
+                return None
+            distributions[int(iid)] = amount
+
+        if not distributions:
+            return None
+
+        if self._gre_bridge.submit_distribution(distributions):
+            self._log_execution_path(
+                ExecutionPath.GRE_AWARE,
+                f"distribute: {len(distributions)} targets via GRE bridge"
+            )
+            return ClickResult(True, 0, 0, "distribute", "GRE bridge")
+        self._gre_bridge_failed_methods.add("distribute")
+        return None
+
+    def _try_gre_bridge_order(
+        self, action: GameAction, game_state: dict[str, Any]
+    ) -> Optional[ClickResult]:
+        """Submit ordering (triggers / blockers / combat damage) via GRE bridge.
+
+        Bridge mapping:
+          OrderRequest         → submit_order
+          SelectFromGroups     → submit_select_from_groups
+          GroupRequest         → submit_group (existing)
+        """
+        pending = self._gre_bridge.get_pending_actions()
+        if not pending or not pending.get("has_pending"):
+            return None
+        req_class = pending.get("request_class") or pending.get("request_type") or ""
+        req_class_str = str(req_class)
+
+        # OrderRequest: submit current order (or LLM-provided ordering if
+        # ever reified). Most stack-trigger ordering is "default order is
+        # fine"; sending the bridge's current Ids list confirms it.
+        if "Order" in req_class_str and "Group" not in req_class_str:
+            if self._gre_bridge.submit_order():
+                self._log_execution_path(
+                    ExecutionPath.GRE_AWARE,
+                    "order: default ordering via GRE bridge"
+                )
+                return ClickResult(True, 0, 0, "order", "GRE bridge")
+            self._gre_bridge_failed_methods.add("order")
+            return None
+
+        # SelectFromGroupsRequest: submit a single empty group to accept
+        # the bridge's current default. The vast majority of in-game
+        # SelectFromGroups prompts (e.g. assignment of triggers to stack
+        # spots) are "confirm the default" interactions.
+        if "SelectFromGroups" in req_class_str:
+            if self._gre_bridge.submit_select_from_groups([]):
+                self._log_execution_path(
+                    ExecutionPath.GRE_AWARE,
+                    "order: select_from_groups default via GRE bridge"
+                )
+                return ClickResult(True, 0, 0, "order", "GRE bridge")
+            self._gre_bridge_failed_methods.add("order")
+            return None
+
+        return None
+
+    def _try_gre_bridge_select_replacement(
+        self, action: GameAction, game_state: dict[str, Any]
+    ) -> Optional[ClickResult]:
+        """Submit a SelectReplacement choice via GRE bridge.
+
+        Uses action.modal_index as the replacement index when set,
+        otherwise picks index 0. Honors a 'decline' card_name / no-op
+        modal as a decline when the request is optional.
+        """
+        pending = self._gre_bridge.get_pending_actions()
+        if not pending or not pending.get("has_pending"):
+            return None
+        req_class = pending.get("request_class") or pending.get("request_type") or ""
+        if "SelectReplacement" not in str(req_class):
+            return None
+
+        button_name = (action.card_name or "").lower().strip()
+        if button_name in ("decline", "cancel", "no", "skip"):
+            if self._gre_bridge.submit_select_replacement(decline=True):
+                self._log_execution_path(
+                    ExecutionPath.GRE_AWARE,
+                    "select_replacement: declined via GRE bridge"
+                )
+                return ClickResult(True, 0, 0, "select_replacement", "GRE bridge")
+            self._gre_bridge_failed_methods.add("select_replacement")
+            return None
+
+        idx = int(getattr(action, "modal_index", 0) or 0)
+        if self._gre_bridge.submit_select_replacement(index=idx):
+            self._log_execution_path(
+                ExecutionPath.GRE_AWARE,
+                f"select_replacement: index {idx} via GRE bridge"
+            )
+            return ClickResult(True, 0, 0, "select_replacement", "GRE bridge")
+        self._gre_bridge_failed_methods.add("select_replacement")
         return None
 
     def _try_gre_bridge_select_n(

@@ -698,6 +698,231 @@ class GREBridge:
             logger.warning(f"GRE bridge submit_targets error: {e}")
         return False
 
+    # -------------------------------------------------------------------
+    # Coverage expansion: full BaseUserRequest family handlers
+    # -------------------------------------------------------------------
+
+    def submit_assign_damage(self, assigners: list[dict[str, Any]]) -> bool:
+        """Submit combat damage assignments.
+
+        assigners: [{"instanceId": <attacker>,
+                     "assignments": [{"instanceId": <receiver>, "damage": <int>}, ...]}, ...]
+        """
+        try:
+            resp = self._send_safe({"action": "submit_assign_damage", "assigners": assigners})
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted assign_damage: {resp.get('assigner_count')} assigners")
+                return True
+            logger.warning(f"GRE bridge submit_assign_damage failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_assign_damage error: {e}")
+        return False
+
+    def submit_distribution(self, distributions: dict[int, int]) -> bool:
+        """Submit a distribution decision (e.g. divide N counters among targets).
+
+        distributions: {target_instance_id: amount, ...}
+        """
+        try:
+            payload = {str(k): int(v) for k, v in distributions.items()}
+            resp = self._send_safe({"action": "submit_distribution", "distributions": payload})
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted distribution: {resp.get('target_count')} targets")
+                return True
+            logger.warning(f"GRE bridge submit_distribution failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_distribution error: {e}")
+        return False
+
+    def submit_order(self, ids: Optional[list[int]] = None) -> bool:
+        """Submit a stack/library ordering decision.
+
+        ids: ordered list of instance IDs. None = submit current order as-is.
+        """
+        try:
+            payload: dict[str, Any] = {"action": "submit_order"}
+            if ids is not None:
+                payload["ids"] = list(ids)
+            resp = self._send_safe(payload)
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted order: {resp.get('count')} ids")
+                return True
+            logger.warning(f"GRE bridge submit_order failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_order error: {e}")
+        return False
+
+    def submit_select_replacement(
+        self,
+        index: int = 0,
+        decline: bool = False,
+    ) -> bool:
+        """Submit replacement-effect choice (or decline if optional)."""
+        try:
+            payload: dict[str, Any] = {"action": "submit_select_replacement"}
+            if decline:
+                payload["decline"] = True
+            else:
+                payload["index"] = int(index)
+            resp = self._send_safe(payload)
+            if resp.get("ok"):
+                if resp.get("declined"):
+                    logger.info("GRE bridge submitted select_replacement: declined")
+                else:
+                    logger.info(f"GRE bridge submitted select_replacement: index {resp.get('index')}")
+                return True
+            logger.warning(f"GRE bridge submit_select_replacement failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_select_replacement error: {e}")
+        return False
+
+    def submit_select_counters(self, pairs: list[dict[str, Any]]) -> bool:
+        """Submit counter selection.
+
+        pairs: [{"counterType": "<name>", "amount": <int>, "instanceId": <int?>}, ...]
+        """
+        try:
+            resp = self._send_safe({"action": "submit_select_counters", "pairs": pairs})
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted select_counters: {resp.get('pair_count')} pairs")
+                return True
+            logger.warning(f"GRE bridge submit_select_counters failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_select_counters error: {e}")
+        return False
+
+    def submit_string_input(self, value: str) -> bool:
+        """Submit a string input (e.g. naming a card)."""
+        try:
+            resp = self._send_safe({"action": "submit_string_input", "value": str(value)})
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted string_input: '{value}'")
+                return True
+            logger.warning(f"GRE bridge submit_string_input failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_string_input error: {e}")
+        return False
+
+    def submit_intermission(self, option: str) -> bool:
+        """Submit intermission decision (NextGameReq, ConcedeReq, etc.).
+
+        option: ClientMessageType enum name as string.
+        """
+        try:
+            resp = self._send_safe({"action": "submit_intermission", "option": option})
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted intermission: {option}")
+                return True
+            logger.warning(f"GRE bridge submit_intermission failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_intermission error: {e}")
+        return False
+
+    def submit_gather(self, gatherings: list[dict[str, int]]) -> bool:
+        """Submit gather request (per-target instance/amount pairs).
+
+        gatherings: [{"instanceId": <int>, "amount": <int>}, ...]
+        """
+        try:
+            resp = self._send_safe({"action": "submit_gather", "gatherings": gatherings})
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted gather: {resp.get('count')} entries")
+                return True
+            logger.warning(f"GRE bridge submit_gather failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_gather error: {e}")
+        return False
+
+    def submit_auto_tap(self, solution_index: int = 0) -> bool:
+        """Submit an auto-tap solution by index (default = first)."""
+        try:
+            resp = self._send_safe({
+                "action": "submit_auto_tap",
+                "solution_index": int(solution_index),
+            })
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted auto_tap: index {solution_index}")
+                return True
+            logger.warning(f"GRE bridge submit_auto_tap failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_auto_tap error: {e}")
+        return False
+
+    def submit_select_from_groups(self, groups: list[dict[str, Any]]) -> bool:
+        """Submit select-from-groups request.
+
+        groups: [{"ids": [<int>, ...], "groupId": <int?>}, ...]
+        """
+        try:
+            resp = self._send_safe({"action": "submit_select_from_groups", "groups": groups})
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted select_from_groups: {resp.get('group_count')} groups")
+                return True
+            logger.warning(f"GRE bridge submit_select_from_groups failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_select_from_groups error: {e}")
+        return False
+
+    def submit_select_n_group(
+        self,
+        ids: Optional[list[int]] = None,
+        single_id: Optional[int] = None,
+    ) -> bool:
+        """Submit a select-N-group request. Provide `ids` (list) or `single_id`."""
+        try:
+            payload: dict[str, Any] = {"action": "submit_select_n_group"}
+            if ids is not None:
+                payload["ids"] = list(ids)
+            elif single_id is not None:
+                payload["id"] = int(single_id)
+            else:
+                logger.warning("submit_select_n_group: must provide ids or single_id")
+                return False
+            resp = self._send_safe(payload)
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted select_n_group: {resp}")
+                return True
+            logger.warning(f"GRE bridge submit_select_n_group failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_select_n_group error: {e}")
+        return False
+
+    def submit_search_from_groups(
+        self,
+        zone: Optional[int] = None,
+        groups: Optional[list[dict[str, Any]]] = None,
+    ) -> bool:
+        """Submit search-from-groups (pick a zone, or pick groups within one)."""
+        try:
+            payload: dict[str, Any] = {"action": "submit_search_from_groups"}
+            if zone is not None:
+                payload["zone"] = int(zone)
+            elif groups is not None:
+                payload["groups"] = groups
+            else:
+                logger.warning("submit_search_from_groups: must provide zone or groups")
+                return False
+            resp = self._send_safe(payload)
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted search_from_groups: {resp}")
+                return True
+            logger.warning(f"GRE bridge submit_search_from_groups failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_search_from_groups error: {e}")
+        return False
+
+    def submit_casting_mana_type(self, colors: list[str]) -> bool:
+        """Submit casting-time mana-type selection (one ManaColor name per inner request)."""
+        try:
+            resp = self._send_safe({"action": "submit_casting_mana_type", "colors": list(colors)})
+            if resp.get("ok"):
+                logger.info(f"GRE bridge submitted casting_mana_type: {colors}")
+                return True
+            logger.warning(f"GRE bridge submit_casting_mana_type failed: {resp.get('error')}")
+        except GREBridgeError as e:
+            logger.warning(f"GRE bridge submit_casting_mana_type error: {e}")
+        return False
+
     def auto_respond(self) -> bool:
         """Send AutoRespond on whatever request is currently pending.
 
