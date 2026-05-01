@@ -820,28 +820,49 @@ class AutopilotEngine:
     ) -> bool:
         """Detect "planner picked an action the bridge no longer offers".
 
-        Only meaningful for `play_land` and `cast_spell` against an
-        ActionsAvailable request — the cases where the planner's stale
-        ``legal_actions`` snapshot can disagree with fresh bridge state
-        (e.g. user already used their land drop). For everything else we
-        return False so the normal `bridge_submit_failed` path still files
-        a bug — those are real bridge issues worth investigating.
+        Two known stale-state shapes:
+
+        1. ``play_land`` / ``cast_spell`` against an ActionsAvailable request
+           that has no matching Play/Cast entries — planner saw stale
+           ``legal_actions`` (e.g. user already used their land drop). Cluster
+           that produced this code path: issues #136 #137 #139 #140.
+        2. ``declare_attackers`` / ``declare_blockers`` against a non-combat
+           request class — rules_engine synthesizes "Declare Attackers: ..."
+           into legal_actions during main phase, but the actual GRE pending is
+           still ActionsAvailable / SelectN / etc. (window changes during the
+           planner's LLM call). Surfacing manual-required is misleading
+           because the user can't act on a step that hasn't started yet.
+
+        For everything else we return False so the normal
+        ``bridge_submit_failed`` path still files a bug — those are real
+        bridge issues worth investigating.
         """
-        if action.action_type not in (ActionType.PLAY_LAND, ActionType.CAST_SPELL):
-            return False
-        bridge_actions = game_state.get("_bridge_actions") or []
-        if not bridge_actions:
-            # No bridge view at all — let the normal path handle it.
-            return False
-        # An ActionsAvailable request that has zero Play (or Cast) entries
-        # for the planner's chosen action_type means the bridge already
-        # moved past that opportunity (lands_played==1, off-stack, etc.).
-        target_type = "Play" if action.action_type == ActionType.PLAY_LAND else "Cast"
-        for ba in bridge_actions:
-            ba_type = (ba.get("actionType") or "")
-            if ba_type == target_type or ba_type == f"ActionType_{target_type}":
-                return False  # Bridge still offers at least one of this type
-        return True
+        if action.action_type in (ActionType.PLAY_LAND, ActionType.CAST_SPELL):
+            bridge_actions = game_state.get("_bridge_actions") or []
+            if not bridge_actions:
+                return False
+            target_type = "Play" if action.action_type == ActionType.PLAY_LAND else "Cast"
+            for ba in bridge_actions:
+                ba_type = (ba.get("actionType") or "")
+                if ba_type == target_type or ba_type == f"ActionType_{target_type}":
+                    return False
+            return True
+
+        if action.action_type in (ActionType.DECLARE_ATTACKERS, ActionType.DECLARE_BLOCKERS):
+            bridge_class = str(game_state.get("_bridge_request_class") or "")
+            bridge_type = str(game_state.get("_bridge_request_type") or "")
+            expected = (
+                "DeclareAttacker"
+                if action.action_type == ActionType.DECLARE_ATTACKERS
+                else "DeclareBlockers"
+            )
+            if expected in bridge_class or expected in bridge_type:
+                return False
+            # Bridge doesn't have the combat request the planner targeted —
+            # planner's legal_actions snapshot was stale.
+            return True
+
+        return False
 
     def _is_critical_decision_state(
         self,
@@ -3778,6 +3799,21 @@ class AutopilotEngine:
                 # `bridge_submit_failed` for play_land where the bridge
                 # simply has no Play action because lands_played != 0).
                 if self._is_planner_action_stale_vs_bridge(action, game_state):
+                    # For combat-stale (declare_attackers/blockers picked while
+                    # bridge is still in main-phase ActionsAvailable), the
+                    # bridge will surface the right request shortly and the
+                    # next plan cycle will pick correctly. Don't pause for
+                    # manual input — the user can't actually declare attackers
+                    # before combat begins anyway.
+                    if action.action_type in (
+                        ActionType.DECLARE_ATTACKERS,
+                        ActionType.DECLARE_BLOCKERS,
+                    ):
+                        self._log_execution_path(
+                            ExecutionPath.GRE_AWARE,
+                            f"{action.action_type.value}: bridge not in combat step yet — skipping (will re-plan)",
+                        )
+                        return ClickResult(True, 0, 0, action.action_type.value, "GRE bridge (stale-skip)")
                     msg = (
                         f"Game advanced past {action.action_type.value} "
                         f"({action.card_name or '?'}) — bridge no longer "
@@ -3789,6 +3825,48 @@ class AutopilotEngine:
                         "planner_action_stale",
                         msg,
                     )
+
+                # Pattern A: pass_priority + nothing pending = no-op success.
+                # MTGA already cleared the priority window we wanted to pass on
+                # (race between plan execution and decision clearing). Logging
+                # a "manual required" here is misleading — there's literally
+                # nothing for the user to do. Treat as benign success.
+                bridge_pending_anything = bool(
+                    game_state.get("_bridge_request_type")
+                    or game_state.get("_bridge_request_class")
+                    or game_state.get("_bridge_has_pending")
+                )
+                if (
+                    action.action_type in (ActionType.PASS_PRIORITY, ActionType.RESOLVE)
+                    and not bridge_pending_anything
+                ):
+                    self._log_execution_path(
+                        ExecutionPath.GRE_AWARE,
+                        f"{action.action_type.value}: bridge has nothing pending — no-op",
+                    )
+                    return ClickResult(True, 0, 0, action.action_type.value, "GRE bridge (no-op)")
+
+                # Pattern B: select_target with no card_name. If the bridge
+                # has SelectTargets pending and exactly one legal candidate,
+                # submit it as a safety net (the planner failed to specify
+                # which target, but there's only one valid choice). Otherwise
+                # fall through to manual required — multi-candidate selection
+                # without a name is a real planner gap that needs a human.
+                if (
+                    action.action_type == ActionType.SELECT_TARGET
+                    and not (action.card_name or "").strip()
+                ):
+                    bridge_class = str(game_state.get("_bridge_request_class") or "")
+                    bridge_type = str(game_state.get("_bridge_request_type") or "")
+                    if "SelectTargets" in bridge_class or "SelectTargets" in bridge_type:
+                        only_id = self._pick_single_target_candidate(game_state)
+                        if only_id is not None and self._gre_bridge.submit_targets(only_id):
+                            self._log_execution_path(
+                                ExecutionPath.GRE_AWARE,
+                                f"select_target (no name): auto-picked sole candidate {only_id}",
+                            )
+                            return ClickResult(True, 0, 0, "select_target", "GRE bridge")
+
                 msg = (
                     f"Bridge couldn't handle {action.action_type.value} "
                     f"({action.card_name or '?'}) — take this action manually."

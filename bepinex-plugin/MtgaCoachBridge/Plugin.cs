@@ -1019,17 +1019,44 @@ namespace MtgaCoachBridge
 
                     if (selectedBlockers.Count > 0)
                     {
-                        // Two-step protocol: UpdateBlockers sends the pairing
-                        // (DeclareBlockersResp), then SubmitBlockers sends the
-                        // "confirm" (SubmitBlockersReq). Without the second
-                        // call MTGA leaves the "N Blockers" confirm button on
-                        // screen waiting for the user to click it.
-                        blockersReq.UpdateBlockers(selectedBlockers.ToArray());
-                        blockersReq.SubmitBlockers();
+                        // BaseUserRequest._outboundMessage is shared mutable
+                        // state — calling UpdateBlockers() then SubmitBlockers()
+                        // back-to-back lets the second message overwrite the
+                        // first before MTGA serializes it, so the pairings
+                        // never reach the server. Build two fresh
+                        // ClientToGREMessage instances and invoke OnSubmit
+                        // directly (same fix as SelectTargets in v2.2.2).
+                        var declMsg = new ClientToGREMessage
+                        {
+                            Type = ClientMessageType.DeclareBlockersResp,
+                            GameStateId = blockersReq.OriginalMessage.GameStateId,
+                            RespId = blockersReq.OriginalMessage.MsgId,
+                            DeclareBlockersResp = new DeclareBlockersResp(),
+                        };
+                        foreach (var b in selectedBlockers)
+                            declMsg.DeclareBlockersResp.SelectedBlockers.Add(b);
+                        _log.LogInfo($"UpdateBlockers (direct): {selectedBlockers.Count} pairings");
+                        blockersReq.OnSubmit?.Invoke(declMsg);
+
+                        var commitMsg = new ClientToGREMessage
+                        {
+                            Type = ClientMessageType.SubmitBlockersReq,
+                            GameStateId = blockersReq.OriginalMessage.GameStateId,
+                            RespId = blockersReq.OriginalMessage.MsgId,
+                        };
+                        _log.LogInfo("SubmitBlockers (direct): finalizing");
+                        blockersReq.OnSubmit?.Invoke(commitMsg);
                     }
                     else
                     {
-                        blockersReq.SubmitBlockers();
+                        var commitMsg = new ClientToGREMessage
+                        {
+                            Type = ClientMessageType.SubmitBlockersReq,
+                            GameStateId = blockersReq.OriginalMessage.GameStateId,
+                            RespId = blockersReq.OriginalMessage.MsgId,
+                        };
+                        _log.LogInfo("SubmitBlockers (direct): no pairings, finalizing");
+                        blockersReq.OnSubmit?.Invoke(commitMsg);
                     }
                 }
 
