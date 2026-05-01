@@ -23,6 +23,7 @@ from arenamcp.action_planner import ActionPlan, ActionPlanner, ActionType, GameA
 from arenamcp.gre_bridge import (
     GREBridge,
     UNMAPPED_INTERACTION_TYPE,
+    _ACTIONS_AVAILABLE_BRIDGE_REQUESTS,
     enrich_snapshot_from_pending_response,
     get_bridge,
 )
@@ -879,13 +880,19 @@ class AutopilotEngine:
     ) -> bool:
         """Detect "planner picked an action the bridge no longer offers".
 
-        Two known stale-state shapes:
+        Three known stale-state shapes:
 
         1. ``play_land`` / ``cast_spell`` against an ActionsAvailable request
            that has no matching Play/Cast entries — planner saw stale
            ``legal_actions`` (e.g. user already used their land drop). Cluster
            that produced this code path: issues #136 #137 #139 #140.
-        2. ``declare_attackers`` / ``declare_blockers`` against a non-combat
+        2. ``play_land`` / ``cast_spell`` against a non-ActionsAvailable
+           request type entirely (SelectN, Search, SelectTargets, PayCosts,
+           CastingTimeOption, etc.). A new decision window opened between
+           plan-generation and submission; the plan's first step is no
+           longer applicable until that window resolves. Cluster: SelectN
+           bridge gap from #189 and the rest of the v2.3.0 SelectN reports.
+        3. ``declare_attackers`` / ``declare_blockers`` against a non-combat
            request class — rules_engine synthesizes "Declare Attackers: ..."
            into legal_actions during main phase, but the actual GRE pending is
            still ActionsAvailable / SelectN / etc. (window changes during the
@@ -897,6 +904,19 @@ class AutopilotEngine:
         bridge issues worth investigating.
         """
         if action.action_type in (ActionType.PLAY_LAND, ActionType.CAST_SPELL):
+            # Shape 2: bridge has a different request type pending entirely.
+            bridge_type = str(game_state.get("_bridge_request_type") or "")
+            bridge_class = str(game_state.get("_bridge_request_class") or "")
+            has_request = bool(bridge_type or bridge_class)
+            is_actions_available = (
+                bridge_type in _ACTIONS_AVAILABLE_BRIDGE_REQUESTS
+                or bridge_class in _ACTIONS_AVAILABLE_BRIDGE_REQUESTS
+            )
+            if has_request and not is_actions_available:
+                return True
+
+            # Shape 1: bridge IS ActionsAvailable but doesn't offer the
+            # specific Play/Cast the planner picked.
             bridge_actions = game_state.get("_bridge_actions") or []
             if not bridge_actions:
                 return False
@@ -919,6 +939,27 @@ class AutopilotEngine:
                 return False
             # Bridge doesn't have the combat request the planner targeted —
             # planner's legal_actions snapshot was stale.
+            return True
+
+        # Shape #4: SelectN-family / search_library — these need a SelectN
+        # or Search bridge request to land. If the bridge has no pending
+        # request at all (the window resolved between plan and submit), or
+        # has a totally different request, it's stale — the planner saw a
+        # decision that's already been resolved.
+        if action.action_type in (
+            ActionType.SELECT_N,
+            ActionType.SEARCH_LIBRARY,
+            ActionType.SELECT_COUNTERS,
+        ):
+            bridge_class = str(game_state.get("_bridge_request_class") or "")
+            bridge_type = str(game_state.get("_bridge_request_type") or "")
+            looks_compatible = any(
+                kw in bridge_class or kw in bridge_type
+                for kw in ("SelectN", "Search", "Group")
+            )
+            if looks_compatible:
+                return False
+            # No matching bridge request — race or already-resolved.
             return True
 
         return False
@@ -1887,6 +1928,29 @@ class AutopilotEngine:
                     # gets re-planned on every backstop tick → infinite loop.
                     self._mark_action_blocked(action, game_state, f"execute failed: {click_result.error}")
                     continue
+
+                # Stale-skip: bridge has moved on (different request type
+                # pending, or in a step the planner's action doesn't apply
+                # to). The action wasn't actually submitted — break out of
+                # the current plan loop and let the next plan cycle pick
+                # against the fresh bridge state. Continuing through later
+                # plan steps would just stale-skip them all and leave us
+                # with a "Plan complete (N actions)" log line for actions
+                # nothing actually happened on.
+                if click_result.error and "stale-skip" in click_result.error:
+                    logger.info(
+                        f"Autopilot: stale-skip detected ({click_result.error}); "
+                        "invalidating plan and yielding to next cycle"
+                    )
+                    try:
+                        self._planner.invalidate_turn_plan(
+                            "bridge moved past plan step (stale-skip)"
+                        )
+                        self._notify_turn_plan(None)
+                    except Exception as e:
+                        logger.debug(f"invalidate_turn_plan on stale-skip failed: {e}")
+                    self._state = AutopilotState.IDLE
+                    return True
 
                 self._actions_executed += 1
 
@@ -3907,21 +3971,61 @@ class AutopilotEngine:
                 # `bridge_submit_failed` for play_land where the bridge
                 # simply has no Play action because lands_played != 0).
                 if self._is_planner_action_stale_vs_bridge(action, game_state):
-                    # For combat-stale (declare_attackers/blockers picked while
-                    # bridge is still in main-phase ActionsAvailable), the
-                    # bridge will surface the right request shortly and the
-                    # next plan cycle will pick correctly. Don't pause for
-                    # manual input — the user can't actually declare attackers
-                    # before combat begins anyway.
-                    if action.action_type in (
+                    # Silent-skip cases — the bridge will surface the right
+                    # request shortly and the next plan cycle will pick
+                    # correctly. Pausing for manual input here is wrong:
+                    # the user can't act on a step that hasn't started yet
+                    # (combat) or one that's been displaced by an
+                    # in-resolution decision window (SelectN/Search/etc).
+                    bridge_type = str(game_state.get("_bridge_request_type") or "")
+                    bridge_class = str(game_state.get("_bridge_request_class") or "")
+                    bridge_is_actions_available = (
+                        bridge_type in _ACTIONS_AVAILABLE_BRIDGE_REQUESTS
+                        or bridge_class in _ACTIONS_AVAILABLE_BRIDGE_REQUESTS
+                    )
+                    bridge_has_other_request = bool(
+                        (bridge_type or bridge_class) and not bridge_is_actions_available
+                    )
+
+                    is_combat_stale = action.action_type in (
                         ActionType.DECLARE_ATTACKERS,
                         ActionType.DECLARE_BLOCKERS,
-                    ):
+                    )
+                    is_displaced_main_action = (
+                        action.action_type in (ActionType.PLAY_LAND, ActionType.CAST_SPELL)
+                        and bridge_has_other_request
+                    )
+                    is_displaced_select = (
+                        action.action_type
+                        in (
+                            ActionType.SELECT_N,
+                            ActionType.SEARCH_LIBRARY,
+                            ActionType.SELECT_COUNTERS,
+                        )
+                    )
+
+                    if is_combat_stale or is_displaced_main_action or is_displaced_select:
+                        if is_combat_stale:
+                            reason = "bridge not in combat step yet"
+                        elif is_displaced_main_action:
+                            reason = f"bridge moved to {bridge_type or bridge_class}"
+                        else:
+                            reason = (
+                                f"bridge has no SelectN/Search pending "
+                                f"(now: {bridge_type or bridge_class or 'nothing'})"
+                            )
                         self._log_execution_path(
                             ExecutionPath.GRE_AWARE,
-                            f"{action.action_type.value}: bridge not in combat step yet — skipping (will re-plan)",
+                            f"{action.action_type.value}: {reason} — skipping (will re-plan)",
                         )
-                        return ClickResult(True, 0, 0, action.action_type.value, "GRE bridge (stale-skip)")
+                        return ClickResult(
+                            True, 0, 0, action.action_type.value, "GRE bridge (stale-skip)"
+                        )
+
+                    # Real Shape 1: bridge IS ActionsAvailable but doesn't
+                    # offer the specific Play/Cast we wanted. The user
+                    # genuinely needs to take over (e.g. they already played
+                    # their land for the turn).
                     msg = (
                         f"Game advanced past {action.action_type.value} "
                         f"({action.card_name or '?'}) — bridge no longer "
