@@ -1323,6 +1323,18 @@ namespace MtgaCoachBridge
                 // doesn't appear in a slot's legal Targets, fall back to the
                 // slot's first legal target. Fill every TargetSelection that
                 // has at least one legal target before finalizing.
+                // Diagnostic: dump full TargetSelections shape so we can see
+                // exactly what MTGA is asking for (idx / min / max / selected /
+                // legal-targets) when submissions don't advance the request.
+                var diagSlots = new List<string>();
+                foreach (var ts in targetsReq.TargetSelections)
+                {
+                    var ids = new List<string>();
+                    foreach (var t in ts.Targets) ids.Add($"{t.TargetInstanceId}");
+                    diagSlots.Add($"idx={ts.TargetIdx} min={ts.MinTargets} max={ts.MaxTargets} sel={ts.SelectedTargets} legal=[{string.Join(",", ids)}]");
+                }
+                _log.LogInfo($"SelectTargets shape (caller={targetInstanceId}): {diagSlots.Count} slot(s) | {string.Join(" | ", diagSlots)}");
+
                 var filledSlots = new List<uint>();
                 bool callerMatched = false;
                 foreach (var ts in targetsReq.TargetSelections)
@@ -1349,8 +1361,45 @@ namespace MtgaCoachBridge
                         // surface the failure as a non-OK response below.
                         continue;
                     }
-                    _log.LogInfo($"UpdateTarget: instanceId={chosen.TargetInstanceId}, targetIdx={ts.TargetIdx}, finalize={finalize}");
-                    targetsReq.UpdateTarget(chosen, ts.TargetIdx);
+                    // Build a FRESH SelectTargetsResp message and invoke OnSubmit
+                    // directly. SelectTargetsRequest.UpdateTarget mutates the
+                    // request's shared _outboundMessage and calls Submit() —
+                    // which passes the SAME REFERENCE to MTGA's GRE pipeline.
+                    // When we then call SubmitTargets, it mutates that shared
+                    // buffer AGAIN before MTGA finishes processing the first
+                    // message, corrupting the SelectTargetsResp into a
+                    // SubmitTargetsReq. Result: MTGA sees "Submit with 0
+                    // targets" and rejects, the request re-presents, and
+                    // autopilot loops forever (Ethereal Armor / Feather of
+                    // Flight observed live 2026-04-30 with v2.2.1 plugin).
+                    //
+                    // Cancel/Undo/Concede in BaseUserRequest already build
+                    // fresh ClientToGREMessage instances and invoke OnSubmit
+                    // directly — we mirror that pattern here. LegalAction =
+                    // Select marks the target as actually selected (request
+                    // copies of legal targets default to None).
+                    var sentTarget = new Target
+                    {
+                        TargetInstanceId = chosen.TargetInstanceId,
+                        LegalAction = SelectAction.Select,
+                        Highlight = chosen.Highlight,
+                    };
+                    var respMsg = new ClientToGREMessage
+                    {
+                        Type = ClientMessageType.SelectTargetsResp,
+                        GameStateId = targetsReq.OriginalMessage.GameStateId,
+                        RespId = targetsReq.OriginalMessage.MsgId,
+                        SelectTargetsResp = new SelectTargetsResp
+                        {
+                            Target = new TargetSelection
+                            {
+                                TargetIdx = ts.TargetIdx,
+                                Targets = { sentTarget },
+                            },
+                        },
+                    };
+                    _log.LogInfo($"UpdateTarget (direct): instanceId={sentTarget.TargetInstanceId}, targetIdx={ts.TargetIdx}, action=Select, finalize={finalize}");
+                    targetsReq.OnSubmit?.Invoke(respMsg);
                     filledSlots.Add(ts.TargetIdx);
                 }
 
@@ -1372,8 +1421,16 @@ namespace MtgaCoachBridge
 
                 if (finalize)
                 {
-                    _log.LogInfo($"SubmitTargets: finalizing ({filledSlots.Count} slots)");
-                    targetsReq.SubmitTargets();
+                    // Fresh message — separate instance from the SelectTargetsResp
+                    // above so MTGA can't see a corrupted Type when serializing.
+                    var commitMsg = new ClientToGREMessage
+                    {
+                        Type = ClientMessageType.SubmitTargetsReq,
+                        GameStateId = targetsReq.OriginalMessage.GameStateId,
+                        RespId = targetsReq.OriginalMessage.MsgId,
+                    };
+                    _log.LogInfo($"SubmitTargets (direct): finalizing ({filledSlots.Count} slots)");
+                    targetsReq.OnSubmit?.Invoke(commitMsg);
                 }
 
                 lock (_interactionLock) { _lastKnownRequest = null; }
@@ -1679,26 +1736,21 @@ namespace MtgaCoachBridge
             // Payload: optional {"solution_index": <int>} to pick from candidates;
             // default: submit the first available solution.
             int solutionIndex = cmd.Json.Value<int?>("solution_index") ?? 0;
-            // AutoTapActionsRequest exposes Solutions — pick by index.
-            var solutionsProp = autoTapReq.GetType().GetProperty("Solutions");
-            object solutionsObj = solutionsProp?.GetValue(autoTapReq);
-            var enumerable = solutionsObj as System.Collections.IEnumerable;
-            AutoTapSolution chosen = null;
-            if (enumerable != null)
+            // AutoTapActionsRequest.Solutions is a readonly FIELD (not property).
+            // Direct access works; earlier reflection via GetProperty returned
+            // null and made every PayCosts auto-pay fail with "No AutoTap solution".
+            if (autoTapReq.Solutions == null || autoTapReq.Solutions.Count == 0)
             {
-                int i = 0;
-                foreach (var s in enumerable)
-                {
-                    if (i == solutionIndex) { chosen = s as AutoTapSolution; break; }
-                    i++;
-                }
-            }
-            if (chosen == null)
-            {
-                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"No AutoTap solution at index {solutionIndex}" });
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = "AutoTap Solutions list is empty" });
                 return;
             }
-            _log.LogInfo($"Submitting AutoTap solution {solutionIndex}");
+            if (solutionIndex < 0 || solutionIndex >= autoTapReq.Solutions.Count)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"AutoTap solution index {solutionIndex} out of range (0-{autoTapReq.Solutions.Count - 1})" });
+                return;
+            }
+            var chosen = autoTapReq.Solutions[solutionIndex];
+            _log.LogInfo($"Submitting AutoTap solution {solutionIndex} (of {autoTapReq.Solutions.Count})");
             autoTapReq.SubmitSolution(chosen);
             lock (_interactionLock) { _lastKnownRequest = null; }
             cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "AutoTap", ["solution_index"] = solutionIndex });
