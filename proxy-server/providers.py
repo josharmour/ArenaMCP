@@ -82,15 +82,27 @@ class Provider:
     def _prepare_body(self, body: dict) -> dict:
         """Adjust request body for provider-specific quirks."""
         if self.is_gemini:
+            body = dict(body)
             # Gemini's OpenAI-compat layer rejects unknown vendor-specific
             # fields with a 400. Strip the ones older desktop clients still
             # send (thinking_config is native-Gemini-only — the OpenAI-compat
             # path uses reasoning_effort instead).
-            body = dict(body)
             for k in ("thinking_config", "thinking", "verbosity"):
                 body.pop(k, None)
+            # Cross-provider failover: when Azure 429s and we fail over to
+            # Gemini, the body still carries model="gpt-5.4". Gemini rejects
+            # that with 404. Substitute the first configured Gemini model
+            # so failover actually serves a response.
+            req_model = body.get("model", "")
+            if req_model and req_model not in self.models and self.models:
+                body["model"] = self.models[0]
             return body
         if not self.is_azure:
+            # OpenAI / Anthropic: also remap unknown model → first configured.
+            body = dict(body)
+            req_model = body.get("model", "")
+            if req_model and self.models and req_model not in self.models:
+                body["model"] = self.models[0]
             return body
         body = dict(body)
         # Azure uses the deployment name in the URL, not the model field —
