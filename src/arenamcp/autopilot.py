@@ -1195,66 +1195,44 @@ class AutopilotEngine:
                 or bridge_request_class in ("PayCostsRequest",)
                 or (game_state.get("decision_context") or {}).get("type") == "pay_costs"
             ):
-                if any(a.lower() == "auto-pay" for a in legal):
-                    logger.info("Autopilot: auto-paying (accepting autotap)")
-                    # PayCostsRequest does NOT accept submit_pass — MTGA rejects
-                    # ("Cannot pass on current interaction"). Use auto_respond
-                    # which calls the request's built-in AutoRespond, accepting
-                    # the autotap solution MTGA pre-computed.
-                    if not self._config.dry_run and (
-                        self._gre_bridge.connected or self._gre_bridge.connect()
-                    ):
-                        if self._gre_bridge.auto_respond():
-                            self._log_execution_path(
-                                ExecutionPath.GRE_AWARE,
-                                "auto_pay via GRE bridge auto_respond",
-                            )
-                            self._record_autopilot_decision(
-                                game_state, trigger,
-                                action_type="pay_costs",
-                                summary="accepted autotap via bridge",
-                            )
-                            return True
-                    self._record_autopilot_decision(
-                        game_state, trigger,
-                        action_type="pay_costs",
-                        summary="auto-pay attempt failed",
-                    )
-                    self._manual_required_bridge_result(
-                        GameAction(
-                            action_type=ActionType.PAY_COSTS,
-                            card_name="auto_pay",
-                            reasoning="accept autotap via GRE bridge",
-                        ),
-                        game_state,
-                        "bridge_submit_failed",
-                        "GRE bridge auto_respond did not advance Pay Costs",
-                    )
-                    return False
-
-                # MTGA usually auto-taps and just asks for confirmation.
-                # PayCostsRequest rejects submit_pass — use auto_respond, which
-                # accepts the pre-computed autotap solution.
-                logger.info("Autopilot: accepting autotap for PayCostsRequest")
-                if not self._config.dry_run:
-                    if self._gre_bridge.connected or self._gre_bridge.connect():
-                        if self._gre_bridge.auto_respond():
-                            self._log_execution_path(ExecutionPath.GRE_AWARE, "accept autotap PayCosts (auto_respond)")
-                            return True
-                        # auto_respond failed — try cancelling instead
-                        logger.info("Autopilot: autotap accept failed, cancelling PayCostsRequest")
-                        if self._gre_bridge.cancel_action():
-                            self._log_execution_path(ExecutionPath.GRE_AWARE, "cancel PayCosts")
-                            return True
+                # User preference (2026-04-30): always click Auto Pay when
+                # MTGA offers it — never try to manually decide which lands
+                # to tap. submit_auto_tap walks PayCostsRequest's children
+                # for the AutoTapActionsRequest and submits its solution
+                # (= what the in-game Auto Pay button does).
+                logger.info("Autopilot: submitting AutoTap solution for PayCosts")
+                if not self._config.dry_run and (
+                    self._gre_bridge.connected or self._gre_bridge.connect()
+                ):
+                    if self._gre_bridge.submit_auto_tap():
+                        self._log_execution_path(
+                            ExecutionPath.GRE_AWARE, "auto_pay via submit_auto_tap"
+                        )
+                        self._record_autopilot_decision(
+                            game_state, trigger,
+                            action_type="pay_costs",
+                            summary="submitted AutoTap solution via bridge",
+                        )
+                        return True
+                    # No autotap child available — fall back to cancel.
+                    logger.info("Autopilot: no AutoTap solution; cancelling PayCostsRequest")
+                    if self._gre_bridge.cancel_action():
+                        self._log_execution_path(ExecutionPath.GRE_AWARE, "cancel PayCosts")
+                        return True
+                self._record_autopilot_decision(
+                    game_state, trigger,
+                    action_type="pay_costs",
+                    summary="auto-pay attempt failed",
+                )
                 self._manual_required_bridge_result(
                     GameAction(
-                        action_type=ActionType.PASS_PRIORITY,
+                        action_type=ActionType.PAY_COSTS,
                         card_name="auto_pay",
-                        reasoning="accept autotap via GRE bridge",
+                        reasoning="submit AutoTap via GRE bridge",
                     ),
                     game_state,
                     "bridge_submit_failed",
-                    "GRE bridge could not confirm the Pay Costs step",
+                    "GRE bridge submit_auto_tap did not advance Pay Costs",
                 )
                 return False
 

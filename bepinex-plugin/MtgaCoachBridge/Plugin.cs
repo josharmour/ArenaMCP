@@ -1654,9 +1654,26 @@ namespace MtgaCoachBridge
         private void HandleSubmitAutoTap(PipeCommand cmd)
         {
             var request = FindPendingInteraction();
-            if (!(request is AutoTapActionsRequest autoTapReq))
+            // PayCostsRequest is a parent wrapper that holds an AutoTapActions
+            // child request when MTGA has a pre-computed Auto Pay solution.
+            // Submitting that child's solution is exactly what the in-game
+            // "Auto Pay" button does — auto_respond on the parent might
+            // Decline (cancel) for optional pays, which is the wrong direction.
+            AutoTapActionsRequest autoTapReq = request as AutoTapActionsRequest;
+            if (autoTapReq == null && request is PayCostsRequest payReq)
             {
-                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, not AutoTapActionsRequest" });
+                autoTapReq = payReq.AutoTapActions;
+                if (autoTapReq == null)
+                {
+                    foreach (var child in payReq.ChildRequests)
+                    {
+                        if (child is AutoTapActionsRequest a) { autoTapReq = a; break; }
+                    }
+                }
+            }
+            if (autoTapReq == null)
+            {
+                cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Pending is {request?.GetType().Name ?? "null"}, no AutoTapActionsRequest available" });
                 return;
             }
             // Payload: optional {"solution_index": <int>} to pick from candidates;
