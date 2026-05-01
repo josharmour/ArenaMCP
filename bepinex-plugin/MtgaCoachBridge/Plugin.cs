@@ -1311,44 +1311,73 @@ namespace MtgaCoachBridge
                 if (finalizeTok != null && finalizeTok.Type != JTokenType.Null)
                     finalize = finalizeTok.Value<bool>();
 
-                // Find the target in the request's own TargetSelections
-                // Each TargetSelection has a TargetIdx and a list of legal Targets
-                bool found = false;
+                // MTGA's SelectTargetsRequest can carry MULTIPLE TargetSelections
+                // (e.g. Ethereal Armor surfaces a metadata slot at idx 0 plus the
+                // enchant slot at idx 1). UpdateTarget builds a SelectTargetsResp
+                // for ONE slot at a time and calls Submit() per slot, then
+                // SubmitTargets() commits. If we fill only one slot when multiple
+                // are required, MTGA silently rejects and re-presents the same
+                // request — autopilot then loops forever (issue observed live
+                // 2026-04-30 with Ethereal Armor and room benefit triggers).
+                // Strategy: try caller's instance_id first per slot; if it
+                // doesn't appear in a slot's legal Targets, fall back to the
+                // slot's first legal target. Fill every TargetSelection that
+                // has at least one legal target before finalizing.
+                var filledSlots = new List<uint>();
+                bool callerMatched = false;
                 foreach (var ts in targetsReq.TargetSelections)
                 {
+                    Target chosen = null;
                     foreach (var t in ts.Targets)
                     {
                         if (t.TargetInstanceId == targetInstanceId)
                         {
-                            _log.LogInfo($"UpdateTarget: instanceId={targetInstanceId}, targetIdx={ts.TargetIdx}, finalize={finalize}");
-                            targetsReq.UpdateTarget(t, ts.TargetIdx);
-                            found = true;
+                            chosen = t;
+                            callerMatched = true;
                             break;
                         }
                     }
-                    if (found) break;
+                    if (chosen == null && ts.Targets.Count > 0)
+                    {
+                        // Fall back to first legal target for this slot.
+                        chosen = ts.Targets[0];
+                    }
+                    if (chosen == null)
+                    {
+                        // Slot has zero legal targets — skip; SubmitTargets will
+                        // either accept (if MinTargets=0) or reject and we'll
+                        // surface the failure as a non-OK response below.
+                        continue;
+                    }
+                    _log.LogInfo($"UpdateTarget: instanceId={chosen.TargetInstanceId}, targetIdx={ts.TargetIdx}, finalize={finalize}");
+                    targetsReq.UpdateTarget(chosen, ts.TargetIdx);
+                    filledSlots.Add(ts.TargetIdx);
                 }
 
-                if (!found)
+                if (filledSlots.Count == 0)
                 {
-                    // Target not in legal targets — log what is available
                     var legalIds = new List<string>();
                     foreach (var ts in targetsReq.TargetSelections)
                         foreach (var t in ts.Targets)
                             legalIds.Add($"{t.TargetInstanceId}");
-                    _log.LogWarning($"Target instanceId={targetInstanceId} not found in legal targets: [{string.Join(",", legalIds)}]");
-                    cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"Target {targetInstanceId} not in legal targets" });
+                    _log.LogWarning($"No slots filled (caller={targetInstanceId}, legal=[{string.Join(",", legalIds)}])");
+                    cmd.SetResponse(new JObject { ["ok"] = false, ["error"] = $"No legal targets to fill" });
                     return;
+                }
+
+                if (!callerMatched)
+                {
+                    _log.LogWarning($"Caller's instance {targetInstanceId} did not match any slot; used per-slot defaults for {filledSlots.Count} slots");
                 }
 
                 if (finalize)
                 {
-                    _log.LogInfo("SubmitTargets: finalizing");
+                    _log.LogInfo($"SubmitTargets: finalizing ({filledSlots.Count} slots)");
                     targetsReq.SubmitTargets();
                 }
 
                 lock (_interactionLock) { _lastKnownRequest = null; }
-                cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "SelectTargets", ["target_instance_id"] = (int)targetInstanceId, ["finalized"] = finalize });
+                cmd.SetResponse(new JObject { ["ok"] = true, ["submitted_type"] = "SelectTargets", ["target_instance_id"] = (int)targetInstanceId, ["slots_filled"] = filledSlots.Count, ["finalized"] = finalize });
             }
             else
             {
