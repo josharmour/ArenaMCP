@@ -5,10 +5,7 @@
 `mtgacoach` (`arenamcp`) is an MTGA coaching project with:
 - Python core in `src/arenamcp/`
 - PySide6 desktop frontend in `src/arenamcp/desktop/`
-- WinUI 3 launcher frontend in `installer/MtgaCoachLauncher/`
 - BepInEx plugin in `bepinex-plugin/MtgaCoachBridge/`
-
-Both frontends are active. Do not delete one as cleanup without an explicit request.
 
 ## Core Direction
 
@@ -62,7 +59,6 @@ pytest tests -q
 python -m arenamcp.desktop
 python -m arenamcp.standalone --backend online
 cd bepinex-plugin/MtgaCoachBridge && dotnet build -c Release
-cd installer/MtgaCoachLauncher && dotnet build -c Debug -p:Platform=x64
 p=$(wslpath -w /home/joshu/repos/ArenaMCP/installer) && powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "\$p='${p}'; Set-Location -LiteralPath \$p; .\build-installer.ps1"
 ```
 

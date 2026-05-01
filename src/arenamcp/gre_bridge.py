@@ -347,14 +347,33 @@ class GREBridge:
             # Use Event.wait so we can be interrupted
             self._keepalive_stop.wait(interval)
 
-    def _send_command(self, cmd: dict[str, Any]) -> dict[str, Any]:
+    # Default per-command read timeout (seconds). Without this, a hung
+    # plugin (Unity main thread busy mid-target-selection, scene transition,
+    # etc.) would block the read forever while holding _pipe_lock — which
+    # cascades into autopilot lock contention and a frozen UI. See bug
+    # report 2026-05-01 (select_target lockup on Optimistic Scavenger).
+    _DEFAULT_READ_TIMEOUT_S: float = 5.0
+
+    def _send_command(
+        self,
+        cmd: dict[str, Any],
+        timeout: Optional[float] = None,
+    ) -> dict[str, Any]:
         """Send a JSON command and read the JSON response.
 
         Thread-safe: serializes pipe I/O so the bridge poller and
         autopilot don't interleave commands/responses.
 
-        Raises GREBridgeError on communication failure.
+        The read is bounded by ``timeout`` (default 5s). If the plugin
+        doesn't respond in time, we close the pipe to unblock the read,
+        disconnect, and raise — preventing the caller from holding the
+        autopilot/UI lock indefinitely.
+
+        Raises GREBridgeError on communication failure or read timeout.
         """
+        if timeout is None:
+            timeout = self._DEFAULT_READ_TIMEOUT_S
+
         with self._pipe_lock:
             if not self._connected or not self._pipe_file:
                 raise GREBridgeError("Not connected")
@@ -363,41 +382,98 @@ class GREBridge:
                 line = json.dumps(cmd, separators=(",", ":")) + "\n"
                 self._pipe_file.write(line.encode("utf-8"))
                 self._pipe_file.flush()
-
-                # Read response line
-                response_bytes = b""
-                while True:
-                    chunk = self._pipe_file.read(1)
-                    if not chunk:
-                        raise GREBridgeError("Pipe closed")
-                    if chunk == b"\n":
-                        break
-                    response_bytes += chunk
-
-                # Strip UTF-8 BOM if present (C# StreamWriter may emit one)
-                text = response_bytes.decode("utf-8-sig")
-                parsed = json.loads(text)
-                # Any successful round-trip counts as liveness evidence —
-                # no need for a keepalive ping right after normal traffic.
-                self._last_ping_at = time.monotonic()
-                return parsed
-
             except (BrokenPipeError, OSError, IOError) as e:
                 self.disconnect()
-                raise GREBridgeError(f"Pipe communication error: {e}")
+                raise GREBridgeError(f"Pipe write error: {e}")
 
-    def _send_safe(self, cmd: dict[str, Any]) -> dict[str, Any]:
+            # Read on a worker thread so we can enforce a timeout.
+            # Closing self._pipe_file (via disconnect()) unblocks the read.
+            result: list[bytes] = []
+            exc: list[BaseException] = []
+
+            def _reader() -> None:
+                try:
+                    response_bytes = b""
+                    pipe_file = self._pipe_file
+                    while True:
+                        if pipe_file is None:
+                            raise GREBridgeError("Pipe closed during read")
+                        chunk = pipe_file.read(1)
+                        if not chunk:
+                            raise GREBridgeError("Pipe closed")
+                        if chunk == b"\n":
+                            break
+                        response_bytes += chunk
+                    result.append(response_bytes)
+                except BaseException as e:  # noqa: BLE001 — propagate verbatim
+                    exc.append(e)
+
+            reader_thread = threading.Thread(
+                target=_reader,
+                name="gre-bridge-read",
+                daemon=True,
+            )
+            reader_thread.start()
+            reader_thread.join(timeout)
+
+            if reader_thread.is_alive():
+                # Plugin didn't respond in time. Force-disconnect so the
+                # blocked read in the worker unblocks (file close raises
+                # in the worker, it exits naturally as a daemon).
+                action_name = cmd.get("action", "?")
+                logger.warning(
+                    "GRE bridge read timeout after %.1fs (action=%s) — disconnecting",
+                    timeout,
+                    action_name,
+                )
+                self.disconnect()
+                raise GREBridgeError(
+                    f"Pipe read timeout ({timeout:.1f}s) for action={action_name}"
+                )
+
+            if exc:
+                err = exc[0]
+                if isinstance(err, (BrokenPipeError, OSError, IOError)):
+                    self.disconnect()
+                    raise GREBridgeError(f"Pipe communication error: {err}")
+                if isinstance(err, GREBridgeError):
+                    self.disconnect()
+                    raise err
+                self.disconnect()
+                raise GREBridgeError(f"Pipe read error: {err}")
+
+            if not result:
+                self.disconnect()
+                raise GREBridgeError("Pipe read produced no result")
+
+            try:
+                # Strip UTF-8 BOM if present (C# StreamWriter may emit one)
+                text = result[0].decode("utf-8-sig")
+                parsed = json.loads(text)
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                raise GREBridgeError(f"Pipe response parse error: {e}")
+
+            # Any successful round-trip counts as liveness evidence —
+            # no need for a keepalive ping right after normal traffic.
+            self._last_ping_at = time.monotonic()
+            return parsed
+
+    def _send_safe(
+        self,
+        cmd: dict[str, Any],
+        timeout: Optional[float] = None,
+    ) -> dict[str, Any]:
         """Send command with auto-reconnect on failure."""
         if not self._connected:
             if not self.connect():
                 raise GREBridgeError("Not connected to GRE bridge")
 
         try:
-            return self._send_command(cmd)
+            return self._send_command(cmd, timeout=timeout)
         except GREBridgeError:
             # One retry after reconnect
             if self.connect():
-                return self._send_command(cmd)
+                return self._send_command(cmd, timeout=timeout)
             raise
 
     # -------------------------------------------------------------------
@@ -1403,13 +1479,78 @@ def enrich_snapshot_from_pending_response(
     *,
     bridge_connected: Optional[bool] = None,
 ) -> None:
-    """Overlay a raw get_pending_actions() response onto a snapshot dict."""
+    """Overlay a raw get_pending_actions() response onto a snapshot dict.
+
+    Composition wrapper. Each phase is its own helper so the cyclomatic
+    complexity stays inside the function that actually needs it:
+
+      1. _normalize_poll              — sanitize intermission/non-actionable
+      2. _stamp_bridge_fields         — write _bridge_* fields onto snapshot
+      3. _clear_snapshot_for_no_pending — fast-path when nothing's pending
+      4. _apply_pending_decision_label — dedupe-aware label override
+      5. _merge_decision_context_from_bridge — overlay bridge ctx + req tags
+      6. _resolve_decision_context_type    — stale-vs-fresh type pick
+      7. _refine_generic_selection_type    — promote generic → specific
+    """
     if bridge_connected is not None:
         snapshot["_bridge_connected"] = bridge_connected
 
     if poll is None:
         return
 
+    normalized = _normalize_poll(poll)
+    is_intermission = normalized["is_intermission"]
+
+    # Surface intermission as a durable signal so the coach loop can
+    # detect end-of-match even after the request fields are zeroed out.
+    snapshot["_bridge_in_intermission"] = is_intermission
+    if is_intermission:
+        snapshot["match_ended"] = True
+
+    _stamp_bridge_fields(snapshot, poll, normalized)
+
+    if not normalized["has_pending"]:
+        _clear_snapshot_for_no_pending(snapshot, bridge_connected)
+        return
+
+    request_type = normalized["request_type"]
+    request_class = normalized["request_class"]
+    request_payload = normalized["request_payload"]
+    bridge_decision_context = normalized["bridge_decision_context"]
+
+    _apply_pending_decision_label(snapshot, request_type, request_class)
+
+    decision_type = _get_bridge_decision_type(request_type, request_class)
+    plugin_provided_type = bool(
+        bridge_decision_context and bridge_decision_context.get("type")
+    )
+    existing_ctx = _merge_decision_context_from_bridge(
+        snapshot, bridge_decision_context, request_type, request_class
+    )
+    existing_ctx = _resolve_decision_context_type(
+        existing_ctx, decision_type, plugin_provided_type
+    )
+    existing_ctx = _refine_generic_selection_type(
+        snapshot,
+        existing_ctx,
+        request_payload,
+        request_type,
+        request_class,
+        decision_type,
+    )
+
+    if existing_ctx:
+        snapshot["decision_context"] = existing_ctx
+
+
+def _normalize_poll(poll: dict[str, Any]) -> dict[str, Any]:
+    """Pull the request fields out of a poll, blanking out non-actionable ones.
+
+    Returns a dict with normalized has_pending / request_type / request_class
+    / actions / request_payload / bridge_decision_context plus an
+    is_intermission flag (which stays True even after the actionable bits
+    are zeroed, so the caller can mark match_ended).
+    """
     has_pending = poll.get("has_pending", False)
     request_type = poll.get("request_type")
     request_class = poll.get("request_class")
@@ -1429,62 +1570,105 @@ def enrich_snapshot_from_pending_response(
         request_payload = None
         bridge_decision_context = {}
 
-    # Surface intermission as a durable signal so the coach loop can
-    # detect end-of-match even after the request fields are zeroed out.
-    snapshot["_bridge_in_intermission"] = is_intermission
-    if is_intermission:
-        snapshot["match_ended"] = True
+    return {
+        "has_pending": has_pending,
+        "request_type": request_type,
+        "request_class": request_class,
+        "actions": actions,
+        "request_payload": request_payload,
+        "bridge_decision_context": bridge_decision_context,
+        "is_intermission": is_intermission,
+    }
 
-    snapshot["_bridge_request_type"] = request_type if has_pending else None
-    snapshot["_bridge_request_class"] = request_class if has_pending else None
+
+def _stamp_bridge_fields(
+    snapshot: dict[str, Any],
+    poll: dict[str, Any],
+    normalized: dict[str, Any],
+) -> None:
+    """Write the `_bridge_*` overlay fields onto the snapshot."""
+    has_pending = normalized["has_pending"]
+    snapshot["_bridge_request_type"] = (
+        normalized["request_type"] if has_pending else None
+    )
+    snapshot["_bridge_request_class"] = (
+        normalized["request_class"] if has_pending else None
+    )
+    actions = normalized["actions"]
     snapshot["_bridge_actions"] = actions if actions else None
     snapshot["_bridge_can_pass"] = poll.get("can_pass", False)
     snapshot["_bridge_can_cancel"] = poll.get("can_cancel", False)
     snapshot["_bridge_allow_undo"] = poll.get("allow_undo", False)
+    request_payload = normalized["request_payload"]
     snapshot["_bridge_request_payload"] = (
         request_payload if has_pending and request_payload else None
     )
 
-    if not has_pending:
-        if bridge_connected:
-            snapshot["pending_decision"] = None
-            snapshot["decision_context"] = None
-            if "legal_actions" in snapshot:
-                snapshot["legal_actions"] = []
-            if "legal_actions_raw" in snapshot:
-                snapshot["legal_actions_raw"] = []
-        return
 
+def _clear_snapshot_for_no_pending(
+    snapshot: dict[str, Any], bridge_connected: Optional[bool]
+) -> None:
+    """No bridge decision pending — clear stale decision/legal-action hints.
+
+    Only does the clear when the bridge is *connected*. If we're disconnected,
+    leave the log-parsed legal_actions in place so the coach can still work.
+    """
+    if not bridge_connected:
+        return
+    snapshot["pending_decision"] = None
+    snapshot["decision_context"] = None
+    if "legal_actions" in snapshot:
+        snapshot["legal_actions"] = []
+    if "legal_actions_raw" in snapshot:
+        snapshot["legal_actions_raw"] = []
+
+
+def _apply_pending_decision_label(
+    snapshot: dict[str, Any],
+    request_type: Optional[str],
+    request_class: Optional[str],
+) -> None:
+    """Set or override `pending_decision` from the bridge request label.
+
+    Bridge polls at ~4 Hz and each fresh snapshot carries the raw
+    log-parsed pending_decision (often "Priority") even after we've
+    overridden it once — without dedupe this produced hundreds of
+    identical override-log lines per priority window.
+    """
     label = _get_bridge_request_label(request_type, request_class)
     existing = snapshot.get("pending_decision")
     if not existing:
         snapshot["pending_decision"] = label
         logger.debug(f"Bridge set pending_decision: {label}")
-    elif existing != label:
-        # Bridge polls at ~4 Hz and each fresh snapshot carries the raw
-        # log-parsed pending_decision (often "Priority") even after we've
-        # overridden it, which produced hundreds of identical lines per
-        # priority window. Dedupe on (from, to) so we log once per
-        # transition and drop the rest to debug.
-        global _LAST_OVERRIDE_LOG
-        key = (existing, label)
-        if _LAST_OVERRIDE_LOG != key:
-            logger.info(
-                f"Bridge overriding stale pending_decision: "
-                f"{existing!r} → {label!r}"
-            )
-            _LAST_OVERRIDE_LOG = key
-        else:
-            logger.debug(
-                f"Bridge overriding stale pending_decision: "
-                f"{existing!r} → {label!r} (repeat)"
-            )
-        snapshot["pending_decision"] = label
+        return
+    if existing == label:
+        return
 
-    decision_type = _get_bridge_decision_type(request_type, request_class)
-    plugin_provided_type = bool(
-        bridge_decision_context and bridge_decision_context.get("type")
-    )
+    global _LAST_OVERRIDE_LOG
+    key = (existing, label)
+    if _LAST_OVERRIDE_LOG != key:
+        logger.info(
+            f"Bridge overriding stale pending_decision: "
+            f"{existing!r} → {label!r}"
+        )
+        _LAST_OVERRIDE_LOG = key
+    else:
+        logger.debug(
+            f"Bridge overriding stale pending_decision: "
+            f"{existing!r} → {label!r} (repeat)"
+        )
+    snapshot["pending_decision"] = label
+
+
+def _merge_decision_context_from_bridge(
+    snapshot: dict[str, Any],
+    bridge_decision_context: dict[str, Any],
+    request_type: Optional[str],
+    request_class: Optional[str],
+) -> dict[str, Any]:
+    """Overlay bridge-provided decision_context onto the snapshot's, then
+    backfill requestType / requestClass tags. Returns the merged dict.
+    """
     existing_ctx = snapshot.get("decision_context") or {}
     if bridge_decision_context:
         snapshot["decision_context"] = {
@@ -1495,66 +1679,84 @@ def enrich_snapshot_from_pending_response(
         existing_ctx = snapshot["decision_context"]
 
     if request_type and "requestType" not in existing_ctx:
-        existing_ctx = {
-            **existing_ctx,
-            "requestType": request_type,
-        }
+        existing_ctx = {**existing_ctx, "requestType": request_type}
     if request_class and "requestClass" not in existing_ctx:
-        existing_ctx = {
-            **existing_ctx,
-            "requestClass": request_class,
-        }
+        existing_ctx = {**existing_ctx, "requestClass": request_class}
+    return existing_ctx
 
-    if decision_type:
-        existing_type = existing_ctx.get("type")
-        # Stale snapshots can carry a previous window's type (e.g. "actions_available")
-        # after the bridge has moved on to a Search/SelectTargets/PayCosts request.
-        # If the plugin did not stamp a type this poll, trust the bridge-mapped one.
-        stale_disagrees = bool(
-            existing_type
-            and existing_type != decision_type
-            and not plugin_provided_type
-        )
-        if (
-            not existing_type
-            or existing_type in {"unknown_req", UNMAPPED_INTERACTION_TYPE}
-            or stale_disagrees
-        ):
-            existing_ctx = {
-                **existing_ctx,
-                "type": decision_type,
-                "_bridge_source": True,
-            }
-            logger.debug(
-                f"Bridge enriched decision_context: {existing_type} → {decision_type}"
-            )
 
+def _resolve_decision_context_type(
+    existing_ctx: dict[str, Any],
+    decision_type: Optional[str],
+    plugin_provided_type: bool,
+) -> dict[str, Any]:
+    """Pick the freshest `type` value for decision_context.
+
+    Stale snapshots can carry a previous window's type (e.g.
+    "actions_available") after the bridge has moved on to a Search /
+    SelectTargets / PayCosts request. When the plugin didn't stamp a type
+    this poll, trust the bridge-mapped one.
+    """
+    if not decision_type:
+        return existing_ctx
+    existing_type = existing_ctx.get("type")
+    stale_disagrees = bool(
+        existing_type
+        and existing_type != decision_type
+        and not plugin_provided_type
+    )
+    needs_update = (
+        not existing_type
+        or existing_type in {"unknown_req", UNMAPPED_INTERACTION_TYPE}
+        or stale_disagrees
+    )
+    if not needs_update:
+        return existing_ctx
+    logger.debug(
+        f"Bridge enriched decision_context: {existing_type} → {decision_type}"
+    )
+    return {**existing_ctx, "type": decision_type, "_bridge_source": True}
+
+
+def _refine_generic_selection_type(
+    snapshot: dict[str, Any],
+    existing_ctx: dict[str, Any],
+    request_payload: Any,
+    request_type: Optional[str],
+    request_class: Optional[str],
+    decision_type: Optional[str],
+) -> dict[str, Any]:
+    """Promote a generic "selection" type into a more specific one when the
+    request payload has enough hints (count, ZoneToSearch, etc.).
+
+    Also rewrites the human-readable pending_decision label when the
+    current one is also generic.
+    """
     current_type = str(existing_ctx.get("type") or "")
-    if current_type in _GENERIC_SELECTION_TYPES or decision_type in _GENERIC_SELECTION_TYPES:
-        inferred_type = _infer_specific_decision_type(
-            existing_ctx,
-            request_payload,
-            request_type,
-            request_class,
-        )
-        if inferred_type:
-            existing_ctx = {
-                **existing_ctx,
-                "type": inferred_type,
-                "_bridge_source": True,
-            }
-            if snapshot.get("pending_decision") in _GENERIC_SELECTION_LABELS:
-                better_label = _label_for_decision_type(inferred_type, existing_ctx.get("count"))
-                if better_label:
-                    snapshot["pending_decision"] = better_label
-            logger.debug(
-                "Bridge inferred specific decision type: %s → %s",
-                current_type or decision_type,
-                inferred_type,
-            )
+    if (
+        current_type not in _GENERIC_SELECTION_TYPES
+        and decision_type not in _GENERIC_SELECTION_TYPES
+    ):
+        return existing_ctx
 
-    if existing_ctx:
-        snapshot["decision_context"] = existing_ctx
+    inferred_type = _infer_specific_decision_type(
+        existing_ctx, request_payload, request_type, request_class
+    )
+    if not inferred_type:
+        return existing_ctx
+
+    if snapshot.get("pending_decision") in _GENERIC_SELECTION_LABELS:
+        better_label = _label_for_decision_type(
+            inferred_type, existing_ctx.get("count")
+        )
+        if better_label:
+            snapshot["pending_decision"] = better_label
+    logger.debug(
+        "Bridge inferred specific decision type: %s → %s",
+        current_type or decision_type,
+        inferred_type,
+    )
+    return {**existing_ctx, "type": inferred_type, "_bridge_source": True}
 
 
 def _is_non_actionable_bridge_request(

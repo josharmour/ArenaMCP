@@ -175,6 +175,81 @@ class CoachTab(QWidget):
                 continue
             self._render_log_line(role, text)
 
+    def _update_turn_plan_panel(self, data: dict[str, Any]) -> None:
+        """Wholesale-replace the sticky turn-plan panel.
+
+        ``data`` is the serialized TurnPlan payload (turn_number, steps,
+        current_idx, replanned_reason). Empty dict / no steps hides the
+        panel. The panel highlights progress with Unicode markers:
+        ✓ = done, → = current, ☐ = pending.
+        """
+        if not isinstance(data, dict):
+            data = {}
+        steps = data.get("steps") or []
+        if not steps:
+            self.turn_plan_label.clear()
+            self.turn_plan_label.setVisible(False)
+            return
+
+        turn_number = data.get("turn_number")
+        current_idx = int(data.get("current_idx", 0) or 0)
+        replanned_reason = str(data.get("replanned_reason") or "").strip()
+
+        header = f"Turn Plan — Turn {turn_number}" if turn_number is not None else "Turn Plan"
+        lines: list[str] = [header]
+        if replanned_reason:
+            lines.append(f"Replanned: {replanned_reason}")
+        for idx, step in enumerate(steps):
+            if not isinstance(step, dict):
+                continue
+            status = str(step.get("status") or "pending").lower()
+            if status == "done":
+                marker = "✓"  # ✓
+            elif status == "skipped":
+                marker = "✘"  # ✘
+            elif idx == current_idx or status == "current":
+                marker = "→"  # →
+            else:
+                marker = "☐"  # ☐
+
+            label = self._format_turn_plan_step(step)
+            rationale = str(step.get("rationale") or "").strip()
+            line = f"  {marker} {label}"
+            if rationale and status != "done":
+                line += f"  — {rationale}"
+            lines.append(line)
+
+        self.turn_plan_label.setText("\n".join(lines))
+        self.turn_plan_label.setVisible(True)
+
+    @staticmethod
+    def _format_turn_plan_step(step: dict[str, Any]) -> str:
+        """Render a single turn-plan step as a one-line label."""
+        action = str(step.get("action_type") or "").strip().lower()
+        name = str(step.get("card_name") or "").strip()
+        targets_raw = step.get("target_names") or []
+        if isinstance(targets_raw, list):
+            targets = [str(t).strip() for t in targets_raw if str(t).strip()]
+        else:
+            targets = []
+
+        if action == "play_land":
+            base = f"Play Land: {name}" if name else "Play Land"
+        elif action == "cast_spell":
+            base = f"Cast {name}" if name else "Cast spell"
+        elif action == "activate_ability":
+            base = f"Activate Ability: {name}" if name else "Activate Ability"
+        elif action == "declare_attackers":
+            base = "Declare Attackers"
+        elif action == "declare_blockers":
+            base = "Declare Blockers"
+        else:
+            base = f"{action}: {name}" if name else action or "(unknown step)"
+
+        if targets:
+            base += f" -> {', '.join(targets)}"
+        return base
+
     def _handle_tts_log(self, text: str) -> None:
         self.append_log(text, role="debug")
 
@@ -304,6 +379,28 @@ class CoachTab(QWidget):
 
         log_box = QGroupBox("Coach Log")
         log_layout = QVBoxLayout(log_box)
+
+        # Sticky turn-plan panel: shows the autopilot's current ordered
+        # plan for the active turn with progress markers. Replaced wholesale
+        # on each `turn_plan` event; hidden when there's no active plan.
+        self.turn_plan_label = QLabel()
+        self.turn_plan_label.setObjectName("turnPlanPanel")
+        self.turn_plan_label.setWordWrap(True)
+        self.turn_plan_label.setTextFormat(Qt.PlainText)
+        self.turn_plan_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.turn_plan_label.setStyleSheet(
+            "QLabel#turnPlanPanel {"
+            "  background: rgba(60, 110, 180, 0.18);"
+            "  border: 1px solid rgba(120, 170, 230, 0.55);"
+            "  border-radius: 6px;"
+            "  padding: 8px 10px;"
+            "  color: #e6e6e6;"
+            "  font-family: Consolas, 'Courier New', monospace;"
+            "}"
+        )
+        self.turn_plan_label.setVisible(False)
+        log_layout.addWidget(self.turn_plan_label)
+
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         log_layout.addWidget(self.log_view)
@@ -608,6 +705,12 @@ class CoachTab(QWidget):
                 self._match_overlay.update_card_positions(data)
             except Exception as exc:
                 self.append_log(f"Card positions update failed: {exc}", role="debug")
+        elif event_type == "turn_plan":
+            data = payload.get("data") or {}
+            try:
+                self._update_turn_plan_panel(data if isinstance(data, dict) else {})
+            except Exception as exc:
+                self.append_log(f"Turn plan update failed: {exc}", role="debug")
         elif event_type == "bug_report_saved":
             self._on_bug_report_saved(str(payload.get("path", "")), str(payload.get("error", "")))
         elif event_type == "draft_state":

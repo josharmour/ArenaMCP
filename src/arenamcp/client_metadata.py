@@ -16,7 +16,7 @@ def _current_version() -> str:
 
 def _normalize_frontend(value: Optional[str]) -> str:
     frontend = str(value or "").strip().lower()
-    if frontend in {"winui", "pyside", "tui", "standalone"}:
+    if frontend in {"pyside", "tui", "standalone"}:
         return frontend
     return "unknown"
 

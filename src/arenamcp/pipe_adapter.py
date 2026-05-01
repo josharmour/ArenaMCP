@@ -42,7 +42,7 @@ class PipeAdapter:
         self._running = False
         self._lock = threading.Lock()
         # Non-blocking write queue — prevents coaching loop from freezing
-        # when the parent WinUI process is slow to read stdout
+        # when the parent process is slow to read stdout
         import queue
         self._write_queue: queue.Queue[str] = queue.Queue(maxsize=500)
 
@@ -88,6 +88,15 @@ class PipeAdapter:
 
     def advice(self, text: str, seat_info: str) -> None:
         self._emit({"type": "advice", "text": strip_markup(text), "seat_info": seat_info})
+
+    def turn_plan(self, payload: Optional[dict[str, Any]]) -> None:
+        """Emit the static turn-plan panel payload (or None to clear).
+
+        Wholesale-replace event: the UI replaces the panel contents on each
+        emission rather than appending. ``payload=None`` (or empty) tells
+        the UI to hide the panel.
+        """
+        self._emit({"type": "turn_plan", "data": payload or {}})
 
     def status(self, key: str, value: str) -> None:
         self._emit({"type": "status", "key": key, "value": strip_markup(value)})

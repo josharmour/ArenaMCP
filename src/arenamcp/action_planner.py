@@ -103,6 +103,58 @@ class ActionPlan:
         return "\n".join(lines)
 
 
+@dataclass
+class TurnPlanStep:
+    """One user-visible play in a multi-step turn plan.
+
+    Mana abilities, casting-time sub-decisions, and search prompts are
+    intentionally NOT modeled here — those are mid-spell mechanical
+    decisions, not plays. The status field is updated as steps execute.
+    """
+    action_type: str        # "play_land", "cast_spell", "activate_ability", "declare_attackers", etc.
+    card_name: str = ""
+    target_names: list[str] = field(default_factory=list)
+    rationale: str = ""
+    status: str = "pending"  # "pending" | "current" | "done" | "skipped"
+
+
+@dataclass
+class TurnPlan:
+    """An ordered list of plays the autopilot intends to make this turn.
+
+    Built once per turn (on the first non-trivial own-turn LLM call) and
+    held until the turn changes or until divergence forces a replan. The
+    UI displays this as a sticky panel and highlights progress as steps
+    complete; per-priority-window single-action LLM calls still happen
+    for execution. The plan is parallel context, not a replacement for
+    the per-window planner.
+    """
+    turn_number: int
+    steps: list[TurnPlanStep] = field(default_factory=list)
+    current_idx: int = 0
+    last_replanned_reason: str = ""
+
+    def __post_init__(self) -> None:
+        # First step starts as "current" so the UI has something to highlight
+        # immediately, before any actions execute.
+        if self.steps and 0 <= self.current_idx < len(self.steps):
+            if self.steps[self.current_idx].status == "pending":
+                self.steps[self.current_idx].status = "current"
+
+    def remaining(self) -> list[TurnPlanStep]:
+        return self.steps[self.current_idx:]
+
+    def mark_current_done(self) -> None:
+        if 0 <= self.current_idx < len(self.steps):
+            self.steps[self.current_idx].status = "done"
+            self.current_idx += 1
+            if self.current_idx < len(self.steps):
+                # Whichever step is now current gets the "current" marker so
+                # the UI can highlight it. Don't touch already-skipped/done.
+                if self.steps[self.current_idx].status == "pending":
+                    self.steps[self.current_idx].status = "current"
+
+
 # JSON schema embedded in the system prompt for constrained output
 ACTION_SCHEMA = """{
   "actions": [{
@@ -128,10 +180,12 @@ AUTOPILOT_SYSTEM_PROMPT = """You are an MTG Arena autopilot. Given the game stat
 
 RULES:
 - ONLY pick actions from the "Legal:" line. Never invent actions.
+- TRUST [OK] tags. "[OK]" on a Cast action means MTGA's mana solver already verified the spell is castable from your current mana — including hybrid, phyrexian, and reduced costs. Do NOT recompute the mana cost yourself or claim you "lack the right colors". If a Cast is [OK] in the legal list, you CAN cast it. Failing to play affordable [OK] spells wastes the turn.
 - If a pending decision is shown, resolve that decision (not a new cast/play).
 - ONE action per plan. Don't sequence (no "play land" + "cast spell").
 - EXCEPTION: declare_attackers/declare_blockers carry the full set in one action — do NOT add a "done" click.
 - [SS] = summoning sick (can't attack). * prefix = token. [3P1P] = 3 +1/+1 counters.
+- If a TURN PLAN is shown, follow it. Stay committed to the locked turn plan unless a material change (opponent response, lethal threat, unexpected trigger) makes it obsolete.
 - Output ONLY JSON matching the schema. No prose, no markdown, no commentary.
 
 ACTION_TYPE MAPPING (match Legal text → action_type):
@@ -152,21 +206,44 @@ SCHEMA:
 """ + ACTION_SCHEMA
 
 
+def _strip_attacker_annotations(tail: str) -> str:
+    """Drop trailing annotations from a "Attack with: X" / "Block with: X" tail.
+
+    Legal lines may carry a "(P/T)" suffix plus warning tags like
+    "[0 POWER ...]"; we keep only the card name + optional #N.
+    """
+    cleaned = tail
+    for marker in (" (", " ["):
+        cut = cleaned.find(marker)
+        if cut >= 0:
+            cleaned = cleaned[:cut]
+    return cleaned
+
+
 class ActionPlanner:
     """Converts game state + trigger into structured JSON action commands via LLM."""
 
     # Ring buffer size for recent planning diagnostics (kept for debug reports)
     _DIAG_BUFFER_SIZE = 10
 
-    def __init__(self, backend: Any, timeout: float = 5.0):
+    def __init__(
+        self,
+        backend: Any,
+        timeout: float = 5.0,
+        land_drop_first: bool = True,
+    ):
         """Initialize the action planner.
 
         Args:
             backend: An LLMBackend instance (same interface as CoachEngine uses).
             timeout: Maximum seconds to wait for LLM response.
+            land_drop_first: When True, deterministically play a land if one is
+                legal and we've played 0 lands this turn — short-circuits the
+                LLM. Set False for landfall-synergy decks.
         """
         self._backend = backend
         self._timeout = timeout
+        self._land_drop_first = land_drop_first
         # Recent planning diagnostics ring buffer for debug reports
         self._recent_diagnostics: list[dict[str, Any]] = []
         # Turn-consistency memo: cache the last plan we produced for a turn
@@ -178,6 +255,22 @@ class ActionPlanner:
         # Executed actions this turn (by string repr); used to tell the LLM
         # "you already did X" in subsequent priority windows.
         self._turn_executed: list[str] = []
+        # Locked turn intent: the first non-trivial overall_strategy the LLM
+        # produced this turn, captured and held for the rest of the turn so
+        # subsequent priority windows reason as "continue the plan" instead
+        # of re-deriving strategy from scratch (the flip-flop pattern).
+        self._turn_intent: Optional[str] = None
+        # Active multi-step turn plan: the ordered list of user-visible plays
+        # we intend to make this turn. Built once on the first non-trivial
+        # own-turn LLM call (an additional `plan_turn` LLM call), then
+        # advanced as actions execute and replaced wholesale on divergence.
+        # Cleared on turn change.
+        self._active_turn_plan: Optional[TurnPlan] = None
+        # Turn number we last attempted plan_turn on. Used to suppress
+        # repeated plan_turn calls within the same turn after a failure
+        # — without this, every priority window in a turn where plan_turn
+        # fails would burn an extra LLM call.
+        self._turn_plan_attempted_for_turn: int = -1
 
     def plan_actions(
         self,
@@ -216,6 +309,14 @@ class ActionPlanner:
             self._turn_memo = None
             self._turn_memo_turn = current_turn
             self._turn_executed = []
+            self._turn_intent = None
+            # Drop the multi-step turn plan as well — a new turn earns a
+            # fresh plan, computed lazily the next time we make an LLM
+            # call from our own active turn.
+            self._active_turn_plan = None
+            # Reset the per-turn plan_turn attempt guard so the new turn
+            # gets one attempt to build a fresh plan.
+            self._turn_plan_attempted_for_turn = -1
         # Mark the last-memoized action as executed if we're in a new priority
         # window of the same turn (the action we proposed last time either
         # fired or became irrelevant — either way, don't re-propose it).
@@ -235,6 +336,57 @@ class ActionPlanner:
             "bridge_request": game_state.get("_bridge_request_type"),
         }
 
+        # Land-drop preflight — if we have a legal Play Land and 0 lands
+        # played this turn, short-circuit the LLM. Fixes the "drops land
+        # after combat" pattern where the LLM picks declare_attackers /
+        # cast_spell from a window that also offered Play Land.
+        forced_land = self._should_force_land_drop(
+            game_state, effective_legal_actions, decision_context
+        )
+        if forced_land:
+            preflight_plan = self._build_preflight_plan(
+                forced_land,
+                trigger=trigger,
+                turn_number=current_turn,
+                tag="land-drop-first",
+            )
+            if preflight_plan.actions:
+                raw = self._resolve_raw_actions_for_matching(
+                    game_state, legal_actions_raw
+                )
+                if raw:
+                    self._attach_gre_refs(preflight_plan, raw, game_state)
+                diag["preflight"] = "land_drop_first"
+                diag["elapsed_ms"] = (time.perf_counter() - start) * 1000
+                diag["planned_actions"] = 1
+                diag["strategy"] = preflight_plan.overall_strategy
+                self._record_diagnostic(diag)
+                self._turn_memo = preflight_plan
+                self._turn_memo_turn = current_turn
+                logger.info(
+                    f"Planner preflight: {preflight_plan.overall_strategy}"
+                )
+                return preflight_plan
+
+        # First non-trivial own-turn LLM call: build a multi-step turn
+        # plan. This is an additional LLM call that runs before the main
+        # per-window action call, so subsequent prompts (and the UI) see
+        # the full ordered list of plays we expect to make this turn.
+        # The attempt guard prevents repeating the call across priority
+        # windows after a failure (parse error, timeout, etc.).
+        if (
+            self._active_turn_plan is None
+            and self._turn_plan_attempted_for_turn != current_turn
+            and self._is_own_actions_available_window(game_state, decision_context)
+        ):
+            self._turn_plan_attempted_for_turn = current_turn
+            try:
+                self.plan_turn(
+                    game_state, effective_legal_actions, decision_context
+                )
+            except Exception as e:
+                logger.warning(f"plan_turn call failed (non-fatal): {e}")
+
         # Build the prompt
         system_prompt = AUTOPILOT_SYSTEM_PROMPT
         user_message = self._build_action_prompt(
@@ -250,12 +402,25 @@ class ActionPlanner:
         import concurrent.futures
 
         def _complete() -> str:
+            # request_timeout_s is what gives the underlying SDK a hard
+            # deadline. Without it, a hung backend keeps the worker thread
+            # alive for ~10 minutes (OpenAI SDK default), which then keeps
+            # this with-block from exiting.
             try:
                 return self._backend.complete(
-                    system_prompt, user_message, 400, temperature=0.0
+                    system_prompt,
+                    user_message,
+                    400,
+                    temperature=0.0,
+                    request_timeout_s=self._timeout,
                 )
             except TypeError:
-                return self._backend.complete(system_prompt, user_message)
+                try:
+                    return self._backend.complete(
+                        system_prompt, user_message, 400, temperature=0.0
+                    )
+                except TypeError:
+                    return self._backend.complete(system_prompt, user_message)
 
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -328,8 +493,363 @@ class ActionPlanner:
             self._turn_memo = plan
             self._turn_memo_turn = current_turn
 
+        # Capture the turn intent: the first non-trivial overall_strategy
+        # produced this turn becomes the locked plan that subsequent windows
+        # follow. Skip preflight/fallback tags and pure-pass plans — those
+        # are reactive rather than strategic.
+        self._maybe_capture_turn_intent(plan, game_state, current_turn)
+
         logger.info(f"Planned {len(plan.actions)} actions: {plan.overall_strategy}")
         return plan
+
+    _NON_INTENT_PREFIXES: tuple[str, ...] = (
+        "[land-drop-first]",
+        "[auto-pick]",
+    )
+
+    def _maybe_capture_turn_intent(
+        self,
+        plan: ActionPlan,
+        game_state: dict[str, Any],
+        current_turn: int,
+    ) -> None:
+        """Lock the first strategic plan of the turn as the turn intent."""
+        if self._turn_intent:
+            return
+        strategy = (plan.overall_strategy or "").strip()
+        if not strategy:
+            return
+        # Skip deterministic/auto-pick markers — they're not strategy.
+        if any(strategy.startswith(p) for p in self._NON_INTENT_PREFIXES):
+            return
+        if not plan.actions:
+            return
+        first_action = plan.actions[0].action_type.value
+        if first_action in ("pass_priority", "mulligan_keep", "mulligan_mull"):
+            return
+        # Only lock intent on our own turn — we don't make turn-level plans
+        # for opponent priority windows.
+        local_seat = game_state.get("local_seat_id")
+        if local_seat is None:
+            for player in game_state.get("players", []):
+                if player.get("is_local"):
+                    local_seat = player.get("seat_id")
+                    break
+        active_player = (game_state.get("turn") or {}).get("active_player")
+        if local_seat is None or active_player != local_seat:
+            return
+        self._turn_intent = strategy
+        self._turn_memo_turn = current_turn
+        logger.info(f"Turn {current_turn} intent locked: {strategy}")
+
+    # ── Multi-step turn plan ─────────────────────────────────────────
+
+    # Action types that count as "user-visible plays" worth showing in
+    # the turn plan. Mana abilities, casting-time sub-decisions, search
+    # prompts, and similar mid-spell mechanics are intentionally excluded.
+    _TURN_PLAN_USER_VISIBLE_ACTIONS = frozenset({
+        "play_land",
+        "cast_spell",
+        "activate_ability",
+        "declare_attackers",
+        "declare_blockers",
+    })
+
+    def _is_own_actions_available_window(
+        self,
+        game_state: dict[str, Any],
+        decision_context: Optional[dict[str, Any]],
+    ) -> bool:
+        """Are we in a normal own-turn ActionsAvailable priority window?"""
+        bridge_request = (game_state.get("_bridge_request_type") or "").strip()
+        bridge_class = (game_state.get("_bridge_request_class") or "").strip()
+        # Allow empty (test states) or ActionsAvailable-family.
+        ok_requests = self._ACTIONS_AVAILABLE_PREFLIGHT_REQUESTS
+        if (
+            bridge_request and bridge_request not in ok_requests
+        ) or (
+            bridge_class and bridge_class not in ok_requests
+        ):
+            return False
+        dc_type = (decision_context or {}).get("type", "")
+        if dc_type and dc_type != "actions_available":
+            return False
+        local_seat = game_state.get("local_seat_id")
+        if local_seat is None:
+            for player in game_state.get("players", []):
+                if player.get("is_local"):
+                    local_seat = player.get("seat_id")
+                    break
+        if local_seat is None:
+            return False
+        active_player = (game_state.get("turn") or {}).get("active_player")
+        return active_player == local_seat
+
+    def plan_turn(
+        self,
+        game_state: dict[str, Any],
+        effective_legal_actions: list[str],
+        decision_context: Optional[dict[str, Any]] = None,
+    ) -> Optional[TurnPlan]:
+        """One-shot LLM call that lays out the user-visible plays for the turn.
+
+        Stores the result on `self._active_turn_plan`. Returns the plan or
+        None if the call failed / produced no useful steps.
+        """
+        import concurrent.futures
+
+        current_turn = (game_state.get("turn") or {}).get("turn_number", 0) or 0
+
+        # Build a lightweight prompt: reuse the same context formatter as
+        # the per-window planner, but ask for an ordered turn plan in JSON
+        # rather than a single action.
+        try:
+            from arenamcp.coach import CoachEngine
+            formatter = CoachEngine.__new__(CoachEngine)
+            context = formatter._format_game_context(game_state, for_planner=True)
+        except Exception as e:
+            logger.warning(f"plan_turn: context formatter failed: {e}")
+            context = self._fallback_format(game_state)
+
+        instructions = (
+            "Output the FULL ordered list of plays for this turn (3-7 items). "
+            "Skip mana abilities, casting-time sub-decisions, and search-prompts — "
+            "list only the user-visible plays (Play Land, Cast X, Activate X, Attack)."
+        )
+        schema_example = (
+            '{"turn_plan": {"steps": ['
+            '{"action_type": "play_land", "card_name": "Forest", "rationale": "fix mana"},'
+            '{"action_type": "cast_spell", "card_name": "Optimistic Scavenger", '
+            '"target_names": [], "rationale": "early pressure"}'
+            ']}}'
+        )
+        user_message = (
+            f"TRIGGER: turn_plan (turn {current_turn})\n\n"
+            f"{context}\n\n"
+            f"INSTRUCTIONS: {instructions}\n"
+            f"Output ONLY a JSON object matching this shape (no prose, no markdown):\n"
+            f"{schema_example}"
+        )
+
+        def _complete() -> str:
+            try:
+                return self._backend.complete(
+                    AUTOPILOT_SYSTEM_PROMPT,
+                    user_message,
+                    600,
+                    temperature=0.0,
+                    request_timeout_s=self._timeout,
+                )
+            except TypeError:
+                try:
+                    return self._backend.complete(
+                        AUTOPILOT_SYSTEM_PROMPT, user_message, 600, temperature=0.0
+                    )
+                except TypeError:
+                    return self._backend.complete(AUTOPILOT_SYSTEM_PROMPT, user_message)
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_complete)
+                response = future.result(timeout=self._timeout)
+        except concurrent.futures.TimeoutError:
+            logger.warning("plan_turn LLM call timed out — leaving turn plan unset")
+            return None
+        except Exception as e:
+            logger.warning(f"plan_turn LLM call failed: {e}")
+            return None
+
+        plan = self._parse_turn_plan_response(response, current_turn)
+        if plan is None or not plan.steps:
+            logger.info(f"plan_turn: no steps parsed from response={(response or '')[:200]!r}")
+            return None
+
+        self._active_turn_plan = plan
+        logger.info(
+            f"Turn plan locked (turn {current_turn}): "
+            + ", ".join(
+                (f"{s.action_type}:{s.card_name}" if s.card_name else s.action_type)
+                for s in plan.steps
+            )
+        )
+        return plan
+
+    def _parse_turn_plan_response(
+        self,
+        response: str,
+        current_turn: int,
+    ) -> Optional[TurnPlan]:
+        """Defensively parse the JSON {"turn_plan": {"steps": [...]}} shape."""
+        if not response:
+            return None
+        text = response.strip()
+        fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+        if fence_match:
+            text = fence_match.group(1).strip()
+        text = re.sub(r",\s*([\]}])", r"\1", text)
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            logger.debug("plan_turn: response was not valid JSON")
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        # Tolerate either {"turn_plan": {"steps": [...]}} or {"steps": [...]}.
+        block = data.get("turn_plan")
+        if isinstance(block, dict):
+            steps_data = block.get("steps", [])
+        else:
+            steps_data = data.get("steps", [])
+
+        if not isinstance(steps_data, list):
+            return None
+
+        steps: list[TurnPlanStep] = []
+        for item in steps_data:
+            if not isinstance(item, dict):
+                continue
+            action_type = str(item.get("action_type") or "").strip().lower()
+            if not action_type:
+                continue
+            # Only keep user-visible plays.
+            if action_type not in self._TURN_PLAN_USER_VISIBLE_ACTIONS:
+                continue
+            card_name = str(item.get("card_name") or "").strip()
+            target_names_raw = item.get("target_names") or []
+            if isinstance(target_names_raw, list):
+                target_names = [str(t).strip() for t in target_names_raw if str(t).strip()]
+            else:
+                target_names = []
+            rationale = str(item.get("rationale") or "").strip()
+            steps.append(
+                TurnPlanStep(
+                    action_type=action_type,
+                    card_name=card_name,
+                    target_names=target_names,
+                    rationale=rationale,
+                    status="pending",
+                )
+            )
+
+        if not steps:
+            return None
+
+        return TurnPlan(turn_number=current_turn, steps=steps)
+
+    def advance_turn_plan(self, executed_action: GameAction) -> bool:
+        """Advance the active turn plan by one step if it matches the action.
+
+        Match is by `action_type` + case-insensitive normalized `card_name`.
+        Returns True on advance, False on mismatch (caller decides whether
+        to invalidate / replan).
+        """
+        plan = self._active_turn_plan
+        if plan is None or plan.current_idx >= len(plan.steps):
+            return False
+        if executed_action is None:
+            return False
+
+        # Skip non-user-visible actions silently — passing priority, paying
+        # costs, or sub-decisions don't count against the plan.
+        executed_type = executed_action.action_type.value
+        if executed_type not in self._TURN_PLAN_USER_VISIBLE_ACTIONS:
+            return False
+
+        current = plan.steps[plan.current_idx]
+        if current.action_type != executed_type:
+            return False
+
+        # For attack/block, we don't compare card names (they're aggregate).
+        if executed_type in ("declare_attackers", "declare_blockers"):
+            plan.mark_current_done()
+            return True
+
+        executed_name = self._strip_decoration(executed_action.card_name or "").lower()
+        expected_name = self._strip_decoration(current.card_name or "").lower()
+        if expected_name and executed_name and expected_name != executed_name:
+            return False
+        plan.mark_current_done()
+        return True
+
+    def invalidate_turn_plan(self, reason: str = "") -> None:
+        """Drop the active turn plan and stash the reason for the UI to show."""
+        plan = self._active_turn_plan
+        if plan is None:
+            return
+        # Preserve the reason on a synthetic empty plan so the UI gets one
+        # last event with the explanation before the panel hides / replans.
+        logger.info(f"Turn plan invalidated: {reason or '<no reason>'}")
+        plan.last_replanned_reason = reason or "diverged"
+        # Clear; a future plan_turn call will rebuild it.
+        self._active_turn_plan = None
+
+    def _format_turn_plan_for_prompt(self, plan: TurnPlan) -> str:
+        """Render the active turn plan as a structured prompt block."""
+        remaining_lines: list[str] = []
+        done_lines: list[str] = []
+        for idx, step in enumerate(plan.steps):
+            label = self._humanize_turn_plan_step(step)
+            if step.status == "done":
+                done_lines.append(f"  ✓ {label}")
+            elif idx == plan.current_idx:
+                remaining_lines.append(f"  → {label} (currently expected next)")
+            else:
+                remaining_lines.append(f"  ☐ {label}")
+
+        sections = [f"\nTURN PLAN (turn {plan.turn_number}) — remaining:"]
+        if remaining_lines:
+            sections.extend(remaining_lines)
+        else:
+            sections.append("  (no remaining steps)")
+        if done_lines:
+            sections.append("Already done: " + ", ".join(line.strip() for line in done_lines))
+        return "\n".join(sections)
+
+    @staticmethod
+    def _humanize_turn_plan_step(step: TurnPlanStep) -> str:
+        """Render a single step as a human-readable label."""
+        action = step.action_type
+        name = step.card_name.strip()
+        if action == "play_land":
+            return f"Play Land: {name}" if name else "Play Land"
+        if action == "cast_spell":
+            return f"Cast {name}" if name else "Cast spell"
+        if action == "activate_ability":
+            return f"Activate Ability: {name}" if name else "Activate Ability"
+        if action == "declare_attackers":
+            return "Declare Attackers"
+        if action == "declare_blockers":
+            return "Declare Blockers"
+        if name:
+            return f"{action}: {name}"
+        return action
+
+    def get_turn_plan_payload(self) -> Optional[dict[str, Any]]:
+        """Serialize the active turn plan into a dict for the pipe event.
+
+        Returns None when there's no active plan.
+        """
+        plan = self._active_turn_plan
+        if plan is None:
+            return None
+        return {
+            "turn_number": plan.turn_number,
+            "steps": [
+                {
+                    "action_type": s.action_type,
+                    "card_name": s.card_name,
+                    "target_names": list(s.target_names),
+                    "rationale": s.rationale,
+                    "status": s.status,
+                }
+                for s in plan.steps
+            ],
+            "current_idx": plan.current_idx,
+            "replanned_reason": plan.last_replanned_reason,
+        }
 
     @staticmethod
     def _resolve_raw_actions_for_matching(
@@ -472,6 +992,93 @@ class ActionPlanner:
 
         return filtered or legal_actions
 
+    _ACTIONS_AVAILABLE_PREFLIGHT_REQUESTS: frozenset[str] = frozenset({
+        "",
+        "ActionsAvailable",
+        "ActionsAvailableRequest",
+    })
+
+    def _should_force_land_drop(
+        self,
+        game_state: dict[str, Any],
+        legal_actions: list[str],
+        decision_context: Optional[dict[str, Any]],
+    ) -> Optional[str]:
+        """Return a Play Land legal-action string if we should force it now.
+
+        Conditions:
+          - feature is enabled (land_drop_first)
+          - decision is a normal priority window (ActionsAvailable / unset)
+          - it's our turn
+          - active player has played 0 lands this turn
+          - a "Play Land: X" entry is in legal_actions
+        """
+        if not self._land_drop_first or not legal_actions:
+            return None
+
+        bridge_request = (game_state.get("_bridge_request_type") or "").strip()
+        bridge_class = (game_state.get("_bridge_request_class") or "").strip()
+        if (
+            bridge_request not in self._ACTIONS_AVAILABLE_PREFLIGHT_REQUESTS
+            or bridge_class not in self._ACTIONS_AVAILABLE_PREFLIGHT_REQUESTS
+        ):
+            return None
+
+        dc_type = (decision_context or {}).get("type", "")
+        if dc_type and dc_type != "actions_available":
+            return None
+
+        local_seat = game_state.get("local_seat_id")
+        if local_seat is None:
+            for player in game_state.get("players", []):
+                if player.get("is_local"):
+                    local_seat = player.get("seat_id")
+                    break
+        if local_seat is None:
+            return None
+
+        turn = game_state.get("turn", {}) or {}
+        if turn.get("active_player") != local_seat:
+            return None
+
+        local_player = next(
+            (
+                p
+                for p in game_state.get("players", [])
+                if p.get("seat_id") == local_seat
+            ),
+            None,
+        )
+        # If lands_played is missing, assume 1 (don't force a drop on
+        # incomplete state — the LLM path is safer than dropping the wrong
+        # land or double-tapping into an "already played" failure).
+        lands_played = (local_player or {}).get("lands_played", 1)
+        if lands_played != 0:
+            return None
+
+        for legal in legal_actions:
+            if legal.lower().startswith("play land:"):
+                return legal
+        return None
+
+    def _build_preflight_plan(
+        self,
+        legal_action: str,
+        *,
+        trigger: str,
+        turn_number: int,
+        tag: str,
+    ) -> ActionPlan:
+        """Build a single-action ActionPlan from a legal-action string."""
+        plan = ActionPlan(trigger=trigger, turn_number=turn_number)
+        action = self._legal_action_to_action(legal_action)
+        if not action:
+            return plan
+        plan.actions = [action]
+        plan.overall_strategy = f"[{tag}] {legal_action}"
+        plan.voice_advice = self._humanize_legal_action(legal_action)
+        return plan
+
     # Oracle phrases that mark a spell as removal / hurts-its-target.
     # Kept in sync with the autopilot bridge-side safety check.
     _REMOVAL_ORACLE_PHRASES = (
@@ -608,11 +1215,34 @@ class ActionPlanner:
             context,
         ]
 
+        # Locked turn intent: a single high-level plan for the whole turn,
+        # captured on the first non-trivial LLM call of the turn. Subsequent
+        # windows see it as TURN PLAN and are pushed to continue executing
+        # against it instead of re-deriving strategy from scratch.
+        current_turn = game_state.get("turn", {}).get("turn_number", 0)
+        if self._turn_intent and self._turn_memo_turn == current_turn:
+            parts.append(
+                f"\nTURN PLAN (locked at start of turn {current_turn}):\n"
+                f"  {self._turn_intent}\n"
+                "Stay committed to this plan unless the board has materially "
+                "changed (opponent response, lethal threat, unexpected trigger)."
+            )
+
+        # Active multi-step turn plan: the ordered list of plays we
+        # committed to at the start of the turn. Show it as a status
+        # checklist so the LLM can see what's done, what's next, and
+        # what's still pending — and follow the plan unless something
+        # material changed.
+        if (
+            self._active_turn_plan is not None
+            and self._active_turn_plan.turn_number == current_turn
+        ):
+            parts.append(self._format_turn_plan_for_prompt(self._active_turn_plan))
+
         # Turn-consistency context: if we already planned something this turn,
         # show the LLM what we promised and what's been executed, so it stays
         # committed to the same strategy instead of re-reasoning from scratch
         # (avoids the "play Forest → then cast Giant instead of Ogre" flip).
-        current_turn = game_state.get("turn", {}).get("turn_number", 0)
         if self._turn_memo and self._turn_memo_turn == current_turn:
             consistency_lines = [
                 "\nTURN CONSISTENCY CONTEXT:",
@@ -1033,103 +1663,152 @@ class ActionPlanner:
     ) -> bool:
         """Require planner output to map to a current legal action.
 
-        For decision-specific actions (SelectN, Search, etc.) the bridge
-        request type is the authoritative signal — the legal_actions list
-        can be stale from the prior ActionsAvailable window.
+        Composition wrapper: dispatches to per-family handlers. Each handler
+        answers a focused question, so the cyclomatic surface stays inside
+        the handler that needs it. See `_is_legal_decision_passthrough` /
+        `_is_legal_combat_declaration` / `_is_legal_default`.
         """
-        # If this is a decision-type action and the bridge tells us a
-        # matching decision is pending, trust the planner's output.
-        if action.action_type in self._DECISION_ACTION_TYPES and bridge_request:
-            accepts = self._BRIDGE_REQUEST_ACCEPTS.get(bridge_request)
-            if accepts and action.action_type in accepts:
-                return True
-        # Similarly, if decision_context.type matches one of the decision
-        # family types, trust the planner.
-        if action.action_type in self._DECISION_ACTION_TYPES and decision_context:
-            ctx_type = str(decision_context.get("type") or "").lower()
-            # e.g. "selection_generic", "search_library", "distribute"
-            action_hint = action.action_type.value.lower()
-            if action_hint in ctx_type or ctx_type in action_hint:
-                return True
-            if ctx_type == "selection_generic" and action.action_type in (
-                ActionType.SELECT_N, ActionType.SELECT_TARGET,
-                ActionType.SELECT_REPLACEMENT, ActionType.SEARCH_LIBRARY,
-            ):
-                return True
+        if self._is_legal_decision_passthrough(action, decision_context, bridge_request):
+            return True
 
         if not legal_actions:
             return True
 
-        # Combat declarations come in as one "Attack with: X" / "Block with: X"
-        # string per creature, while the planner emits a full set in a single
-        # GameAction. Validate the plan against the union of legal creature
-        # names, not by exact-match on a single legal entry.
         if action.action_type in (ActionType.DECLARE_ATTACKERS, ActionType.DECLARE_BLOCKERS):
-            legal_names: set[str] = set()
-            in_combat_context = False
-            # For the "Declare Attackers: A, B, C" summary line we can't
-            # safely comma-split because card names themselves may contain
-            # commas (e.g. "Lluwen, Imperfect Naturalist"). We prefer the
-            # individual "Attack with: X" lines, which are one-name-per-line.
-            has_individual_attack_lines = any(
-                la.lower().strip().startswith("attack with:") for la in legal_actions
-            )
-            def _strip_attacker_annotations(tail: str) -> str:
-                # Legal lines may carry a "(P/T)" suffix plus warning tags
-                # like "[0 POWER ...]"; drop anything after the name+#N.
-                cleaned = tail
-                for marker in (" (", " ["):
-                    cut = cleaned.find(marker)
-                    if cut >= 0:
-                        cleaned = cleaned[:cut]
-                return cleaned
+            return self._is_legal_combat_declaration(action, legal_actions)
 
-            for legal_action in legal_actions:
-                low = legal_action.lower().strip()
-                if action.action_type == ActionType.DECLARE_ATTACKERS:
-                    if low.startswith("attack with:"):
-                        # Exactly one creature per line; keep the full tail
-                        # (including any commas in the name).
+        return self._is_legal_default(action, legal_actions)
+
+    def _is_legal_decision_passthrough(
+        self,
+        action: GameAction,
+        decision_context: Optional[dict[str, Any]],
+        bridge_request: Optional[str],
+    ) -> bool:
+        """Trust planner output for decision-family actions when the bridge or
+        decision context confirms a matching decision is open.
+
+        For decision-specific actions (SelectN, Search, etc.) the bridge
+        request type is the authoritative signal — the legal_actions list
+        can be stale from the prior ActionsAvailable window.
+        """
+        if action.action_type not in self._DECISION_ACTION_TYPES:
+            return False
+
+        if bridge_request:
+            accepts = self._BRIDGE_REQUEST_ACCEPTS.get(bridge_request)
+            if accepts and action.action_type in accepts:
+                return True
+
+        if not decision_context:
+            return False
+
+        ctx_type = str(decision_context.get("type") or "").lower()
+        # e.g. "selection_generic", "search_library", "distribute"
+        action_hint = action.action_type.value.lower()
+        if action_hint in ctx_type or ctx_type in action_hint:
+            return True
+        if ctx_type == "selection_generic" and action.action_type in (
+            ActionType.SELECT_N, ActionType.SELECT_TARGET,
+            ActionType.SELECT_REPLACEMENT, ActionType.SEARCH_LIBRARY,
+        ):
+            return True
+        return False
+
+    def _is_legal_combat_declaration(
+        self, action: GameAction, legal_actions: list[str]
+    ) -> bool:
+        """Validate a DECLARE_ATTACKERS / DECLARE_BLOCKERS plan.
+
+        Combat declarations come in as one "Attack with: X" / "Block with: X"
+        string per creature, while the planner emits a full set in a single
+        GameAction. We compare the planner's set against the union of legal
+        creature names rather than exact-matching on any single entry.
+        """
+        legal_names, in_combat_context = self._collect_combat_legal_names(
+            action.action_type, legal_actions
+        )
+        if not in_combat_context:
+            return False
+
+        if action.action_type == ActionType.DECLARE_ATTACKERS:
+            plan_names = {
+                n.strip().lower() for n in action.attacker_names if n and n.strip()
+            }
+        else:
+            plan_names = {
+                k.strip().lower()
+                for k in action.blocker_assignments.keys()
+                if k and k.strip()
+            }
+        return plan_names.issubset(legal_names)
+
+    def _collect_combat_legal_names(
+        self, action_type: ActionType, legal_actions: list[str]
+    ) -> tuple[set[str], bool]:
+        """Walk legal_actions and pull out the set of legal attacker/blocker names.
+
+        Returns (legal_names, in_combat_context). in_combat_context is True
+        iff at least one combat-related legal line was seen — so a missing
+        flag distinguishes "wrong window entirely" from "right window, but
+        the planner picked an off-list creature".
+        """
+        legal_names: set[str] = set()
+        in_combat_context = False
+
+        # For the "Declare Attackers: A, B, C" summary line we can't safely
+        # comma-split because card names themselves may contain commas
+        # (e.g. "Lluwen, Imperfect Naturalist"). Prefer the per-creature
+        # "Attack with: X" lines when they exist.
+        has_individual_attack_lines = any(
+            la.lower().strip().startswith("attack with:") for la in legal_actions
+        )
+
+        for legal_action in legal_actions:
+            low = legal_action.lower().strip()
+            if action_type == ActionType.DECLARE_ATTACKERS:
+                if low.startswith("attack with:"):
+                    tail = legal_action.split(":", 1)[1]
+                    tail = _strip_attacker_annotations(tail)
+                    clean = self._normalize_action_text(tail).strip().lower()
+                    if clean:
+                        legal_names.add(clean)
+                    in_combat_context = True
+                elif low.startswith("declare attackers:"):
+                    in_combat_context = True
+                    if not has_individual_attack_lines:
                         tail = legal_action.split(":", 1)[1]
-                        tail = _strip_attacker_annotations(tail)
-                        clean = self._normalize_action_text(tail).strip().lower()
-                        if clean:
-                            legal_names.add(clean)
-                        in_combat_context = True
-                    elif low.startswith("declare attackers:"):
-                        in_combat_context = True
-                        if not has_individual_attack_lines:
-                            # Fallback comma-split only if no per-creature lines
-                            tail = legal_action.split(":", 1)[1]
-                            for name in tail.split(","):
-                                name = _strip_attacker_annotations(name)
-                                clean = self._normalize_action_text(name).strip().lower()
-                                if clean:
-                                    legal_names.add(clean)
-                    elif "confirm attackers" in low:
-                        in_combat_context = True
-                else:
-                    if low.startswith("block with:"):
-                        tail = legal_action.split(":", 1)[1]
-                        tail = _strip_attacker_annotations(tail)
-                        clean = self._normalize_action_text(tail).strip().lower()
-                        if clean:
-                            legal_names.add(clean)
-                        in_combat_context = True
-                    elif "confirm blockers" in low:
-                        in_combat_context = True
-
-            if not in_combat_context:
-                return False
-
-            if action.action_type == ActionType.DECLARE_ATTACKERS:
-                plan_names = {n.strip().lower() for n in action.attacker_names if n and n.strip()}
+                        for name in tail.split(","):
+                            name = _strip_attacker_annotations(name)
+                            clean = self._normalize_action_text(name).strip().lower()
+                            if clean:
+                                legal_names.add(clean)
+                elif "confirm attackers" in low:
+                    in_combat_context = True
             else:
-                plan_names = {
-                    k.strip().lower() for k in action.blocker_assignments.keys() if k and k.strip()
-                }
-            return plan_names.issubset(legal_names)
+                if low.startswith("block with:"):
+                    tail = legal_action.split(":", 1)[1]
+                    tail = _strip_attacker_annotations(tail)
+                    clean = self._normalize_action_text(tail).strip().lower()
+                    if clean:
+                        legal_names.add(clean)
+                    in_combat_context = True
+                elif "confirm blockers" in low:
+                    in_combat_context = True
 
+        return legal_names, in_combat_context
+
+    def _is_legal_default(
+        self, action: GameAction, legal_actions: list[str]
+    ) -> bool:
+        """Match a non-combat planner action against legal_actions.
+
+        Iterates legal_actions and tries to round-trip each one through
+        `_legal_action_to_action`, then compares the right field for the
+        action's family (card_name for cast/play/activate, target_names[0]
+        for select-target, play_or_draw for choose-starting-player, otherwise
+        action-type match alone).
+        """
         normalized_card_name = self._normalize_action_text(action.card_name).lower()
 
         for legal_action in legal_actions:
@@ -1148,7 +1827,10 @@ class ActionPlanner:
 
             if action.action_type == ActionType.SELECT_TARGET:
                 if legal.target_names and action.target_names:
-                    if legal.target_names[0].strip().lower() == action.target_names[0].strip().lower():
+                    if (
+                        legal.target_names[0].strip().lower()
+                        == action.target_names[0].strip().lower()
+                    ):
                         return True
                 continue
 

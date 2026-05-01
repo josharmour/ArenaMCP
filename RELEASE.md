@@ -35,13 +35,13 @@ Installed launch target:
 
 The installed app runs from `C:\Program Files\mtgacoach` and does not depend on a repo checkout.
 
-## Migration From WinUI
+## Migration From Earlier Installs
 
-The installer keeps the existing Inno `AppId`, so a `v2.0.0` install upgrades the prior WinUI install in place.
+The installer keeps the existing Inno `AppId`, so a `v2.0.0+` install upgrades any prior install in place.
 
 Migration behavior:
 
-- old WinUI shortcut target is replaced by the PySide launcher
+- old shortcut target is replaced by the PySide launcher
 - old `{app}\launcher` files are deleted during install
 - `%LOCALAPPDATA%\mtgacoach` is preserved
 - `~/.arenamcp` settings/logs are preserved

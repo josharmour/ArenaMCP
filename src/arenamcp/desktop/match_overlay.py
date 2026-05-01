@@ -118,9 +118,9 @@ class MatchOverlayWindow(QWidget):
         self._advice_seat: str = ""
         self._advice_expire_at: float = 0.0
         # Position of the advice panel corner, expressed as a fraction of
-        # the overlay window (0..1 in x/y). Default = top-right.
+        # the overlay window (0..1 in x/y). Default = bottom-left.
         # User can move it via settings or future drag gesture.
-        self._advice_panel_anchor: str = "top-right"  # or "top-left", "bottom-right", "bottom-left"
+        self._advice_panel_anchor: str = "bottom-left"  # or "top-left", "top-right", "bottom-right"
         # Whether to show the advice panel at all (may want pill only).
         self._show_advice_panel: bool = True
 

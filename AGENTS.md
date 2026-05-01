@@ -2,23 +2,8 @@
 
 ## Project Structure & Module Organization
 
-### Desktop Frontends
-There are two live desktop frontends:
-- `installer/MtgaCoachLauncher/` — WinUI 3 native Windows app
-- `src/arenamcp/desktop/` — PySide6 desktop app
-
-Both are active. Do not remove one as cleanup unless the task explicitly requires it.
-
-### Native Desktop App (WinUI 3)
-The WinUI app at `installer/MtgaCoachLauncher/` communicates with a headless Python coaching subprocess via JSON lines over stdin/stdout (pipe protocol). Key C# files:
-- `App.xaml.cs` — App entry, dark theme, hidden console allocation for PortAudio
-- `Views/CoachPage.xaml + .cs` — Main coaching surface: game state, advice log, control buttons, chat
-- `Views/RepairPage.xaml + .cs` — Runtime status, MTGA/BepInEx repair, log tails
-- `Views/MainPage.xaml + .cs` — NavigationView shell (Coach + Repair tabs), auto-starts coach
-- `Services/CoachProcess.cs` — Manages Python subprocess, reads stdout JSON events, sends stdin commands
-- `Services/RuntimeDetector.cs` — C# port of windows_integration.py detection logic
-- `Services/ProcessLauncher.cs` — Launch/repair subprocess helpers
-- `Models/RuntimeState.cs` — Runtime state model (mirrors Python dataclass)
+### Desktop Frontend
+The desktop frontend is the PySide6 app at `src/arenamcp/desktop/`. It spawns the headless coach as a subprocess and communicates via JSON lines over stdin/stdout (pipe protocol).
 
 ### Python Coaching Engine
 Core Python code lives in `src/arenamcp/`. Key runtime modules:
@@ -56,14 +41,14 @@ Repair/setup surfaces should expose explicit actions for:
 
 ## Architecture: Pipe Protocol
 
-The WinUI app launches Python as a headless subprocess with `--pipe`:
+The PySide6 app launches Python as a headless coach subprocess with `--pipe`:
 ```
-WinUI App (C#)  ←→  Python (standalone.py --pipe)
-                stdout: {"type":"log|advice|status|error|game_state", ...}
-                stdin:  {"cmd":"toggle_autopilot|cycle_voice|chat", ...}
+Desktop App (PySide6)  ←→  Coach (standalone.py --pipe)
+                       stdout: {"type":"log|advice|status|error|game_state", ...}
+                       stdin:  {"cmd":"toggle_autopilot|cycle_voice|chat", ...}
 ```
 
-`PipeAdapter` implements the `UIAdapter` interface, replacing the Textual TUI's `TUIAdapter`. All coach→UI communication (log, advice, status, game_state) flows as JSON lines. GUI→coach commands (button clicks, chat) flow as JSON lines on stdin.
+`PipeAdapter` implements the `UIAdapter` interface. All coach→UI communication (log, advice, status, game_state) flows as JSON lines. GUI→coach commands (button clicks, chat) flow as JSON lines on stdin.
 
 ## Build, Test, and Development Commands
 
@@ -71,21 +56,17 @@ WinUI App (C#)  ←→  Python (standalone.py --pipe)
 - `pytest tests -q`: run the Python regression suite.
 - `python -m arenamcp.standalone --pipe`: start the coach in headless pipe mode (for native GUI).
 - `python -m arenamcp.diagnose`: run local environment diagnostics.
-- `cd installer/MtgaCoachLauncher && dotnet build -c Debug -p:Platform=x64`: build the WinUI debug exe.
-- `cd installer/MtgaCoachLauncher && dotnet publish -c Release -p:Platform=x64 --self-contained`: publish WinUI launcher binaries.
 - `iscc installer/mtgacoach.iss`: build the Windows installer (requires Inno Setup 6).
 - `cd bepinex-plugin/MtgaCoachBridge && dotnet build -c Release`: build the BepInEx plugin DLL.
 - `p=$(wslpath -w /home/joshu/repos/ArenaMCP/installer) && powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "\$p='${p}'; Set-Location -LiteralPath \$p; .\build-installer.ps1"`: build the Windows installer from WSL.
 
 ### Dev Workflow
 For iterating on changes without rebuilding the installer:
-- **Python changes**: Just restart the app — the dev exe reads from `src/` in the repo.
-- **C# changes**: `dotnet build -c Debug -p:Platform=x64` then relaunch the debug exe.
-- **Debug exe path**: `installer/MtgaCoachLauncher/bin/x64/Debug/net8.0-windows10.0.19041.0/win-x64/MtgaCoachLauncher.exe`
+- **Python changes**: Just restart the app — the launch script imports from `src/` in the repo.
 
 ## Coding Style & Naming Conventions
 
-Use 4-space indentation in Python and keep type hints on public functions where practical. Follow existing Python naming: `snake_case` for functions/modules, `PascalCase` for classes, and concise internal helper names prefixed with `_`. Keep JSON-like state keys stable; downstream code depends on exact names such as `pending_decision`, `decision_context`, and `local_seat_id`. In C#, follow the existing plugin style: `PascalCase` methods, private `_camelCase` fields.
+Use 4-space indentation in Python and keep type hints on public functions where practical. Follow existing Python naming: `snake_case` for functions/modules, `PascalCase` for classes, and concise internal helper names prefixed with `_`. Keep JSON-like state keys stable; downstream code depends on exact names such as `pending_decision`, `decision_context`, and `local_seat_id`. In C# (BepInEx plugin), follow the existing plugin style: `PascalCase` methods, private `_camelCase` fields.
 
 ## Testing Guidelines
 
@@ -93,7 +74,7 @@ Use `pytest` for Python changes. Add or update focused regression tests in `test
 
 ## Commit & Pull Request Guidelines
 
-Recent history uses short imperative subjects with prefixes like `fix:`, `feat:`, `debug:`, plus versioned release commits such as `v1.8.0: native WinUI coaching app`. Keep commits scoped and explain the subsystem touched. Do not add Co-Authored-By lines.
+Recent history uses short imperative subjects with prefixes like `fix:`, `feat:`, `debug:`, plus versioned release commits such as `v2.2.3: ...`. Keep commits scoped and explain the subsystem touched. Do not add Co-Authored-By lines.
 
 When revving a release, bump:
 - `pyproject.toml`

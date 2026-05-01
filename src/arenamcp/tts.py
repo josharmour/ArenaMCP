@@ -24,7 +24,7 @@ from typing import Optional
 
 import logging
 
-# Lazy numpy import — module-level import hangs in WinUI subprocess
+# Lazy numpy import — module-level import hangs in subprocess contexts
 np = None
 
 def _ensure_numpy():
@@ -716,7 +716,7 @@ class VoiceOutput:
         if self._muted:
             return
 
-        # SAPI-only mode (pipe/WinUI) — use Windows built-in TTS directly
+        # SAPI-only mode (pipe) — use Windows built-in TTS directly
         if getattr(self, '_sapi_only', False):
             if not text or not text.strip():
                 return

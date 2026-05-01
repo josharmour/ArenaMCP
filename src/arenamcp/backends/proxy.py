@@ -67,6 +67,13 @@ class ProxyBackend:
             api_key=api_key or "ollama",
         )
 
+    # Hard ceiling applied at the SDK level. Per-call request_timeout_s in
+    # complete() can tighten this. Without a finite client-level timeout,
+    # the OpenAI SDK defaults to ~10 minutes — which means a hung backend
+    # leaves the worker thread alive long after the future times out, and
+    # that's the thread leak the autopilot+coach were paying for.
+    _CLIENT_HARD_TIMEOUT_S = 60.0
+
     def _get_client(self):
         """Lazy init of OpenAI client."""
         if self._client is None:
@@ -81,6 +88,7 @@ class ProxyBackend:
                     base_url=url,
                     api_key=key,
                     default_headers=client_headers,
+                    timeout=self._CLIENT_HARD_TIMEOUT_S,
                 )
             except ImportError:
                 raise ImportError("openai package required: pip install openai")
@@ -116,6 +124,7 @@ class ProxyBackend:
         user_message: str,
         max_tokens: int = 400,
         temperature: float = 0.3,
+        request_timeout_s: Optional[float] = None,
     ) -> str:
         """Get completion from the API endpoint.
 
@@ -123,11 +132,18 @@ class ProxyBackend:
             temperature: Sampling temperature. Default 0.3 for flavorful
                 coach advice; pass 0.0 for deterministic planner calls
                 (avoids cross-priority-window flip-flops).
+            request_timeout_s: Hard deadline for the underlying HTTP call.
+                When the SDK hits this, it tears down the socket and raises,
+                which lets the calling worker thread exit cleanly. Without
+                it, hung backends silently leak threads forever (the future
+                timeout only abandons the thread, it doesn't kill it).
         """
         import time
 
         try:
             client = self._get_client()
+            if request_timeout_s is not None:
+                client = client.with_options(timeout=request_timeout_s)
 
             params = {
                 "model": self.model,
@@ -205,13 +221,21 @@ class ProxyBackend:
             logger.error(f"API error: {e}")
             return f"Error getting advice: {e}"
 
-    def complete_with_image(self, system_prompt: str, user_message: str, image_bytes: bytes) -> str:
+    def complete_with_image(
+        self,
+        system_prompt: str,
+        user_message: str,
+        image_bytes: bytes,
+        request_timeout_s: Optional[float] = None,
+    ) -> str:
         """Get completion with an image via the OpenAI multimodal message format."""
         import base64
         import time
 
         try:
             client = self._get_client()
+            if request_timeout_s is not None:
+                client = client.with_options(timeout=request_timeout_s)
             b64 = base64.b64encode(image_bytes).decode("utf-8")
 
             params = {

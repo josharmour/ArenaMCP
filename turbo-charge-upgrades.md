@@ -217,42 +217,20 @@ Treat BepInEx as a first-class dependency with repair semantics:
 
 This is now core product scope, not optional polish.
 
-#### E. Native Windows Shell (WinUI 3)
+#### E. Native Desktop Shell
 
-**Current repo status:** Planned, but environment-blocked on the current machine.
+**Current repo status:** Implemented as a PySide6 desktop app at `src/arenamcp/desktop/`.
 
-What exists now:
-- The current Windows surface is still the Python/Tk launcher (`launcher_gui.py`)
-  plus the internal TUI restart wrapper (`launcher.py`).
-- An Inno Setup installer scaffold already exists in `installer/mtgacoach.iss`,
-  including Start Menu / desktop shortcuts that target `launch.vbs`.
-- The launcher/runtime contract is already oriented around a single entry surface,
-  `%LOCALAPPDATA%\\mtgacoach` mutable state, and `Program Files` app payloads.
+The native shell now owns:
+- launch coach / autopilot
+- runtime provisioning status
+- MTGA / BepInEx / bridge repair flows
+- logs / diagnostics entrypoints
 
-What is still missing:
-- WinUI toolchain readiness on the current Windows environment
-- a scaffolded native launcher project
-- native implementations of launch / repair / status surfaces
-- integration between the native shell and the existing Python runtime contract
-
-Current design direction:
-- the eventual native shell should **replace** the Tk launcher, not sit beside it
-- the likely packaging model is **unpackaged WinUI**, because install/update is already
-  being handled by an external installer rather than MSIX
-- the native shell should own:
-  - launch coach / autopilot
-  - runtime provisioning status
-  - MTGA / BepInEx / bridge repair flows
-  - logs / diagnostics entrypoints
-
-2026-03-28 readiness note:
-- Using the `winui-app` skill flow, `dotnet new list winui` currently returns
-  **no installed WinUI templates** on the Windows machine. Native shell work should
-  therefore stay in the plan, but scaffolding is blocked until the Windows App SDK /
-  WinUI project template toolchain is installed.
-- Do **not** add Windows App SDK packages to `MtgaCoachBridge.csproj`.
-  The BepInEx bridge plugin remains a separate .NET Framework game plugin;
-  the native launcher must live in its own desktop project.
+Packaging is handled by the Inno Setup installer (`installer/mtgacoach.iss`), which
+ships the PySide app and creates Start Menu / desktop shortcuts targeting `launch.vbs`.
+The BepInEx bridge plugin (`MtgaCoachBridge.csproj`) remains a separate .NET Framework
+game plugin and is not part of the desktop shell.
 
 ### 2026-03-28 Status Checkpoint
 
@@ -288,11 +266,9 @@ Current design direction:
   payloads, while `launcher_gui.py` exposes bridge repair flows. Still missing are
   guaranteed bundled BepInEx assets in release builds, explicit bridge/app
   compatibility enforcement, and installed-build validation for repair paths.
-- **E. Native Windows shell:** not started in code, but now clarified.
-  The direction is a single installed launcher that eventually replaces the TUI
-  with a proper native GUI. The blocker is environmental, not conceptual:
-  the current Windows machine does not yet have the WinUI template/toolchain
-  required to scaffold that shell.
+- **E. Native desktop shell:** implemented as a PySide6 app at `src/arenamcp/desktop/`,
+  which replaced the TUI as the primary user surface. The shell owns launch,
+  runtime provisioning, repair flows, and diagnostics entrypoints.
 
 ### Phase 1 Status: COMPLETE (2026-03-26)
 

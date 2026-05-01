@@ -261,6 +261,11 @@ class GameObject:
     parent_instance_id: Optional[int] = None
     # For summoning sickness tracking
     turn_entered_battlefield: int = -1
+    # True only if this object entered the battlefield via the "play land"
+    # action (ZoneTransferReason.PlayLand). Lands put onto the battlefield by
+    # spells/abilities (Rampant Growth → "Put", Goldspan → "Resolve" cast,
+    # etc.) leave this False so they aren't counted as the turn's land drop.
+    entered_via_play_land: bool = False
     # Combat status
     is_attacking: bool = False
     is_blocking: bool = False
@@ -342,6 +347,8 @@ class GameObject:
             result["saddled_this_turn"] = True
         if self.is_phased_out:
             result["is_phased_out"] = True
+        if self.entered_via_play_land:
+            result["entered_via_play_land"] = True
         if self.class_level is not None:
             result["class_level"] = self.class_level
         if self.copied_from_grp_id is not None:
@@ -786,6 +793,7 @@ class GameState:
                         is_tapped=bool(obj_data.get("is_tapped", False)),
                         parent_instance_id=_coerce_optional_int(obj_data.get("parent_instance_id")),
                         turn_entered_battlefield=_coerce_int(obj_data.get("turn_entered_battlefield", -1), -1),
+                        entered_via_play_land=bool(obj_data.get("entered_via_play_land", False)),
                         is_attacking=bool(obj_data.get("is_attacking", False)),
                         is_blocking=bool(obj_data.get("is_blocking", False)),
                         object_kind=_parse_object_kind(obj_data.get("object_kind")),
@@ -1690,6 +1698,7 @@ class GameState:
             subtypes = existing_obj.subtypes
             parent_instance_id = existing_obj.parent_instance_id
             turn_entered_battlefield = existing_obj.turn_entered_battlefield
+            entered_via_play_land = existing_obj.entered_via_play_land
             is_attacking = existing_obj.is_attacking
             is_blocking = existing_obj.is_blocking
             object_kind = existing_obj.object_kind
@@ -1707,6 +1716,7 @@ class GameState:
             subtypes = []
             parent_instance_id = None
             turn_entered_battlefield = -1
+            entered_via_play_land = False
             is_attacking = False
             is_blocking = False
             object_kind = GameObjectKind.UNKNOWN
@@ -1782,6 +1792,7 @@ class GameState:
             is_tapped=is_tapped,
             parent_instance_id=parent_instance_id,
             turn_entered_battlefield=turn_entered_battlefield,
+            entered_via_play_land=entered_via_play_land,
             is_attacking=is_attacking,
             is_blocking=is_blocking,
             object_kind=object_kind,
@@ -1972,8 +1983,11 @@ class GameState:
         else:
             lands_played = 0
 
-        # FALLBACK: Arena doesn't always track landsPlayedThisTurn correctly
-        # Infer by counting lands that entered battlefield this turn
+        # FALLBACK: Arena doesn't always track landsPlayedThisTurn correctly.
+        # Infer by counting lands that entered battlefield this turn via the
+        # play-land action. Ramp-spell lands (entered_via_play_land=False)
+        # are deliberately excluded — counting them as "played" makes the
+        # land-drop preflight refuse to play the actual land for the turn.
         if lands_played == 0 and self.turn_info.turn_number > 0:
             current_turn = self.turn_info.turn_number
             inferred_lands = 0
@@ -1981,7 +1995,8 @@ class GameState:
                 if (obj.owner_seat_id == seat_id and
                     obj.controller_seat_id == seat_id and
                     self._is_land_object(obj) and
-                    obj.turn_entered_battlefield == current_turn):
+                    obj.turn_entered_battlefield == current_turn and
+                    obj.entered_via_play_land):
                     inferred_lands += 1
                     logger.debug(f"Inferred land: grp_id={obj.grp_id} entered turn {current_turn} for seat {seat_id}")
 
@@ -2056,6 +2071,12 @@ class GameState:
         Arena doesn't always include player data in diff messages, so
         lands_played can stay at 0 even after a land enters the battlefield.
         This runs after every game state message to correct that.
+
+        Only counts lands that came in via the "play land" action
+        (entered_via_play_land=True). Lands put onto the battlefield by ramp
+        spells like Rampant Growth must NOT count — otherwise the planner
+        thinks the land drop is already used and refuses to play the actual
+        land for the turn.
         """
         if self.turn_info.turn_number <= 0:
             return
@@ -2070,7 +2091,8 @@ class GameState:
                 if (obj.owner_seat_id == seat_id and
                     obj.controller_seat_id == seat_id and
                     self._is_land_object(obj) and
-                    obj.turn_entered_battlefield == current_turn):
+                    obj.turn_entered_battlefield == current_turn and
+                    obj.entered_via_play_land):
                     inferred_lands += 1
 
             if inferred_lands > 0:
@@ -2218,6 +2240,8 @@ class GameState:
                     for obj_id in affected_ids:
                         obj = self.game_objects.get(obj_id)
                         if obj:
+                            if category == "PlayLand":
+                                obj.entered_via_play_land = True
                             self._add_event({
                                 "type": "zone_transfer",
                                 "card": self._resolve_card_name(obj.grp_id),

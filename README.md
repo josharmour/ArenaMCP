@@ -138,11 +138,7 @@ pytest tests -q
 cd bepinex-plugin/MtgaCoachBridge
 dotnet build -c Release
 
-# Build the WinUI debug exe
-cd installer/MtgaCoachLauncher && dotnet build -c Debug -p:Platform=x64
-
-# Build the installer
-cd installer/MtgaCoachLauncher && dotnet publish -c Release -p:Platform=x64 --self-contained
+# Build the installer (Windows, requires Inno Setup)
 iscc installer/mtgacoach.iss
 ```
 

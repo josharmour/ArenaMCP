@@ -163,6 +163,12 @@ class AutopilotConfig:
     dry_run: bool = False
     afk_mode: bool = False  # When True, auto-pass everything without LLM
     land_drop_mode: bool = False  # When True, auto-play one land per turn (no LLM)
+    # When True, the planner deterministically plays a land first if the
+    # active player has 0 lands played this turn and a Play Land action is
+    # legal. Skips the LLM entirely for that priority window. Set False for
+    # landfall-synergy decks where casting a trigger source before the land
+    # is correct (Lotus Cobra, Felidar Retreat, etc.).
+    land_drop_first: bool = True
     # Legacy name, current behavior: keep autopilot bridge-only and refuse
     # to simulate actions with mouse clicks. Actions the bridge cannot
     # submit are surfaced as MANUAL REQUIRED and auto-filed as bridge bugs.
@@ -211,6 +217,7 @@ class AutopilotEngine:
         speak_fn: Optional[Callable[[str, bool], None]] = None,
         ui_advice_fn: Optional[Callable[[str, str], None]] = None,
         bug_report_fn: Optional[Callable[[str, dict], None]] = None,
+        ui_turn_plan_fn: Optional[Callable[[Optional[dict[str, Any]]], None]] = None,
     ):
         """Initialize the autopilot engine.
 
@@ -226,6 +233,10 @@ class AutopilotEngine:
                 whenever the GRE bridge can't submit an action and autopilot
                 has to fall back. Used to auto-file a bug report so we have
                 telemetry on every bridge miss.
+            ui_turn_plan_fn: Optional UI callback (payload-or-None) for the
+                static turn-plan panel. Receives the serialized turn plan
+                whenever progress advances or the plan is invalidated; None
+                payload means "hide the panel". Wholesale-replace; no append.
         """
         self._planner = planner
         self._mapper = mapper
@@ -235,6 +246,7 @@ class AutopilotEngine:
         self._speak_fn = speak_fn
         self._ui_advice_fn = ui_advice_fn
         self._bug_report_fn = bug_report_fn
+        self._ui_turn_plan_fn = ui_turn_plan_fn
         # Optional callback to record autopilot-driven decisions into the
         # app's advice_history. Set by standalone after construction.
         self._advice_recorder: Optional[Any] = None
@@ -783,8 +795,17 @@ class AutopilotEngine:
             logger.debug(f"_record_autopilot_decision failed: {e}")
 
     def _pause_for_manual(self, reason: str, game_state: Optional[dict[str, Any]] = None) -> None:
-        """Pause the autopilot and surface that manual input is required."""
+        """Pause the autopilot and surface that manual input is required.
+
+        Appends a short bridge-gap hint to the user-facing notification so
+        the operator can tell *why* autopilot stopped: a known unhandled
+        request type ("Bridge gap: SelectTargets") reads very differently
+        from "bridge offline" or "no request pending". Without this hint
+        the user just sees "MANUAL REQUIRED: Bridge couldn't handle X" and
+        has no signal whether to file a bug, reconnect, or just wait.
+        """
         self._state = AutopilotState.PAUSED
+        hint = self._format_bridge_gap_hint(game_state)
         details = ""
         if game_state:
             details = (
@@ -792,7 +813,45 @@ class AutopilotEngine:
                 f" bridge={game_state.get('_bridge_request_type') or game_state.get('_bridge_request_class')!r}"
             )
         logger.warning("Autopilot manual required: %s%s", reason, details)
-        self._notify("AUTOPILOT", f"MANUAL REQUIRED: {reason}")
+        suffix = f" [{hint}]" if hint else ""
+        self._notify("AUTOPILOT", f"MANUAL REQUIRED: {reason}{suffix}")
+
+    def _format_bridge_gap_hint(
+        self, game_state: Optional[dict[str, Any]]
+    ) -> str:
+        """Build a short user-facing explanation of why the bridge couldn't act.
+
+        Possible shapes:
+          - "Bridge gap: SelectTargetsRequest" — bridge has a pending request
+            but no handler for that type yet.
+          - "Bridge offline"                   — bridge isn't connected.
+          - "No bridge request pending"        — bridge connected but quiet.
+          - ""                                 — no game_state available.
+        """
+        if not game_state:
+            return ""
+
+        connected = game_state.get("_bridge_connected")
+        if connected is False:
+            return "Bridge offline"
+
+        req = (
+            game_state.get("_bridge_request_type")
+            or game_state.get("_bridge_request_class")
+        )
+        if not req:
+            pending = game_state.get("pending_decision")
+            if pending:
+                return f"No bridge request pending (pending_decision={pending!r})"
+            return "No bridge request pending"
+
+        decision_type = ""
+        ctx = game_state.get("decision_context") or {}
+        if isinstance(ctx, dict):
+            decision_type = str(ctx.get("type") or "")
+        if decision_type:
+            return f"Bridge gap: {req} (type={decision_type})"
+        return f"Bridge gap: {req}"
 
     def _manual_required_bridge_result(
         self,
@@ -1524,6 +1583,11 @@ class AutopilotEngine:
                 game_state, trigger, legal_actions, decision_context
             )
 
+            # Surface any newly-built turn plan to the UI immediately so the
+            # static panel populates before the first action lands. Safe to
+            # call when there's no active plan — the helper short-circuits.
+            self._emit_turn_plan_payload()
+
             if not plan.actions:
                 self._consecutive_plan_failures += 1
                 logger.warning(
@@ -1827,18 +1891,41 @@ class AutopilotEngine:
                 self._actions_executed += 1
 
                 # --- 4. VERIFYING ---
+                action_verified = True
                 if self._config.verify_after_action and pre_state:
                     self._state = AutopilotState.VERIFYING
                     verified = self._verify_action(action, pre_state)
                     if not verified:
+                        action_verified = False
                         logger.warning(f"Action verification failed for: {action}")
                         self._notify("AUTOPILOT", "Verification: state unchanged (may be OK)")
                         self._consecutive_failed_verifications += 1
-                        
+
                         if self._consecutive_failed_verifications >= 3:
                             self._recover_stuck()
                     else:
                         self._consecutive_failed_verifications = 0
+
+                # Advance the multi-step turn plan when an action lands.
+                # On mismatch, drop the plan and re-emit so the UI shows
+                # a "Replanned: ..." note before the panel hides — the
+                # next own-turn LLM call will produce a fresh plan.
+                if action_verified:
+                    try:
+                        advanced = self._planner.advance_turn_plan(action)
+                    except Exception as e:
+                        logger.debug(f"advance_turn_plan failed: {e}")
+                        advanced = False
+                    if advanced:
+                        self._emit_turn_plan_payload()
+                    elif self._planner.get_turn_plan_payload() is not None:
+                        # We had a plan, the executed action didn't match,
+                        # so divergence — invalidate, emit the cleared
+                        # state with the reason, then a None to hide.
+                        self._planner.invalidate_turn_plan(
+                            "executed action diverged from plan"
+                        )
+                        self._notify_turn_plan(None)
 
                 # Delay between actions
                 if i < len(plan.actions) - 1:
@@ -2319,6 +2406,27 @@ class AutopilotEngine:
                 self._ui_advice_fn(text, label)
             except Exception as e:
                 logger.debug(f"UI notification callback failed: {e}")
+
+    def _notify_turn_plan(self, payload: Optional[dict[str, Any]]) -> None:
+        """Forward a turn-plan payload to the UI panel callback.
+
+        ``payload`` may be ``None`` to clear/hide the panel (replan/invalidate).
+        """
+        if self._ui_turn_plan_fn is None:
+            return
+        try:
+            self._ui_turn_plan_fn(payload)
+        except Exception as e:
+            logger.debug(f"UI turn-plan callback failed: {e}")
+
+    def _emit_turn_plan_payload(self) -> None:
+        """Re-emit the planner's current turn-plan payload (or None)."""
+        try:
+            payload = self._planner.get_turn_plan_payload()
+        except Exception as e:
+            logger.debug(f"get_turn_plan_payload failed: {e}")
+            return
+        self._notify_turn_plan(payload)
 
     def _report_fallback_bug(
         self,

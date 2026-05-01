@@ -1371,7 +1371,11 @@ class StandaloneCoach:
                 enable_tts_preview=True,
             )
 
-            planner = ActionPlanner(autopilot_backend, timeout=config.planning_timeout)
+            planner = ActionPlanner(
+                autopilot_backend,
+                timeout=config.planning_timeout,
+                land_drop_first=config.land_drop_first,
+            )
 
             # Reuse shared VisionMapper if available, otherwise fall back to static coords
             if self._vision_mapper:
@@ -1392,6 +1396,9 @@ class StandaloneCoach:
                 speak_fn=self.speak_advice,
                 ui_advice_fn=self.ui.advice if self.ui else None,
                 bug_report_fn=self._auto_bug_report_bridge_fallback,
+                ui_turn_plan_fn=(
+                    self.ui.turn_plan if self.ui and hasattr(self.ui, "turn_plan") else None
+                ),
             )
             # Give the autopilot a way to write into advice_history so
             # auto-handled decisions (auto-target, auto-pay, etc.) show

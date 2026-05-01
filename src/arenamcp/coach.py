@@ -2403,6 +2403,105 @@ class CoachEngine:
             lines.append(library_summary)
         return lines
 
+    def _resolve_raw_legal_actions(
+        self, game_state: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Pick the freshest raw-action list available.
+
+        Bridge actions are the most authoritative source (they reflect live
+        castability and autotap solutions). For non-ActionsAvailable bridge
+        requests (target-select, search, casting-time options, etc.) an empty
+        bridge action list is itself authoritative — we must NOT fall back
+        to stale `legal_actions_raw` from a previous priority window.
+        """
+        bridge_req = game_state.get("_bridge_request_type")
+        bridge_request_class = game_state.get("_bridge_request_class")
+        bridge_actions = game_state.get("_bridge_actions")
+        is_actions_available_bridge_request = (
+            bridge_req in _ACTIONS_AVAILABLE_BRIDGE_REQUESTS
+            or bridge_request_class in _ACTIONS_AVAILABLE_BRIDGE_REQUESTS
+        )
+        if bridge_req and not is_actions_available_bridge_request:
+            return bridge_actions or []
+        return bridge_actions or game_state.get("legal_actions_raw") or []
+
+    def _post_filter_uncastable_legal_moves(
+        self,
+        lines: list[str],
+        valid_moves: list[str],
+        raw_legal_actions: list[dict[str, Any]],
+        no_target_card_names: set[str],
+        uncastable_card_names: set[str],
+        game_state: dict[str, Any],
+    ) -> None:
+        """Strip uncastable spells from the Legal: and LegalGRE: lines in-place.
+
+        The GRE may report a spell as legal because it considers potential
+        mana abilities, but our mana / target analysis can prove the spell
+        actually can't be cast right now. Showing it as legal anyway makes
+        the LLM suggest spells the engine will reject. This rewrites both
+        lines[1] (the human-readable Legal: line) and any LegalGRE: line in
+        place so the LLM only ever sees actionable options.
+        """
+        cards_to_filter = no_target_card_names | uncastable_card_names
+        non_ok_cast_names = {
+            m[5:].split("[", 1)[0].strip()
+            for m in valid_moves
+            if isinstance(m, str)
+            and m.lower().startswith("cast ")
+            and "[ok]" not in m.lower()
+        }
+        cards_to_filter |= non_ok_cast_names
+        if not valid_moves:
+            return
+
+        filtered_moves = [
+            m for m in valid_moves
+            if not (
+                isinstance(m, str)
+                and m.lower().startswith("cast ")
+                and (
+                    "[ok]" not in m.lower()
+                    or any(f"Cast {nt}" in m for nt in cards_to_filter)
+                )
+            )
+        ]
+        if filtered_moves == valid_moves:
+            return
+
+        if not filtered_moves:
+            new_legal = 'NONE — say "pass priority"'
+        else:
+            new_legal = ", ".join(filtered_moves[:8])
+            if len(filtered_moves) > 8:
+                new_legal += f"... (+{len(filtered_moves) - 8})"
+        lines[1] = f"Legal: {new_legal}"
+
+        if not raw_legal_actions:
+            return
+
+        filter_grp_ids: set[int] = set()
+        for zone_name in ("hand", "command"):
+            for card in game_state.get(zone_name, []):
+                if card.get("name") in cards_to_filter:
+                    gid = card.get("grp_id")
+                    if gid:
+                        filter_grp_ids.add(gid)
+        filtered_raw = [
+            a for a in raw_legal_actions
+            if not (
+                a.get("actionType") == "ActionType_Cast"
+                and (
+                    a.get("grpId") in filter_grp_ids
+                    or not a.get("autoTapSolution")
+                )
+            )
+        ]
+        for i, line in enumerate(lines):
+            if isinstance(line, str) and line.startswith("LegalGRE:"):
+                lines[i] = "LegalGRE: " + _format_legal_actions_raw_for_prompt(filtered_raw)
+                break
+
     def _format_game_context(
         self, game_state: dict[str, Any], question: str = "",
         *, for_planner: bool = False,
@@ -2446,21 +2545,7 @@ class CoachEngine:
             match_tag = f" [Match #{match_num} id={short_id}]"
         lines.append(f"=== NEW GAME ==={match_tag}" if turn_num <= 1 and match_tag else f"=== GAME ==={match_tag}")
         lines.append(f"Legal: {valid_moves_str}")
-        # Bridge request type: authoritative decision classification from GRE
-        bridge_req = game_state.get("_bridge_request_type")
-        bridge_request_class = game_state.get("_bridge_request_class")
-        # Prefer bridge actions (fresher castability/autotap data) over log-parsed.
-        # For non-ActionsAvailable bridge requests, an empty bridge action list is
-        # authoritative and must not fall back to stale priority actions.
-        bridge_actions = game_state.get("_bridge_actions")
-        is_actions_available_bridge_request = (
-            bridge_req in _ACTIONS_AVAILABLE_BRIDGE_REQUESTS
-            or bridge_request_class in _ACTIONS_AVAILABLE_BRIDGE_REQUESTS
-        )
-        if bridge_req and not is_actions_available_bridge_request:
-            raw_legal_actions = bridge_actions or []
-        else:
-            raw_legal_actions = bridge_actions or game_state.get("legal_actions_raw") or []
+        raw_legal_actions = self._resolve_raw_legal_actions(game_state)
         lines.extend(_build_bridge_context_lines(game_state, raw_legal_actions, for_planner=for_planner))
 
         # Post-land planning
@@ -2617,68 +2702,20 @@ class CoachEngine:
         )
         lines.extend(hand_lines)
 
-        # Post-filter: Remove [NO TARGETS] and [NEED:...] cards from Legal line
-        # The GRE may report spells as legal (since it considers potential mana
-        # abilities), but if our mana analysis says NEED, filter them out to
-        # avoid the LLM suggesting unaffordable spells.
-        cards_to_filter = no_target_card_names | uncastable_card_names
-        non_ok_cast_names = {
-            m[5:].split("[", 1)[0].strip()
-            for m in valid_moves
-            if isinstance(m, str)
-            and m.lower().startswith("cast ")
-            and "[ok]" not in m.lower()
-        }
-        cards_to_filter |= non_ok_cast_names
-        if valid_moves:
-            filtered_moves = [
-                m for m in valid_moves
-                if not (
-                    isinstance(m, str)
-                    and m.lower().startswith("cast ")
-                    and (
-                        "[ok]" not in m.lower()
-                        or any(f"Cast {nt}" in m for nt in cards_to_filter)
-                    )
-                )
-            ]
-            if filtered_moves != valid_moves:
-                if not filtered_moves:
-                    new_legal = 'NONE \u2014 say "pass priority"'
-                else:
-                    new_legal = ", ".join(filtered_moves[:8])
-                    if len(filtered_moves) > 8:
-                        new_legal += f"... (+{len(filtered_moves) - 8})"
-                lines[1] = f"Legal: {new_legal}"
-
-                # Also filter LegalGRE raw actions so the LLM can't see
-                # no-target or non-autotap spells as castable in raw GRE data.
-                if raw_legal_actions:
-                    filter_grp_ids = set()
-                    for zone_name in ("hand", "command"):
-                        for card in game_state.get(zone_name, []):
-                            if card.get("name") in cards_to_filter:
-                                gid = card.get("grp_id")
-                                if gid:
-                                    filter_grp_ids.add(gid)
-                    filtered_raw = [
-                        a for a in raw_legal_actions
-                        if not (
-                            a.get("actionType") == "ActionType_Cast"
-                            and (
-                                a.get("grpId") in filter_grp_ids
-                                or not a.get("autoTapSolution")
-                            )
-                        )
-                    ]
-                    for i, line in enumerate(lines):
-                        if isinstance(line, str) and line.startswith("LegalGRE:"):
-                            lines[i] = "LegalGRE: " + _format_legal_actions_raw_for_prompt(filtered_raw)
-                            break
+        # Post-filter: drop spells the GRE thought were legal but our mana /
+        # target analysis says aren't actually castable, and rewrite the
+        # Legal: line and LegalGRE: raw-action line to match.
+        self._post_filter_uncastable_legal_moves(
+            lines,
+            valid_moves,
+            raw_legal_actions,
+            no_target_card_names,
+            uncastable_card_names,
+            game_state,
+        )
 
         return "\n".join(lines)
 
-    # Dead code removed — old _format_game_context body replaced by helper calls above.
     def _filter_legal_attacker_names(
         self, game_state: dict[str, Any], legal_attackers: list[str]
     ) -> list[str]:
@@ -3014,8 +3051,16 @@ class CoachEngine:
         import concurrent.futures
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        complete_kwargs = (
+            {"request_timeout_s": api_timeout}
+            if isinstance(self._backend, ProxyBackend)
+            else {}
+        )
         future = executor.submit(
-            self._backend.complete, effective_system_prompt, user_message
+            self._backend.complete,
+            effective_system_prompt,
+            user_message,
+            **complete_kwargs,
         )
         try:
             response = future.result(timeout=api_timeout)
@@ -3028,9 +3073,9 @@ class CoachEngine:
             # Return error string (not empty) to avoid triggering the
             # consecutive-empty-response restart counter in standalone.py
             response = f"Error: LLM timed out after {api_timeout}s"
-        # Don't wait for thread completion — shutdown(wait=True) would block
-        # until the backend call finishes, defeating the timeout entirely.
-        # The backend's own timeout will clean up the subprocess.
+        # shutdown(wait=False) only abandons the thread; the SDK-level
+        # request_timeout_s above is what actually unblocks it. Without
+        # that, every hung backend call leaks a thread forever.
         executor.shutdown(wait=False)
         api_time = (time.perf_counter() - api_start) * 1000
 
@@ -3111,10 +3156,14 @@ class CoachEngine:
         api_start = time.perf_counter()
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Win plans need more tokens than standard advice (400).
-        # Only ProxyBackend supports the max_tokens kwarg.
+        # Only ProxyBackend supports the max_tokens / request_timeout_s kwargs.
         if isinstance(be, ProxyBackend):
             future = executor.submit(
-                be.complete, system_prompt, user_message, 1200
+                be.complete,
+                system_prompt,
+                user_message,
+                1200,
+                request_timeout_s=api_timeout,
             )
         else:
             future = executor.submit(
@@ -3271,11 +3320,21 @@ class CoachEngine:
         # Try with max_tokens first, fall back to 2-arg call.
         import inspect
         sig = inspect.signature(be.complete)
-        if len(sig.parameters) > 2 or any(
+        accepts_kwargs = len(sig.parameters) > 2 or any(
             p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-        ):
+        )
+        if accepts_kwargs:
+            submit_kwargs = (
+                {"request_timeout_s": api_timeout}
+                if isinstance(be, ProxyBackend)
+                else {}
+            )
             future = executor.submit(
-                be.complete, POST_MATCH_ANALYSIS_PROMPT, user_message, 2048
+                be.complete,
+                POST_MATCH_ANALYSIS_PROMPT,
+                user_message,
+                2048,
+                **submit_kwargs,
             )
         else:
             future = executor.submit(
@@ -3336,10 +3395,18 @@ class CoachEngine:
         user_message = f"{context}{opp_cards_str}\n\nEstimate win probability."
 
         import concurrent.futures
+        api_timeout = 30
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(be.complete, system_prompt, user_message, 200)
+        submit_kwargs = (
+            {"request_timeout_s": api_timeout}
+            if isinstance(be, ProxyBackend)
+            else {}
+        )
+        future = executor.submit(
+            be.complete, system_prompt, user_message, 200, **submit_kwargs
+        )
         try:
-            response = future.result(timeout=30)
+            response = future.result(timeout=api_timeout)
         except concurrent.futures.TimeoutError:
             logger.warning("Win probability timed out")
             response = ""
@@ -3357,7 +3424,14 @@ class CoachEngine:
         1. Strip markdown formatting (headers, bold, bullets) for spoken output
         2. Truncate overly long responses when style is concise
         3. Remove 'Play [Land]' suggestions when no land is in hand
-        4. Fix typos in card names using fuzzy matching
+        4. Fix typos in card names using fuzzy matching against the game state
+
+        This is a band-aid layer over freeform LLM prose. The cleaner long-term
+        fix is to switch the coach to structured JSON output (action + say
+        fields) the way the autopilot planner does — that way the action gets
+        validated against legal actions before TTS reads it, and most of these
+        regex passes go away. Tracked separately; for now we keep the cleanup
+        targeted and data-driven rather than hardcoded.
         """
         if not advice:
             return ""
@@ -3474,46 +3548,59 @@ class CoachEngine:
             all_cards.extend(game_state.get(zone, []))
         all_card_names = {c.get("name", "") for c in all_cards if c.get("name")}
 
-        # Check for land names in hand
-        land_types = {"forest", "island", "swamp", "mountain", "plains"}
-        lands_in_hand = {
-            name for name in hand_names if any(lt in name for lt in land_types)
+        # Build the set of land card names known to this game. Anything with
+        # "Land" in its type_line counts — covers basics, snow, Triomes,
+        # shocks, fetch, Cavern of Souls, etc. The hardcoded basic-only list
+        # we used to keep here missed every modern land.
+        known_land_names = {
+            (c.get("name") or "").lower()
+            for c in all_cards
+            if "land" in (c.get("type_line") or "").lower() and c.get("name")
         }
+        # Generic words the LLM might use even when no specific land card is
+        # actually visible. Kept here (not in a regex literal) so the set is
+        # easy to extend.
+        generic_land_terms = {"a land", "any land", "land"}
 
-        # 1. Remove "Play [Land]" if no land in hand
+        # Check whether any land sits in the local player's hand.
+        local_seat = None
+        for p in game_state.get("players", []):
+            if p.get("is_local"):
+                local_seat = p.get("seat_id")
+                break
+        lands_in_hand: set[str] = set()
+        for c in hand_cards:
+            type_line = (c.get("type_line") or "").lower()
+            name = (c.get("name") or "").lower()
+            if "land" in type_line and name:
+                lands_in_hand.add(name)
+
+        # 1. Remove "Play <X>" suggestions when there's no land in hand.
+        # We match X against actual land card names from this game's state
+        # plus a small set of generic land phrases. This is data-driven
+        # instead of a hardcoded basic-lands list, so Triomes / shocks /
+        # snow basics all get caught too.
         if not lands_in_hand:
-            # Remove patterns like "Play Forest.", "Play Island,", "Play a land."
-            advice = re.sub(
-                r"Play\s+(Forest|Island|Swamp|Mountain|Plains|a land)[.,]?\s*",
-                "",
-                advice,
-                flags=re.IGNORECASE,
-            )
-            # Clean up any resulting double spaces or leading/trailing spaces
-            advice = re.sub(r"\s+", " ", advice).strip()
+            removable_land_names = known_land_names | generic_land_terms
+            if removable_land_names:
+                # Sort longest first so multi-word names match before substrings
+                land_alternatives = sorted(removable_land_names, key=len, reverse=True)
+                land_pattern = re.compile(
+                    r"Play\s+(?:"
+                    + "|".join(re.escape(n) for n in land_alternatives)
+                    + r")[.,]?\s*",
+                    flags=re.IGNORECASE,
+                )
+                advice = land_pattern.sub("", advice)
+                # Clean up any resulting double spaces or leading/trailing spaces
+                advice = re.sub(r"\s+", " ", advice).strip()
 
-        # 2. Fix typos in card names using simple fuzzy matching
-        # Common typos seen from Gemma 3N:
-        typo_fixes = {
-            "brerak out": "Break Out",
-            "braimble familiar": "Bramble Familiar",
-            "llanowar eves": "Llanowar Elves",
-            "llanowar elfs": "Llanowar Elves",
-            "craterhood behemoth": "Craterhoof Behemoth",
-            "creterhoof behemoth": "Craterhoof Behemoth",
-            "crterhoof behemoth": "Craterhoof Behemoth",
-            "baadgermole cub": "Badgermole Cub",
-            "badgremole cub": "Badgermole Cub",
-        }
-
-        advice_lower = advice.lower()
-        for typo, correct in typo_fixes.items():
-            if typo in advice_lower:
-                # Case-insensitive replacement
-                pattern = re.compile(re.escape(typo), re.IGNORECASE)
-                advice = pattern.sub(correct, advice)
-
-        # Also try to match against actual card names in game state
+        # 2. Fix typos in card names by fuzzy-matching against the actual
+        # card names in this game's state. The previous hardcoded
+        # typo-fixes dict (Gemma 3N misreads of specific card names) is
+        # gone — it never scaled past the handful of cards we'd seen
+        # break, and the fuzzy pass below catches the same misspellings
+        # generically as long as the real card is somewhere in state.
         # Split advice into words and check for near-matches
         for card_name in all_card_names:
             if len(card_name) < 4:
@@ -3543,11 +3630,7 @@ class CoachEngine:
         # 3. Remove Cast suggestions for cards that cost more mana than available
         # Calculate available mana (lands on battlefield + land drop potential)
         battlefield = game_state.get("battlefield", [])
-        local_seat = None
-        for p in game_state.get("players", []):
-            if p.get("is_local"):
-                local_seat = p.get("seat_id")
-                break
+        # local_seat already resolved above when computing land state.
 
         # Count untapped lands we control
         untapped_lands = 0

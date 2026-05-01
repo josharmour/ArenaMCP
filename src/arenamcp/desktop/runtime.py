@@ -98,11 +98,10 @@ def _is_app_root(path: Path) -> bool:
 
     pyproject = path / "pyproject.toml"
     src_dir = path / "src" / "arenamcp"
-    launcher_dir = path / "installer" / "MtgaCoachLauncher"
     bridge_dir = path / "bepinex-plugin" / "MtgaCoachBridge"
     if pyproject.exists() and src_dir.is_dir():
         return True
-    if src_dir.is_dir() and (launcher_dir.is_dir() or bridge_dir.is_dir()):
+    if src_dir.is_dir() and bridge_dir.is_dir():
         return True
     return False
 

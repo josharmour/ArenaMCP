@@ -3,7 +3,7 @@
 #define MyAppURL "https://github.com/josharmour/mtgacoach"
 
 #ifndef AppVersion
-  #define AppVersion "2.2.3"
+  #define AppVersion "2.3.0"
 #endif
 
 [Setup]
@@ -33,7 +33,7 @@ SetupLogging=yes
 Name: "desktopicon"; Description: "Create a desktop icon"; GroupDescription: "Additional icons:"
 
 [InstallDelete]
-; Remove obsolete WinUI launcher from prior installs (v2.0.1 and earlier).
+; Remove obsolete launcher files from prior installs (v2.0.1 and earlier).
 Type: filesandordirs; Name: "{app}\launcher"
 Type: filesandordirs; Name: "{app}\runtime"
 

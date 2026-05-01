@@ -52,7 +52,6 @@ C:\Users\joshu\AppData\Local\mtgacoach\venv\Scripts\python.exe -m pip install -e
 
 - `C:\Users\Public\Desktop\mtgacoach.lnk`
 - `C:\Program Files\mtgacoach\...`
-- `installer\MtgaCoachLauncher\bin\...`
 - `mtgacoach-dev.lnk`
 
 Those are no longer part of the source-iteration workflow.
@@ -83,4 +82,4 @@ C:\Users\joshu\AppData\Local\mtgacoach\venv\Scripts\python.exe -m pytest Z:\Aren
 
 - The PySide6 app is the full desktop app now: coach UI plus repair/install flows.
 - The coaching engine still runs as a subprocess internally over the existing JSON pipe protocol. That separation is intentional and keeps the UI responsive while preserving the current backend seam.
-- Customer releases are now expected to come from the packaged PySide installer built by `installer\build-installer.ps1`, not the old WinUI launcher.
+- Customer releases come from the packaged PySide installer built by `installer\build-installer.ps1`.
