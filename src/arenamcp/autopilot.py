@@ -116,6 +116,40 @@ def _match_target_in_battlefield(
     return None, None
 
 
+_PLANNER_CARD_NAME_PREFIXES = (
+    "ability:",
+    "activate ability:",
+    "activate:",
+    "play land:",
+    "cast:",
+    "cast spell:",
+)
+
+
+def _normalize_planner_card_name(name: str) -> str:
+    """Strip leading legal-action-string labels the LLM sometimes leaves on.
+
+    The legal_actions strings the planner reads are formatted like
+    "Activate Ability: Promising Vein" / "Cast Lightning Bolt", and the
+    schema instructs the LLM to put just the card name in `card_name`.
+    Models occasionally keep the label prefix anyway. The bridge match
+    path does case-insensitive equality against the bridge's resolved
+    card name ("Promising Vein"), so an unstripped prefix silently
+    breaks every type+name match for that ability.
+
+    Strips one matching prefix, case-insensitively. Idempotent on
+    already-clean names.
+    """
+    if not name:
+        return name
+    stripped = name.strip()
+    lo = stripped.lower()
+    for prefix in _PLANNER_CARD_NAME_PREFIXES:
+        if lo.startswith(prefix):
+            return stripped[len(prefix):].strip()
+    return stripped
+
+
 class ExecutionPath:
     """Tracks which execution path was used for an action.
 
@@ -2964,13 +2998,17 @@ class AutopilotEngine:
                 # which submits the wrong card when multiple casts are legal
                 # (e.g. submitting Michelangelo instead of Emerald Medallion).
                 best_idx = None
+                # Strip any leading "Ability: " / "Cast: " etc. label the LLM
+                # may have left on action.card_name (the legal_actions strings
+                # use those labels and models occasionally copy them through).
+                wanted_name = _normalize_planner_card_name(action.card_name or "")
                 for idx, ba in enumerate(bridge_actions):
                     ba_type = ba.get("actionType", "")
                     # Normalize comparison
                     if not (ba_type == gre_type or f"ActionType_{ba_type}" == gre_type or ba_type == gre_type.replace("ActionType_", "")):
                         continue
                     # Verify card identity via grpId → card name lookup
-                    if action.card_name:
+                    if wanted_name:
                         ba_grp_id = ba.get("grpId", 0)
                         if ba_grp_id:
                             try:
@@ -2979,8 +3017,14 @@ class AutopilotEngine:
                                 ba_name = card_info.get("name", "")
                             except Exception:
                                 ba_name = ""
-                            if ba_name and ba_name.lower() != action.card_name.lower():
-                                continue  # Wrong card — skip
+                            if ba_name:
+                                w = wanted_name.lower()
+                                c = ba_name.lower()
+                                # Allow substring-in-either-direction so split
+                                # cards / faces (e.g. "Lightning Bolt //
+                                # Shock") and shorthand still match.
+                                if not (w == c or w in c or c in w):
+                                    continue  # Wrong card — skip
                     best_idx = idx
                     break
 
