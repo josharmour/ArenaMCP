@@ -24,16 +24,9 @@ namespace MtgaCoachBridge
         private static ManualLogSource _log;
         private Thread _pipeThread;
         private volatile bool _running;
-        private readonly ConcurrentQueue<PipeCommand> _pendingCommands = new ConcurrentQueue<PipeCommand>();
-        private SynchronizationContext _unityContext;
-        private int _mainThreadId;
 
         private BaseUserRequest _lastKnownRequest;
         private readonly object _interactionLock = new object();
-
-        // Cached reference to GameManager (only valid on main thread)
-        private GameManager _cachedGameManager;
-        private float _lastGameManagerLookup;
 
         private sealed class CastingTimeOptionEntry
         {
@@ -78,13 +71,13 @@ namespace MtgaCoachBridge
             _log = Logger;
             _log.LogInfo($"MtgaCoachBridge v{PluginInfo.Version} loaded");
             DontDestroyOnLoad(gameObject);
-            _unityContext = SynchronizationContext.Current;
-            _mainThreadId = Thread.CurrentThread.ManagedThreadId;
-            _log.LogInfo(
-                _unityContext != null
-                    ? $"Captured Unity synchronization context on thread {_mainThreadId}"
-                    : $"Unity synchronization context unavailable on thread {_mainThreadId}; falling back to Update() dispatch"
-            );
+
+            // Unity-thread state (sync context, command queue, GameManager
+            // cache) lives on a separate persistent host. BepInEx's manager
+            // GameObject — which owns this Plugin — gets destroyed on the
+            // first MTGA scene transition. The host survives because it is
+            // a root-level GameObject we own with HideAndDontSave + DDOL.
+            MtgaCoachHost.CreateOrFind(_log, ExecutePipeCommand);
 
             _running = true;
             _pipeThread = new Thread(PipeClientLoop)
@@ -97,20 +90,7 @@ namespace MtgaCoachBridge
 
         private void OnDestroy()
         {
-            _log.LogInfo("OnDestroy called — pipe thread continues and main-thread dispatch uses the captured synchronization context");
-        }
-
-        private void Update()
-        {
-            DrainPendingCommands();
-        }
-
-        private void DrainPendingCommands()
-        {
-            while (_pendingCommands.TryDequeue(out var cmd))
-            {
-                ExecutePipeCommand(cmd);
-            }
+            _log?.LogInfo("Plugin OnDestroy — pipe thread + persistent host continue");
         }
 
         private void ExecutePipeCommand(PipeCommand cmd)
@@ -132,20 +112,34 @@ namespace MtgaCoachBridge
 
         private JObject DispatchCommandToUnityThread(PipeCommand cmd, int timeoutMs)
         {
-            if (Thread.CurrentThread.ManagedThreadId == _mainThreadId)
+            var host = MtgaCoachHost.Instance;
+            if (host == null)
+            {
+                cmd.SetResponse(new JObject
+                {
+                    ["ok"] = false,
+                    ["error"] = "MtgaCoachHost not available"
+                });
+                return cmd.WaitForResponse(timeoutMs);
+            }
+
+            if (Thread.CurrentThread.ManagedThreadId == host.MainThreadId)
             {
                 ExecutePipeCommand(cmd);
                 return cmd.WaitForResponse(timeoutMs);
             }
 
-            var unityContext = _unityContext;
+            var unityContext = host.UnityContext;
             if (unityContext != null)
             {
+                // Primary path: Post via captured Unity SyncContext.
+                // Fallback queue is processed by the host's Update() if Post
+                // ever fails to deliver.
                 unityContext.Post(_ => ExecutePipeCommand(cmd), null);
             }
             else
             {
-                _pendingCommands.Enqueue(cmd);
+                host.PendingCommands.Enqueue(cmd);
             }
 
             return cmd.WaitForResponse(timeoutMs);
@@ -299,13 +293,18 @@ namespace MtgaCoachBridge
 
         private GameManager GetGameManager()
         {
-            float now = Time.unscaledTime;
-            if (_cachedGameManager == null || now - _lastGameManagerLookup > 5f)
+            // Host's Update() refreshes this every second. The host lives on
+            // its own DDOL'd GameObject so it survives MTGA scene transitions
+            // even when this Plugin's MonoBehaviour is destroyed.
+            var host = MtgaCoachHost.Instance;
+            if (host != null)
             {
-                _cachedGameManager = FindObjectOfType<GameManager>();
-                _lastGameManagerLookup = now;
+                var cached = host.GetGameManager();
+                if (cached != null)
+                    return cached;
             }
-            return _cachedGameManager;
+            // Fallback: direct lookup (e.g. before host's first Update tick).
+            return FindObjectOfType<GameManager>();
         }
 
         // -------------------------------------------------------------------
@@ -4040,6 +4039,6 @@ namespace MtgaCoachBridge
     {
         public const string GUID = "com.mtgacoach.grebridge";
         public const string Name = "MtgaCoach GRE Bridge";
-        public const string Version = "0.6.1";
+        public const string Version = "0.6.2";
     }
 }

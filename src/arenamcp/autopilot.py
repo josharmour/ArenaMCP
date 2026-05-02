@@ -914,8 +914,14 @@ class AutopilotEngine:
     ) -> bool:
         """Detect "planner picked an action the bridge no longer offers".
 
-        Three known stale-state shapes:
+        Known stale-state shapes:
 
+        0. **Bridge has no pending request at all** — the priority window
+           closed between plan-generation and submission. Any planner action
+           would just produce ``bridge_submit_failed``; treat as stale so we
+           re-plan cleanly instead of filing a noise bug report. Cluster:
+           issues #191 #194 (post-resolution race) and the duplicates #192
+           #193 (match-boundary takeover).
         1. ``play_land`` / ``cast_spell`` against an ActionsAvailable request
            that has no matching Play/Cast entries — planner saw stale
            ``legal_actions`` (e.g. user already used their land drop). Cluster
@@ -932,21 +938,32 @@ class AutopilotEngine:
            still ActionsAvailable / SelectN / etc. (window changes during the
            planner's LLM call). Surfacing manual-required is misleading
            because the user can't act on a step that hasn't started yet.
+        4. ``select_n`` / ``select_target`` / ``search_library`` /
+           ``select_counters`` against a non-selection bridge request. These
+           need SelectN / SelectTargets / Search / Group request types.
 
         For everything else we return False so the normal
         ``bridge_submit_failed`` path still files a bug — those are real
         bridge issues worth investigating.
         """
+        bridge_type = str(game_state.get("_bridge_request_type") or "")
+        bridge_class = str(game_state.get("_bridge_request_class") or "")
+
+        # Shape 0: bridge connected but no pending request at all. Any submit
+        # would hit "no pending window" — the priority window closed. Skip
+        # rather than file a bridge_submit_failed bug. Excluded action types:
+        # ones that legitimately submit while no GRE request is pending (none
+        # currently — every submit path needs a target request).
+        if not bridge_type and not bridge_class:
+            return True
+
         if action.action_type in (ActionType.PLAY_LAND, ActionType.CAST_SPELL):
             # Shape 2: bridge has a different request type pending entirely.
-            bridge_type = str(game_state.get("_bridge_request_type") or "")
-            bridge_class = str(game_state.get("_bridge_request_class") or "")
-            has_request = bool(bridge_type or bridge_class)
             is_actions_available = (
                 bridge_type in _ACTIONS_AVAILABLE_BRIDGE_REQUESTS
                 or bridge_class in _ACTIONS_AVAILABLE_BRIDGE_REQUESTS
             )
-            if has_request and not is_actions_available:
+            if not is_actions_available:
                 return True
 
             # Shape 1: bridge IS ActionsAvailable but doesn't offer the
@@ -962,8 +979,6 @@ class AutopilotEngine:
             return True
 
         if action.action_type in (ActionType.DECLARE_ATTACKERS, ActionType.DECLARE_BLOCKERS):
-            bridge_class = str(game_state.get("_bridge_request_class") or "")
-            bridge_type = str(game_state.get("_bridge_request_type") or "")
             expected = (
                 "DeclareAttacker"
                 if action.action_type == ActionType.DECLARE_ATTACKERS
@@ -975,21 +990,21 @@ class AutopilotEngine:
             # planner's legal_actions snapshot was stale.
             return True
 
-        # Shape #4: SelectN-family / search_library — these need a SelectN
-        # or Search bridge request to land. If the bridge has no pending
-        # request at all (the window resolved between plan and submit), or
-        # has a totally different request, it's stale — the planner saw a
-        # decision that's already been resolved.
+        # Shape #4: selection-family — SelectN / SelectTargets / Search /
+        # Group / SelectReplacement etc. all expect a "selection-class"
+        # bridge request to be pending. If the bridge has a different
+        # request, it's stale — the planner saw a decision that's already
+        # been resolved or hasn't started.
         if action.action_type in (
             ActionType.SELECT_N,
+            ActionType.SELECT_TARGET,
             ActionType.SEARCH_LIBRARY,
             ActionType.SELECT_COUNTERS,
+            ActionType.SELECT_REPLACEMENT,
         ):
-            bridge_class = str(game_state.get("_bridge_request_class") or "")
-            bridge_type = str(game_state.get("_bridge_request_type") or "")
             looks_compatible = any(
                 kw in bridge_class or kw in bridge_type
-                for kw in ("SelectN", "Search", "Group")
+                for kw in ("SelectN", "SelectTarget", "Search", "Group", "SelectReplacement")
             )
             if looks_compatible:
                 return False
@@ -2481,19 +2496,17 @@ class AutopilotEngine:
             return []
 
     def _format_plan_preview(self, plan: ActionPlan) -> str:
-        """Format a plan for human-readable preview."""
+        """Format a plan for human-readable preview.
+
+        Hotkey hints (F1/F4/F11) are intentionally not appended here — the
+        advice overlay should show only the advice itself. Hotkeys are
+        documented in the desktop UI and remain functional regardless.
+        """
         lines = [f"PLAN: {plan.overall_strategy}"]
         for i, action in enumerate(plan.actions, 1):
             lines.append(f"  {i}. {action}")
             if action.reasoning:
                 lines.append(f"     ({action.reasoning})")
-        delay = self._config.auto_execute_delay
-        if delay > 0 and not self._config.confirm_plan:
-            lines.append(f"[Auto-executing in {delay:.0f}s | F1/F4=cancel | F11=abort]")
-        elif self._config.confirm_plan:
-            lines.append("[F1=confirm | F4=skip | F11=abort]")
-        else:
-            lines.append("[Executing immediately | F11=abort]")
         return "\n".join(lines)
 
     def _notify(self, label: str, text: str) -> None:

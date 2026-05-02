@@ -360,11 +360,11 @@ class CoachTab(QWidget):
         )
         button_row.addWidget(self._overlay_toggle_btn)
 
-        # Advice panel corner cycle — click to move the panel between the
-        # four corners of MTGA.
-        self._advice_anchor_btn = QPushButton("Advice Corner")
-        self._advice_anchor_btn.setToolTip("Click to move the advice panel to a different corner")
-        self._advice_anchor_btn.clicked.connect(self._cycle_advice_anchor)
+        # Reset advice panel — drag the panel anywhere over MTGA to move it,
+        # use the corner grip to resize. Click this button to put it back.
+        self._advice_anchor_btn = QPushButton("Reset Advice Panel")
+        self._advice_anchor_btn.setToolTip("Snap the advice panel back to its default position and size")
+        self._advice_anchor_btn.clicked.connect(self._reset_advice_panel)
         button_row.addWidget(self._advice_anchor_btn)
 
         top_layout.addLayout(button_row)
@@ -463,13 +463,13 @@ class CoachTab(QWidget):
         """Route commands from the overlay HUD buttons."""
         self._send_command(command)
 
-    def _cycle_advice_anchor(self) -> None:
-        """Move the match overlay's advice panel to the next corner."""
+    def _reset_advice_panel(self) -> None:
+        """Reset the match overlay's advice panel to its default position."""
         try:
-            new_anchor = self._match_overlay.cycle_advice_anchor()
-            self.append_log(f"Advice panel: {new_anchor}", role="status")
+            self._match_overlay.reset_advice_panel_position()
+            self.append_log("Advice panel: reset to default position", role="status")
         except Exception as exc:
-            self.append_log(f"Failed to move advice panel: {exc}", role="error")
+            self.append_log(f"Failed to reset advice panel: {exc}", role="error")
 
     def _toggle_status_section(self) -> None:
         """Collapse/expand the Status section."""

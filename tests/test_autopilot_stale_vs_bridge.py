@@ -115,15 +115,74 @@ def test_play_land_against_actions_available_without_play_is_stale():
     assert engine._is_planner_action_stale_vs_bridge(_make_play_land(), state) is True
 
 
-def test_play_land_with_no_bridge_request_at_all_is_not_stale():
-    """No bridge request info → don't second-guess; let the normal path run."""
+def test_play_land_with_no_bridge_request_at_all_is_stale():
+    """Shape #0 — bridge connected but no pending request at all means the
+    priority window closed during planning. Issues #191 and #194 are the
+    bug reports this auto-files when we don't catch it as stale.
+    """
     engine, _ = _engine_with_method()
     state = {
         "_bridge_request_type": None,
         "_bridge_request_class": None,
         "_bridge_actions": None,
     }
-    assert engine._is_planner_action_stale_vs_bridge(_make_play_land(), state) is False
+    assert engine._is_planner_action_stale_vs_bridge(_make_play_land(), state) is True
+
+
+def test_select_target_with_no_bridge_request_is_stale():
+    """Issue #191 specifically — autopilot tried select_target on a target
+    that already resolved, bridge had no pending request. Was filing
+    bridge_submit_failed; should stale-skip silently and re-plan.
+    """
+    engine, ap = _engine_with_method()
+    action = ap.GameAction(
+        action_type=ap.ActionType.SELECT_TARGET,
+        target_names=["Tsagan, Raider Warlord"],
+    )
+    state = {
+        "_bridge_request_type": None,
+        "_bridge_request_class": None,
+    }
+    assert engine._is_planner_action_stale_vs_bridge(action, state) is True
+
+
+def test_select_target_against_select_targets_request_is_not_stale():
+    engine, ap = _engine_with_method()
+    action = ap.GameAction(
+        action_type=ap.ActionType.SELECT_TARGET,
+        target_names=["Llanowar Elves"],
+    )
+    state = {
+        "_bridge_request_type": "SelectTargets",
+        "_bridge_request_class": "SelectTargetsRequest",
+    }
+    assert engine._is_planner_action_stale_vs_bridge(action, state) is False
+
+
+def test_select_target_against_actions_available_is_stale():
+    """Window changed before submit — planner picked select_target but
+    bridge moved on to a fresh ActionsAvailable window."""
+    engine, ap = _engine_with_method()
+    action = ap.GameAction(
+        action_type=ap.ActionType.SELECT_TARGET,
+        target_names=["Llanowar Elves"],
+    )
+    state = {
+        "_bridge_request_type": "ActionsAvailable",
+        "_bridge_request_class": "ActionsAvailableRequest",
+    }
+    assert engine._is_planner_action_stale_vs_bridge(action, state) is True
+
+
+def test_cast_spell_with_no_bridge_request_is_stale():
+    """Issue #194 — autopilot tried to re-cast Michelangelo after it had
+    already resolved, bridge had no pending request."""
+    engine, _ = _engine_with_method()
+    state = {
+        "_bridge_request_type": None,
+        "_bridge_request_class": None,
+    }
+    assert engine._is_planner_action_stale_vs_bridge(_make_cast_spell("Michelangelo"), state) is True
 
 
 def test_declare_attackers_against_main_phase_request_is_stale():

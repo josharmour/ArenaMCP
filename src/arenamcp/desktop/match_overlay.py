@@ -42,6 +42,8 @@ except Exception:
     find_mtga_hwnd = None  # type: ignore[assignment]
     get_client_rect = None  # type: ignore[assignment]
 
+from arenamcp.desktop.advice_panel import AdvicePanelWindow
+
 logger = logging.getLogger(__name__)
 
 
@@ -112,16 +114,12 @@ class MatchOverlayWindow(QWidget):
         self._calib_drag_oy0: float = 0.0
         self._calib_saved_at: float = 0.0
         self._load_calibration()
-        # Latest coach advice (plain text). Displayed on the overlay so the
-        # user can keep eyes on MTGA instead of switching windows.
-        self._advice_text: str = ""
-        self._advice_seat: str = ""
-        self._advice_expire_at: float = 0.0
-        # Position of the advice panel corner, expressed as a fraction of
-        # the overlay window (0..1 in x/y). Default = bottom-left.
-        # User can move it via settings or future drag gesture.
-        self._advice_panel_anchor: str = "bottom-left"  # or "top-left", "top-right", "bottom-right"
-        # Whether to show the advice panel at all (may want pill only).
+        # Advice display moved off the click-through overlay onto a separate
+        # mouse-interactive top-level window (AdvicePanelWindow). The overlay
+        # only forwards advice to it; all rendering, drag, resize, and
+        # persistence live there. Anchor field retained on disk for backward
+        # compatibility but ignored by the new panel.
+        self._advice_panel: AdvicePanelWindow = AdvicePanelWindow()
         self._show_advice_panel: bool = True
 
         self.setWindowFlags(
@@ -150,6 +148,10 @@ class MatchOverlayWindow(QWidget):
         for t in (self._follow_timer, self._position_timer, self._pulse_timer):
             if t.isActive():
                 t.stop()
+        try:
+            self._advice_panel.close()
+        except Exception:
+            pass
         super().closeEvent(event)
 
     # -- Public API ----------------------------------------------------------
@@ -161,34 +163,29 @@ class MatchOverlayWindow(QWidget):
     def set_enabled(self, enabled: bool) -> None:
         """Toggle the entire overlay on/off without destroying it."""
         self._user_enabled = enabled
-        if not enabled and self.isVisible():
-            self.hide()
+        if not enabled:
+            if self.isVisible():
+                self.hide()
+            if self._advice_panel.isVisible():
+                self._advice_panel.hide()
 
     def set_advice_panel_visible(self, visible: bool) -> None:
         """Show or hide just the advice panel (keeps pill + highlights)."""
         self._show_advice_panel = bool(visible)
-        self.update()
+        if visible:
+            if self._user_enabled and self._get_mtga_rect() is not None:
+                self._advice_panel.show()
+        else:
+            self._advice_panel.hide()
 
-    def set_advice_anchor(self, anchor: str) -> None:
-        """Move the advice panel. Valid anchors:
-        'top-right', 'top-left', 'bottom-right', 'bottom-left'.
+    def reset_advice_panel_position(self) -> None:
+        """Snap the advice panel back to its default position/size and
+        persist. Useful if the user has dragged it off-screen.
         """
-        if anchor in ("top-right", "top-left", "bottom-right", "bottom-left"):
-            self._advice_panel_anchor = anchor
-            self._save_advice_anchor()
-            self.update()
-
-    def cycle_advice_anchor(self) -> str:
-        """Rotate through the four corners. Returns the new anchor."""
-        order = ["top-right", "bottom-right", "bottom-left", "top-left"]
         try:
-            idx = order.index(self._advice_panel_anchor)
-        except ValueError:
-            idx = -1
-        self._advice_panel_anchor = order[(idx + 1) % len(order)]
-        self._save_advice_anchor()
-        self.update()
-        return self._advice_panel_anchor
+            self._advice_panel.reset_to_default()
+        except Exception as exc:
+            logger.debug(f"reset advice panel failed: {exc}")
 
     def on_match_active(self, active: bool) -> None:
         """Let the coach tell us whether a match is in progress. When inactive,
@@ -261,22 +258,8 @@ class MatchOverlayWindow(QWidget):
         self.update()
 
     def set_advice(self, text: str, seat_info: str = "") -> None:
-        """Set the latest advice text to display on the overlay.
-
-        Coach passes this along with each advice event. The overlay keeps
-        it visible for ADVICE_TTL_SEC seconds or until replaced by a new
-        advice. Pass empty text to clear immediately.
-        """
-        text = (text or "").strip()
-        if not text:
-            self._advice_text = ""
-            self._advice_seat = ""
-            self._advice_expire_at = 0.0
-        else:
-            self._advice_text = text
-            self._advice_seat = seat_info
-            self._advice_expire_at = time.time() + self.ADVICE_TTL_SEC
-        self.update()
+        """Set the latest advice text. Forwarded to AdvicePanelWindow."""
+        self._advice_panel.set_advice(text, seat_info)
 
     # -- Calibration persistence --------------------------------------------
 
@@ -312,11 +295,6 @@ class MatchOverlayWindow(QWidget):
                 self._calib_scale_x = 1.0
             if self._calib_scale_y <= 0:
                 self._calib_scale_y = 1.0
-            saved_anchor = data.get("advice_anchor")
-            if saved_anchor in (
-                "top-right", "top-left", "bottom-right", "bottom-left"
-            ):
-                self._advice_panel_anchor = saved_anchor
         except Exception as e:
             logger.debug(f"load overlay_calibration failed: {e}")
 
@@ -337,8 +315,9 @@ class MatchOverlayWindow(QWidget):
 
     def _save_calibration(self) -> None:
         try:
-            # Merge with any advice_anchor already on disk so hitting Ctrl+S
-            # in calibration doesn't wipe the user's corner preference.
+            # Merge with whatever else is on disk (advice_panel block,
+            # legacy advice_anchor) so calibration save doesn't wipe the
+            # advice panel's persisted geometry.
             existing = self._read_calibration_file()
             data = {
                 **existing,
@@ -346,7 +325,6 @@ class MatchOverlayWindow(QWidget):
                 "offset_y": round(self._calib_offset_y, 3),
                 "scale_x": round(self._calib_scale_x, 5),
                 "scale_y": round(self._calib_scale_y, 5),
-                "advice_anchor": self._advice_panel_anchor,
             }
             self._write_calibration_file(data)
             self._calib_saved_at = time.time()
@@ -354,16 +332,6 @@ class MatchOverlayWindow(QWidget):
         except Exception as e:
             logger.error(f"save overlay_calibration failed: {e}")
         self.update()
-
-    def _save_advice_anchor(self) -> None:
-        """Persist just the advice anchor without touching calibration."""
-        try:
-            existing = self._read_calibration_file()
-            existing["advice_anchor"] = self._advice_panel_anchor
-            self._write_calibration_file(existing)
-            logger.info(f"advice_anchor saved: {self._advice_panel_anchor}")
-        except Exception as e:
-            logger.debug(f"save advice_anchor failed: {e}")
 
     def _reset_calibration(self) -> None:
         """Revert in-memory calibration to identity. Does not delete the
@@ -603,6 +571,8 @@ class MatchOverlayWindow(QWidget):
         if not should_show:
             if self.isVisible():
                 self.hide()
+            if self._advice_panel.isVisible():
+                self._advice_panel.hide()
             return
 
         # Match MTGA window bounds so our local coords align with it
@@ -613,15 +583,16 @@ class MatchOverlayWindow(QWidget):
         now = time.time()
         if self._suggested_actions and now > self._actions_expire_at:
             self.clear_actions()
-        # Expire stale advice
-        if self._advice_text and now > self._advice_expire_at:
-            self._advice_text = ""
-            self._advice_seat = ""
-            self.update()
 
         if not self.isVisible():
             self.show()
             self._apply_click_through()
+
+        # Drive the advice panel: keep it positioned relative to MTGA and
+        # visible whenever the overlay is.
+        self._advice_panel.apply_mtga_rect(rect)
+        if self._show_advice_panel and not self._advice_panel.isVisible():
+            self._advice_panel.show()
 
         # Force topmost on every tick. MTGA's borderless-fullscreen mode
         # often pushes non-foreground windows behind it even when they have
@@ -781,10 +752,9 @@ class MatchOverlayWindow(QWidget):
 
         # Always-visible "armed" badge whenever the overlay is shown (i.e.
         # MTGA is detected). Calibration mode has its own visualization.
+        # Advice text is rendered by the separate AdvicePanelWindow.
         if not self._calibration_mode:
             self._draw_armed_badge(painter)
-            if self._advice_text and self._show_advice_panel:
-                self._draw_advice_panel(painter)
 
         # Calibration mode: draw a thin outline around every detected card
         # so we can verify BepInEx is returning accurate positions.
@@ -936,94 +906,6 @@ class MatchOverlayWindow(QWidget):
             font.setPixelSize(16)
             painter.setFont(font)
             painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, str(sequence))
-
-    def _draw_advice_panel(self, painter: QPainter) -> None:
-        """Render the latest coach advice as a panel in the top-right corner.
-
-        Word-wrapped; fades out after ADVICE_TTL_SEC seconds or when
-        replaced. Styled to stand out against MTGA art but not block
-        important game elements.
-        """
-        max_w = min(480, self.width() // 3)
-        pad_x = 14
-        pad_y = 10
-
-        title_font = QFont(); title_font.setPixelSize(11); title_font.setBold(True)
-        body_font = QFont(); body_font.setPixelSize(15)
-
-        painter.setFont(body_font)
-        # Crude word-wrap via QFontMetrics.boundingRect with text width
-        metrics = painter.fontMetrics()
-        wrap_rect = metrics.boundingRect(
-            0, 0, max_w - pad_x * 2, 10000,
-            Qt.TextFlag.TextWordWrap,
-            self._advice_text,
-        )
-        body_w = wrap_rect.width()
-        body_h = wrap_rect.height()
-
-        painter.setFont(title_font)
-        title_metrics = painter.fontMetrics()
-        title = f"COACH{f'  ·  {self._advice_seat}' if self._advice_seat else ''}"
-        title_h = title_metrics.height()
-
-        panel_w = max(body_w, title_metrics.horizontalAdvance(title)) + pad_x * 2
-        panel_h = title_h + 6 + body_h + pad_y * 2
-
-        margin_x = 14
-        # Drop the top margin below the usual MTGA title/player banner row
-        # so the panel doesn't cover opponent name, mana icons, or the
-        # close button.
-        margin_top = 48
-        margin_bottom = 40  # leaves room for the pill
-        anchor = self._advice_panel_anchor
-        if anchor == "top-right":
-            panel_x = self.width() - panel_w - margin_x
-            panel_y = margin_top
-        elif anchor == "top-left":
-            panel_x = margin_x
-            panel_y = margin_top
-        elif anchor == "bottom-left":
-            panel_x = margin_x
-            panel_y = self.height() - panel_h - margin_bottom
-        else:  # bottom-right (default fallback)
-            panel_x = self.width() - panel_w - margin_x
-            panel_y = self.height() - panel_h - margin_bottom
-
-        # Background + accent border
-        bg = QColor(18, 22, 28, 225)
-        accent = QColor(105, 212, 108)  # green (advice)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(bg)
-        painter.drawRoundedRect(panel_x, panel_y, panel_w, panel_h, 8, 8)
-        painter.setPen(QPen(accent, 2))
-        painter.setBrush(Qt.NoBrush)
-        painter.drawRoundedRect(panel_x, panel_y, panel_w, panel_h, 8, 8)
-        # Accent bar on the left edge
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(accent)
-        painter.drawRect(panel_x, panel_y, 3, panel_h)
-
-        # Title
-        painter.setFont(title_font)
-        painter.setPen(QColor(148, 163, 184))  # cool grey
-        painter.drawText(
-            panel_x + pad_x, panel_y + pad_y + title_h - 3, title
-        )
-
-        # Body
-        painter.setFont(body_font)
-        painter.setPen(QColor(240, 244, 248))
-        body_rect = QRect(
-            panel_x + pad_x, panel_y + pad_y + title_h + 6, body_w, body_h
-        )
-        painter.drawText(
-            body_rect, int(Qt.TextFlag.TextWordWrap), self._advice_text
-        )
-        # Reset brush so later paint calls (ring draws, badge) don't
-        # inherit the green accent fill.
-        painter.setBrush(Qt.NoBrush)
-        painter.setPen(Qt.NoPen)
 
     def _draw_armed_badge(self, painter: QPainter) -> None:
         """Small unobtrusive badge confirming the overlay is alive in a match.
