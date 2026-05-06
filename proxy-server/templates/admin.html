@@ -102,6 +102,7 @@
     <div id="dashboard" class="panel container">
         <div class="tabs">
             <div class="tab active" onclick="showTab('activity')">Activity</div>
+            <div class="tab" onclick="showTab('eval')">Eval</div>
             <div class="tab" onclick="showTab('subscribers')">Subscribers</div>
             <div class="tab" onclick="showTab('messages')">Messages</div>
             <div class="tab" onclick="showTab('usage')">Usage</div>
@@ -126,6 +127,45 @@
                 <canvas id="activity-chart" style="display:none"></canvas>
                 <div id="activity-empty" class="activity-empty">Loading…</div>
             </div>
+        </div>
+
+        <!-- Eval tab -->
+        <div id="tab-eval" class="panel">
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap">
+                <h2 style="margin:0">LLM Coach Eval</h2>
+                <button class="btn btn-sm" style="background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="loadEval()">Refresh</button>
+                <span id="eval-empty-hint" style="font-size:0.85rem;color:var(--muted);display:none"></span>
+            </div>
+
+            <h3 style="font-size:1.1rem;margin:16px 0 8px;color:var(--accent)">General LLM eval</h3>
+            <p style="font-size:0.85rem;color:var(--muted);margin-bottom:12px">
+                Replays captured coach prompts through one or more backends; scored by an online judge model on a 1-5 rubric (correctness, reasoning, conciseness, legality).
+            </p>
+            <div class="stats" id="eval-general-stats"></div>
+            <div class="activity-chart-wrap" style="min-height:280px">
+                <canvas id="eval-general-chart" style="display:none"></canvas>
+                <div id="eval-general-empty" class="activity-empty">No general-eval results uploaded yet.</div>
+            </div>
+            <div class="activity-chart-wrap" style="min-height:240px">
+                <canvas id="eval-general-hist" style="display:none"></canvas>
+                <div id="eval-general-hist-empty" class="activity-empty">Score histograms appear once results land.</div>
+            </div>
+            <div id="eval-general-meta" style="font-size:0.8rem;color:var(--muted)"></div>
+
+            <h3 style="font-size:1.1rem;margin:32px 0 8px;color:var(--accent)">17lands mulligan eval</h3>
+            <p style="font-size:0.85rem;color:var(--muted);margin-bottom:12px">
+                Asks each backend to KEEP or MULLIGAN a real diamond+ opening hand. Ground truth = empirical higher-WR option in the bucket. <b>Higher-WR pick rate</b> is the headline metric: 50% = coin flip, 70%+ = real signal.
+            </p>
+            <div class="stats" id="eval-17l-stats"></div>
+            <div class="activity-chart-wrap" style="min-height:280px">
+                <canvas id="eval-17l-chart" style="display:none"></canvas>
+                <div id="eval-17l-empty" class="activity-empty">No 17lands-mulligan results uploaded yet.</div>
+            </div>
+            <div class="activity-chart-wrap" style="min-height:240px">
+                <canvas id="eval-17l-hist" style="display:none"></canvas>
+                <div id="eval-17l-hist-empty" class="activity-empty">Decision share appears once results land.</div>
+            </div>
+            <div id="eval-17l-meta" style="font-size:0.8rem;color:var(--muted)"></div>
         </div>
 
         <!-- Subscribers tab -->
@@ -248,10 +288,265 @@
             if (name === 'logs' && typeof loadLogs === 'function') loadLogs();
             if (name === 'providers') loadProviders();
             if (name === 'activity') loadActivity();
+            if (name === 'eval') loadEval();
         }
 
         async function loadAll() {
-            await Promise.all([loadSubscribers(), loadMessages(), loadUsage(), loadActivity()]);
+            await Promise.all([loadSubscribers(), loadMessages(), loadUsage(), loadActivity(), loadEval()]);
+        }
+
+        // -- Eval charts -------------------------------------------------------
+        let evalGeneralChart = null, evalGeneralHist = null;
+        let eval17lChart = null, eval17lHist = null;
+
+        const SCORE_DIM_COLORS = {
+            correctness: '#6366f1',
+            reasoning:   '#22c55e',
+            conciseness: '#f59e0b',
+            legality:    '#ef4444',
+        };
+
+        function _palette(n) {
+            const base = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#a855f7', '#0ea5e9', '#ec4899'];
+            return Array.from({length: n}, (_, i) => base[i % base.length]);
+        }
+
+        function _evalEmpty(emptyEl, canvasEl, msg) {
+            emptyEl.textContent = msg;
+            emptyEl.style.display = '';
+            canvasEl.style.display = 'none';
+        }
+
+        async function loadEval() {
+            let resp;
+            try {
+                resp = await api('/admin/api/eval');
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            } catch (e) {
+                document.getElementById('eval-empty-hint').textContent = `Failed: ${e.message || e}`;
+                document.getElementById('eval-empty-hint').style.display = '';
+                return;
+            }
+            document.getElementById('eval-empty-hint').style.display = 'none';
+
+            const data = await resp.json();
+            renderEvalGeneral(data.general);
+            renderEval17l(data['17lands_mulligan']);
+        }
+
+        function renderEvalGeneral(slot) {
+            const stats = document.getElementById('eval-general-stats');
+            const meta = document.getElementById('eval-general-meta');
+            const canvas = document.getElementById('eval-general-chart');
+            const empty = document.getElementById('eval-general-empty');
+            const histCanvas = document.getElementById('eval-general-hist');
+            const histEmpty = document.getElementById('eval-general-hist-empty');
+
+            if (!slot || !slot.latest) {
+                stats.innerHTML = '';
+                meta.textContent = '';
+                _evalEmpty(empty, canvas, 'No general-eval results uploaded yet.');
+                _evalEmpty(histEmpty, histCanvas, 'Score histograms appear once results land.');
+                return;
+            }
+            const payload = slot.latest;
+            const backends = payload.backends || [];
+            const ts = new Date(payload.ts * 1000).toLocaleString();
+
+            stats.innerHTML = `
+                <div class="stat"><div class="number">${payload.n_prompts_unique || 0}</div><div class="label">Prompts</div></div>
+                <div class="stat"><div class="number">${payload.n_responses || 0}</div><div class="label">Responses</div></div>
+                <div class="stat"><div class="number">${backends.length}</div><div class="label">Backends</div></div>
+                <div class="stat"><div class="number">${slot.history ? slot.history.length : 1}</div><div class="label">Run History</div></div>
+            `;
+            meta.textContent = `Latest run: ${ts} • ${slot.history ? slot.history.length : 1} run(s) on file`;
+
+            if (!backends.length) {
+                _evalEmpty(empty, canvas, 'Run had zero backends.');
+                _evalEmpty(histEmpty, histCanvas, '');
+                return;
+            }
+
+            // ===== Per-backend rubric chart (grouped bars) =====
+            empty.style.display = 'none';
+            canvas.style.display = '';
+            const dims = ['correctness', 'reasoning', 'conciseness', 'legality'];
+            const datasets = dims.map(d => ({
+                label: d,
+                data: backends.map(b => b[`${d}_mean`] || 0),
+                backgroundColor: SCORE_DIM_COLORS[d],
+                borderColor: SCORE_DIM_COLORS[d],
+                borderWidth: 1,
+            }));
+            datasets.push({
+                label: 'overall',
+                data: backends.map(b => b.overall_mean || 0),
+                backgroundColor: '#9ca3af',
+                borderColor: '#9ca3af',
+                borderWidth: 2,
+                type: 'line',
+                pointRadius: 4,
+            });
+            if (evalGeneralChart) { evalGeneralChart.destroy(); evalGeneralChart = null; }
+            evalGeneralChart = new Chart(canvas.getContext('2d'), {
+                type: 'bar',
+                data: { labels: backends.map(b => b.backend), datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { labels: { color: '#e0e0e8' } } },
+                    scales: {
+                        x: { ticks: { color: '#888' }, grid: { color: 'rgba(42,42,58,0.4)' } },
+                        y: {
+                            beginAtZero: true, max: 5,
+                            ticks: { color: '#888', stepSize: 1 },
+                            grid: { color: 'rgba(42,42,58,0.4)' },
+                            title: { display: true, text: 'Mean rubric score (1-5)', color: '#888' },
+                        },
+                    },
+                },
+            });
+
+            // ===== Score histogram (per backend, stacked bars over score 1-5) =====
+            histEmpty.style.display = 'none';
+            histCanvas.style.display = '';
+            // Aggregate: pick correctness as the canonical histogram dimension
+            // (one chart, one dim — show side-by-side per backend).
+            const buckets = ['1', '2', '3', '4', '5'];
+            const histDatasets = backends.map((b, i) => ({
+                label: b.backend,
+                data: buckets.map(k => (b.score_histograms && b.score_histograms.correctness && b.score_histograms.correctness[k]) || 0),
+                backgroundColor: _palette(backends.length)[i],
+            }));
+            if (evalGeneralHist) { evalGeneralHist.destroy(); evalGeneralHist = null; }
+            evalGeneralHist = new Chart(histCanvas.getContext('2d'), {
+                type: 'bar',
+                data: { labels: buckets.map(b => `score ${b}`), datasets: histDatasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { labels: { color: '#e0e0e8' } },
+                        title: { display: true, text: 'Correctness-score distribution per backend', color: '#888' },
+                    },
+                    scales: {
+                        x: { ticks: { color: '#888' }, grid: { color: 'rgba(42,42,58,0.4)' } },
+                        y: {
+                            beginAtZero: true, ticks: { color: '#888', precision: 0 },
+                            grid: { color: 'rgba(42,42,58,0.4)' },
+                            title: { display: true, text: 'Number of responses', color: '#888' },
+                        },
+                    },
+                },
+            });
+        }
+
+        function renderEval17l(slot) {
+            const stats = document.getElementById('eval-17l-stats');
+            const meta = document.getElementById('eval-17l-meta');
+            const canvas = document.getElementById('eval-17l-chart');
+            const empty = document.getElementById('eval-17l-empty');
+            const histCanvas = document.getElementById('eval-17l-hist');
+            const histEmpty = document.getElementById('eval-17l-hist-empty');
+
+            if (!slot || !slot.latest) {
+                stats.innerHTML = '';
+                meta.textContent = '';
+                _evalEmpty(empty, canvas, 'No 17lands-mulligan results uploaded yet.');
+                _evalEmpty(histEmpty, histCanvas, 'Decision share appears once results land.');
+                return;
+            }
+            const payload = slot.latest;
+            const backends = payload.backends || [];
+            const ts = new Date(payload.ts * 1000).toLocaleString();
+
+            const topHigherWR = backends.length
+                ? Math.max(...backends.map(b => (b.higher_wr_rate || 0) * 100))
+                : 0;
+            stats.innerHTML = `
+                <div class="stat"><div class="number">${payload.n_prompts || 0}</div><div class="label">Prompts</div></div>
+                <div class="stat"><div class="number">${backends.length}</div><div class="label">Backends</div></div>
+                <div class="stat"><div class="number">${topHigherWR.toFixed(1)}%</div><div class="label">Best higher-WR%</div></div>
+                <div class="stat"><div class="number">${slot.history ? slot.history.length : 1}</div><div class="label">Run History</div></div>
+            `;
+            meta.textContent = `Latest run: ${ts} • ${slot.history ? slot.history.length : 1} run(s) on file`;
+
+            if (!backends.length) {
+                _evalEmpty(empty, canvas, 'Run had zero backends.');
+                _evalEmpty(histEmpty, histCanvas, '');
+                return;
+            }
+
+            // ===== Per-backend higher_wr% / played% (grouped bars) =====
+            empty.style.display = 'none';
+            canvas.style.display = '';
+            const datasets = [
+                {
+                    label: 'higher_wr%',
+                    data: backends.map(b => Math.round((b.higher_wr_rate || 0) * 1000) / 10),
+                    backgroundColor: '#22c55e',
+                },
+                {
+                    label: 'played%',
+                    data: backends.map(b => Math.round((b.played_agreement_rate || 0) * 1000) / 10),
+                    backgroundColor: '#6366f1',
+                },
+            ];
+            if (eval17lChart) { eval17lChart.destroy(); eval17lChart = null; }
+            eval17lChart = new Chart(canvas.getContext('2d'), {
+                type: 'bar',
+                data: { labels: backends.map(b => b.backend), datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { labels: { color: '#e0e0e8' } },
+                        annotation: undefined,
+                    },
+                    scales: {
+                        x: { ticks: { color: '#888' }, grid: { color: 'rgba(42,42,58,0.4)' } },
+                        y: {
+                            beginAtZero: true, max: 100,
+                            ticks: { color: '#888', callback: v => `${v}%` },
+                            grid: { color: 'rgba(42,42,58,0.4)' },
+                            title: { display: true, text: 'Match rate (50% = coin flip)', color: '#888' },
+                        },
+                    },
+                },
+            });
+
+            // ===== Decision distribution (keep% vs mull% per backend, stacked bar) =====
+            histEmpty.style.display = 'none';
+            histCanvas.style.display = '';
+            const keepPcts = backends.map(b => Math.round((b.decision_share?.keep || 0) * 1000) / 10);
+            const mullPcts = backends.map(b => Math.round((b.decision_share?.mull || 0) * 1000) / 10);
+            if (eval17lHist) { eval17lHist.destroy(); eval17lHist = null; }
+            eval17lHist = new Chart(histCanvas.getContext('2d'), {
+                type: 'bar',
+                data: {
+                    labels: backends.map(b => b.backend),
+                    datasets: [
+                        { label: 'kept', data: keepPcts, backgroundColor: '#22c55e' },
+                        { label: 'mulled', data: mullPcts, backgroundColor: '#ef4444' },
+                    ],
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { labels: { color: '#e0e0e8' } },
+                        title: { display: true, text: 'Decision share (keep vs mull) per backend', color: '#888' },
+                    },
+                    scales: {
+                        x: { stacked: true, ticks: { color: '#888' }, grid: { color: 'rgba(42,42,58,0.4)' } },
+                        y: {
+                            stacked: true, beginAtZero: true, max: 100,
+                            ticks: { color: '#888', callback: v => `${v}%` },
+                            grid: { color: 'rgba(42,42,58,0.4)' },
+                        },
+                    },
+                },
+            });
         }
 
         // -- Activity chart ----------------------------------------------------
