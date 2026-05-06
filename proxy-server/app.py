@@ -1566,6 +1566,24 @@ async def admin_eval(request: Request, _=Depends(_require_admin)):
     return db.get_latest_eval_results()
 
 
+@app.get("/admin/api/eval/history")
+async def admin_eval_history(request: Request, _=Depends(_require_admin)):
+    """Return the last N eval payloads for a single target (oldest first).
+
+    Query params:
+      - target: required (e.g. 'general' or '17lands_mulligan')
+      - limit:  default 30, max 200
+    """
+    target = (request.query_params.get("target") or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="missing 'target' query param")
+    try:
+        limit = max(1, min(200, int(request.query_params.get("limit", "30"))))
+    except ValueError:
+        limit = 30
+    return {"target": target, "history": db.get_eval_results_history(target, limit)}
+
+
 @app.post("/admin/api/eval/results")
 async def admin_eval_upload(request: Request, _=Depends(_require_admin)):
     """Accept an eval-results upload from `tools/eval/upload_results.py`.

@@ -402,6 +402,29 @@ def insert_eval_result(target: str, payload: dict) -> int:
         return int(cur.lastrowid)
 
 
+def get_eval_results_history(target: str, limit: int = 30) -> list[dict]:
+    """Return the last N full payloads for a target, oldest first.
+
+    Used by the trend-over-time chart. Each row's stored payload is parsed
+    and augmented with ``id`` and ``ts`` from the row metadata.
+    """
+    import json as _json
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, ts, payload_json FROM eval_results "
+            "WHERE target = ? ORDER BY ts DESC LIMIT ?",
+            (target, int(limit)),
+        ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        payload = _json.loads(r["payload_json"])
+        payload["id"] = int(r["id"])
+        payload["ts"] = float(r["ts"])
+        out.append(payload)
+    out.reverse()  # oldest first for charts
+    return out
+
+
 def get_latest_eval_results(targets: list[str] | None = None) -> dict:
     """Return the latest payload per target, plus a small history list.
 

@@ -152,6 +152,36 @@
             </div>
             <div id="eval-general-meta" style="font-size:0.8rem;color:var(--muted)"></div>
 
+            <h3 style="font-size:1.1rem;margin:32px 0 8px;color:var(--accent)">General eval — trend over time</h3>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+                <label style="color:var(--muted);font-size:0.9rem">Backend:</label>
+                <select id="eval-trend-backend" onchange="loadEvalTrend()" style="padding:6px 12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;min-width:220px"></select>
+                <label style="color:var(--muted);font-size:0.9rem">Dimension:</label>
+                <select id="eval-trend-dimension" onchange="loadEvalTrend()" style="padding:6px 12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem">
+                    <option value="*" selected>All dimensions</option>
+                    <option value="correctness">correctness</option>
+                    <option value="legality">legality</option>
+                    <option value="reasoning">reasoning</option>
+                    <option value="conciseness">conciseness</option>
+                    <option value="overall">overall</option>
+                </select>
+                <span style="color:var(--muted);font-size:0.85rem">Y-axis is 1-5 (higher = better). Click legend entries to hide/show lines.</span>
+            </div>
+            <div class="activity-chart-wrap" style="min-height:280px">
+                <canvas id="eval-general-trend" style="display:none"></canvas>
+                <div id="eval-general-trend-empty" class="activity-empty">Trend appears once 2+ runs are uploaded.</div>
+            </div>
+
+            <div style="display:flex;gap:8px;align-items:center;margin:16px 0 12px;flex-wrap:wrap">
+                <label style="color:var(--muted);font-size:0.9rem">17lands trend backend:</label>
+                <select id="eval-17l-trend-backend" onchange="loadEval17lTrend()" style="padding:6px 12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;min-width:220px"></select>
+                <span style="color:var(--muted);font-size:0.85rem">Higher_wr% over time. 50% = coin flip.</span>
+            </div>
+            <div class="activity-chart-wrap" style="min-height:240px">
+                <canvas id="eval-17l-trend" style="display:none"></canvas>
+                <div id="eval-17l-trend-empty" class="activity-empty">17lands trend appears once 2+ runs are uploaded.</div>
+            </div>
+
             <h3 style="font-size:1.1rem;margin:32px 0 8px;color:var(--accent)">17lands mulligan eval</h3>
             <p style="font-size:0.85rem;color:var(--muted);margin-bottom:12px">
                 Asks each backend to KEEP or MULLIGAN a real diamond+ opening hand. Ground truth = empirical higher-WR option in the bucket. <b>Higher-WR pick rate</b> is the headline metric: 50% = coin flip, 70%+ = real signal.
@@ -297,7 +327,8 @@
 
         // -- Eval charts -------------------------------------------------------
         let evalGeneralChart = null, evalGeneralHist = null;
-        let eval17lChart = null, eval17lHist = null;
+        let evalGeneralTrend = null;
+        let eval17lChart = null, eval17lHist = null, eval17lTrend = null;
 
         const SCORE_DIM_COLORS = {
             correctness: '#6366f1',
@@ -332,6 +363,273 @@
             const data = await resp.json();
             renderEvalGeneral(data.general);
             renderEval17l(data['17lands_mulligan']);
+            populateTrendSelector('eval-trend-backend', data.general);
+            populateTrendSelector('eval-17l-trend-backend', data['17lands_mulligan']);
+            loadEvalTrend();
+            loadEval17lTrend();
+        }
+
+        function populateTrendSelector(selectId, slot) {
+            const sel = document.getElementById(selectId);
+            const previous = sel.value;
+            const backends = (slot && slot.latest && slot.latest.backends) || [];
+            const names = backends.map(b => b.backend);
+            // Always include an "All backends (overlay)" option at the top.
+            const options = ['<option value="*">All backends (overlay)</option>'];
+            const defaultPick = (previous && (previous === '*' || names.includes(previous)))
+                ? previous
+                : (names.find(n => n.startsWith('online:')) || names[0] || '*');
+            for (const n of names) {
+                options.push(`<option value="${n}" ${n === defaultPick ? 'selected' : ''}>${n}</option>`);
+            }
+            // If "*" is the default, mark it selected.
+            if (defaultPick === '*') {
+                options[0] = '<option value="*" selected>All backends (overlay)</option>';
+            }
+            sel.innerHTML = options.join('');
+        }
+
+        const RUBRIC_DIMS = ['correctness', 'legality', 'reasoning', 'conciseness', 'overall'];
+        const RUBRIC_DIM_COLOR = {
+            correctness: '#6366f1',
+            legality:    '#ef4444',
+            reasoning:   '#22c55e',
+            conciseness: '#f59e0b',
+            overall:     '#9ca3af',
+        };
+
+        function _xLabels(points) {
+            return points.map(p => new Date(p.ts * 1000).toLocaleString(
+                undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }
+            ));
+        }
+
+        // Build datasets for the general trend chart based on the two selectors.
+        // Cases:
+        //   backend=specific, dim=*  -> 5 lines (one per rubric dim) for that backend
+        //   backend=*, dim=specific  -> 1 line per backend (for the chosen dim)
+        //   backend=specific, dim=specific -> single line
+        //   backend=*, dim=*         -> N×M lines, default-hidden except correctness
+        function _generalTrendDatasets(history, backend, dim) {
+            // Derive sorted unique backends from history.
+            const allBackends = Array.from(new Set(
+                history.flatMap(p => (p.backends || []).map(b => b.backend))
+            )).sort();
+
+            const palette = _palette(allBackends.length);
+            const beColor = Object.fromEntries(allBackends.map((b, i) => [b, palette[i]]));
+
+            const dimsToPlot = dim === '*' ? RUBRIC_DIMS : [dim];
+            const backendsToPlot = backend === '*' ? allBackends : [backend];
+
+            const datasets = [];
+            for (const be of backendsToPlot) {
+                for (const d of dimsToPlot) {
+                    const data = history.map(p => {
+                        const row = (p.backends || []).find(b => b.backend === be);
+                        return row ? row[`${d}_mean`] : null;
+                    });
+                    if (data.every(v => v == null)) continue;
+
+                    let label, color;
+                    if (backend === '*' && dim === '*') {
+                        label = `${be} · ${d}`;
+                        color = beColor[be];
+                    } else if (backend === '*') {
+                        label = be;
+                        color = beColor[be];
+                    } else if (dim === '*') {
+                        label = d;
+                        color = RUBRIC_DIM_COLOR[d];
+                    } else {
+                        label = `${be} · ${d}`;
+                        color = beColor[be] || RUBRIC_DIM_COLOR[d];
+                    }
+
+                    datasets.push({
+                        label, data,
+                        borderColor: color,
+                        backgroundColor: color,
+                        pointRadius: 4,
+                        pointHoverRadius: 6,
+                        tension: 0.2,
+                        borderWidth: d === 'overall' ? 2 : 2,
+                        borderDash: d === 'overall' ? [4, 4] : undefined,
+                        hidden: backend === '*' && dim === '*' && d !== 'correctness',
+                        spanGaps: true,
+                    });
+                }
+            }
+            return datasets;
+        }
+
+        async function loadEvalTrend() {
+            const backend = document.getElementById('eval-trend-backend').value || '*';
+            const dim = document.getElementById('eval-trend-dimension').value || '*';
+            const canvas = document.getElementById('eval-general-trend');
+            const empty = document.getElementById('eval-general-trend-empty');
+
+            let resp;
+            try {
+                resp = await api(`/admin/api/eval/history?target=general&limit=60`);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            } catch (e) {
+                _evalEmpty(empty, canvas, `Failed to load history: ${e.message || e}`);
+                return;
+            }
+            const data = await resp.json();
+            const history = data.history || [];
+            if (!history.length) {
+                _evalEmpty(empty, canvas, 'No general-eval history yet.');
+                return;
+            }
+
+            const labels = _xLabels(history);
+            const datasets = _generalTrendDatasets(history, backend, dim);
+            if (!datasets.length) {
+                _evalEmpty(empty, canvas, `No data for backend=${backend}, dim=${dim}.`);
+                return;
+            }
+
+            // ≥2 runs needed to see a trend; show but hint if just 1.
+            if (history.length < 2) {
+                empty.textContent = `Only 1 run uploaded so far — points will form lines once you re-run and upload again.`;
+                empty.style.display = '';
+            } else {
+                empty.style.display = 'none';
+            }
+            canvas.style.display = '';
+
+            let titleText;
+            if (backend === '*' && dim === '*') {
+                titleText = 'All backends · all dimensions (toggle via legend)';
+            } else if (backend === '*') {
+                titleText = `All backends — ${dim} over time`;
+            } else if (dim === '*') {
+                titleText = `${backend} — all dimensions over time`;
+            } else {
+                titleText = `${backend} — ${dim} over time`;
+            }
+
+            if (evalGeneralTrend) { evalGeneralTrend.destroy(); evalGeneralTrend = null; }
+            evalGeneralTrend = new Chart(canvas.getContext('2d'), {
+                type: 'line',
+                data: { labels, datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: {
+                        legend: { labels: { color: '#e0e0e8' } },
+                        title: { display: true, text: titleText, color: '#e0e0e8' },
+                    },
+                    scales: {
+                        x: { ticks: { color: '#888', maxRotation: 0, autoSkip: true, maxTicksLimit: 10 },
+                             grid: { color: 'rgba(42,42,58,0.4)' } },
+                        y: {
+                            beginAtZero: true, max: 5,
+                            ticks: { color: '#888', stepSize: 1 },
+                            grid: { color: 'rgba(42,42,58,0.4)' },
+                            title: { display: true, text: 'Mean score (1-5, higher = better)', color: '#888' },
+                        },
+                    },
+                },
+            });
+        }
+
+        async function loadEval17lTrend() {
+            const backend = document.getElementById('eval-17l-trend-backend').value || '*';
+            const canvas = document.getElementById('eval-17l-trend');
+            const empty = document.getElementById('eval-17l-trend-empty');
+
+            let resp;
+            try {
+                resp = await api(`/admin/api/eval/history?target=17lands_mulligan&limit=60`);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            } catch (e) {
+                _evalEmpty(empty, canvas, `Failed to load history: ${e.message || e}`);
+                return;
+            }
+            const data = await resp.json();
+            const history = data.history || [];
+            if (!history.length) {
+                _evalEmpty(empty, canvas, 'No 17lands history yet.');
+                return;
+            }
+
+            const allBackends = Array.from(new Set(
+                history.flatMap(p => (p.backends || []).map(b => b.backend))
+            )).sort();
+            const palette = _palette(allBackends.length);
+            const beColor = Object.fromEntries(allBackends.map((b, i) => [b, palette[i]]));
+
+            const backendsToPlot = backend === '*' ? allBackends : [backend];
+            const datasets = backendsToPlot.map(be => ({
+                label: `${be} · higher_wr%`,
+                data: history.map(p => {
+                    const row = (p.backends || []).find(b => b.backend === be);
+                    return row && row.higher_wr_rate != null
+                        ? Math.round(row.higher_wr_rate * 1000) / 10
+                        : null;
+                }),
+                borderColor: beColor[be],
+                backgroundColor: beColor[be],
+                pointRadius: 4,
+                pointHoverRadius: 6,
+                tension: 0.2,
+                spanGaps: true,
+            }));
+
+            // Add a 50% reference line (coin-flip floor).
+            datasets.push({
+                label: 'coin-flip (50%)',
+                data: history.map(_ => 50),
+                borderColor: '#6b7280',
+                backgroundColor: '#6b7280',
+                pointRadius: 0,
+                borderWidth: 1,
+                borderDash: [3, 3],
+                tension: 0,
+            });
+
+            if (history.length < 2) {
+                empty.textContent = 'Only 1 17lands run uploaded — re-run + upload to see a trend.';
+                empty.style.display = '';
+            } else {
+                empty.style.display = 'none';
+            }
+            canvas.style.display = '';
+
+            if (eval17lTrend) { eval17lTrend.destroy(); eval17lTrend = null; }
+            eval17lTrend = new Chart(canvas.getContext('2d'), {
+                type: 'line',
+                data: { labels: _xLabels(history), datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: {
+                        legend: { labels: { color: '#e0e0e8' } },
+                        title: {
+                            display: true,
+                            text: backend === '*'
+                                ? 'All backends — higher_wr% over time'
+                                : `${backend} — higher_wr% over time`,
+                            color: '#e0e0e8',
+                        },
+                    },
+                    scales: {
+                        x: { ticks: { color: '#888', maxRotation: 0, autoSkip: true, maxTicksLimit: 10 },
+                             grid: { color: 'rgba(42,42,58,0.4)' } },
+                        y: {
+                            beginAtZero: true, max: 100,
+                            ticks: { color: '#888', callback: v => `${v}%` },
+                            grid: { color: 'rgba(42,42,58,0.4)' },
+                            title: { display: true, text: 'higher_wr%', color: '#888' },
+                        },
+                    },
+                },
+            });
         }
 
         function renderEvalGeneral(slot) {
