@@ -79,7 +79,11 @@
         /* Activity chart */
         .activity-controls { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
         .activity-controls select { padding: 6px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 0.9rem; }
-        .activity-chart-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; min-height: 320px; position: relative; }
+        /* Chart.js with maintainAspectRatio:false uses the parent's *fixed*
+           height. Use 'height', not 'min-height', or the canvas can grow on
+           re-render (the cause of the eval-tab "really tall charts" bug). */
+        .activity-chart-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; height: 320px; position: relative; box-sizing: border-box; }
+        .activity-chart-wrap canvas { width: 100% !important; height: 100% !important; max-height: calc(100% - 8px); }
         .activity-empty { text-align: center; padding: 80px 0; color: var(--muted); font-size: 0.9rem; }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
@@ -147,11 +151,11 @@
                 Replays captured coach prompts through one or more backends; scored by an online judge model on a 1-5 rubric (correctness, reasoning, conciseness, legality).
             </p>
             <div class="stats" id="eval-general-stats"></div>
-            <div class="activity-chart-wrap" style="min-height:280px">
+            <div class="activity-chart-wrap" style="height:280px">
                 <canvas id="eval-general-chart" style="display:none"></canvas>
                 <div id="eval-general-empty" class="activity-empty">No general-eval results uploaded yet.</div>
             </div>
-            <div class="activity-chart-wrap" style="min-height:240px">
+            <div class="activity-chart-wrap" style="height:240px">
                 <canvas id="eval-general-hist" style="display:none"></canvas>
                 <div id="eval-general-hist-empty" class="activity-empty">Score histograms appear once results land.</div>
             </div>
@@ -172,7 +176,7 @@
                 </select>
                 <span style="color:var(--muted);font-size:0.85rem">Y-axis is 1-5 (higher = better). Click legend entries to hide/show lines.</span>
             </div>
-            <div class="activity-chart-wrap" style="min-height:280px">
+            <div class="activity-chart-wrap" style="height:280px">
                 <canvas id="eval-general-trend" style="display:none"></canvas>
                 <div id="eval-general-trend-empty" class="activity-empty">Trend appears once 2+ runs are uploaded.</div>
             </div>
@@ -182,7 +186,7 @@
                 <select id="eval-17l-trend-backend" onchange="loadEval17lTrend()" style="padding:6px 12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;min-width:220px"></select>
                 <span style="color:var(--muted);font-size:0.85rem">Higher_wr% over time. 50% = coin flip.</span>
             </div>
-            <div class="activity-chart-wrap" style="min-height:240px">
+            <div class="activity-chart-wrap" style="height:240px">
                 <canvas id="eval-17l-trend" style="display:none"></canvas>
                 <div id="eval-17l-trend-empty" class="activity-empty">17lands trend appears once 2+ runs are uploaded.</div>
             </div>
@@ -192,11 +196,11 @@
                 Asks each backend to KEEP or MULLIGAN a real diamond+ opening hand. Ground truth = empirical higher-WR option in the bucket. <b>Higher-WR pick rate</b> is the headline metric: 50% = coin flip, 70%+ = real signal.
             </p>
             <div class="stats" id="eval-17l-stats"></div>
-            <div class="activity-chart-wrap" style="min-height:280px">
+            <div class="activity-chart-wrap" style="height:280px">
                 <canvas id="eval-17l-chart" style="display:none"></canvas>
                 <div id="eval-17l-empty" class="activity-empty">No 17lands-mulligan results uploaded yet.</div>
             </div>
-            <div class="activity-chart-wrap" style="min-height:240px">
+            <div class="activity-chart-wrap" style="height:240px">
                 <canvas id="eval-17l-hist" style="display:none"></canvas>
                 <div id="eval-17l-hist-empty" class="activity-empty">Decision share appears once results land.</div>
             </div>
@@ -207,11 +211,11 @@
                 For each turn of a winning diamond+ game (sampled early/mid/late), asks the coach which action categories to take. Ground truth = what the player <i>actually</i> did that turn (per <code>user_turn_N_*</code> count columns). <b>Exact-match%</b> is how often the coach's set equals the actual set; <b>mean Jaccard</b> is the average set similarity.
             </p>
             <div class="stats" id="eval-ta-stats"></div>
-            <div class="activity-chart-wrap" style="min-height:300px">
+            <div class="activity-chart-wrap" style="height:300px">
                 <canvas id="eval-ta-chart" style="display:none"></canvas>
                 <div id="eval-ta-empty" class="activity-empty">No turn-action results uploaded yet.</div>
             </div>
-            <div class="activity-chart-wrap" style="min-height:280px">
+            <div class="activity-chart-wrap" style="height:280px">
                 <canvas id="eval-ta-f1" style="display:none"></canvas>
                 <div id="eval-ta-f1-empty" class="activity-empty">Per-category F1 appears once results land.</div>
             </div>
@@ -220,7 +224,7 @@
                 <select id="eval-ta-trend-backend" onchange="loadEvalTaTrend()" style="padding:6px 12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;min-width:220px"></select>
                 <span style="color:var(--muted);font-size:0.85rem">Lines = exact-match% and mean Jaccard over time.</span>
             </div>
-            <div class="activity-chart-wrap" style="min-height:240px">
+            <div class="activity-chart-wrap" style="height:240px">
                 <canvas id="eval-ta-trend" style="display:none"></canvas>
                 <div id="eval-ta-trend-empty" class="activity-empty">Trend appears once 2+ runs are uploaded.</div>
             </div>
