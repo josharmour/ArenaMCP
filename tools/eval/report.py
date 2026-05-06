@@ -39,7 +39,8 @@ def _median(xs: list[float]) -> float:
     return statistics.median(xs) if xs else 0.0
 
 
-def report(responses_path: Path, scores_path: Path, csv_path: Path | None) -> None:
+def report(responses_path: Path, scores_path: Path, csv_path: Path | None,
+           json_path: Path | None = None) -> None:
     responses = list(_read_jsonl(responses_path))
     scores = list(_read_jsonl(scores_path))
 
@@ -133,14 +134,53 @@ def report(responses_path: Path, scores_path: Path, csv_path: Path | None) -> No
                 ])
         print(f"\nWrote {csv_path}")
 
+    if json_path:
+        import json as _json
+        import time as _time
+        backends_payload = []
+        for be, row, slot, score_means, overall, latency_med, chars_med in rows:
+            # Score histograms: per-dimension count of 1..5
+            hist = {k: {str(i): 0 for i in range(1, 6)} for k in SCORE_DIMS}
+            for v in slot[SCORE_DIMS[0]]:
+                pass  # iterate below
+            # We need to recount from raw scores stored on the slot, but they're
+            # already in slot[k] as floats from the rubric. Re-bucket.
+            for k in SCORE_DIMS:
+                for v in slot[k]:
+                    bucket = max(1, min(5, int(round(v))))
+                    hist[k][str(bucket)] += 1
+            backends_payload.append({
+                "backend": be,
+                "n": slot["n"],
+                "errors": slot["errors"],
+                "latency_ms_median": round(latency_med, 1),
+                "response_chars_median": int(chars_med),
+                **{f"{k}_mean": round(score_means[k], 3) for k in SCORE_DIMS},
+                "overall_mean": round(overall, 3),
+                "score_histograms": hist,
+            })
+        payload = {
+            "target": "general",
+            "ts": _time.time(),
+            "n_prompts_unique": len({(r['prompt_id'],) for r in responses}),
+            "n_responses": len(responses),
+            "n_scored": len(scores),
+            "backends": backends_payload,
+        }
+        with open(json_path, "w", encoding="utf-8") as f:
+            _json.dump(payload, f, indent=2)
+        print(f"\nWrote {json_path}")
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--responses", required=True, type=Path)
     parser.add_argument("--scores", required=True, type=Path)
     parser.add_argument("--csv", type=Path)
+    parser.add_argument("--json", type=Path,
+                        help="Optional structured JSON summary (for the admin dashboard)")
     args = parser.parse_args()
-    report(args.responses, args.scores, args.csv)
+    report(args.responses, args.scores, args.csv, args.json)
 
 
 if __name__ == "__main__":
