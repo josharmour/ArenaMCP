@@ -4,13 +4,51 @@ Handles both online (mtgacoach.com) and local (Ollama/LM Studio) modes
 through the same OpenAI-compatible chat completions interface.
 """
 
+import json
 import logging
+import os
 import threading
+import time
 from typing import Optional
 
 from arenamcp.client_metadata import get_client_headers
 
 logger = logging.getLogger(__name__)
+
+
+# Prompt capture hook for the eval harness (tools/eval). Always-off unless
+# MTGACOACH_PROMPT_DUMP_PATH points at a writable JSONL file. Each .complete()
+# call appends one line: {"ts","model","system","user","max_tokens","temperature"}.
+# Zero overhead when the env var is unset.
+_CAPTURE_LOCK = threading.Lock()
+
+
+def _maybe_capture_prompt(
+    model: str,
+    system_prompt: str,
+    user_message: str,
+    max_tokens: int,
+    temperature: float,
+) -> None:
+    path = os.environ.get("MTGACOACH_PROMPT_DUMP_PATH", "")
+    if not path:
+        return
+    try:
+        record = {
+            "ts": time.time(),
+            "model": model,
+            "system": system_prompt,
+            "user": user_message,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        line = json.dumps(record, ensure_ascii=False)
+        with _CAPTURE_LOCK:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception as e:
+        # Capture must never break a real coach call.
+        logger.debug(f"prompt-capture write failed: {e}")
 
 # Online mode: hardcoded API endpoint
 ONLINE_BASE_URL = "https://api.mtgacoach.com/v1"
@@ -139,6 +177,8 @@ class ProxyBackend:
                 timeout only abandons the thread, it doesn't kill it).
         """
         import time
+
+        _maybe_capture_prompt(self.model, system_prompt, user_message, max_tokens, temperature)
 
         try:
             client = self._get_client()
