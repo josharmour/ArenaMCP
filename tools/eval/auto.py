@@ -171,6 +171,54 @@ def cmd_mulligan(args: argparse.Namespace) -> None:
         _admin_upload(summary)
 
 
+# -- turn-action subcommand --------------------------------------------------
+
+def cmd_turn_action(args: argparse.Namespace) -> None:
+    data = _data_dir()
+
+    csv_path = data / "17lands" / f"replay_data_public.{args.set_code}.{args.event}.csv.gz"
+    if not csv_path.exists() or args.redownload:
+        rc = _run([sys.executable, "-m", "tools.eval.seventeenlands.download",
+                   "--set", args.set_code, "--event", args.event,
+                   *(["--force"] if args.redownload else [])])
+        _require_zero(rc, "download")
+
+    prompts = data / args.prompts_name
+    if not prompts.exists() or args.rebuild_prompts:
+        rc = _run([sys.executable, "-m", "tools.eval.seventeenlands.build_turn_action_prompts",
+                   "--csv", str(csv_path),
+                   "--out", str(prompts),
+                   "--n", str(args.n_samples),
+                   "--min-rank", args.min_rank,
+                   "--seed", str(args.seed)])
+        _require_zero(rc, "build_turn_action_prompts")
+    else:
+        print(f"[auto] reusing existing prompts: {prompts} (--rebuild-prompts to refresh)")
+
+    responses = data / args.responses_name
+    summary = data / args.json_name
+
+    backend_args: list[str] = []
+    for b in args.backends:
+        backend_args.extend(["--backend", b])
+
+    rc = _run([sys.executable, "-m", "tools.eval.run",
+               "--prompts", str(prompts),
+               "--responses", str(responses),
+               *backend_args])
+    _require_zero(rc, "run")
+
+    rc = _run([sys.executable, "-m", "tools.eval.seventeenlands.score_turn_actions",
+               "--prompts", str(prompts),
+               "--responses", str(responses),
+               "--json", str(summary)])
+    _require_zero(rc, "score_turn_actions")
+
+    print(f"\n[auto] turn-action summary written to {summary}")
+    if args.upload:
+        _admin_upload(summary)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawTextHelpFormatter)
@@ -204,6 +252,21 @@ def main():
     p_m.add_argument("--redownload", action="store_true")
     p_m.add_argument("--upload", action="store_true")
     p_m.set_defaults(func=cmd_mulligan)
+
+    p_t = sub.add_parser("turn-action", help="full 17lands turn-action eval pipeline")
+    p_t.add_argument("--set", required=True, dest="set_code")
+    p_t.add_argument("--event", default="PremierDraft")
+    p_t.add_argument("--backends", nargs="+", required=True)
+    p_t.add_argument("--n", dest="n_samples", type=int, default=200)
+    p_t.add_argument("--min-rank", default="diamond")
+    p_t.add_argument("--seed", type=int, default=42)
+    p_t.add_argument("--prompts-name", default="turn_action_prompts.jsonl")
+    p_t.add_argument("--responses-name", default="turn_action_responses.jsonl")
+    p_t.add_argument("--json-name", default="turn_action_summary.json")
+    p_t.add_argument("--rebuild-prompts", action="store_true")
+    p_t.add_argument("--redownload", action="store_true")
+    p_t.add_argument("--upload", action="store_true")
+    p_t.set_defaults(func=cmd_turn_action)
 
     args = parser.parse_args()
     started = time.time()

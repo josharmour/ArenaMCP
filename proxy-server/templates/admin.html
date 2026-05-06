@@ -196,6 +196,30 @@
                 <div id="eval-17l-hist-empty" class="activity-empty">Decision share appears once results land.</div>
             </div>
             <div id="eval-17l-meta" style="font-size:0.8rem;color:var(--muted)"></div>
+
+            <h3 style="font-size:1.1rem;margin:32px 0 8px;color:var(--accent)">17lands turn-action eval</h3>
+            <p style="font-size:0.85rem;color:var(--muted);margin-bottom:12px">
+                For each turn of a winning diamond+ game (sampled early/mid/late), asks the coach which action categories to take. Ground truth = what the player <i>actually</i> did that turn (per <code>user_turn_N_*</code> count columns). <b>Exact-match%</b> is how often the coach's set equals the actual set; <b>mean Jaccard</b> is the average set similarity.
+            </p>
+            <div class="stats" id="eval-ta-stats"></div>
+            <div class="activity-chart-wrap" style="min-height:300px">
+                <canvas id="eval-ta-chart" style="display:none"></canvas>
+                <div id="eval-ta-empty" class="activity-empty">No turn-action results uploaded yet.</div>
+            </div>
+            <div class="activity-chart-wrap" style="min-height:280px">
+                <canvas id="eval-ta-f1" style="display:none"></canvas>
+                <div id="eval-ta-f1-empty" class="activity-empty">Per-category F1 appears once results land.</div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;margin:16px 0 12px;flex-wrap:wrap">
+                <label style="color:var(--muted);font-size:0.9rem">Turn-action trend backend:</label>
+                <select id="eval-ta-trend-backend" onchange="loadEvalTaTrend()" style="padding:6px 12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.9rem;min-width:220px"></select>
+                <span style="color:var(--muted);font-size:0.85rem">Lines = exact-match% and mean Jaccard over time.</span>
+            </div>
+            <div class="activity-chart-wrap" style="min-height:240px">
+                <canvas id="eval-ta-trend" style="display:none"></canvas>
+                <div id="eval-ta-trend-empty" class="activity-empty">Trend appears once 2+ runs are uploaded.</div>
+            </div>
+            <div id="eval-ta-meta" style="font-size:0.8rem;color:var(--muted)"></div>
         </div>
 
         <!-- Subscribers tab -->
@@ -329,6 +353,7 @@
         let evalGeneralChart = null, evalGeneralHist = null;
         let evalGeneralTrend = null;
         let eval17lChart = null, eval17lHist = null, eval17lTrend = null;
+        let evalTaChart = null, evalTaF1 = null, evalTaTrend = null;
 
         const SCORE_DIM_COLORS = {
             correctness: '#6366f1',
@@ -363,10 +388,13 @@
             const data = await resp.json();
             renderEvalGeneral(data.general);
             renderEval17l(data['17lands_mulligan']);
+            renderEvalTa(data['17lands_turn_action']);
             populateTrendSelector('eval-trend-backend', data.general);
             populateTrendSelector('eval-17l-trend-backend', data['17lands_mulligan']);
+            populateTrendSelector('eval-ta-trend-backend', data['17lands_turn_action']);
             loadEvalTrend();
             loadEval17lTrend();
+            loadEvalTaTrend();
         }
 
         function populateTrendSelector(selectId, slot) {
@@ -841,6 +869,201 @@
                             stacked: true, beginAtZero: true, max: 100,
                             ticks: { color: '#888', callback: v => `${v}%` },
                             grid: { color: 'rgba(42,42,58,0.4)' },
+                        },
+                    },
+                },
+            });
+        }
+
+        // -- Turn-action eval rendering ---------------------------------------
+
+        const TA_CATEGORIES = ['PLAY_LAND', 'CAST_CREATURE', 'CAST_SPELL', 'ATTACK', 'ACTIVATE', 'PASS'];
+
+        function renderEvalTa(slot) {
+            const stats = document.getElementById('eval-ta-stats');
+            const meta = document.getElementById('eval-ta-meta');
+            const canvas = document.getElementById('eval-ta-chart');
+            const empty = document.getElementById('eval-ta-empty');
+            const f1Canvas = document.getElementById('eval-ta-f1');
+            const f1Empty = document.getElementById('eval-ta-f1-empty');
+
+            if (!slot || !slot.latest) {
+                stats.innerHTML = '';
+                meta.textContent = '';
+                _evalEmpty(empty, canvas, 'No turn-action results uploaded yet.');
+                _evalEmpty(f1Empty, f1Canvas, 'Per-category F1 appears once results land.');
+                return;
+            }
+            const payload = slot.latest;
+            const backends = payload.backends || [];
+            const ts = new Date(payload.ts * 1000).toLocaleString();
+            const topExact = backends.length
+                ? Math.max(...backends.map(b => (b.exact_match_rate || 0) * 100))
+                : 0;
+            stats.innerHTML = `
+                <div class="stat"><div class="number">${payload.n_prompts || 0}</div><div class="label">Decisions</div></div>
+                <div class="stat"><div class="number">${backends.length}</div><div class="label">Backends</div></div>
+                <div class="stat"><div class="number">${topExact.toFixed(1)}%</div><div class="label">Best exact-match%</div></div>
+                <div class="stat"><div class="number">${slot.history ? slot.history.length : 1}</div><div class="label">Run History</div></div>
+            `;
+            meta.textContent = `Latest run: ${ts} • ${slot.history ? slot.history.length : 1} run(s) on file`;
+
+            if (!backends.length) {
+                _evalEmpty(empty, canvas, 'Run had zero backends.');
+                _evalEmpty(f1Empty, f1Canvas, '');
+                return;
+            }
+
+            // ===== Headline: exact-match% + mean_jaccard per backend =====
+            empty.style.display = 'none'; canvas.style.display = '';
+            const exactPcts = backends.map(b => Math.round((b.exact_match_rate || 0) * 1000) / 10);
+            const jaccards = backends.map(b => Math.round((b.mean_jaccard || 0) * 1000) / 10);
+            if (evalTaChart) { evalTaChart.destroy(); evalTaChart = null; }
+            evalTaChart = new Chart(canvas.getContext('2d'), {
+                type: 'bar',
+                data: {
+                    labels: backends.map(b => b.backend),
+                    datasets: [
+                        { label: 'exact_match%', data: exactPcts, backgroundColor: '#22c55e' },
+                        { label: 'mean_jaccard × 100', data: jaccards, backgroundColor: '#6366f1' },
+                    ],
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { legend: { labels: { color: '#e0e0e8' } } },
+                    scales: {
+                        x: { ticks: { color: '#888' }, grid: { color: 'rgba(42,42,58,0.4)' } },
+                        y: {
+                            beginAtZero: true, max: 100,
+                            ticks: { color: '#888', callback: v => `${v}%` },
+                            grid: { color: 'rgba(42,42,58,0.4)' },
+                            title: { display: true, text: 'Match rate (%)', color: '#888' },
+                        },
+                    },
+                },
+            });
+
+            // ===== Per-category F1 grouped by backend =====
+            f1Empty.style.display = 'none'; f1Canvas.style.display = '';
+            const palette = _palette(backends.length);
+            const datasets = backends.map((b, i) => ({
+                label: b.backend,
+                data: TA_CATEGORIES.map(c => {
+                    const f1 = (b.per_category && b.per_category[c] && b.per_category[c].f1);
+                    return f1 != null ? Math.round(f1 * 1000) / 10 : 0;
+                }),
+                backgroundColor: palette[i],
+            }));
+            if (evalTaF1) { evalTaF1.destroy(); evalTaF1 = null; }
+            evalTaF1 = new Chart(f1Canvas.getContext('2d'), {
+                type: 'bar',
+                data: { labels: TA_CATEGORIES, datasets },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: {
+                        legend: { labels: { color: '#e0e0e8' } },
+                        title: { display: true, text: 'Per-category F1 (×100)', color: '#888' },
+                    },
+                    scales: {
+                        x: { ticks: { color: '#888' }, grid: { color: 'rgba(42,42,58,0.4)' } },
+                        y: {
+                            beginAtZero: true, max: 100,
+                            ticks: { color: '#888', callback: v => `${v}` },
+                            grid: { color: 'rgba(42,42,58,0.4)' },
+                            title: { display: true, text: 'F1 ×100 (higher = better)', color: '#888' },
+                        },
+                    },
+                },
+            });
+        }
+
+        async function loadEvalTaTrend() {
+            const backend = document.getElementById('eval-ta-trend-backend').value || '*';
+            const canvas = document.getElementById('eval-ta-trend');
+            const empty = document.getElementById('eval-ta-trend-empty');
+
+            let resp;
+            try {
+                resp = await api(`/admin/api/eval/history?target=17lands_turn_action&limit=60`);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            } catch (e) {
+                _evalEmpty(empty, canvas, `Failed: ${e.message || e}`);
+                return;
+            }
+            const data = await resp.json();
+            const history = data.history || [];
+            if (!history.length) {
+                _evalEmpty(empty, canvas, 'No turn-action history yet.');
+                return;
+            }
+
+            const allBackends = Array.from(new Set(
+                history.flatMap(p => (p.backends || []).map(b => b.backend))
+            )).sort();
+            const palette = _palette(allBackends.length);
+            const beColor = Object.fromEntries(allBackends.map((b, i) => [b, palette[i]]));
+
+            const backendsToPlot = backend === '*' ? allBackends : [backend];
+            const datasets = [];
+            for (const be of backendsToPlot) {
+                datasets.push({
+                    label: `${be} · exact_match%`,
+                    data: history.map(p => {
+                        const row = (p.backends || []).find(b => b.backend === be);
+                        return row && row.exact_match_rate != null
+                            ? Math.round(row.exact_match_rate * 1000) / 10 : null;
+                    }),
+                    borderColor: beColor[be],
+                    backgroundColor: beColor[be],
+                    pointRadius: 4, tension: 0.2, spanGaps: true,
+                });
+                datasets.push({
+                    label: `${be} · mean_jaccard ×100`,
+                    data: history.map(p => {
+                        const row = (p.backends || []).find(b => b.backend === be);
+                        return row && row.mean_jaccard != null
+                            ? Math.round(row.mean_jaccard * 1000) / 10 : null;
+                    }),
+                    borderColor: beColor[be],
+                    backgroundColor: beColor[be],
+                    pointRadius: 3, tension: 0.2, spanGaps: true,
+                    borderDash: [4, 4],
+                });
+            }
+
+            if (history.length < 2) {
+                empty.textContent = `Only 1 run uploaded — re-run + upload to see a trend.`;
+                empty.style.display = '';
+            } else {
+                empty.style.display = 'none';
+            }
+            canvas.style.display = '';
+
+            if (evalTaTrend) { evalTaTrend.destroy(); evalTaTrend = null; }
+            evalTaTrend = new Chart(canvas.getContext('2d'), {
+                type: 'line',
+                data: { labels: _xLabels(history), datasets },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: {
+                        legend: { labels: { color: '#e0e0e8' } },
+                        title: {
+                            display: true,
+                            text: backend === '*'
+                                ? 'All backends — turn-action match rates over time'
+                                : `${backend} — turn-action match rates over time`,
+                            color: '#e0e0e8',
+                        },
+                    },
+                    scales: {
+                        x: { ticks: { color: '#888', maxRotation: 0, autoSkip: true, maxTicksLimit: 10 },
+                             grid: { color: 'rgba(42,42,58,0.4)' } },
+                        y: {
+                            beginAtZero: true, max: 100,
+                            ticks: { color: '#888', callback: v => `${v}%` },
+                            grid: { color: 'rgba(42,42,58,0.4)' },
+                            title: { display: true, text: 'Match rate', color: '#888' },
                         },
                     },
                 },
