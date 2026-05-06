@@ -30,6 +30,9 @@ def upload(json_path: Path, proxy_url: str, admin_key: str) -> None:
         headers={
             "Content-Type": "application/json",
             "X-Admin-Key": admin_key,
+            # Cloudflare's WAF blocks Python's default urllib UA (~code 1010)
+            # for the api.mtgacoach.com hostname. Send a realistic UA.
+            "User-Agent": "mtgacoach-eval-uploader/1.0",
         },
         method="POST",
     )
