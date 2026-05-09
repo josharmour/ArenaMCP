@@ -251,7 +251,7 @@ def check_backends() -> dict[str, bool]:
     if not any(results.values()):
         _fix("No working backend found! Configure at least one:")
         _fix("  Online: subscribe at https://mtgacoach.com/subscribe, then /key YOUR_KEY")
-        _fix("  Local:  install Ollama (https://ollama.com) then: ollama pull llama3.2")
+        _fix("  Local:  start vLLM at http://localhost:8000 (or Ollama at :11434, LM Studio at :1234)")
 
     return results
 

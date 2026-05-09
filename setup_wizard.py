@@ -242,7 +242,9 @@ MTGA_LOG_DEFAULT = (
     if IS_WIN else Path.home() / ".wine" / "MTGA" / "Player.log"  # unlikely but placeholder
 )
 
+VLLM_DEFAULT_URL = "http://localhost:8000/v1"
 OLLAMA_DEFAULT_URL = "http://localhost:11434/v1"
+LMSTUDIO_DEFAULT_URL = "http://localhost:1234/v1"
 ONLINE_API_URL = "https://api.mtgacoach.com/v1"
 SUBSCRIBE_URL = "https://mtgacoach.com/subscribe"
 
@@ -428,44 +430,58 @@ def detect_backends() -> dict[str, dict]:
         "details": "license key saved" if has_key else ("reachable" if online_reachable else "no license key"),
     }
 
-    # 2. Local (Ollama / LM Studio)
+    # 2. Local (vLLM / Ollama / LM Studio)
+    vllm_running = check_url(f"{VLLM_DEFAULT_URL}/models")
     ollama_bin = shutil.which("ollama")
-    ollama_running = check_url("http://localhost:11434/v1/models")
-    lmstudio_running = check_url("http://localhost:1234/v1/models")
+    ollama_running = check_url(f"{OLLAMA_DEFAULT_URL}/models")
+    lmstudio_running = check_url(f"{LMSTUDIO_DEFAULT_URL}/models")
+    vllm_models: list[str] = []
     ollama_models: list[str] = []
     lmstudio_models: list[str] = []
     provider = ""
+
+    if vllm_running:
+        vllm_models = fetch_models_from_url(VLLM_DEFAULT_URL)
+        provider = "vllm"
 
     if ollama_bin or ollama_running:
         ollama_models = fetch_ollama_models()
         if not ollama_models and ollama_running:
             ollama_models = fetch_models_from_url(OLLAMA_DEFAULT_URL)
-        provider = "ollama"
+        if not provider:
+            provider = "ollama"
 
     if lmstudio_running:
-        lmstudio_models = fetch_models_from_url("http://localhost:1234/v1")
+        lmstudio_models = fetch_models_from_url(LMSTUDIO_DEFAULT_URL)
         if not provider:
             provider = "lm-studio"
 
-    all_local_models = ollama_models + lmstudio_models
-    local_available = bool(ollama_bin or ollama_running or lmstudio_running)
+    all_local_models = vllm_models + ollama_models + lmstudio_models
+    local_available = bool(vllm_running or ollama_bin or ollama_running or lmstudio_running)
 
-    if ollama_running and lmstudio_running:
-        detail = f"Ollama ({len(ollama_models)} models) + LM Studio ({len(lmstudio_models)} models)"
-    elif ollama_running or ollama_bin:
-        detail = f"Ollama: {len(ollama_models)} model(s)" if ollama_models else ("Ollama installed but no models" if ollama_bin else "Ollama not running")
-    elif lmstudio_running:
-        detail = f"LM Studio: {len(lmstudio_models)} model(s)"
-    else:
-        detail = "not detected"
+    detail_parts = []
+    if vllm_running:
+        detail_parts.append(f"vLLM ({len(vllm_models)} model{'s' if len(vllm_models) != 1 else ''})")
+    if ollama_running or ollama_bin:
+        if ollama_models:
+            detail_parts.append(f"Ollama ({len(ollama_models)} models)")
+        elif ollama_bin:
+            detail_parts.append("Ollama installed but no models")
+        else:
+            detail_parts.append("Ollama not running")
+    if lmstudio_running:
+        detail_parts.append(f"LM Studio ({len(lmstudio_models)} models)")
+    detail = " + ".join(detail_parts) if detail_parts else "not detected"
 
     modes["local"] = {
         "available": local_available,
         "details": detail,
         "models": all_local_models,
+        "vllm_models": vllm_models,
         "ollama_models": ollama_models,
         "lmstudio_models": lmstudio_models,
         "provider": provider,
+        "vllm_running": vllm_running,
         "ollama_running": ollama_running,
         "lmstudio_running": lmstudio_running,
     }
@@ -789,53 +805,46 @@ def step_detect_and_choose_backend(settings: dict) -> tuple[str, str]:
     else:
         mode = "local"
 
+        vllm_running = local_info.get("vllm_running", False)
         ollama_running = local_info.get("ollama_running", False)
         lmstudio_running = local_info.get("lmstudio_running", False)
         ollama_bin = shutil.which("ollama")
+        vllm_models = local_info.get("vllm_models", [])
         ollama_models = local_info.get("ollama_models", [])
         lmstudio_models = local_info.get("lmstudio_models", [])
 
-        # Determine which local provider to use
-        if ollama_running and lmstudio_running:
+        # Build a menu of every provider that's actually running. vLLM wins ties.
+        candidates: list[tuple[str, str, str, list[str], str]] = []  # (label, provider, url, models, api_key)
+        if vllm_running:
+            candidates.append((f"vLLM ({len(vllm_models)} models)", "vllm",
+                               VLLM_DEFAULT_URL, vllm_models, "vllm"))
+        if ollama_running or ollama_bin:
+            candidates.append((f"Ollama ({len(ollama_models)} models)", "ollama",
+                               OLLAMA_DEFAULT_URL, ollama_models, "ollama"))
+        if lmstudio_running:
+            candidates.append((f"LM Studio ({len(lmstudio_models)} models)", "lm-studio",
+                               LMSTUDIO_DEFAULT_URL, lmstudio_models, "lm-studio"))
+
+        if len(candidates) > 1:
             print()
-            print(f"    [1] Ollama ({len(ollama_models)} models)")
-            print(f"    [2] LM Studio ({len(lmstudio_models)} models)")
+            for i, (label, *_rest) in enumerate(candidates, 1):
+                print(f"    [{i}] {label}")
             print()
-            sub = prompt_choice(["Ollama", "LM Studio"], "Select provider")
-            if sub == 1:
-                provider = "ollama"
-                local_url = OLLAMA_DEFAULT_URL
-                local_api_key = "ollama"
-                available_models = ollama_models
-            else:
-                provider = "lm-studio"
-                local_url = "http://localhost:1234/v1"
-                local_api_key = "lm-studio"
-                available_models = lmstudio_models
-        elif lmstudio_running:
-            provider = "lm-studio"
-            local_url = "http://localhost:1234/v1"
-            local_api_key = "lm-studio"
-            available_models = lmstudio_models
-            ok("LM Studio detected")
-        elif ollama_bin or ollama_running:
-            provider = "ollama"
-            local_url = OLLAMA_DEFAULT_URL
-            local_api_key = "ollama"
-            available_models = ollama_models
-            if ollama_running:
-                ok("Ollama detected")
-            else:
-                info("Ollama installed but not running")
+            sub = prompt_choice([c[0] for c in candidates], "Select provider")
+            _label, provider, local_url, available_models, local_api_key = candidates[sub - 1]
+            ok(f"{provider} selected")
+        elif len(candidates) == 1:
+            _label, provider, local_url, available_models, local_api_key = candidates[0]
+            ok(f"{provider} detected")
         else:
             fail("No local LLM server detected")
-            info("Install Ollama from https://ollama.ai")
+            info("Start vLLM (recommended) or install Ollama from https://ollama.ai")
             info("  or LM Studio from https://lmstudio.ai")
             if not prompt_yn("Continue anyway?"):
                 return "local", model
-            provider = "ollama"
-            local_url = OLLAMA_DEFAULT_URL
-            local_api_key = "ollama"
+            provider = "vllm"
+            local_url = VLLM_DEFAULT_URL
+            local_api_key = "vllm"
             available_models = []
 
         if available_models:
@@ -938,15 +947,16 @@ def step_verify(settings: dict) -> None:
         except Exception:
             fail("Could not reach mtgacoach.com (check your license key and internet)")
     elif mode == "local":
-        local_url = settings.get("local_url", OLLAMA_DEFAULT_URL)
+        local_url = settings.get("local_url", VLLM_DEFAULT_URL)
         base = local_url.replace("/v1", "")
         info("Testing local LLM connection...")
         if check_url(f"{local_url}/models"):
             ok(f"Local LLM API responding ({local_url})")
-        elif check_url(f"{base}/api/tags"):
+        elif "11434" in local_url and check_url(f"{base}/api/tags"):
+            # Ollama-specific fallback: endpoint up but /v1/models flaky.
             ok(f"Local LLM responding ({base})")
         else:
-            fail("Local LLM not responding (start Ollama with: ollama serve)")
+            fail(f"Local LLM not responding at {local_url} (is your vLLM/Ollama/LM Studio server running?)")
 
     # Test MTGA log path
     info("Checking MTGA log path...")

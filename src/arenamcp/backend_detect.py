@@ -11,8 +11,8 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Default local model
-DEFAULT_LOCAL_MODEL = "llama3.2:latest"
+# Default local model (vLLM serves Gemma 4 E2B-it under this alias)
+DEFAULT_LOCAL_MODEL = "gemma4:e2b"
 
 
 def detect_backends_quick() -> dict[str, bool]:
@@ -65,9 +65,9 @@ def _is_local_available() -> bool:
     """Check if the configured local endpoint responds."""
     try:
         from arenamcp.settings import get_settings
-        local_url = get_settings().get("local_url") or "http://localhost:11434/v1"
+        local_url = get_settings().get("local_url") or "http://localhost:8000/v1"
     except Exception:
-        local_url = "http://localhost:11434/v1"
+        local_url = "http://localhost:8000/v1"
 
     try:
         req = urllib.request.Request(f"{local_url}/models", method="GET")
@@ -119,9 +119,9 @@ def _validate_local() -> tuple[bool, str]:
     """Check local mode: endpoint reachable with at least one model."""
     try:
         from arenamcp.settings import get_settings
-        local_url = get_settings().get("local_url") or "http://localhost:11434/v1"
+        local_url = get_settings().get("local_url") or "http://localhost:8000/v1"
     except Exception:
-        local_url = "http://localhost:11434/v1"
+        local_url = "http://localhost:8000/v1"
 
     try:
         req = urllib.request.Request(f"{local_url}/models", method="GET")

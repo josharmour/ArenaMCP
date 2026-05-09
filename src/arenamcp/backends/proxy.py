@@ -53,9 +53,9 @@ def _maybe_capture_prompt(
 # Online mode: hardcoded API endpoint
 ONLINE_BASE_URL = "https://api.mtgacoach.com/v1"
 
-# Default local endpoint (Ollama)
-DEFAULT_LOCAL_URL = "http://localhost:11434/v1"
-DEFAULT_LOCAL_MODEL = "llama3.2"
+# Default local endpoint (vLLM). Ollama lives at :11434 if a user wants to fall back.
+DEFAULT_LOCAL_URL = "http://localhost:8000/v1"
+DEFAULT_LOCAL_MODEL = "gemma4:e2b"
 
 
 class ProxyBackend:
@@ -79,8 +79,8 @@ class ProxyBackend:
         self._api_key = api_key
         self._client = None
 
-        # Fire-and-forget warmup for Ollama to pre-load the model
-        self._ollama_warmup()
+        # Fire-and-forget warmup for any local backend to pre-load weights/KV cache
+        self._local_warmup()
 
     @classmethod
     def create_online(cls, model: Optional[str] = None, license_key: str = "") -> "ProxyBackend":
@@ -98,11 +98,11 @@ class ProxyBackend:
         url: Optional[str] = None,
         api_key: Optional[str] = None,
     ) -> "ProxyBackend":
-        """Create a backend configured for local mode (Ollama/LM Studio)."""
+        """Create a backend configured for local mode (vLLM/Ollama/LM Studio)."""
         return cls(
             model=model or DEFAULT_LOCAL_MODEL,
             base_url=url or DEFAULT_LOCAL_URL,
-            api_key=api_key or "ollama",
+            api_key=api_key or "vllm",
         )
 
     # Hard ceiling applied at the SDK level. Per-call request_timeout_s in
@@ -132,13 +132,19 @@ class ProxyBackend:
                 raise ImportError("openai package required: pip install openai")
         return self._client
 
-    def _ollama_warmup(self) -> None:
-        """Send a minimal warmup request to Ollama in a background thread."""
+    def _local_warmup(self) -> None:
+        """Send a minimal warmup request to a local backend in a background thread.
+
+        Fires for any non-online endpoint (vLLM/Ollama/LM Studio/etc.) so the
+        first real coach call doesn't pay the cold-start cost.
+        """
         url = self._base_url or ""
-        key = self._api_key or ""
-        is_ollama = ("localhost:11434" in url or "127.0.0.1:11434" in url or
-                     key == "ollama")
-        if not is_ollama:
+        if not url or url == ONLINE_BASE_URL:
+            return
+        # Only warm up obvious local URLs to avoid surprising arbitrary endpoints.
+        is_local = ("localhost" in url or "127.0.0.1" in url or
+                    url.startswith("http://0.0.0.0"))
+        if not is_local:
             return
 
         def _warmup():
@@ -149,9 +155,9 @@ class ProxyBackend:
                     messages=[{"role": "user", "content": "hi"}],
                     max_tokens=1,
                 )
-                logger.info(f"[PROXY] Ollama warmup complete for model {self.model}")
+                logger.info(f"[PROXY] Local warmup complete for model {self.model}")
             except Exception as e:
-                logger.debug(f"[PROXY] Ollama warmup failed (non-fatal): {e}")
+                logger.debug(f"[PROXY] Local warmup failed (non-fatal): {e}")
 
         t = threading.Thread(target=_warmup, daemon=True)
         t.start()

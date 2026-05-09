@@ -50,9 +50,9 @@ DEFAULTS = {
     # Subscription license key for online mode
     "license_key": "",
     # Local model endpoint config
-    "local_url": "http://localhost:11434/v1",  # Default: Ollama
+    "local_url": "http://localhost:8000/v1",  # Default: vLLM (Ollama is at :11434)
     "local_model": None,  # None = auto-detect first available
-    "local_api_key": "ollama",  # Ollama ignores this; LM Studio needs "lm-studio"
+    "local_api_key": "vllm",  # vLLM/Ollama ignore this; LM Studio needs "lm-studio"
     # Subscription messages tracking
     "last_seen_message_id": None,
 }

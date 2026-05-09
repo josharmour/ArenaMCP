@@ -908,16 +908,21 @@ class PipeAdapter:
         arg = parts[1].strip() if len(parts) > 1 else ""
 
         if not arg:
-            url = settings.get("local_url", "http://localhost:11434/v1")
+            url = settings.get("local_url", "http://localhost:8000/v1")
             model = settings.get("local_model", "auto-detect")
-            api_key = settings.get("local_api_key", "ollama")
+            api_key = settings.get("local_api_key", "vllm")
             self.log(f"Local config: URL={url}, Model={model or 'auto-detect'}, Key={api_key}")
             return
 
         arg_parts = arg.split(maxsplit=1)
         provider = arg_parts[0].lower()
 
-        if provider == "ollama":
+        if provider == "vllm":
+            settings.set("local_url", "http://localhost:8000/v1", save=False)
+            settings.set("local_api_key", "vllm", save=False)
+            settings.set("local_model", None, save=True)
+            self.log("Local config set to vLLM (localhost:8000)")
+        elif provider == "ollama":
             settings.set("local_url", "http://localhost:11434/v1", save=False)
             settings.set("local_api_key", "ollama", save=False)
             settings.set("local_model", None, save=True)
@@ -935,7 +940,7 @@ class PipeAdapter:
             settings.set("local_model", None, save=True)
             self.log(f"Local config set to {url}")
         else:
-            self.error(f"Unknown provider: {provider}. Use ollama, lmstudio, or a URL.")
+            self.error(f"Unknown provider: {provider}. Use vllm, ollama, lmstudio, or a URL.")
             return
 
         # Switch to local mode

@@ -291,6 +291,22 @@ from arenamcp.backends import (  # noqa: E402
 )
 
 
+def _is_local_backend(be: Any) -> bool:
+    """True when `be` is a ProxyBackend pointed at a local LLM server.
+
+    Detects vLLM (port 8000), Ollama (11434), LM Studio (1234), and the
+    legacy api_key markers we wrote out before the vLLM migration. Used to
+    pick the longer LLM timeouts that local inference needs.
+    """
+    if not isinstance(be, ProxyBackend):
+        return False
+    url = (getattr(be, '_base_url', '') or '').lower()
+    if any(host in url for host in ("localhost", "127.0.0.1", "0.0.0.0")):
+        return True
+    key = (getattr(be, '_api_key', '') or '').lower()
+    return key in ("vllm", "ollama", "lm-studio")
+
+
 def get_available_modes() -> list[tuple[str, str]]:
     """Return available backend modes.
 
@@ -340,9 +356,9 @@ def get_models_for_mode(mode: str) -> list[tuple[str, Optional[str]]]:
     if mode == "local":
         try:
             from arenamcp.settings import get_settings
-            local_url = get_settings().get("local_url") or "http://localhost:11434/v1"
+            local_url = get_settings().get("local_url") or "http://localhost:8000/v1"
         except Exception:
-            local_url = "http://localhost:11434/v1"
+            local_url = "http://localhost:8000/v1"
         # Try OpenAI-compatible /v1/models
         try:
             req = _urlreq.Request(f"{local_url}/models")
@@ -454,8 +470,8 @@ def create_backend(
     if mode == "local":
         from arenamcp.settings import get_settings
         s = get_settings()
-        local_url = s.get("local_url") or "http://localhost:11434/v1"
-        local_api_key = s.get("local_api_key") or "ollama"
+        local_url = s.get("local_url") or "http://localhost:8000/v1"
+        local_api_key = s.get("local_api_key") or "vllm"
         local_model = model or s.get("local_model")
 
         # If no model specified, try to auto-detect from the endpoint
@@ -491,11 +507,11 @@ def create_local_fallback(
     try:
         from arenamcp.settings import get_settings
         s = get_settings()
-        local_url = s.get("local_url") or "http://localhost:11434/v1"
-        local_api_key = s.get("local_api_key") or "ollama"
+        local_url = s.get("local_url") or "http://localhost:8000/v1"
+        local_api_key = s.get("local_api_key") or "vllm"
     except Exception:
-        local_url = "http://localhost:11434/v1"
-        local_api_key = "ollama"
+        local_url = "http://localhost:8000/v1"
+        local_api_key = "vllm"
     return ProxyBackend.create_local(
         model=model or DEFAULT_LOCAL_MODEL,
         url=local_url,
@@ -572,6 +588,8 @@ CRITICAL STRATEGY RULES:
 - TRADE CHECK: Read the "If X blocks Y:" lines below the Atk: summary. Lines marked "BAD" mean the attacker dies for free or bounces off. Do NOT attack into a BAD trade unless it enables lethal or a critical strategy. If every possible block is BAD, don't attack with that creature.
 - WORST-CASE BLOCKING: The opponent WILL choose the block that's best for THEM. If ANY "If X blocks Y:" line shows BAD for your attacker, assume the opponent will make that block. Don't suggest attacking because one blocker gives a GOOD trade when another blocker kills your creature — the opponent won't cooperate with your plan.
 - ATTACK DEFAULT: When declaring attackers, attack with ALL eligible creatures (listed after "can attack:" in the Atk: line) unless you have a concrete reason to hold one back (e.g., BAD trade, need it to block a lethal crackback). Do NOT suggest attacking with only one creature when multiple are available without explaining why the others should stay back.
+- MAIN PHASE ACTION DEFAULT: When YOU have priority on YOUR own Main Phase and either an unplayed land is in hand OR any card shows [OK]/[CAN CAST], you should almost always recommend taking an action — not "pass priority". Default play sequence: play a land if available, then cast your highest-impact [OK] spell. The bar to pass on your own turn with castable plays is HIGH. Only pass on your own main phase if you have a specific reason (e.g., holding mana up for a known counter on opponent's turn, holding a combat trick for declare-attackers). Never pass just because you're unsure — pick the best [OK] play.
+- PASS PRIORITY is correct when: (a) it's NOT your turn and you have no instant-speed plays, (b) you have NO [OK] cards AND no land drop available on your main phase, (c) end-of-turn/upkeep with no triggers or responses to make. Otherwise, recommend an action.
 - CRACKBACK CHECK: Before attacking, count opponent's total power on board vs YOUR life total.
   If opponent can kill you on their next attack and you need creatures to block, do NOT attack with them.
   Holding back blockers to survive is more important than dealing a few damage.
@@ -3042,7 +3060,7 @@ class CoachEngine:
         # the lock, causing cascading lock-busy failures on subsequent calls
         # which triggers unnecessary restarts.
         backend_timeout = getattr(self._backend, 'timeout_s', 12.0)
-        is_local = isinstance(self._backend, ProxyBackend) and getattr(self._backend, '_api_key', None) in ("ollama", "lm-studio")
+        is_local = _is_local_backend(self._backend)
         if is_local:
             api_timeout = max(backend_timeout + 5, 45)  # Local models need more time
         else:
@@ -3065,8 +3083,8 @@ class CoachEngine:
         try:
             response = future.result(timeout=api_timeout)
         except concurrent.futures.TimeoutError:
-            is_ollama = isinstance(self._backend, ProxyBackend) and getattr(self._backend, '_api_key', None) == "ollama"
-            hint = " — try a smaller model (e.g. llama3.2:1b) or use a cloud backend" if is_ollama else ""
+            is_local = _is_local_backend(self._backend)
+            hint = " — try a smaller model or use a cloud backend" if is_local else ""
             logger.warning(
                 f"LLM API call timed out after {api_timeout}s (model may be too slow for real-time coaching){hint}"
             )
@@ -3145,7 +3163,7 @@ class CoachEngine:
 
         # Longer timeout for strategic plans (more tokens to generate).
         is_thinking = isinstance(be, ProxyBackend) and be.enable_thinking
-        is_local = isinstance(be, ProxyBackend) and getattr(be, '_api_key', None) in ("ollama", "lm-studio")
+        is_local = _is_local_backend(be)
         if is_thinking:
             api_timeout = 90
         elif is_local:
