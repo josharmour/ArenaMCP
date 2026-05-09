@@ -17,6 +17,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Optional
 
 
 def _read_jsonl(path: Path):
@@ -31,16 +32,48 @@ def _read_jsonl(path: Path):
                 continue
 
 
+_CARD_DB = None
+_CMC_CACHE: dict[int, float] = {}
+
+
+def _cmc_for(grp_id: Optional[int]) -> Optional[float]:
+    """Resolve a grpId to converted mana cost. None on lookup failure.
+
+    Memoized to amortize the card-DB cost across thousands of contested
+    checks. Card DB lazy-loads on first use.
+    """
+    if grp_id is None:
+        return None
+    gid = int(grp_id)
+    if gid in _CMC_CACHE:
+        return _CMC_CACHE[gid]
+    global _CARD_DB
+    if _CARD_DB is None:
+        try:
+            from arenamcp.card_db import get_card_database  # type: ignore
+            _CARD_DB = get_card_database()
+        except Exception:
+            _CARD_DB = False  # sentinel: never try again
+    if _CARD_DB is False:
+        return None
+    info = _CARD_DB.get_card_by_arena_id(gid)
+    cmc = float(getattr(info, "cmc", 0) or 0) if info else None
+    _CMC_CACHE[gid] = cmc
+    return cmc
+
+
 def _is_contested(rec: dict) -> bool:
     """True when this decision had a real choice — not a forced/trivial move.
 
     Disaggregates "matches the boring majority play" from "matches when there
     were real options on the table." Definitions per kind:
 
-    - ActionsAvailable: contested when there's at least one Cast/Play card
-      action AND at least one other distinct action on offer (so it's not
-      just "pass" or a single forced cast). A long list of mana-tap actions
-      doesn't count — those are mechanical, not strategic.
+    - ActionsAvailable: contested when the player faced a real sequencing
+      choice — multiple castable spells competing for similar mana, or
+      they actively chose to Pass while a play was available. The mana
+      filter prunes "1-drop alongside a 5-drop board wipe" cases where
+      one card dominates the call. Cards within ±1 CMC of the chosen
+      play are treated as competing alternatives.
     - DeclareAttackers: contested when the player held back at least one
       qualified attacker (i.e., qualified_ids > chosen). All-out attacks
       are the "boring majority" we're filtering out.
@@ -64,20 +97,45 @@ def _is_contested(rec: dict) -> bool:
         actions = rec.get("actions") or []
         card_types = {"ActionType_Cast", "ActionType_Play",
                       "ActionType_PlayMDFC", "ActionType_CastOmen"}
-        n_card_actions = sum(
-            1 for a in actions
+        card_actions = [
+            a for a in actions
             if (a.get("action_type") or a.get("actionType")) in card_types
-        )
+        ]
         chosen_type = (rec.get("ground_truth") or {}).get("action_type")
+        gt = rec.get("ground_truth") or {}
+        chosen_grp_ids = gt.get("grp_ids") or []
+        chosen_grp_id = chosen_grp_ids[0] if chosen_grp_ids else None
+
         if chosen_type in card_types:
-            # Player picked a card play; contested if there were >=2 card
-            # actions on offer (had to *choose* which one).
-            return n_card_actions >= 2
+            # Player picked a card play; contested only if at least one
+            # other card action is competing for the same mana band
+            # (within ±1 CMC of the chosen card). This filters out the
+            # "1-drop trash alongside a 5-drop wipe" case where the call
+            # isn't really between two plays.
+            if len(card_actions) < 2:
+                return False
+            chosen_cmc = _cmc_for(chosen_grp_id)
+            if chosen_cmc is None:
+                # Card DB miss — fall back to the count-only rule so we
+                # don't silently zero contested counts on DB outages.
+                return len(card_actions) >= 2
+            for a in card_actions:
+                gid = a.get("grp_id") or a.get("grpId")
+                if gid is None or int(gid) == int(chosen_grp_id or 0):
+                    continue
+                other_cmc = _cmc_for(gid)
+                if other_cmc is None:
+                    continue
+                if abs(other_cmc - chosen_cmc) <= 1.0:
+                    return True
+            return False
         if chosen_type == "ActionType_Pass":
-            # Player declined to play; contested if a play was available
-            # (chose to hold up mana / preserve resources).
-            return n_card_actions >= 1
-        # Mana abilities, activate, etc. are mechanical — not strategic.
+            # Player declined to play with a card on offer. The "real"
+            # version of this is "held up mana for an instant or trick";
+            # for v1 we still count any card-action-available pass as
+            # contested since they're not common enough to subdivide.
+            return len(card_actions) >= 1
+        # Mana abilities, Activate, etc. are mechanical — not strategic.
         return False
     return False
 

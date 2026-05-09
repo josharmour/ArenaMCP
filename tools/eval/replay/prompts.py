@@ -344,20 +344,59 @@ def build_declare_blockers_prompt(snap, request,
 
 
 MULL_SYSTEM_PROMPT = (
-    "You are a Magic: The Gathering Arena coach. Mulligan decision: keep "
-    "the offered hand or take a free London mulligan (down 1 card from this "
-    "hand size). Reply on the FIRST LINE: `KEEP` or `MULL`. Then a brief reason."
+    "Binary classifier for MTG Arena opening hands: KEEP or MULL.\n"
+    "\n"
+    "Default to KEEP. Pro players keep ~85-95% of opening hands. Only MULL "
+    "if the hand is clearly unkeepable:\n"
+    "  - 0 lands or 1 land (mana flood-out risk)\n"
+    "  - 5+ lands out of 7 (mana screw risk)\n"
+    "  - Zero plays before turn 4 (slow-rolled out)\n"
+    "Otherwise KEEP, even if the hand is mediocre — a 6-card mulligan is "
+    "usually weaker.\n"
+    "\n"
+    "Reply on the FIRST LINE with exactly one word: `KEEP` or `MULL`."
 )
+
+
+def _classify_hand(hand_cards: list[dict]) -> tuple[int, int, int]:
+    """Return (lands, spells, low_drops) where low_drops = #cards with cmc<=3.
+
+    Land detection uses the card DB type_line; failures count as spells
+    (conservative — a missing type_line is more often a non-land card).
+    """
+    lands = 0
+    spells = 0
+    low_drops = 0
+    cdb = _cdb()
+    for c in hand_cards:
+        gid = c.get("grpId")
+        info = cdb.get_card_by_arena_id(int(gid)) if gid is not None else None
+        type_line = (getattr(info, "type_line", None) or "").lower() if info else ""
+        cmc = float(getattr(info, "cmc", 0) or 0) if info else 0.0
+        if "land" in type_line:
+            lands += 1
+        else:
+            spells += 1
+            if cmc and cmc <= 3:
+                low_drops += 1
+    return lands, spells, low_drops
 
 
 def build_mulligan_prompt(snap, request, hand_cards: list[dict],
                           mulligan_count: int) -> str:
-    nums_remaining = 7 - mulligan_count  # London: hand size after this decision if kept
-    seat = snap.local_seat_id
+    """Stripped-down mulligan prompt for small models.
+
+    Designed for E2B-class models that get lost in heavy context. Surfaces
+    the three signals that drive the decision (lands count, spells count,
+    early plays) so the model doesn't have to derive them from card names.
+    """
+    nums_remaining = 7 - mulligan_count
+    lands, spells, low_drops = _classify_hand(hand_cards)
     lines = [
-        f"Mulligan decision (#{mulligan_count}). London format.",
-        f"You're being offered a {nums_remaining}-card hand. After mulligan you'd see another "
-        f"{nums_remaining}-card hand and bottom {mulligan_count + 1} cards.",
+        f"Mulligan #{mulligan_count}. {nums_remaining}-card hand. London format "
+        f"(mulligan = bottom {mulligan_count + 1} after seeing a fresh {nums_remaining}).",
+        "",
+        f"Lands: {lands}/{nums_remaining}.  Spells: {spells} (with {low_drops} that cost 3 or less).",
         "",
         "Hand:",
     ]
@@ -365,7 +404,7 @@ def build_mulligan_prompt(snap, request, hand_cards: list[dict],
         n = _name_for_grpid(c.get("grpId"))
         lines.append(f"  {i + 1}. {n}")
     lines.append("")
-    lines.append("Reply: `KEEP` or `MULL`.")
+    lines.append("KEEP or MULL?")
     return "\n".join(lines)
 
 
