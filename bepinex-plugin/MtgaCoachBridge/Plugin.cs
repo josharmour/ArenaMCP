@@ -469,6 +469,14 @@ namespace MtgaCoachBridge
                     HandleListReplays(cmd);
                     break;
 
+                case "start_bot_battle":
+                    cmd.SetResponse(BotBattleBridge.Start(cmd.Json, _log));
+                    break;
+
+                case "bot_battle_status":
+                    cmd.SetResponse(BotBattleBridge.GetStatus());
+                    break;
+
                 default:
                     cmd.SetResponse(new JObject
                     {
