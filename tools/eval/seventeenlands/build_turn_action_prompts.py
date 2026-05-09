@@ -55,12 +55,19 @@ SYSTEM_PROMPT = (
     "You are a Magic: The Gathering Arena coach. Given the state at the "
     "start of the user's turn, recommend which action categories the user "
     "should take this turn.\n\n"
+    "You have priority on YOUR OWN Main Phase 1. High-rank Limited players "
+    "take 2-4 actions on most main-phase turns — typically PLAY_LAND + at "
+    "least one CAST + ATTACK if creatures are available. **PASS-only turns "
+    "are very rare** (under 5% at diamond+ rank).\n\n"
     "Reply on the FIRST LINE with comma-separated tags from this exact set, "
     "in any order:\n"
     "  PLAY_LAND, CAST_CREATURE, CAST_SPELL, ATTACK, ACTIVATE, PASS\n\n"
-    "Use PASS alone if the right answer is to draw and do nothing else. "
-    "Combine tags freely otherwise (e.g. 'PLAY_LAND, CAST_CREATURE, ATTACK'). "
-    "Then, on subsequent lines, give one short sentence of reasoning."
+    "Use PASS only when you genuinely have nothing to do this turn (no land "
+    "in hand AND no castable spell AND no creature that can attack AND no "
+    "ability worth activating). Combine multiple tags freely (e.g. "
+    "'PLAY_LAND, CAST_CREATURE, ATTACK'). Then on subsequent lines give one "
+    "short sentence of reasoning. Default to action — pass should require a "
+    "specific justification."
 )
 
 
@@ -123,10 +130,34 @@ def _peek_header(csv_gz: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _to_int(v) -> int:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
+    """Parse a numeric scalar field (e.g. '20.0', '20', ''). Returns 0 on miss."""
+    if v is None:
         return 0
+    s = str(v).strip()
+    if not s:
+        return 0
+    try:
+        return int(s)
+    except ValueError:
+        try:
+            return int(float(s))
+        except ValueError:
+            return 0
+
+
+def _count_list(v) -> int:
+    """Count items in a pipe-separated list field (17lands per-turn lists).
+
+    Most per-turn columns (lands_played, creatures_cast, eot_user_lands_in_play,
+    eot_user_cards_in_hand, ...) are pipe-separated grpids/instance-ids, NOT
+    counts. Returns the number of non-empty items.
+    """
+    if v is None:
+        return 0
+    s = str(v).strip()
+    if not s:
+        return 0
+    return sum(1 for tok in s.split("|") if tok.strip())
 
 
 def _sample_turns(num_turns: int) -> list[int]:
@@ -149,32 +180,70 @@ def _sample_turns(num_turns: int) -> list[int]:
     return out
 
 
-def _resolve_names(grpids: list[int], cdb) -> list[str]:
-    out: list[str] = []
-    for g in grpids:
-        info = cdb.get_card_by_arena_id(g) if cdb else None
-        if info is None:
-            out.append(f"Unknown({g})")
+# Per-process memo so we don't re-hit the SQLite MTGA DB for every prompt's
+# 7+N drawn cards. A set has only ~600 distinct grpids.
+_RESOLVE_CACHE: dict[int, tuple[str, str]] = {}
+
+
+def _resolve_grpid(grpid: int, cdb) -> tuple[str, str]:
+    """Return (name, kind) for a grpid; kind in {land, creature, spell}."""
+    cached = _RESOLVE_CACHE.get(grpid)
+    if cached is not None:
+        return cached
+    info = cdb.get_card_by_arena_id(grpid) if cdb else None
+    if info is None:
+        cached = (f"Unknown({grpid})", "spell")
+    else:
+        name = getattr(info, "name", None) or f"Unknown({grpid})"
+        type_line = (getattr(info, "type_line", "") or "").lower()
+        if "land" in type_line:
+            kind = "land"
+        elif "creature" in type_line:
+            kind = "creature"
         else:
-            out.append(getattr(info, "name", None) or f"Unknown({g})")
+            kind = "spell"
+        cached = (name, kind)
+    _RESOLVE_CACHE[grpid] = cached
+    return cached
+
+
+def _resolve_names(grpids: list[int], cdb) -> list[str]:
+    return [_resolve_grpid(g, cdb)[0] for g in grpids]
+
+
+def _classify(grpid: int, cdb) -> str:
+    """Classify a card grpid as 'land', 'creature', or 'spell'."""
+    return _resolve_grpid(grpid, cdb)[1]
+
+
+def _resolve_with_types(grpids: list[int], cdb) -> list[tuple[int, str, str]]:
+    """Return [(grpid, name, kind)] for each grpid; kind is land/creature/spell."""
+    out: list[tuple[int, str, str]] = []
+    for g in grpids:
+        name, kind = _resolve_grpid(g, cdb)
+        out.append((g, name, kind))
     return out
 
 
 def _action_set(row: dict, n: int) -> set[str]:
-    """Extract the actually-played category set for user turn N."""
+    """Extract the actually-played category set for user turn N.
+
+    Per-turn fields are pipe-separated grpid/instance-id lists. Use
+    ``_count_list`` not ``_to_int`` (those columns are not numeric scalars).
+    """
     p = f"user_turn_{n}_"
     s: set[str] = set()
-    if _to_int(row.get(p + "lands_played")) > 0:
+    if _count_list(row.get(p + "lands_played")) > 0:
         s.add("PLAY_LAND")
-    if _to_int(row.get(p + "creatures_cast")) > 0:
+    if _count_list(row.get(p + "creatures_cast")) > 0:
         s.add("CAST_CREATURE")
-    if _to_int(row.get(p + "non_creatures_cast")) > 0:
+    if _count_list(row.get(p + "non_creatures_cast")) > 0:
         s.add("CAST_SPELL")
-    if _to_int(row.get(p + "user_instants_sorceries_cast")) > 0:
+    if _count_list(row.get(p + "user_instants_sorceries_cast")) > 0:
         s.add("CAST_SPELL")
-    if _to_int(row.get(p + "creatures_attacked")) > 0:
+    if _count_list(row.get(p + "creatures_attacked")) > 0:
         s.add("ATTACK")
-    if _to_int(row.get(p + "user_abilities")) > 0:
+    if _count_list(row.get(p + "user_abilities")) > 0:
         s.add("ACTIVATE")
     if not s:
         s.add("PASS")
@@ -187,9 +256,9 @@ def _format_prompt(row: dict, n: int, cdb) -> str:
     splash = row.get("splash_colors") or ""
     opp_colors = row.get("opp_colors") or "(unknown)"
 
-    # State at start of turn N: use end-of-prior-turn for both sides where
-    # available, else initial. Prior-turn key is N-1 for both user and opp
-    # eot snapshots (the columns are end-of-that-turn snapshots).
+    # State at start of turn N: use end-of-prior-turn snapshots.
+    # Per-turn list fields (lands_in_play, creatures_in_play, cards_in_hand,
+    # ...) are pipe-separated grpid/instance-id lists, not scalars.
     prev = max(1, n - 1)
     user_p = f"user_turn_{prev}_"
     if n == 1:
@@ -199,78 +268,92 @@ def _format_prompt(row: dict, n: int, cdb) -> str:
         opp_lands = 0
         user_creatures = 0
         opp_creatures = 0
-        user_hand = 7 - _to_int(row.get("num_mulligans"))
-        opp_hand = 7 - _to_int(row.get("opp_num_mulligans"))
+        opp_hand = 7
+        # Hand at start of turn 1 = the opening hand (post mulligan).
+        hand_grpids = list(parse_grpid_list(row.get("opening_hand", "")))
     else:
-        user_life = _to_int(row.get(user_p + "eot_user_life") or 20)
-        opp_life = _to_int(row.get(user_p + "eot_oppo_life") or 20)
-        user_lands = _to_int(row.get(user_p + "eot_user_lands_in_play"))
-        opp_lands = _to_int(row.get(user_p + "eot_oppo_lands_in_play"))
-        user_creatures = _to_int(row.get(user_p + "eot_user_creatures_in_play"))
-        opp_creatures = _to_int(row.get(user_p + "eot_oppo_creatures_in_play"))
-        user_hand = _to_int(row.get(user_p + "eot_user_cards_in_hand"))
-        opp_hand = _to_int(row.get(user_p + "eot_oppo_cards_in_hand"))
+        user_life = _to_int(row.get(user_p + "eot_user_life")) or 20
+        opp_life = _to_int(row.get(user_p + "eot_oppo_life")) or 20
+        user_lands = _count_list(row.get(user_p + "eot_user_lands_in_play"))
+        opp_lands = _count_list(row.get(user_p + "eot_oppo_lands_in_play"))
+        user_creatures = _count_list(row.get(user_p + "eot_user_creatures_in_play"))
+        opp_creatures = _count_list(row.get(user_p + "eot_oppo_creatures_in_play"))
+        opp_hand = _count_list(row.get(user_p + "eot_oppo_cards_in_hand"))
+        # End-of-prior-user-turn cards-in-hand IS the start-of-turn-N hand
+        # (before the draw step). Add this turn's cards_drawn/tutored to get
+        # the effective hand on Main Phase 1.
+        hand_grpids = list(parse_grpid_list(row.get(user_p + "eot_user_cards_in_hand", "")))
+        hand_grpids.extend(parse_grpid_list(row.get(f"user_turn_{n}_cards_drawn", "")))
+        hand_grpids.extend(parse_grpid_list(row.get(f"user_turn_{n}_cards_tutored", "")))
 
-    # Cards user has drawn so far (opening + each prior+current turn's draws).
-    drawn_grpids: list[int] = list(parse_grpid_list(row.get("opening_hand", "")))
-    for k in range(1, n + 1):
-        drawn_grpids.extend(parse_grpid_list(row.get(f"user_turn_{k}_cards_drawn", "")))
-        drawn_grpids.extend(parse_grpid_list(row.get(f"user_turn_{k}_cards_tutored", "")))
-    drawn_names = _resolve_names(drawn_grpids, cdb)
+    # Render the hand by category. Names for unknown grpids fall through to
+    # 'Unknown(N)' — that's still useful signal (count + colors).
+    typed = _resolve_with_types(hand_grpids, cdb)
+    hand_lands = [name for _, name, k in typed if k == "land"]
+    hand_creatures = [name for _, name, k in typed if k == "creature"]
+    hand_spells = [name for _, name, k in typed if k == "spell"]
+    user_hand = len(hand_grpids)
 
-    # Opp's prior turn summary (what just happened).
+    def _hand_section(label: str, names: list[str]) -> str:
+        if not names:
+            return f"  {label} (0): (none)"
+        return f"  {label} ({len(names)}): {', '.join(names)}"
+
+    hand_block = "\n".join([
+        _hand_section("LAND", hand_lands),
+        _hand_section("CREATURE", hand_creatures),
+        _hand_section("OTHER SPELL", hand_spells),
+    ])
+
+    # Opp's prior turn summary.
     if n == 1 and on_play:
         opp_summary = "Opponent has not acted yet."
     else:
         opp_turn_n = n - 1 if on_play else n
         op = f"oppo_turn_{opp_turn_n}_"
-        opp_lands_played = _to_int(row.get(op + "lands_played"))
-        opp_creatures_cast = _to_int(row.get(op + "creatures_cast"))
+        opp_lands_played = _count_list(row.get(op + "lands_played"))
+        opp_creatures_cast = _count_list(row.get(op + "creatures_cast"))
         opp_spells_cast = (
-            _to_int(row.get(op + "non_creatures_cast"))
-            + _to_int(row.get(op + "oppo_instants_sorceries_cast"))
+            _count_list(row.get(op + "non_creatures_cast"))
+            + _count_list(row.get(op + "oppo_instants_sorceries_cast"))
         )
-        opp_attacks = _to_int(row.get(op + "creatures_attacked"))
+        opp_attacks = _count_list(row.get(op + "creatures_attacked"))
         damage_we_took = _to_int(row.get(op + "user_combat_damage_taken"))
-        opp_drew_grpids = parse_grpid_list(row.get(op + "cards_drawn_or_tutored", ""))
-        opp_drew_names = _resolve_names(opp_drew_grpids, cdb)
+        # opp's cards_drawn_or_tutored is a SCALAR count (we don't know what
+        # the opponent drew), unlike the user's pipe-separated grpid lists.
+        opp_drew_count = _to_int(row.get(op + "cards_drawn_or_tutored"))
         opp_summary = (
             f"On opponent's last turn (T{opp_turn_n}): "
             f"played {opp_lands_played} land(s), "
             f"cast {opp_creatures_cast} creature(s), "
             f"cast {opp_spells_cast} non-creature spell(s), "
             f"attacked with {opp_attacks} creature(s), "
-            f"dealt {damage_we_took} combat damage to you."
+            f"dealt {damage_we_took} combat damage to you, "
+            f"drew {opp_drew_count} card(s)."
         )
-        if opp_drew_names:
-            opp_summary += f" Opponent drew/tutored: {', '.join(opp_drew_names)}."
-
-    # User's currently-drawn name list (capped for prompt size).
-    drawn_label = ", ".join(drawn_names[-30:]) or "(none)"
-    if len(drawn_names) > 30:
-        drawn_label = f"…(earlier omitted) {drawn_label}"
 
     play_str = "play" if on_play else "draw"
     deck_colors = main_colors + (f" (splash {splash})" if splash else "")
 
     prompt = (
-        f"It is the start of your turn {n}, Main Phase 1. You are on the {play_str}.\n"
+        f"It is the START of your turn {n}, Main Phase 1. You have priority "
+        f"and must decide which action(s) to take. You are on the {play_str}.\n"
         f"\n"
-        f"Your deck: {deck_colors}.  Opponent's deck: {opp_colors}.\n"
+        f"Your deck colors: {deck_colors}.  Opponent's deck colors: {opp_colors}.\n"
         f"\n"
-        f"State at start of your turn {n}:\n"
-        f"  You — life {user_life}, lands {user_lands}, creatures {user_creatures}, "
+        f"BOARD STATE at start of your turn {n}:\n"
+        f"  You — life {user_life}, lands in play {user_lands}, creatures in play {user_creatures}, "
         f"hand size {user_hand}\n"
-        f"  Opp — life {opp_life}, lands {opp_lands}, creatures {opp_creatures}, "
+        f"  Opp — life {opp_life}, lands in play {opp_lands}, creatures in play {opp_creatures}, "
         f"hand size {opp_hand}\n"
         f"\n"
-        f"{opp_summary}\n"
+        f"OPPONENT'S LAST TURN: {opp_summary}\n"
         f"\n"
-        f"Cards you have seen (drawn or tutored, including opening hand) so far:\n"
-        f"  {drawn_label}\n"
+        f"YOUR HAND at start of turn {n} (after this turn's draw):\n"
+        f"{hand_block}\n"
         f"\n"
-        f"What action categories should you take this turn? "
-        f"Reply with the tag list per the system prompt format."
+        f"With those resources, what action(s) should you take this turn? "
+        f"Output the tags per the system-prompt format."
     )
     return prompt
 

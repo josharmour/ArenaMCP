@@ -163,7 +163,8 @@ def cmd_mulligan(args: argparse.Namespace) -> None:
     rc = _run([sys.executable, "-m", "tools.eval.seventeenlands.score_mulligan",
                "--prompts", str(prompts),
                "--responses", str(responses),
-               "--json", str(summary)])
+               "--json", str(summary),
+               "--set", args.set_code])
     _require_zero(rc, "score_mulligan")
 
     print(f"\n[auto] mulligan summary written to {summary}")
@@ -211,7 +212,8 @@ def cmd_turn_action(args: argparse.Namespace) -> None:
     rc = _run([sys.executable, "-m", "tools.eval.seventeenlands.score_turn_actions",
                "--prompts", str(prompts),
                "--responses", str(responses),
-               "--json", str(summary)])
+               "--json", str(summary),
+               "--set", args.set_code])
     _require_zero(rc, "score_turn_actions")
 
     print(f"\n[auto] turn-action summary written to {summary}")

@@ -86,17 +86,27 @@ def _is_land(card_info) -> bool:
     return "land" in type_line
 
 
+# Per-process memo so the pass-1 scan doesn't hit the SQLite-on-/mnt/c MTGA DB
+# 21M times. A set has only ~600 distinct grpids; caching collapses those down
+# to one lookup each.
+_RESOLVE_CACHE: dict[int, tuple[str, bool]] = {}
+
+
 def _resolve_hand(grpids: list[int], cdb) -> list[tuple[int, str, bool]]:
     """Look up grpids -> (grpid, name, is_land). Unresolved grpids stay as
     ``Unknown(<grpid>)``."""
     out: list[tuple[int, str, bool]] = []
     for g in grpids:
-        info = cdb.get_card_by_arena_id(g) if cdb else None
-        if info is None:
-            out.append((g, f"Unknown({g})", False))
-        else:
-            name = getattr(info, "name", None) or f"Unknown({g})"
-            out.append((g, name, _is_land(info)))
+        cached = _RESOLVE_CACHE.get(g)
+        if cached is None:
+            info = cdb.get_card_by_arena_id(g) if cdb else None
+            if info is None:
+                cached = (f"Unknown({g})", False)
+            else:
+                name = getattr(info, "name", None) or f"Unknown({g})"
+                cached = (name, _is_land(info))
+            _RESOLVE_CACHE[g] = cached
+        out.append((g, cached[0], cached[1]))
     return out
 
 

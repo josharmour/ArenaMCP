@@ -44,6 +44,12 @@ MTGA_PATHS = [
         / "Wizards of the Coast/MTGA",
     Path(os.environ.get("ProgramFiles", "C:/Program Files"))
         / "Wizards of the Coast/MTGA",
+    # WSL — same install, mounted via /mnt/c. Lets eval/dev tooling running
+    # under Linux resolve the same DB the Windows desktop app uses.
+    Path("/mnt/c/Program Files/Wizards of the Coast/MTGA"),
+    Path("/mnt/c/Program Files (x86)/Wizards of the Coast/MTGA"),
+    Path("/mnt/c/Program Files (x86)/Steam/steamapps/common/MTGA"),
+    Path("/mnt/c/Program Files/Epic Games/MagicTheGathering"),
 ]
 
 

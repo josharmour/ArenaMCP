@@ -426,16 +426,24 @@ def get_eval_results_history(target: str, limit: int = 30) -> list[dict]:
 
 
 def get_latest_eval_results(targets: list[str] | None = None) -> dict:
-    """Return the latest payload per target, plus a small history list.
+    """Return the latest payload per target, plus per-set latest and history.
 
     Shape:
         {
             target: {
                 "latest": {payload dict, with 'id' and 'ts'},
+                "by_set": {
+                    "<SET_CODE>": {payload dict},   # latest run for that set
+                    ...
+                    "_unset": {payload dict},       # most recent untagged run
+                },
                 "history": [{"id", "ts"}, ...]   (recent N for trend lines)
             },
             ...
         }
+
+    ``by_set`` lets the dashboard compare sets side-by-side without each
+    set's data point clobbering the others on the trend chart.
     """
     import json as _json
     with get_db() as conn:
@@ -454,14 +462,23 @@ def get_latest_eval_results(targets: list[str] | None = None) -> dict:
             ).fetchall()
     out: dict[str, dict] = {}
     for r in rows:
-        slot = out.setdefault(r["target"], {"latest": None, "history": []})
+        slot = out.setdefault(r["target"], {"latest": None, "by_set": {}, "history": []})
+        payload_loaded = None
         if slot["latest"] is None:
-            payload = _json.loads(r["payload_json"])
-            payload["id"] = int(r["id"])
-            payload["ts"] = float(r["ts"])
-            slot["latest"] = payload
+            payload_loaded = _json.loads(r["payload_json"])
+            payload_loaded["id"] = int(r["id"])
+            payload_loaded["ts"] = float(r["ts"])
+            slot["latest"] = payload_loaded
         if len(slot["history"]) < 30:
             slot["history"].append({"id": int(r["id"]), "ts": float(r["ts"])})
+        # First (newest) row per (target, set_code) wins.
+        if payload_loaded is None:
+            payload_loaded = _json.loads(r["payload_json"])
+            payload_loaded["id"] = int(r["id"])
+            payload_loaded["ts"] = float(r["ts"])
+        set_code = (payload_loaded.get("set_code") or "_unset").strip().upper()
+        if set_code and set_code not in slot["by_set"]:
+            slot["by_set"][set_code] = payload_loaded
     return out
 
 

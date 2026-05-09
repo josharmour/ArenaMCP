@@ -30,11 +30,19 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
-CATEGORIES = ("PLAY_LAND", "CAST_CREATURE", "CAST_SPELL", "ATTACK", "ACTIVATE", "PASS")
+CATEGORIES = ("PLAY_LAND", "CAST_CREATURE", "CAST_SPELL", "ATTACK", "PASS")
+
+# ACTIVATE is parsed (so the regex can still recognize it in responses) but
+# stripped from both predicted and actual sets before scoring. Reasoning: the
+# 17lands ground truth ``user_abilities`` count includes mana-tap activations
+# the coach can't see in our prompts — there's no way for any model to
+# correctly predict ACTIVATE under the current prompt format. We drop it from
+# scoring rather than penalize models for an unmeasurable category.
 _TAG_RE = re.compile(
     r"\b(PLAY_LAND|CAST_CREATURE|CAST_SPELL|CAST|ATTACK|ACTIVATE|PASS)\b",
     re.IGNORECASE,
 )
+_DROP_TAGS = {"ACTIVATE"}
 
 
 def parse_action_set(response: str) -> set[str] | None:
@@ -80,7 +88,12 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(union)
 
 
-def score(prompts_path: Path, responses_path: Path, json_out: Path | None) -> None:
+def score(
+    prompts_path: Path,
+    responses_path: Path,
+    json_out: Path | None,
+    set_code: str | None = None,
+) -> None:
     prompts = {p["id"]: p for p in _read_jsonl(prompts_path)}
     responses = list(_read_jsonl(responses_path))
     if not prompts:
@@ -111,6 +124,8 @@ def score(prompts_path: Path, responses_path: Path, json_out: Path | None) -> No
 
         meta = prompt.get("meta") or {}
         actual = set(meta.get("actually_did") or [])
+        # Drop unmeasurable tags (see _DROP_TAGS comment above).
+        actual -= _DROP_TAGS
         if not actual:
             continue
 
@@ -119,6 +134,7 @@ def score(prompts_path: Path, responses_path: Path, json_out: Path | None) -> No
             if len(s["unparsed_examples"]) < 3:
                 s["unparsed_examples"].append((pid, (r.get("response") or "")[:160]))
             continue
+        predicted -= _DROP_TAGS
         s["parsed"] += 1
 
         if predicted == actual:
@@ -219,6 +235,8 @@ def score(prompts_path: Path, responses_path: Path, json_out: Path | None) -> No
             "categories": list(CATEGORIES),
             "backends": backends_payload,
         }
+        if set_code:
+            payload["set_code"] = set_code
         with open(json_out, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         print(f"\nWrote {json_out}")
@@ -230,8 +248,10 @@ def main():
     parser.add_argument("--prompts", required=True, type=Path)
     parser.add_argument("--responses", required=True, type=Path)
     parser.add_argument("--json", type=Path)
+    parser.add_argument("--set", dest="set_code", default=None,
+                        help="Optional set code to embed in the summary payload")
     args = parser.parse_args()
-    score(args.prompts, args.responses, args.json)
+    score(args.prompts, args.responses, args.json, set_code=args.set_code)
 
 
 if __name__ == "__main__":

@@ -78,7 +78,12 @@ def _read_jsonl(path: Path):
                 continue
 
 
-def score(prompts_path: Path, responses_path: Path, json_out: Path | None = None) -> None:
+def score(
+    prompts_path: Path,
+    responses_path: Path,
+    json_out: Path | None = None,
+    set_code: str | None = None,
+) -> None:
     prompts = {p["id"]: p for p in _read_jsonl(prompts_path)}
     responses = list(_read_jsonl(responses_path))
 
@@ -89,17 +94,30 @@ def score(prompts_path: Path, responses_path: Path, json_out: Path | None = None
         print(f"no responses in {responses_path}", file=sys.stderr)
         sys.exit(1)
 
-    # backend -> stats
-    stats: dict[str, dict] = defaultdict(lambda: {
-        "n": 0,
-        "parsed": 0,
-        "unparsed_examples": [],
-        "errors": 0,
-        "matches_higher_wr": 0,
-        "scorable": 0,
-        "matches_played": 0,
-        "by_decision": {"keep": 0, "mull": 0},
-    })
+    # The dataset at diamond+ is keep-heavy: ~80% of buckets favor KEEP. A
+    # model that always keeps scores ~80% on the all-buckets metric without
+    # actually reasoning. We compute a second metric restricted to buckets
+    # with a meaningful margin (|keep_wr - mull_wr| >= MARGIN_THRESHOLD).
+    MARGIN_THRESHOLD = 0.05  # 5pp
+
+    # backend -> stats. We track the all-buckets metric AND a margin>=5pp
+    # subset metric. The margin subset is the more honest comparison.
+    def _new_stats():
+        return {
+            "n": 0,
+            "parsed": 0,
+            "unparsed_examples": [],
+            "errors": 0,
+            "matches_higher_wr": 0,
+            "scorable": 0,
+            "matches_played": 0,
+            "by_decision": {"keep": 0, "mull": 0},
+            # margin>=threshold subset
+            "margin_scorable": 0,
+            "margin_matches_higher_wr": 0,
+            "margin_threshold": MARGIN_THRESHOLD,
+        }
+    stats: dict[str, dict] = defaultdict(_new_stats)
 
     # Also break down by whether the bucket was a "keep" or "mull" call —
     # useful to spot lopsided coaches (e.g. always-keep biases).
@@ -114,7 +132,15 @@ def score(prompts_path: Path, responses_path: Path, json_out: Path | None = None
         if not prompt:
             continue
         meta = prompt.get("meta") or {}
-        bucket = (meta.get("bucket_stats") or {}).get("correct")
+        bstats = meta.get("bucket_stats") or {}
+        bucket = bstats.get("correct")
+        keep_wr = bstats.get("keep_wr")
+        mull_wr = bstats.get("mull_wr")
+        margin = (
+            abs(keep_wr - mull_wr)
+            if isinstance(keep_wr, (int, float)) and isinstance(mull_wr, (int, float))
+            else None
+        )
         played = meta.get("actually_played")
 
         s = stats[be]
@@ -133,25 +159,34 @@ def score(prompts_path: Path, responses_path: Path, json_out: Path | None = None
 
         if bucket in ("keep", "mull"):
             s["scorable"] += 1
-            if decision == bucket:
+            matched_higher = (decision == bucket)
+            if matched_higher:
                 s["matches_higher_wr"] += 1
             by_correct[(be, bucket)]["n"] += 1
-            if decision == bucket:
+            if matched_higher:
                 by_correct[(be, bucket)]["match"] += 1
+            # Margin subset: only count buckets with a real WR gap.
+            if margin is not None and margin >= MARGIN_THRESHOLD:
+                s["margin_scorable"] += 1
+                if matched_higher:
+                    s["margin_matches_higher_wr"] += 1
 
         if played in ("keep", "mull") and decision == played:
             s["matches_played"] += 1
 
-    # Print main table
+    # Print main table. Balanced is the headline honest metric — it's the
+    # average of per-side accuracies (keep_acc + mull_acc) / 2 and so isn't
+    # gamed by an always-keep baseline.
     print()
     cols = [
         ("backend",             30),
         ("n",                    4),
         ("parse%",               7),
-        ("higher_wr%",          11),
-        ("played%",              9),
+        ("balanced%",           10),
+        ("keep_acc%",           10),
+        ("mull_acc%",           10),
+        ("hi_wr_all%",          11),
         ("kept%",                7),
-        ("mulled%",              8),
     ]
     header = " ".join(f"{name:<{w}}" for name, w in cols)
     print(header)
@@ -163,19 +198,23 @@ def score(prompts_path: Path, responses_path: Path, json_out: Path | None = None
         higher_wr_pct = (
             s["matches_higher_wr"] / s["scorable"] * 100 if s["scorable"] else 0.0
         )
-        played_pct = s["matches_played"] / s["parsed"] * 100 if s["parsed"] else 0.0
+        keep_d = by_correct.get((be, "keep"), {"n": 0, "match": 0})
+        mull_d = by_correct.get((be, "mull"), {"n": 0, "match": 0})
+        keep_acc = keep_d["match"] / keep_d["n"] * 100 if keep_d["n"] >= 5 else None
+        mull_acc = mull_d["match"] / mull_d["n"] * 100 if mull_d["n"] >= 5 else None
+        balanced = (keep_acc + mull_acc) / 2 if (keep_acc is not None and mull_acc is not None) else None
         kept = s["by_decision"]["keep"]
         mulled = s["by_decision"]["mull"]
         total_decisions = kept + mulled or 1
         kept_pct = kept / total_decisions * 100
-        mulled_pct = mulled / total_decisions * 100
         row = [
             be[:30], s["n"],
             f"{parse_pct:.0f}%",
+            f"{balanced:.1f}%" if balanced is not None else "n/a",
+            f"{keep_acc:.1f}% (n={keep_d['n']})" if keep_acc is not None else f"n/a (n={keep_d['n']})",
+            f"{mull_acc:.1f}% (n={mull_d['n']})" if mull_acc is not None else f"n/a (n={mull_d['n']})",
             f"{higher_wr_pct:.1f}%",
-            f"{played_pct:.0f}%",
             f"{kept_pct:.0f}%",
-            f"{mulled_pct:.0f}%",
         ]
         print(" ".join(f"{str(v):<{w}}" for v, (_, w) in zip(row, cols)))
 
@@ -205,6 +244,20 @@ def score(prompts_path: Path, responses_path: Path, json_out: Path | None = None
             higher_wr_pct = (
                 s["matches_higher_wr"] / s["scorable"] if s["scorable"] else None
             )
+            margin_hi_wr_pct = (
+                s["margin_matches_higher_wr"] / s["margin_scorable"]
+                if s["margin_scorable"] else None
+            )
+            # Balanced accuracy = mean of per-side accuracies. Honest with
+            # class-imbalanced samples (96% of diamond+ buckets favor KEEP).
+            keep_d = by_correct.get((be, "keep"), {"n": 0, "match": 0})
+            mull_d = by_correct.get((be, "mull"), {"n": 0, "match": 0})
+            keep_acc = keep_d["match"] / keep_d["n"] if keep_d["n"] >= 5 else None
+            mull_acc = mull_d["match"] / mull_d["n"] if mull_d["n"] >= 5 else None
+            if keep_acc is not None and mull_acc is not None:
+                balanced_acc = (keep_acc + mull_acc) / 2
+            else:
+                balanced_acc = None
             played_pct = s["matches_played"] / s["parsed"] if s["parsed"] else None
             kept = s["by_decision"]["keep"]
             mulled = s["by_decision"]["mull"]
@@ -218,6 +271,18 @@ def score(prompts_path: Path, responses_path: Path, json_out: Path | None = None
                 "matches_higher_wr": s["matches_higher_wr"],
                 "matches_played": s["matches_played"],
                 "higher_wr_rate": round(higher_wr_pct, 4) if higher_wr_pct is not None else None,
+                # Margin>=5pp subset: filters near-coin-flip buckets.
+                "margin_threshold": s["margin_threshold"],
+                "margin_scorable": s["margin_scorable"],
+                "margin_matches_higher_wr": s["margin_matches_higher_wr"],
+                "margin_higher_wr_rate": round(margin_hi_wr_pct, 4) if margin_hi_wr_pct is not None else None,
+                # Balanced accuracy is the headline honest metric. Average of
+                # per-side accuracies (keep_buckets, mull_buckets). Equal
+                # weight regardless of how often each side appears in the
+                # dataset, so 'always-keep' baselines no longer score 80%+.
+                "balanced_higher_wr_rate": round(balanced_acc, 4) if balanced_acc is not None else None,
+                "keep_bucket_accuracy": round(keep_acc, 4) if keep_acc is not None else None,
+                "mull_bucket_accuracy": round(mull_acc, 4) if mull_acc is not None else None,
                 "played_agreement_rate": round(played_pct, 4) if played_pct is not None else None,
                 "decisions": {"keep": kept, "mull": mulled},
                 "decision_share": {
@@ -244,6 +309,8 @@ def score(prompts_path: Path, responses_path: Path, json_out: Path | None = None
             "n_responses": len(responses),
             "backends": backends_payload,
         }
+        if set_code:
+            payload["set_code"] = set_code
         with open(json_out, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         print(f"\nWrote {json_out}")
@@ -258,8 +325,10 @@ def main():
     parser.add_argument("--responses", required=True, type=Path)
     parser.add_argument("--json", type=Path,
                         help="Optional structured JSON summary (for admin dashboard)")
+    parser.add_argument("--set", dest="set_code", default=None,
+                        help="Optional set code to embed in the summary payload")
     args = parser.parse_args()
-    score(args.prompts, args.responses, args.json)
+    score(args.prompts, args.responses, args.json, set_code=args.set_code)
 
 
 if __name__ == "__main__":
