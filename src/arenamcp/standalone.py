@@ -237,7 +237,6 @@ def copy_to_clipboard(text: str) -> bool:
         process = subprocess.Popen(
             ['clip'],
             stdin=subprocess.PIPE,
-            shell=True
         )
         process.communicate(input=text.encode('utf-8'), timeout=2)
         return process.returncode == 0
@@ -1032,7 +1031,7 @@ class StandaloneCoach:
                 if not deck_grp_ids:
                     try:
                         gs = self._mcp.get_game_state()
-                        deck_grp_ids = gs.get("deck_cards", [])
+                        deck_grp_ids = list(gs.get("deck_cards") or [])
                         if not deck_grp_ids:
                             local_seat = self._get_local_seat_from_state(gs)
                             if local_seat is not None:
@@ -2149,7 +2148,7 @@ class StandaloneCoach:
                     and turn_num > 0
                     and seat_announced
                 ):
-                    deck_cards = curr_state.get("deck_cards", [])
+                    deck_cards = list(curr_state.get("deck_cards") or [])
 
                     # Fallback for mid-game join: ConnectResp was missed,
                     # so reconstruct deck from all known local-player cards

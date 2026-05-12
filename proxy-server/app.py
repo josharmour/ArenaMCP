@@ -46,7 +46,12 @@ with open(CONFIG_PATH) as f:
 # Resolve env vars in admin password
 admin_password = config.get("admin", {}).get("password", "")
 if admin_password.startswith("${") and admin_password.endswith("}"):
-    admin_password = os.environ.get(admin_password[2:-1], "changeme")
+    admin_password = os.environ.get(admin_password[2:-1], "")
+if not admin_password:
+    raise RuntimeError(
+        "ADMIN_PASSWORD not configured. "
+        "Set 'admin.password' in config.yaml or export the referenced env var."
+    )
 
 # Initialize
 db.init_db()
