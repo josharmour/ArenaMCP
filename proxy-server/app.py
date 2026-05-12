@@ -479,6 +479,15 @@ def _chat_tool_calls_for_response_item(item: dict[str, Any]) -> list[dict[str, A
                 "arguments": json.dumps(item.get("operation", {}), separators=(",", ":"), ensure_ascii=False),
             },
         }]
+    if item_type == "custom_tool_call":
+        return [{
+            "id": str(item.get("call_id") or item.get("id") or _new_id("tool")),
+            "type": "function",
+            "function": {
+                "name": str(item.get("name", "")),
+                "arguments": json.dumps({"input": str(item.get("input", ""))}, separators=(",", ":"), ensure_ascii=False),
+            },
+        }]
     raise HTTPException(400, f"Unsupported response input item type: {item_type}")
 
 
@@ -502,7 +511,7 @@ def _responses_input_item_to_chat_messages(item: Any) -> list[dict[str, Any]]:
             message["name"] = str(item["phase"])
         return [message]
 
-    if item_type in {"function_call", "local_shell_call", "shell_call", "apply_patch_call"}:
+    if item_type in {"function_call", "local_shell_call", "shell_call", "apply_patch_call", "custom_tool_call"}:
         return [{
             "role": "assistant",
             "content": "",
@@ -520,7 +529,7 @@ def _responses_input_item_to_chat_messages(item: Any) -> list[dict[str, Any]]:
             "tool_call_id": str(item.get("id", "")),
             "content": _tool_output_to_text(item.get("output", "")),
         }]
-    if item_type in {"shell_call_output", "apply_patch_call_output"}:
+    if item_type in {"shell_call_output", "apply_patch_call_output", "custom_tool_call_output"}:
         return [{
             "role": "tool",
             "tool_call_id": str(item.get("call_id", "")),
@@ -637,6 +646,34 @@ def _tool_to_chat_tool(tool: Any) -> dict[str, Any]:
                     "required": ["commands"],
                     "additionalProperties": False,
                 },
+            },
+        }
+
+    if tool_type == "custom":
+        name = str(tool.get("name", "")).strip()
+        if not name:
+            raise HTTPException(400, "custom tool requires a name")
+        description = str(tool.get("description") or "")
+        fmt = tool.get("format") if isinstance(tool.get("format"), dict) else {}
+        fmt_type = str(fmt.get("type", "text"))
+        if fmt_type == "grammar":
+            grammar = fmt.get("grammar")
+            if grammar:
+                description = (description + "\n\nThe `input` must conform to this grammar:\n" + json.dumps(grammar, ensure_ascii=False)).strip()
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "input": {"type": "string", "description": "The body of the tool invocation (free-form text)."},
+                    },
+                    "required": ["input"],
+                    "additionalProperties": False,
+                },
+                "strict": True,
             },
         }
 
@@ -767,10 +804,14 @@ def _response_output_items_to_chat_history(output_items: list[dict[str, Any]]) -
     return history
 
 
-def _chat_message_to_response_output_items(message: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _chat_message_to_response_output_items(
+    message: dict[str, Any],
+    custom_tool_names: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     content_text, tool_calls = _chat_message_text_and_tools(message)
     output_items: list[dict[str, Any]] = []
     history_messages: list[dict[str, Any]] = []
+    custom_tool_names = custom_tool_names or set()
 
     if content_text:
         message_item = {
@@ -792,6 +833,28 @@ def _chat_message_to_response_output_items(message: dict[str, Any]) -> tuple[lis
         tool_name = str(function.get("name", ""))
         tool_call_id = str(tool_call.get("id") or _new_id("call"))
         arguments = str(function.get("arguments", ""))
+
+        if tool_name in custom_tool_names:
+            parsed = _parse_tool_arguments(arguments, tool_name)
+            tool_input = ""
+            if isinstance(parsed, dict):
+                tool_input = str(parsed.get("input", ""))
+            elif isinstance(parsed, str):
+                tool_input = parsed
+            output_items.append({
+                "id": _new_id("custom"),
+                "call_id": tool_call_id,
+                "type": "custom_tool_call",
+                "status": "completed",
+                "name": tool_name,
+                "input": tool_input,
+            })
+            pending_tool_calls.append({
+                "id": tool_call_id,
+                "type": "function",
+                "function": {"name": tool_name, "arguments": arguments},
+            })
+            continue
 
         if tool_name == _pseudo_tool_name("apply_patch"):
             output_items.append({
@@ -957,6 +1020,16 @@ async def _dispatch_chat_completion(body: dict[str, Any], sub: dict) -> tuple[di
         raise HTTPException(502, f"Provider error: {e}")
 
 
+def _custom_tool_names_from_body(body: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    for tool in body.get("tools") or []:
+        if isinstance(tool, dict) and tool.get("type") == "custom":
+            name = str(tool.get("name", "")).strip()
+            if name:
+                names.add(name)
+    return names
+
+
 def _chat_completion_to_response(
     original_body: dict[str, Any],
     chat_data: dict[str, Any],
@@ -969,7 +1042,9 @@ def _chat_completion_to_response(
     if not isinstance(message, dict):
         raise HTTPException(502, "Upstream chat completion returned an invalid message payload.")
 
-    output_items, output_history = _chat_message_to_response_output_items(message)
+    output_items, output_history = _chat_message_to_response_output_items(
+        message, _custom_tool_names_from_body(original_body)
+    )
     usage = chat_data.get("usage") or {}
     response_id = _new_id("resp")
     created_at = float(chat_data.get("created") or time.time())
@@ -1066,6 +1141,21 @@ def _stream_events_for_response(response: dict[str, Any]):
                 yield f"data: {json.dumps({'type': 'response.function_call_arguments.delta', 'sequence_number': seq, 'output_index': output_index, 'item_id': item['id'], 'delta': arguments})}\n\n"
                 seq += 1
                 yield f"data: {json.dumps({'type': 'response.function_call_arguments.done', 'sequence_number': seq, 'output_index': output_index, 'item_id': item['id'], 'name': item.get('name', ''), 'arguments': arguments})}\n\n"
+                seq += 1
+                yield f"data: {json.dumps({'type': 'response.output_item.done', 'sequence_number': seq, 'output_index': output_index, 'item': item})}\n\n"
+                seq += 1
+                continue
+
+            if item_type == "custom_tool_call":
+                skeleton = dict(item)
+                skeleton["status"] = "in_progress"
+                skeleton["input"] = ""
+                yield f"data: {json.dumps({'type': 'response.output_item.added', 'sequence_number': seq, 'output_index': output_index, 'item': skeleton})}\n\n"
+                seq += 1
+                tool_input = str(item.get("input", ""))
+                yield f"data: {json.dumps({'type': 'response.custom_tool_call_input.delta', 'sequence_number': seq, 'output_index': output_index, 'item_id': item['id'], 'delta': tool_input})}\n\n"
+                seq += 1
+                yield f"data: {json.dumps({'type': 'response.custom_tool_call_input.done', 'sequence_number': seq, 'output_index': output_index, 'item_id': item['id'], 'name': item.get('name', ''), 'input': tool_input})}\n\n"
                 seq += 1
                 yield f"data: {json.dumps({'type': 'response.output_item.done', 'sequence_number': seq, 'output_index': output_index, 'item': item})}\n\n"
                 seq += 1

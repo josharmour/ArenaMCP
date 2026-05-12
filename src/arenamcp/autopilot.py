@@ -3227,8 +3227,14 @@ class AutopilotEngine:
     def _try_gre_bridge_blockers(self, action: GameAction) -> Optional[ClickResult]:
         """Submit blocker assignments via the GRE bridge.
 
-        Maps card names in action.blocker_assignments to instance IDs
-        from the current game state's decision context.
+        Resolves blocker/attacker instance IDs from the bridge's own
+        DeclareBlockersRequest payload (`blockers` array with
+        `blockerInstanceId` and `attackerInstanceIds`). MTGA renumbers
+        instances on zone transitions (e.g. token/clone re-IDs), so the
+        gamestate snapshot can hold stale IDs by the time we submit —
+        which made the plugin's match against `AllBlockers` silently
+        fall through to a no-op `SubmitBlockersReq` and stuck the
+        autopilot in a Declare-Blockers loop.
         """
         # Verify the bridge actually has a DeclareBlockers request pending
         pending = self._gre_bridge.get_pending_actions()
@@ -3240,29 +3246,89 @@ class AutopilotEngine:
             logger.info(f"GRE bridge blockers: pending is {req_class}, not DeclareBlockers, falling back")
             return None
 
+        bridge_blockers = pending.get("blockers") or []
+        if not bridge_blockers:
+            logger.info("GRE bridge blockers: bridge reports empty blockers list, falling back")
+            return None
+
         game_state = self._get_game_state()
-        blocker_id_map = self._build_blocker_id_map(game_state)
         battlefield = game_state.get("battlefield", [])
-        opp_seat = None
-        for p in game_state.get("players", []):
-            if not p.get("is_local"):
-                opp_seat = p.get("seat_id")
+
+        def _name_of(iid: int) -> str:
+            for c in battlefield:
+                try:
+                    if int(c.get("instance_id") or 0) == iid:
+                        return (c.get("name") or "").lower()
+                except (TypeError, ValueError):
+                    continue
+            return ""
+
+        bridge_by_name: dict[str, dict] = {}
+        bridge_id_list: list[int] = []
+        for b in bridge_blockers:
+            try:
+                biid = int(b.get("blockerInstanceId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not biid:
+                continue
+            bridge_id_list.append(biid)
+            n = _name_of(biid)
+            if n:
+                bridge_by_name[n] = b
 
         assignments = []
         for blocker_name, attacker_name in action.blocker_assignments.items():
-            blocker_id = blocker_id_map.get(blocker_name)
-            if blocker_id is None:
-                blocker_id = self._find_instance_id(
-                    blocker_name, battlefield,
-                    next((p.get("seat_id") for p in game_state.get("players", []) if p.get("is_local")), None)
-                )
-            attacker_id = self._find_instance_id(attacker_name, battlefield, opp_seat)
+            bn = (blocker_name or "").lower()
+            b_entry = bridge_by_name.get(bn)
+            if not b_entry:
+                for k, v in bridge_by_name.items():
+                    if bn and (bn in k or k in bn):
+                        b_entry = v
+                        break
 
-            if blocker_id is None or attacker_id is None:
+            if not b_entry:
                 logger.warning(
-                    f"GRE bridge blockers: can't resolve IDs for "
-                    f"{blocker_name}({blocker_id}) -> {attacker_name}({attacker_id}), "
-                    "surfacing manual-required to caller"
+                    f"GRE bridge blockers: can't find blocker {blocker_name!r} "
+                    f"among bridge entries (names: {list(bridge_by_name)}, "
+                    f"ids: {bridge_id_list}), surfacing manual-required"
+                )
+                return None
+
+            try:
+                blocker_id = int(b_entry["blockerInstanceId"])
+            except (TypeError, ValueError, KeyError):
+                logger.warning(f"GRE bridge blockers: bad blockerInstanceId in {b_entry}")
+                return None
+
+            an = (attacker_name or "").lower()
+            attacker_id: Optional[int] = None
+            legal_attackers = b_entry.get("attackerInstanceIds") or []
+            for aid in legal_attackers:
+                try:
+                    aid_i = int(aid)
+                except (TypeError, ValueError):
+                    continue
+                cand_name = _name_of(aid_i)
+                if cand_name == an or (an and (an in cand_name or cand_name in an)):
+                    attacker_id = aid_i
+                    break
+
+            if attacker_id is None and len(legal_attackers) == 1:
+                try:
+                    attacker_id = int(legal_attackers[0])
+                    logger.info(
+                        f"GRE bridge blockers: attacker name lookup failed for "
+                        f"{attacker_name!r}; using sole legal attacker {attacker_id}"
+                    )
+                except (TypeError, ValueError):
+                    attacker_id = None
+
+            if attacker_id is None:
+                logger.warning(
+                    f"GRE bridge blockers: can't resolve attacker {attacker_name!r} "
+                    f"for blocker {blocker_name!r} (legal attacker ids: "
+                    f"{legal_attackers}), surfacing manual-required"
                 )
                 return None
 
@@ -3275,7 +3341,7 @@ class AutopilotEngine:
             desc = ", ".join(f"{b}->{a}" for b, a in action.blocker_assignments.items())
             self._log_execution_path(
                 ExecutionPath.GRE_AWARE,
-                f"declare_blockers: {desc} submitted via GRE bridge"
+                f"declare_blockers: {desc} submitted via GRE bridge (bridge-authoritative ids)"
             )
             return ClickResult(True, 0, 0, "declare_blockers", "GRE bridge")
 
@@ -5354,6 +5420,24 @@ class AutopilotEngine:
                     post_atk = sum(1 for c in post_state.get("battlefield", []) if c.get("is_attacking"))
                     if post_atk > pre_atk or (post_atk == 0 and pre_atk > 0): # attacking finished
                         logger.info("Action verified: attackers declared")
+                        return True
+
+                if action.action_type == ActionType.DECLARE_BLOCKERS:
+                    # Blocks don't change zone or phase — combat damage is the
+                    # same step as Declare Blockers. The reliable signal is
+                    # the bridge's pending request moving off DeclareBlockers
+                    # (next step is usually ActionsAvailable for second main /
+                    # combat damage triggers, or the phase advancing).
+                    pre_bridge_class = (pre_state.get("_bridge_request_class") or "")
+                    post_bridge_class = (post_state.get("_bridge_request_class") or "")
+                    if (
+                        "DeclareBlockers" in pre_bridge_class
+                        and "DeclareBlockers" not in post_bridge_class
+                    ):
+                        logger.info(
+                            f"Action verified: bridge moved off DeclareBlockers "
+                            f"({pre_bridge_class!r} -> {post_bridge_class!r})"
+                        )
                         return True
 
                 # 3. Generic fallback: did ANYTHING change?

@@ -9,6 +9,35 @@ server:
 # Provider routing: requests are tried in order of priority (lowest first).
 # The proxy picks the first available provider and forwards the request.
 providers:
+  - name: local-vllm
+    priority: 0
+    # Home-lab vLLM on RTX PRO 6000 Blackwell (96 GB). Serves the TrevorJS
+    # abliterated Gemma 4 31B (bf16) with MTP speculative decoding via
+    # google/gemma-4-31B-it-assistant as drafter. Both the bare name and the
+    # :latest alias resolve here so clients that mix Ollama-style tags and
+    # vLLM-style names route the same way.
+    base_url: "http://10.0.0.10:8000/v1"
+    # vLLM accepts any non-empty bearer; literal keeps the provider always
+    # "enabled" without needing an env var on the NAS.
+    api_key: "vllm"
+    models:
+      - "gemma4-31b-uncensored"
+      - "gemma4-31b-uncensored:latest"
+    enabled: true
+
+  - name: ollama-local
+    priority: 5
+    # Failover for the abliterated 31B if vLLM is down. Same physical box,
+    # Ollama on port 11434 serves the Q4_K_M GGUF (smaller, faster cold-start,
+    # no MTP). Requires OLLAMA_HOST=0.0.0.0:11434 on the Windows host +
+    # firewall rule for inbound TCP 11434.
+    base_url: "http://10.0.0.10:11434/v1"
+    # Ollama ignores the bearer token; literal keeps the provider enabled.
+    api_key: "ollama"
+    models:
+      - "gemma4-31b-uncensored:latest"
+    enabled: true
+
   - name: azure
     priority: 1
     base_url: "https://bmfllm-resource.cognitiveservices.azure.com/openai"
