@@ -799,6 +799,107 @@ namespace MtgaCoachBridge
                 resp["distribution_max_per"] = (int)distReqExpose.MaxPer;
                 resp["can_pass"] = false;
             }
+            else if (request is SearchRequest searchReqExpose)
+            {
+                // Library/zone search: surface the candidate grpIds plus the
+                // zones being searched. Python can pick directly from
+                // search_candidates without re-resolving names.
+                var optionsArr = new JArray();
+                foreach (var gid in searchReqExpose.Options) optionsArr.Add((int)gid);
+                var zonesArr = new JArray();
+                foreach (var z in searchReqExpose.ZonesToSearch) zonesArr.Add((int)z);
+                var addlZonesArr = new JArray();
+                foreach (var z in searchReqExpose.AdditionalZones) addlZonesArr.Add((int)z);
+                var ctxArr = new JArray();
+                foreach (var c in searchReqExpose.ContextOptions) ctxArr.Add((int)c);
+                resp["search_candidates"] = optionsArr;
+                resp["search_zones"] = zonesArr;
+                resp["search_additional_zones"] = addlZonesArr;
+                resp["search_context_options"] = ctxArr;
+                resp["search_is_multi_zone"] = searchReqExpose.IsMultiZoneSearch;
+                resp["can_pass"] = false;
+            }
+            else if (request is SelectNRequest selectNReqExpose)
+            {
+                // Generic "choose N from a set" decision. The Ids list holds
+                // the candidate instance/grp/etc. IDs (interpretation
+                // governed by IdType), and MinSel/MaxSel bound the selection
+                // size. ShouldCancel == true means submitting an empty
+                // selection (SubmitArbitrary) is a legal "skip" path.
+                var idsArr = new JArray();
+                foreach (var id in selectNReqExpose.Ids) idsArr.Add((int)id);
+                var zoneIdsArr = new JArray();
+                foreach (var z in selectNReqExpose.ZoneIds) zoneIdsArr.Add((int)z);
+                resp["select_n_ids"] = idsArr;
+                resp["select_n_zone_ids"] = zoneIdsArr;
+                resp["select_n_id_type"] = selectNReqExpose.IdType.ToString();
+                resp["select_n_list_type"] = selectNReqExpose.ListType.ToString();
+                resp["select_n_context"] = selectNReqExpose.Context.ToString();
+                resp["select_n_option_context"] = selectNReqExpose.OptionContext.ToString();
+                resp["select_n_min"] = selectNReqExpose.MinSel;
+                resp["select_n_max"] = (int)selectNReqExpose.MaxSel;
+                resp["select_n_can_cancel"] = selectNReqExpose.ShouldCancel;
+                // Useful shape flags so Python doesn't have to recompute.
+                resp["select_n_is_instance_id"] = selectNReqExpose.IsInstanceIdSelection;
+                resp["select_n_is_zone"] = selectNReqExpose.IsZoneSelection;
+                resp["select_n_is_mana_color"] = selectNReqExpose.IsManaColorSelection;
+                resp["select_n_is_card_color"] = selectNReqExpose.IsCardColorSelection;
+                resp["can_pass"] = false;
+            }
+            else if (request is GroupRequest groupReqExpose)
+            {
+                // Grouping / ordering decisions. InstanceIds is the pool to
+                // assign; GroupSpecs describes the slot constraints.
+                var instanceArr = new JArray();
+                foreach (var iid in groupReqExpose.InstanceIds) instanceArr.Add((int)iid);
+                // GroupSpecification's concrete fields aren't part of the
+                // decompiled surface we have committed to the repo, so
+                // serialize each spec via reflection over its public
+                // properties — Python gets whatever Min/Max/etc. fields
+                // the runtime exposes.
+                var groupSpecsArr = new JArray();
+                foreach (var spec in groupReqExpose.GroupSpecs)
+                {
+                    if (spec == null)
+                    {
+                        groupSpecsArr.Add(new JObject());
+                        continue;
+                    }
+                    var specObj = new JObject();
+                    foreach (var p in spec.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                    {
+                        if (!p.CanRead || p.GetIndexParameters().Length != 0) continue;
+                        try
+                        {
+                            var token = SerializePendingRequestValue(p.GetValue(spec, null), 0);
+                            if (token != null) specObj[ToCamelCase(p.Name)] = token;
+                        }
+                        catch { }
+                    }
+                    groupSpecsArr.Add(specObj);
+                }
+                resp["group_instance_ids"] = instanceArr;
+                resp["group_specs"] = groupSpecsArr;
+                resp["group_context"] = groupReqExpose.Context.ToString();
+                resp["can_pass"] = false;
+            }
+            else if (request is NumericInputRequest numReqExpose)
+            {
+                // Standalone "choose a number" decisions (X-value outside
+                // CastingTimeOption_NumericInputRequest).
+                var disallowedArr = new JArray();
+                foreach (var v in numReqExpose.DisallowedValues) disallowedArr.Add((int)v);
+                var suggestedArr = new JArray();
+                foreach (var v in numReqExpose.SuggestedValues) suggestedArr.Add((int)v);
+                resp["numeric_min"] = (int)numReqExpose.Min;
+                resp["numeric_max"] = (int)numReqExpose.Max;
+                resp["numeric_input_type"] = numReqExpose.InputType.ToString();
+                resp["numeric_disallowed"] = disallowedArr;
+                resp["numeric_suggested"] = suggestedArr;
+                resp["numeric_disallow_even"] = numReqExpose.DisallowEven;
+                resp["numeric_disallow_odd"] = numReqExpose.DisallowOdd;
+                resp["can_pass"] = false;
+            }
 
             var requestPayload = BuildPendingRequestPayload(request);
             if (requestPayload.Count > 0)
