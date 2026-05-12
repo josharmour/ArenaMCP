@@ -43,6 +43,7 @@ import sys
 import threading
 import time
 import traceback
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -555,17 +556,19 @@ class StandaloneCoach:
         self._advice_history: list[dict] = []
 
         # Post-match analysis
-        self._saved_advice_history: list[dict] = []
-        self._saved_missed_decisions: list[dict] = []
-        self._last_match_result: Optional[str] = None
-        self._last_match_final_state: Optional[dict] = None
-        self._last_match_replay_path: Optional[str] = None
+        # Bug B: per-match staging dict keyed by match_id string.
+        # Value is {"advice_history", "missed_decisions", "result",
+        #           "final_state", "replay_path"}.
+        self._staged_analyses: dict[str, dict] = {}
+        # Bug A: deep-copied snapshot from analysis-completion time,
+        # plus the completed analysis text, for F7 bug reports.
+        self._post_match_snapshot: Optional[dict] = None
+        self._post_match_analysis_text: Optional[str] = None
+        self._post_match_result: Optional[str] = None
         self._game_end_handled: bool = False  # Prevents duplicate triggers
         self._match_boundary_ts: float = 0.0  # Suppress stale triggers after reset
         self._last_game_end_check_error: str = ""
         self._post_match_analysis_running: bool = False
-        self._pending_post_match_analysis: Optional[str] = None  # For GH issue filing via F7
-        self._pending_post_match_result: Optional[str] = None
 
         # Vision watchdog: tempo anomaly detection + missed decision tracking
         self._tempo_tracker = _TempoTracker()
@@ -1051,23 +1054,33 @@ class StandaloneCoach:
                     logger.info("No deck cards available for strategy brief")
                     return
 
+                # Use the card database directly, skipping the MCP tool
+                # layer. For a 60-card deck the MCP indirection adds tens of
+                # ms of pointless overhead per call.
+                from arenamcp.card_db import get_card_database
+                card_db = get_card_database()
                 enriched = []
                 for grp_id in deck_grp_ids:
                     try:
-                        info = self._mcp.get_card_info(grp_id)
-                        enriched.append((
-                            info.get("name", f"Unknown({grp_id})"),
-                            info.get("type_line", ""),
-                            info.get("oracle_text", ""),
-                        ))
+                        info = card_db.get_card_by_arena_id(grp_id)
+                        if info is not None:
+                            enriched.append((
+                                info.name or f"Unknown({grp_id})",
+                                info.type_line or "",
+                                info.oracle_text or "",
+                            ))
+                        else:
+                            enriched.append((f"Unknown({grp_id})", "", ""))
                     except Exception:
                         enriched.append((f"Unknown({grp_id})", "", ""))
 
                 from arenamcp.coach import create_backend
                 brief_backend = create_backend(self._backend_name, model=self.model_name)
-                strategy = self._coach.get_deck_strategy_brief(enriched, backend=brief_backend)
-                if hasattr(brief_backend, "close"):
-                    brief_backend.close()
+                try:
+                    strategy = self._coach.get_deck_strategy_brief(enriched, backend=brief_backend)
+                finally:
+                    if hasattr(brief_backend, "close"):
+                        brief_backend.close()
 
                 if strategy:
                     # Also store as the deck strategy so /deck-strategy can recall it
@@ -1091,6 +1104,7 @@ class StandaloneCoach:
         match_result: Optional[str],
         final_state: Optional[dict],
         replay_path: Optional[str],
+        match_id: Optional[str] = None,
         advice_history: Optional[list[dict]] = None,
         missed_decisions: Optional[list[dict]] = None,
         reason: str,
@@ -1113,19 +1127,29 @@ class StandaloneCoach:
             logger.info(f"Skipping post-match staging ({reason}): no advice history")
             return False
 
-        self._saved_advice_history = staged_history
-        self._saved_missed_decisions = list(
-            self._missed_decisions if missed_decisions is None else missed_decisions
-        )
-        self._last_match_result = match_result or "unknown"
-        self._last_match_final_state = dict(final_state) if isinstance(final_state, dict) else final_state
-        self._last_match_replay_path = replay_path
+        mid = str(match_id) if match_id is not None else f"match_{self._match_number}"
+        staged = {
+            "advice_history": staged_history,
+            "missed_decisions": list(
+                self._missed_decisions if missed_decisions is None else missed_decisions
+            ),
+            "result": match_result or "unknown",
+            "final_state": deepcopy(final_state) if isinstance(final_state, dict) else final_state,
+            "replay_path": replay_path,
+        }
+        self._staged_analyses[mid] = staged
+
+        # Cap at last 3; evict oldest with log
+        while len(self._staged_analyses) > 3:
+            oldest_key = next(iter(self._staged_analyses))
+            logger.info("Evicting oldest staged analysis (%s) — cap of 3 reached", oldest_key)
+            del self._staged_analyses[oldest_key]
 
         logger.info(
             "Staged post-match analysis (%s): entries=%s result=%s replay=%s auto=%s",
             reason,
-            len(self._saved_advice_history),
-            self._last_match_result,
+            len(staged["advice_history"]),
+            staged["result"],
             replay_path or "none",
             self._auto_post_match_analysis if auto_start is None else auto_start,
         )
@@ -1145,16 +1169,25 @@ class StandaloneCoach:
             logger.info(f"Post-match analysis already running; skipping launch ({reason})")
             return False
 
-        if not self._saved_advice_history:
+        # Find a staged analysis to run (prefer most-recently-added)
+        mid = None
+        staged = None
+        if self._staged_analyses:
+            mid = next(reversed(self._staged_analyses))
+            staged = self._staged_analyses[mid]
+
+        if not staged or not staged.get("advice_history"):
             logger.info(f"No saved post-match data; skipping launch ({reason})")
             return False
 
         self._post_match_analysis_running = True
-        threading.Thread(
+        thread = threading.Thread(
             target=self._post_match_analysis_worker,
             daemon=True,
             name="post-match-analysis",
-        ).start()
+            args=(mid,),
+        )
+        thread.start()
         logger.info(f"Started post-match analysis worker ({reason})")
         return True
 
@@ -1312,24 +1345,40 @@ class StandaloneCoach:
                     self._vlm_card_failures.add(c.get("grp_id", 0))
                 continue
 
-            # Match identified names back to unknown cards (best effort: order-based)
+            # Match identified names back to unknown cards by grp_id.
+            # The prompt asks the VLM to echo grp_id with each card, but
+            # fall back to positional matching if the VLM omitted grp_id
+            # (older model or model that ignored the schema instruction).
+            by_grpid: dict[int, dict] = {}
+            for entry in identified:
+                try:
+                    gid = int(entry.get("grp_id") or 0)
+                except (TypeError, ValueError):
+                    gid = 0
+                if gid:
+                    by_grpid[gid] = entry
+
             for i, card in enumerate(cards):
                 grp_id = card.get("grp_id", 0)
-                if i < len(identified):
-                    resolved_name = identified[i].get("name", "")
-                    conf = identified[i].get("confidence", 0)
-                    if resolved_name:
-                        self._vlm_card_cache[grp_id] = resolved_name
-                        # Patch the card in-place in game state
-                        card["name"] = f"{resolved_name} (vision)"
-                        self.ui.log(
-                            f"[dim cyan]Vision ID: {resolved_name} "
-                            f"(grpId={grp_id}, {zone_name}, conf={conf:.0%})[/]"
-                        )
-                        # Also try to enrich via Scryfall now that we have a name
-                        self._enrich_vlm_resolved_card(card, resolved_name)
-                        continue
-                self._vlm_card_failures.add(grp_id)
+                entry = by_grpid.get(grp_id)
+                if entry is None and not by_grpid and i < len(identified):
+                    # No grp_ids in response at all — best-effort positional
+                    entry = identified[i]
+                if entry is None:
+                    self._vlm_card_failures.add(grp_id)
+                    continue
+                resolved_name = entry.get("name", "")
+                conf = entry.get("confidence", 0)
+                if not resolved_name:
+                    self._vlm_card_failures.add(grp_id)
+                    continue
+                self._vlm_card_cache[grp_id] = resolved_name
+                card["name"] = f"{resolved_name} (vision)"
+                self.ui.log(
+                    f"[dim cyan]Vision ID: {resolved_name} "
+                    f"(grpId={grp_id}, {zone_name}, conf={conf:.0%})[/]"
+                )
+                self._enrich_vlm_resolved_card(card, resolved_name)
 
     @staticmethod
     def _enrich_vlm_resolved_card(card: dict, name: str) -> None:
@@ -1444,13 +1493,28 @@ class StandaloneCoach:
                 self._autopilot_afk = False
                 self._init_autopilot()
             if self._autopilot:
-                # Reset lock in case previous session left it stuck
+                # Reset lock only if the owner thread is gone. Force-releasing
+                # a lock held by a live thread silently corrupts state.
                 if self._autopilot._lock.locked():
-                    logger.warning("Autopilot: releasing stuck lock from previous session")
-                    try:
-                        self._autopilot._lock.release()
-                    except RuntimeError:
-                        pass  # Lock wasn't held by this thread
+                    owner_id = self._autopilot._lock_owner_thread_id
+                    owner_alive = owner_id is not None and any(
+                        t.ident == owner_id and t.is_alive()
+                        for t in threading.enumerate()
+                    )
+                    if owner_alive:
+                        logger.error(
+                            f"Autopilot: lock held by alive thread {owner_id} — "
+                            f"refusing to force-release. Wait a few seconds or restart the coach."
+                        )
+                        self.ui.log(
+                            "[red]Autopilot: previous session still running. "
+                            "Try again shortly or restart the coach.[/]"
+                        )
+                        return False
+                    logger.warning(
+                        "Autopilot: lock owner thread is gone, safely resetting"
+                    )
+                    self._autopilot._release_lock()
                 # Clear abort/skip/confirm events from previous session —
                 # on_abort() sets _abort_event which persists across toggles
                 # and causes process_trigger() to bail out immediately.
@@ -1720,6 +1784,7 @@ class StandaloneCoach:
 
         last_advice_turn = 0
         last_advice_phase = ""
+        _hb_consecutive_failures = 0
         # Critical triggers that always fire regardless of frequency setting
         # Combat triggers removed - too noisy for "start_of_turn" mode
         # decision_required added - scry, discard, target choices need immediate advice
@@ -1752,9 +1817,16 @@ class StandaloneCoach:
                 try:
                     hb_state = self._mcp.get_game_state()
                     if isinstance(hb_state, dict):
+                        _hb_consecutive_failures = 0
                         self._emit_pipe_snapshots(game_state=hb_state)
                 except Exception:
-                    pass
+                    _hb_consecutive_failures += 1
+                    if _hb_consecutive_failures >= 5:
+                        logger.warning(
+                            "MCP heartbeat failed %d consecutive times — "
+                            "coach is blind (log parsing or MCP may be down)",
+                            _hb_consecutive_failures,
+                        )
 
                 # Poll card positions from the bridge and forward to the UI
                 # match overlay. The UI no longer runs its own GREBridge
@@ -2052,7 +2124,7 @@ class StandaloneCoach:
                     self._advice_history = []
                     self._deck_analyzed = False
                     self._game_end_handled = False
-                    # Note: _pending_post_match_analysis is NOT cleared here —
+                    # Note: _post_match_analysis_text is NOT cleared here —
                     # it persists until F7 is pressed or a new analysis replaces it.
                     self._tempo_tracker.reset()
                     self._missed_decisions = []
@@ -2113,7 +2185,7 @@ class StandaloneCoach:
                     self._advice_history = []
                     self._deck_analyzed = False
                     self._game_end_handled = False
-                    # Note: _pending_post_match_analysis is NOT cleared here —
+                    # Note: _post_match_analysis_text is NOT cleared here —
                     # it persists until F7 is pressed or a new analysis replaces it.
                     self._tempo_tracker.reset()
                     self._missed_decisions = []
@@ -2195,13 +2267,12 @@ class StandaloneCoach:
                                 deck_backend = create_backend(backend_name, model=model_name)
 
                                 # Full strategy analysis (stored, injected into every prompt)
-                                strategy = coach.analyze_deck(enriched, backend=deck_backend)
-
-                                # Brief spoken summary (3-5 sentences for TTS)
-                                brief = coach.get_deck_strategy_brief(enriched, backend=deck_backend)
-
-                                if hasattr(deck_backend, 'close'):
-                                    deck_backend.close()
+                                try:
+                                    strategy = coach.analyze_deck(enriched, backend=deck_backend)
+                                    brief = coach.get_deck_strategy_brief(enriched, backend=deck_backend)
+                                finally:
+                                    if hasattr(deck_backend, 'close'):
+                                        deck_backend.close()
 
                                 if strategy:
                                     first_line = strategy.split("\n")[0].strip()
@@ -2252,10 +2323,11 @@ class StandaloneCoach:
                     bridge_trigger = None
                     if self._bridge_poller:
                         bridge_trigger = self._bridge_poller.poll()
+                        # Only enrich the snapshot when poll() returns a new decision.
+                        # When poll() returns None, _last_poll_result is stale and
+                        # enrich_snapshot would overlay stale bridge actions/targets
+                        # onto the current game state — a correctness bug (#205).
                         if bridge_trigger:
-                            self._bridge_poller.enrich_snapshot(curr_state)
-                        elif self._bridge_poller.connected:
-                            # No change, but still enrich snapshot with latest bridge data
                             self._bridge_poller.enrich_snapshot(curr_state)
 
                         # Update bridge status in UI (only on change)
@@ -3454,7 +3526,14 @@ class StandaloneCoach:
         report["mtga_log"] = self._get_mtga_log_status()
 
         _progress("Capturing current game state...")
-        report["game_state"] = self._mcp.get_game_state() if self._mcp else {}
+        # Bug A: prefer deep-copied completion-time snapshot over live state
+        # to prevent F7 bug reports from mixing games in a BO3.
+        if self._post_match_snapshot and self._post_match_analysis_text:
+            report["game_state"] = self._post_match_snapshot
+            report["game_state_source"] = "post_match_snapshot"
+        else:
+            report["game_state"] = self._mcp.get_game_state() if self._mcp else {}
+            report["game_state_source"] = "live"
         report["draft_state"] = self._mcp.get_draft_pack() if self._mcp else {}
 
         _progress("Collecting match context...")
@@ -3513,13 +3592,13 @@ class StandaloneCoach:
         context = dict(extra_context or {})
         analysis = str(
             context.get("analysis")
-            or self._pending_post_match_analysis
+            or self._post_match_analysis_text
             or ""
         ).strip()
         feedback = str(context.get("user_feedback") or "").strip()
         match_result = str(
             context.get("match_result")
-            or self._pending_post_match_result
+            or self._post_match_result
             or ""
         ).strip()
         source = str(context.get("source") or "").strip()
@@ -3536,6 +3615,12 @@ class StandaloneCoach:
             payload["analysis"] = analysis
         if feedback:
             payload["user_feedback"] = feedback
+
+        # Bug A: include deep-copied completion-time snapshot so
+        # the bug report's game_state field doesn't mix games.
+        if self._post_match_snapshot:
+            payload["post_match_snapshot"] = self._post_match_snapshot
+
         return payload
 
     def _collect_autopilot_info(self) -> dict:
@@ -4073,17 +4158,26 @@ class StandaloneCoach:
             logger.warning(f"Failed to extract replay context: {e}", exc_info=True)
             return None
 
-    def _post_match_analysis_worker(self) -> None:
+    def _post_match_analysis_worker(self, match_id: str) -> None:
         """Background worker: generate post-match strategic analysis.
 
         Spawned when a match ends. Uses a dedicated backend to avoid
         lock contention with real-time coaching.
         """
+        # Pop our match_id from staged so no other worker can claim it.
+        # This isolates each match's analysis from BO3 clobbering.
+        if match_id not in self._staged_analyses:
+            logger.info(f"No staged analysis for match_id={match_id}")
+            self._post_match_analysis_running = False
+            return
+        staged = self._staged_analyses.pop(match_id)
+
         try:
-            advice_history = self._saved_advice_history
-            match_result = self._last_match_result or "unknown"
-            final_state = self._last_match_final_state
-            replay_path = self._last_match_replay_path
+            advice_history = staged["advice_history"]
+            match_result = staged["result"]
+            final_state = staged["final_state"]
+            replay_path = staged["replay_path"]
+            missed_decisions = staged["missed_decisions"]
 
             if not advice_history:
                 logger.info("No advice history for post-match analysis")
@@ -4138,7 +4232,7 @@ class StandaloneCoach:
                 deck_strategy=deck_strategy,
                 final_life_totals=final_life,
                 opponent_played_cards=opponent_cards,
-                missed_decisions=self._saved_missed_decisions,
+                missed_decisions=missed_decisions,
                 replay_context=replay_context,
             )
 
@@ -4182,8 +4276,16 @@ class StandaloneCoach:
             logger.info(f"Post-match analysis complete: {len(analysis)} chars")
 
             # Store analysis for inclusion in /bugreport
-            self._pending_post_match_analysis = display_analysis
-            self._pending_post_match_result = match_result
+            # Bug A: deep-copy live game state at completion time so F7
+            # bug reports don't mix games in a BO3.
+            try:
+                self._post_match_snapshot = deepcopy(
+                    self._mcp.get_game_state()
+                )
+            except Exception:
+                self._post_match_snapshot = None
+            self._post_match_analysis_text = display_analysis
+            self._post_match_result = match_result
             emit_feedback_request = getattr(self.ui, "emit_post_match_feedback_request", None)
             if callable(emit_feedback_request):
                 emit_feedback_request(display_analysis, match_result)
@@ -4191,14 +4293,7 @@ class StandaloneCoach:
                 self.ui.log("[bold yellow]Type /bugreport to file coaching improvements to GitHub[/]")
 
             # Offer to file GH issue for missed decisions detected by vision watchdog
-            self._offer_missed_decision_issue()
-
-            # Clear saved data only on success
-            self._saved_advice_history = []
-            self._saved_missed_decisions = []
-            self._last_match_result = None
-            self._last_match_final_state = None
-            self._last_match_replay_path = None
+            self._offer_missed_decision_issue(missed_decisions=missed_decisions)
 
         except Exception as e:
             logger.error(f"Post-match analysis error: {e}", exc_info=True)
@@ -4207,9 +4302,13 @@ class StandaloneCoach:
         finally:
             self._post_match_analysis_running = False
 
-    def _offer_missed_decision_issue(self) -> None:
-        """Offer to file a GH issue if vision detected missed decisions this match."""
-        missed = self._saved_missed_decisions
+    def _offer_missed_decision_issue(self, missed_decisions: Optional[list[dict]] = None) -> None:
+        """Offer to file a GH issue if vision detected missed decisions this match.
+
+        Accepts missed_decisions directly to avoid coupling to instance state.
+        Falls back to getattr for callers that still use the old singleton pattern.
+        """
+        missed = missed_decisions if missed_decisions is not None else getattr(self, "_saved_missed_decisions", [])
         if not missed:
             return
 
@@ -4350,7 +4449,8 @@ class StandaloneCoach:
             self.ui.log("[yellow]Analysis already in progress...[/]")
             return
 
-        has_saved = bool(self._saved_advice_history)
+        _staged_count = len(self._staged_analyses)
+        has_saved = _staged_count > 0
         has_current = bool(self._advice_history)
 
         if has_saved:

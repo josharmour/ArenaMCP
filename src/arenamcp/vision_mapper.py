@@ -159,14 +159,14 @@ I need you to identify the card(s) that are visible but whose names I cannot det
 The card(s) I need identified are in the following zone: {zone}.
 {hint}
 
-Read the card name text visible on the card art, title bar, or tooltip. If multiple unknown cards exist in
-that zone, list all of them.
+For each grpId in the hint, identify which physical card on screen it corresponds to and read its name.
+Return the original grpId alongside the name so the caller can match results back unambiguously.
 
 Output ONLY a JSON object:
 {{
   "cards": [
-    {{"name": "Exact Card Name", "confidence": 0.9}},
-    {{"name": "Another Card", "confidence": 0.7}}
+    {{"grp_id": 12345, "name": "Exact Card Name", "confidence": 0.9}},
+    {{"grp_id": 67890, "name": "Another Card", "confidence": 0.7}}
   ]
 }}
 

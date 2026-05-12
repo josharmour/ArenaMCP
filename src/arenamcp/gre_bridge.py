@@ -398,12 +398,14 @@ class GREBridge:
                     while True:
                         if pipe_file is None:
                             raise GREBridgeError("Pipe closed during read")
-                        chunk = pipe_file.read(1)
+                        chunk = pipe_file.read(4096)
                         if not chunk:
                             raise GREBridgeError("Pipe closed")
-                        if chunk == b"\n":
-                            break
                         response_bytes += chunk
+                        nl_idx = response_bytes.find(b"\n")
+                        if nl_idx >= 0:
+                            response_bytes = response_bytes[:nl_idx]
+                            break
                     result.append(response_bytes)
                 except BaseException as e:  # noqa: BLE001 — propagate verbatim
                     exc.append(e)

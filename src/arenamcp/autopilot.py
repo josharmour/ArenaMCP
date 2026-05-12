@@ -297,6 +297,10 @@ class AutopilotEngine:
         self._current_plan = None
         self._current_action_idx = 0
         self._lock = threading.Lock()
+        # Track which thread owns _lock so toggle_autopilot can distinguish
+        # a stuck lock (owner thread dead/gone) from a live one before
+        # force-releasing. Force-releasing a live owner's lock corrupts state.
+        self._lock_owner_thread_id: Optional[int] = None
 
         # Confirmation events
         self._confirm_event = threading.Event()
@@ -1109,6 +1113,25 @@ class AutopilotEngine:
         self._skip_event.clear()
         self._abort_event.clear()
 
+    def _acquire_lock(self, blocking: bool = True, timeout: float = -1) -> bool:
+        """Acquire self._lock and record owner thread on success."""
+        acquired = self._lock.acquire(blocking=blocking, timeout=timeout)
+        if acquired:
+            self._lock_owner_thread_id = threading.get_ident()
+        return acquired
+
+    def _release_lock(self) -> None:
+        """Release self._lock and clear owner thread.
+
+        Safe to call when the lock isn't held by the current thread
+        (e.g. after a force-release recovery).
+        """
+        self._lock_owner_thread_id = None
+        try:
+            self._lock.release()
+        except RuntimeError:
+            pass
+
     def _wait_for_cancel(self, timeout: Optional[float] = None) -> str:
         """Countdown timer that auto-executes unless user cancels.
 
@@ -1187,14 +1210,11 @@ class AutopilotEngine:
         Returns:
             True if plan was fully executed, False otherwise.
         """
-        if not self._lock.acquire(timeout=10.0):
+        if not self._acquire_lock(timeout=10.0):
             # Lock held for >10 seconds — force release (previous call is hung)
             logger.warning(f"Autopilot: lock held >10s, force-releasing for {trigger}")
-            try:
-                self._lock.release()
-            except RuntimeError:
-                pass
-            if not self._lock.acquire(blocking=False):
+            self._release_lock()
+            if not self._acquire_lock(blocking=False):
                 logger.error(f"Autopilot: could not acquire lock even after force-release")
                 return False
 
@@ -2124,14 +2144,14 @@ class AutopilotEngine:
 
                 if should_continue and self._continuation_depth < self._MAX_CONTINUATION_DEPTH:
                     # Release lock temporarily so process_trigger can re-acquire
-                    self._lock.release()
+                    self._release_lock()
                     self._continuation_depth += 1
                     try:
                         self.process_trigger(post_plan_state, "decision_required")
                     finally:
                         self._continuation_depth -= 1
                         # Re-acquire for the outer finally block
-                        self._lock.acquire()
+                        self._acquire_lock()
                 elif should_continue:
                     logger.warning(
                         f"Post-plan: skipping continuation (depth {self._continuation_depth} "
@@ -2142,10 +2162,7 @@ class AutopilotEngine:
 
             return True
         finally:
-            try:
-                self._lock.release()
-            except RuntimeError:
-                pass  # Lock was externally released (e.g. toggle off/on)
+            self._release_lock()
 
     def _deterministic_fallback(
         self,

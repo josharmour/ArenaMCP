@@ -16,6 +16,13 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+_MANA_COLOR_MAP = {
+    "ManaColor_White": "W", "ManaColor_Blue": "U",
+    "ManaColor_Black": "B", "ManaColor_Red": "R",
+    "ManaColor_Green": "G", "ManaColor_Colorless": "C",
+    "ManaColor_Any": "Any",
+}
+
 
 def _ensure_list(value: Any) -> list[Any]:
     """Normalize GRE repeated fields that sometimes arrive as scalars."""
@@ -2006,12 +2013,6 @@ class GameState:
 
         # Extract mana pool if present, otherwise preserve existing
         # GRE uses "color" field with values like "ManaColor_Green" → map to WUBRG/C
-        _MANA_COLOR_MAP = {
-            "ManaColor_White": "W", "ManaColor_Blue": "U",
-            "ManaColor_Black": "B", "ManaColor_Red": "R",
-            "ManaColor_Green": "G", "ManaColor_Colorless": "C",
-            "ManaColor_Any": "Any",
-        }
         if "manaPool" in player_data:
             mana_pool = {}
             for mana_data in _ensure_dict_list(player_data["manaPool"]):

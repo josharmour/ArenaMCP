@@ -11,6 +11,8 @@ import time
 from collections import Counter
 from typing import Any, Optional
 
+from arenamcp.backends import LLMBackend, ProxyBackend
+
 logger = logging.getLogger(__name__)
 
 
@@ -285,10 +287,6 @@ def _fallback_non_action_advice(game_state: dict[str, Any]) -> str:
 
 
 # LLM Backend Protocol and Implementations
-from arenamcp.backends import (  # noqa: E402
-    LLMBackend,
-    ProxyBackend,
-)
 
 
 def _is_local_backend(be: Any) -> bool:
