@@ -3899,39 +3899,78 @@ class AutopilotEngine:
         # mill-then-pick) the IdType is InstanceId — two copies of the
         # same card have different instance IDs. Submitting grp_ids in
         # that case silently no-ops and the game keeps asking.
+        #
+        # Prefer the explicit fields from the bridge response when they
+        # exist (newer plugin builds — see HandleGetPendingActions for
+        # SelectNRequest). Fall back to decision_context for older
+        # bridges that only emitted the reflected request_payload.
         decision_context = game_state.get("decision_context") or {}
-        id_type = str(decision_context.get("id_type") or "").strip()
-        option_ids = decision_context.get("option_ids") or []
-        try:
-            option_ids = [int(x) for x in option_ids]
-        except (TypeError, ValueError):
-            option_ids = []
-        wants_instance_ids = (
-            "InstanceId" in id_type
-            or "instance" in id_type.lower()
-            # Heuristic fallback: if the request advertises a short list
-            # of specific IDs AND those IDs resolve to battlefield/library
-            # game objects, they're instance IDs.
-            or (
-                len(option_ids) > 0
-                and len(option_ids) <= 20
-                and all(
-                    any(
-                        int(c.get("instance_id") or 0) == oid
-                        for c in (
-                            game_state.get("battlefield", [])
-                            + game_state.get("library_top_revealed", [])
-                            + game_state.get("hand", [])
-                            + game_state.get("graveyard", [])
-                            + game_state.get("stack", [])
-                            + game_state.get("exile", [])
+        explicit_ids = pending.get("select_n_ids")
+        if isinstance(explicit_ids, list):
+            try:
+                option_ids = [int(x) for x in explicit_ids]
+            except (TypeError, ValueError):
+                option_ids = []
+        else:
+            option_ids = decision_context.get("option_ids") or []
+            try:
+                option_ids = [int(x) for x in option_ids]
+            except (TypeError, ValueError):
+                option_ids = []
+
+        # Explicit flag wins; fall back to id_type string parsing + the
+        # battlefield-membership heuristic when the bridge didn't tag it.
+        explicit_is_instance = pending.get("select_n_is_instance_id")
+        if isinstance(explicit_is_instance, bool):
+            wants_instance_ids = explicit_is_instance
+        else:
+            id_type = str(
+                pending.get("select_n_id_type")
+                or decision_context.get("id_type")
+                or ""
+            ).strip()
+            wants_instance_ids = (
+                "InstanceId" in id_type
+                or "instance" in id_type.lower()
+                or (
+                    len(option_ids) > 0
+                    and len(option_ids) <= 20
+                    and all(
+                        any(
+                            int(c.get("instance_id") or 0) == oid
+                            for c in (
+                                game_state.get("battlefield", [])
+                                + game_state.get("library_top_revealed", [])
+                                + game_state.get("hand", [])
+                                + game_state.get("graveyard", [])
+                                + game_state.get("stack", [])
+                                + game_state.get("exile", [])
+                            )
+                            if isinstance(c, dict)
                         )
-                        if isinstance(c, dict)
+                        for oid in option_ids[:5]
                     )
-                    for oid in option_ids[:5]
                 )
             )
-        )
+
+        # Selection size: prefer explicit min/max from the bridge so the
+        # match loop doesn't over- or under-collect when decision_context
+        # is empty (e.g. fresh CastingTime sub-decision).
+        try:
+            select_min = int(pending.get("select_n_min") or 0)
+        except (TypeError, ValueError):
+            select_min = 0
+        try:
+            select_max = int(pending.get("select_n_max") or 0)
+        except (TypeError, ValueError):
+            select_max = 0
+        if select_max > 0:
+            target_count = select_max
+        else:
+            try:
+                target_count = max(1, int(decision_context.get("count") or 1))
+            except (TypeError, ValueError):
+                target_count = 1
 
         matched_ids: list[int] = []
         zone_keys = (
@@ -3963,9 +4002,9 @@ class AutopilotEngine:
                             if iid not in matched_ids:
                                 matched_ids.append(iid)
                             break
-                    if len(matched_ids) >= max(1, int(decision_context.get("count") or 1)):
+                    if len(matched_ids) >= target_count:
                         break
-                if len(matched_ids) >= max(1, int(decision_context.get("count") or 1)):
+                if len(matched_ids) >= target_count:
                     break
 
         if not matched_ids:

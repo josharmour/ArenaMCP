@@ -844,6 +844,11 @@ namespace MtgaCoachBridge
                 resp["select_n_is_zone"] = selectNReqExpose.IsZoneSelection;
                 resp["select_n_is_mana_color"] = selectNReqExpose.IsManaColorSelection;
                 resp["select_n_is_card_color"] = selectNReqExpose.IsCardColorSelection;
+                resp["select_n_is_counter"] = selectNReqExpose.IsCounterSelection;
+                resp["select_n_is_basic_land"] = selectNReqExpose.IsBasicLandSelection;
+                resp["select_n_is_triggered_ability"] = selectNReqExpose.IsTriggeredAbilitySelection;
+                resp["select_n_is_stacking_decision"] = selectNReqExpose.IsStackingDecision;
+                resp["select_n_should_cancel"] = selectNReqExpose.ShouldCancel;
                 resp["can_pass"] = false;
             }
             else if (request is GroupRequest groupReqExpose)
