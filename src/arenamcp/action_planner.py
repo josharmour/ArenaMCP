@@ -967,12 +967,17 @@ class ActionPlanner:
                             card_hand_entry = card
                             break
                     if card_cost and not rules_engine_cls._can_afford(card_cost, mana_pool):
-                        logger.info(
-                            "Filtering unaffordable spell: %s (cost=%s)",
+                        # We log this but do NOT filter it out. 
+                        # The [OK] tag from MTGA is the source of truth.
+                        # If our local RulesEngine disagrees, the LLM will still see the [OK] 
+                        # and can make the correct decision.
+                        logger.warning(
+                            "RulesEngine mismatch: [OK] spell %s flagged as unaffordable by local check (cost=%s). Trusting MTGA.",
                             card_name,
                             card_cost,
                         )
-                        continue
+                        # Removed 'continue' to prevent filtering out valid [OK] spells
+
 
                     # Block removal spells that would only have friendly
                     # targets. Casting them just forces the user to either
